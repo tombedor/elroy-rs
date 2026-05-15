@@ -390,6 +390,7 @@ version = "0.1.0"
 dependencies = [
  "elroy-memory",
  "serde_yaml",
+ "strsim",
 ]
 
 [[package]]

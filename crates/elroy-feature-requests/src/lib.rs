@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 
 use elroy_memory::sanitize_filename;
 use serde_yaml::Value as YamlValue;
+use strsim::normalized_levenshtein;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FeatureRequestRecord {
@@ -16,6 +17,13 @@ pub struct FeatureRequestRecord {
     pub summary: String,
     pub rationale: Option<String>,
     pub supporting_context: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FeatureRequestMatch {
+    pub record: FeatureRequestRecord,
+    pub score: f64,
+    pub reason: String,
 }
 
 pub fn feature_requests_dir(home_dir: &Path) -> PathBuf {
@@ -229,6 +237,40 @@ pub fn is_active_feature_request(record: &FeatureRequestRecord) -> bool {
     )
 }
 
+pub fn find_best_feature_request_match(
+    home_dir: &Path,
+    title: &str,
+    description: &str,
+) -> std::io::Result<Option<FeatureRequestMatch>> {
+    let matches = list_feature_requests(home_dir)?
+        .into_iter()
+        .map(|record| score_match(title, description, record))
+        .collect::<Vec<_>>();
+    let Some(best_match) = matches
+        .into_iter()
+        .max_by(|left, right| left.score.total_cmp(&right.score))
+    else {
+        return Ok(None);
+    };
+
+    if best_match.score >= 0.92 {
+        return Ok(Some(best_match));
+    }
+    if best_match.score >= 0.6 && best_match.reason == "strong title overlap" {
+        return Ok(Some(best_match));
+    }
+    let description_similarity = title_score(description, &best_match.record.summary);
+    let title_overlap = token_overlap(title, &best_match.record.title);
+    if description_similarity >= 0.72 && title_overlap >= 0.25 {
+        return Ok(Some(FeatureRequestMatch {
+            record: best_match.record,
+            score: best_match.score,
+            reason: "similar behavior description".to_string(),
+        }));
+    }
+    Ok(None)
+}
+
 fn feature_request_path(root: &Path, title: &str) -> PathBuf {
     let base = slugify_feature_request_title(title);
     let first = root.join(format!("{base}.md"));
@@ -315,6 +357,59 @@ fn build_feature_request_content(spec: &FeatureRequestContentSpec<'_>) -> String
     format!("---\n{}---\n\n{}\n", frontmatter, body.join("\n"))
 }
 
+fn score_match(
+    title: &str,
+    description: &str,
+    record: FeatureRequestRecord,
+) -> FeatureRequestMatch {
+    let existing_titles = std::iter::once(&record.title)
+        .chain(record.aliases.iter())
+        .collect::<Vec<_>>();
+    let best_title_score = existing_titles
+        .iter()
+        .map(|existing_title| title_score(title, existing_title))
+        .fold(0.0, f64::max);
+    let summary_score = title_score(description, &record.summary);
+    let overlap_score = existing_titles
+        .iter()
+        .map(|existing_title| token_overlap(title, existing_title))
+        .fold(0.0, f64::max);
+    let combined = best_title_score
+        .max((best_title_score * 0.7) + (summary_score * 0.15) + (overlap_score * 0.15));
+    let reason = if best_title_score >= 0.995 {
+        "exact title match"
+    } else if best_title_score >= 0.92 {
+        "very similar title"
+    } else if best_title_score >= 0.45 && overlap_score >= 0.5 {
+        "strong title overlap"
+    } else {
+        "weak match"
+    };
+    FeatureRequestMatch {
+        record,
+        score: combined,
+        reason: reason.to_string(),
+    }
+}
+
+fn title_score(candidate: &str, existing: &str) -> f64 {
+    normalized_levenshtein(&normalize(candidate), &normalize(existing))
+}
+
+fn token_overlap(candidate: &str, existing: &str) -> f64 {
+    let candidate_tokens = token_set(candidate);
+    let existing_tokens = token_set(existing);
+    if candidate_tokens.is_empty() || existing_tokens.is_empty() {
+        return 0.0;
+    }
+    let intersection = candidate_tokens.intersection(&existing_tokens).count();
+    intersection as f64 / candidate_tokens.len().max(existing_tokens.len()) as f64
+}
+
+fn token_set(text: &str) -> std::collections::BTreeSet<String> {
+    tokenize(text).into_iter().collect()
+}
+
 fn parse_frontmatter_and_body(raw: &str) -> (serde_yaml::Mapping, String) {
     let Some(stripped) = raw.strip_prefix("---\n") else {
         return (serde_yaml::Mapping::new(), raw.trim().to_string());
@@ -384,6 +479,10 @@ fn yaml_value_to_string(value: &YamlValue) -> Option<String> {
 }
 
 fn normalize(text: &str) -> String {
+    tokenize(text).join(" ")
+}
+
+fn tokenize(text: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut current = String::new();
     for ch in text.chars() {
@@ -396,7 +495,7 @@ fn normalize(text: &str) -> String {
     if !current.is_empty() {
         tokens.push(current);
     }
-    tokens.join(" ")
+    tokens
 }
 
 fn iso_timestamp_now() -> String {
@@ -411,9 +510,9 @@ fn iso_timestamp_now() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        get_feature_request, is_active_feature_request, list_feature_requests,
-        list_self_reflection_feature_requests, load_feature_request, update_feature_request,
-        write_new_feature_request,
+        find_best_feature_request_match, get_feature_request, is_active_feature_request,
+        list_feature_requests, list_self_reflection_feature_requests, load_feature_request,
+        update_feature_request, write_new_feature_request,
     };
 
     #[test]
@@ -471,6 +570,49 @@ mod tests {
 
         let reloaded = load_feature_request(&closed.path).expect("feature request should reload");
         assert_eq!(reloaded.status, "closed");
+
+        std::fs::remove_dir_all(home).expect("home dir should be removed");
+    }
+
+    #[test]
+    fn feature_request_matching_merges_similar_titles() {
+        let unique = format!(
+            "elroy-rs-feature-request-matching-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        std::fs::create_dir_all(&home).expect("home dir should be created");
+
+        write_new_feature_request(
+            &home,
+            "Add calendar sync",
+            "Sync Elroy tasks to a calendar provider.",
+            Some("Users want a unified schedule."),
+            None,
+            "user_request",
+        )
+        .expect("feature request should be created");
+
+        let matched = find_best_feature_request_match(
+            &home,
+            "Add calendar synchronization",
+            "Sync tasks to an external calendar.",
+        )
+        .expect("match should succeed")
+        .expect("match should be found");
+
+        assert_eq!(matched.record.title, "Add calendar sync");
+        assert!(
+            matches!(
+                matched.reason.as_str(),
+                "very similar title" | "strong title overlap" | "similar behavior description"
+            ),
+            "unexpected match reason: {}",
+            matched.reason
+        );
 
         std::fs::remove_dir_all(home).expect("home dir should be removed");
     }

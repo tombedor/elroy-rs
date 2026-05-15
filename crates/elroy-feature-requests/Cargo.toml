@@ -12,3 +12,4 @@ workspace = true
 [dependencies]
 elroy-memory = { path = "../elroy-memory" }
 serde_yaml = "0.9"
+strsim = "0.11"
