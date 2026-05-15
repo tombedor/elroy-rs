@@ -5,7 +5,10 @@ use elroy_config::AppConfig;
 use elroy_core::{AppSession, TurnContext};
 use elroy_db::{BootstrapInventory, BootstrapPlan, bootstrap_database};
 use elroy_llm::StreamEvent;
-use elroy_tui::{SidebarAction, SidebarSection, TuiRuntime, run_with_snapshot_and_runtime};
+use elroy_tui::{
+    PromptUpdate, SidebarAction, SidebarSection, TuiPromptStream, TuiRuntime,
+    run_with_snapshot_and_runtime,
+};
 
 fn main() {
     let args = env::args().skip(1).collect::<Vec<_>>();
@@ -106,6 +109,10 @@ struct CliTuiRuntime {
     runtime: AppRuntime,
 }
 
+struct CliPromptStream {
+    inner: elroy_app::PromptEventStream,
+}
+
 impl CliTuiRuntime {
     fn new(runtime: AppRuntime) -> Self {
         Self { runtime }
@@ -117,6 +124,13 @@ impl TuiRuntime for CliTuiRuntime {
         self.runtime
             .process_message(prompt, MessageProcessOptions::default())
             .map(|result| result.snapshot)
+            .map_err(|error| error.to_string())
+    }
+
+    fn start_prompt_stream(&mut self, prompt: &str) -> Result<Box<dyn TuiPromptStream>, String> {
+        self.runtime
+            .process_message_stream(prompt, MessageProcessOptions::default())
+            .map(|inner| Box::new(CliPromptStream { inner }) as Box<dyn TuiPromptStream>)
             .map_err(|error| error.to_string())
     }
 
@@ -139,6 +153,35 @@ impl TuiRuntime for CliTuiRuntime {
         self.runtime
             .mutate_sidebar_item(section, title, action)
             .map_err(|error| error.to_string())
+    }
+}
+
+impl TuiPromptStream for CliPromptStream {
+    fn next_update(&mut self) -> Result<Option<PromptUpdate>, String> {
+        Ok(self.inner.next().map(|event| match event {
+            StreamEvent::AssistantResponse { content } => PromptUpdate::AssistantDelta(content),
+            StreamEvent::AssistantInternalThought { content } => {
+                PromptUpdate::InternalThought(content)
+            }
+            StreamEvent::AssistantToolResult { content, is_error } => {
+                PromptUpdate::ToolResult { content, is_error }
+            }
+            StreamEvent::StatusUpdate { content } => PromptUpdate::Status(content),
+            StreamEvent::ToolCallRequested(call) => PromptUpdate::ToolCall {
+                name: call.name,
+                arguments_json: call.arguments_json,
+            },
+        }))
+    }
+
+    fn finalize(self: Box<Self>) -> Result<elroy_tui::TuiSnapshot, String> {
+        self.inner
+            .into_snapshot()
+            .map_err(|error| error.to_string())
+    }
+
+    fn cancel(self: Box<Self>) -> Result<elroy_tui::TuiSnapshot, String> {
+        self.inner.cancel().map_err(|error| error.to_string())
     }
 }
 

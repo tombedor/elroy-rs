@@ -48,6 +48,7 @@ The preferred approach is:
 - `M1` core runtime and session model: started
 - `M2` persistence and domain data model: started at the bootstrap-planning level
 - `M3` tool system and conversation loop: started with a messenger-style shared runtime surface for prompt processing and background follow-up turns, and now includes a live incremental provider-stream path through the shared messenger runtime
+- `M4` terminal UI shell: now consumes the shared messenger stream incrementally with editable-draft, blocked-resubmit, and `Ctrl+C` clear/cancel behavior, but still lacks broader bootstrap/session workflow parity
 - `M4` memory, recall, reminders, agenda: started with file-backed memory/agenda/task flows and persisted local-user naming/persona preferences
 - `M6` agent workflow and operational polish: started with persisted Codex-session metadata, async dispatch/resume orchestration, session-file discovery, background follow-up messaging, and session-inspection tools
 - `M5` TUI and UX parity: started with a `ratatui` shell

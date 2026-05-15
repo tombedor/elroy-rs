@@ -38,6 +38,7 @@ pub enum FocusTarget {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UiIntent {
     SubmitPrompt,
+    CancelPrompt,
     HistoryPrevious,
     HistoryNext,
     CompleteInput,
@@ -78,8 +79,30 @@ pub enum SidebarAction {
     Delete,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PromptUpdate {
+    AssistantDelta(String),
+    InternalThought(String),
+    ToolCall {
+        name: String,
+        arguments_json: String,
+    },
+    ToolResult {
+        content: String,
+        is_error: bool,
+    },
+    Status(String),
+}
+
+pub trait TuiPromptStream {
+    fn next_update(&mut self) -> Result<Option<PromptUpdate>, String>;
+    fn finalize(self: Box<Self>) -> Result<TuiSnapshot, String>;
+    fn cancel(self: Box<Self>) -> Result<TuiSnapshot, String>;
+}
+
 pub trait TuiRuntime {
     fn submit_prompt(&mut self, prompt: &str) -> Result<TuiSnapshot, String>;
+    fn start_prompt_stream(&mut self, prompt: &str) -> Result<Box<dyn TuiPromptStream>, String>;
     fn open_sidebar_item(&mut self, section: SidebarSection, title: &str)
     -> Result<String, String>;
     fn mutate_sidebar_item(
@@ -132,7 +155,9 @@ fn run_event_loop(
     app: &mut TuiApp,
     runtime: &mut impl TuiRuntime,
 ) -> io::Result<()> {
+    let mut pending_prompt = None;
     loop {
+        advance_prompt_stream(app, &mut pending_prompt);
         terminal.draw(|frame| {
             app.render(frame.area(), frame.buffer_mut());
         })?;
@@ -143,7 +168,7 @@ fn run_event_loop(
 
         match event::read()? {
             Event::Key(key) => {
-                if apply_key_event(app, key, runtime) == TuiExit::Quit {
+                if apply_key_event(app, key, runtime, &mut pending_prompt) == TuiExit::Quit {
                     return Ok(());
                 }
             }
@@ -155,10 +180,20 @@ fn run_event_loop(
     }
 }
 
-fn apply_key_event(app: &mut TuiApp, key: KeyEvent, runtime: &mut impl TuiRuntime) -> TuiExit {
+fn apply_key_event(
+    app: &mut TuiApp,
+    key: KeyEvent,
+    runtime: &mut impl TuiRuntime,
+    pending_prompt: &mut Option<PendingPrompt>,
+) -> TuiExit {
     if key.code == KeyCode::Char('d') && key.modifiers.contains(KeyModifiers::CONTROL) {
         app.status = "quit".to_string();
         return TuiExit::Quit;
+    }
+
+    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        apply_intent_with_runtime(app, UiIntent::CancelPrompt, runtime, pending_prompt);
+        return TuiExit::Continue;
     }
 
     if app.focus == FocusTarget::Input {
@@ -179,13 +214,18 @@ fn apply_key_event(app: &mut TuiApp, key: KeyEvent, runtime: &mut impl TuiRuntim
 
     if let Some(token) = key_event_token(key) {
         let intent = app.handle_key(token);
-        apply_intent_with_runtime(app, intent, runtime);
+        apply_intent_with_runtime(app, intent, runtime, pending_prompt);
     }
 
     TuiExit::Continue
 }
 
-fn apply_intent_with_runtime(app: &mut TuiApp, intent: UiIntent, runtime: &mut impl TuiRuntime) {
+fn apply_intent_with_runtime(
+    app: &mut TuiApp,
+    intent: UiIntent,
+    runtime: &mut impl TuiRuntime,
+    pending_prompt: &mut Option<PendingPrompt>,
+) {
     match intent {
         UiIntent::SubmitPrompt => {
             let submitted = app.input.trim().to_string();
@@ -193,15 +233,42 @@ fn apply_intent_with_runtime(app: &mut TuiApp, intent: UiIntent, runtime: &mut i
                 app.status = "prompt was empty".to_string();
                 return;
             }
-            match runtime.submit_prompt(&submitted) {
-                Ok(snapshot) => {
-                    app.apply_snapshot(snapshot);
+            if pending_prompt.is_some() {
+                app.status = "Wait for the current task to finish before sending another message."
+                    .to_string();
+                return;
+            }
+            match runtime.start_prompt_stream(&submitted) {
+                Ok(stream) => {
+                    app.conversation_lines.push(format!("user: {submitted}"));
                     app.input.clear();
-                    app.status = format!("submitted prompt: {submitted}");
+                    app.status = "thinking...".to_string();
+                    *pending_prompt = Some(PendingPrompt {
+                        submitted_prompt: submitted,
+                        stream,
+                    });
                 }
                 Err(error) => {
                     app.status = format!("prompt failed: {error}");
                 }
+            }
+        }
+        UiIntent::CancelPrompt => {
+            if let Some(pending) = pending_prompt.take() {
+                match pending.stream.cancel() {
+                    Ok(snapshot) => {
+                        app.apply_snapshot(snapshot);
+                        app.status = "Chat stream cancelled".to_string();
+                    }
+                    Err(error) => {
+                        app.status = format!("cancel failed: {error}");
+                    }
+                }
+                return;
+            }
+            if app.focus == FocusTarget::Input {
+                app.input.clear();
+                app.status = "cleared prompt".to_string();
             }
         }
         UiIntent::OpenSelected => {
@@ -243,6 +310,71 @@ fn apply_intent_with_runtime(app: &mut TuiApp, intent: UiIntent, runtime: &mut i
             }
         }
         _ => app.apply_intent(intent),
+    }
+}
+
+struct PendingPrompt {
+    submitted_prompt: String,
+    stream: Box<dyn TuiPromptStream>,
+}
+
+fn advance_prompt_stream(app: &mut TuiApp, pending_prompt: &mut Option<PendingPrompt>) {
+    let Some(pending) = pending_prompt.as_mut() else {
+        return;
+    };
+    match pending.stream.next_update() {
+        Ok(Some(update)) => apply_prompt_update(app, update),
+        Ok(None) => {
+            let pending = pending_prompt.take().expect("pending prompt should exist");
+            match pending.stream.finalize() {
+                Ok(snapshot) => {
+                    app.apply_snapshot(snapshot);
+                    app.status = format!("submitted prompt: {}", pending.submitted_prompt);
+                }
+                Err(error) => {
+                    app.status = format!("prompt failed: {error}");
+                }
+            }
+        }
+        Err(error) => {
+            pending_prompt.take();
+            app.status = format!("prompt failed: {error}");
+        }
+    }
+}
+
+fn apply_prompt_update(app: &mut TuiApp, update: PromptUpdate) {
+    match update {
+        PromptUpdate::AssistantDelta(delta) => {
+            if let Some(last) = app.conversation_lines.last_mut()
+                && last.starts_with("assistant: ")
+            {
+                last.push_str(&delta);
+            } else {
+                app.conversation_lines.push(format!("assistant: {delta}"));
+            }
+        }
+        PromptUpdate::InternalThought(content) => {
+            app.status = format!("thinking: {content}");
+        }
+        PromptUpdate::ToolCall {
+            name,
+            arguments_json,
+        } => {
+            app.conversation_lines
+                .push(format!("tool requested: {name} {arguments_json}"));
+        }
+        PromptUpdate::ToolResult { content, is_error } => {
+            let label = if is_error {
+                "tool error"
+            } else {
+                "tool result"
+            };
+            app.conversation_lines.push(format!("{label}: {content}"));
+        }
+        PromptUpdate::Status(content) => {
+            app.status = content;
+        }
     }
 }
 
@@ -388,7 +520,7 @@ impl TuiApp {
     pub fn footer_hints(&self) -> &'static str {
         match self.focus {
             FocusTarget::Input => {
-                "Esc command mode  Ctrl+M memories  Ctrl+A agenda  s codex sessions  Ctrl+D quit"
+                "Esc command mode  Ctrl+C clear/cancel  Ctrl+M memories  Ctrl+A agenda  s codex sessions  Ctrl+D quit"
             }
             FocusTarget::Command(_) => {
                 "Tab switch pane  j/k move  Enter open  c complete  d archive/delete  i/a/Esc chat mode"
@@ -441,6 +573,9 @@ impl TuiApp {
                     self.status = format!("submitted prompt: {submitted}");
                     self.input.clear();
                 }
+            }
+            UiIntent::CancelPrompt => {
+                self.status = "cancel requested".to_string();
             }
             UiIntent::HistoryPrevious => {
                 self.status = "prompt history previous".to_string();
@@ -588,9 +723,29 @@ impl TuiApp {
 
 struct NoopRuntime;
 
+struct NoopPromptStream;
+
+impl TuiPromptStream for NoopPromptStream {
+    fn next_update(&mut self) -> Result<Option<PromptUpdate>, String> {
+        Ok(None)
+    }
+
+    fn finalize(self: Box<Self>) -> Result<TuiSnapshot, String> {
+        Ok(TuiSnapshot::default())
+    }
+
+    fn cancel(self: Box<Self>) -> Result<TuiSnapshot, String> {
+        Ok(TuiSnapshot::default())
+    }
+}
+
 impl TuiRuntime for NoopRuntime {
     fn submit_prompt(&mut self, _prompt: &str) -> Result<TuiSnapshot, String> {
         Ok(TuiSnapshot::default())
+    }
+
+    fn start_prompt_stream(&mut self, _prompt: &str) -> Result<Box<dyn TuiPromptStream>, String> {
+        Ok(Box::new(NoopPromptStream))
     }
 
     fn open_sidebar_item(
@@ -618,8 +773,9 @@ mod tests {
     use ratatui::layout::Rect;
 
     use super::{
-        CommandPane, FocusTarget, SidebarAction, SidebarSection, TuiApp, TuiExit, TuiRuntime,
-        TuiSnapshot, UiIntent, apply_intent_with_runtime, apply_key_event, key_event_token,
+        CommandPane, FocusTarget, PromptUpdate, SidebarAction, SidebarSection, TuiApp, TuiExit,
+        TuiPromptStream, TuiRuntime, TuiSnapshot, UiIntent, advance_prompt_stream,
+        apply_intent_with_runtime, apply_key_event, key_event_token,
     };
 
     #[derive(Default)]
@@ -627,6 +783,30 @@ mod tests {
         submitted_prompts: Vec<String>,
         last_opened: Option<(SidebarSection, String)>,
         last_mutation: Option<(SidebarSection, String, SidebarAction)>,
+    }
+
+    struct FakePromptStream {
+        updates: Vec<PromptUpdate>,
+        finalized_snapshot: TuiSnapshot,
+        cancelled_snapshot: TuiSnapshot,
+    }
+
+    impl TuiPromptStream for FakePromptStream {
+        fn next_update(&mut self) -> Result<Option<PromptUpdate>, String> {
+            if self.updates.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(self.updates.remove(0)))
+            }
+        }
+
+        fn finalize(self: Box<Self>) -> Result<TuiSnapshot, String> {
+            Ok(self.finalized_snapshot)
+        }
+
+        fn cancel(self: Box<Self>) -> Result<TuiSnapshot, String> {
+            Ok(self.cancelled_snapshot)
+        }
     }
 
     impl TuiRuntime for FakeRuntime {
@@ -642,6 +822,35 @@ mod tests {
                 codex_session_titles: vec!["Fresh Session".to_string()],
                 status: Some("runtime updated".to_string()),
             })
+        }
+
+        fn start_prompt_stream(
+            &mut self,
+            prompt: &str,
+        ) -> Result<Box<dyn TuiPromptStream>, String> {
+            self.submitted_prompts.push(prompt.to_string());
+            Ok(Box::new(FakePromptStream {
+                updates: vec![
+                    PromptUpdate::Status("thinking...".to_string()),
+                    PromptUpdate::AssistantDelta("runtime ".to_string()),
+                    PromptUpdate::AssistantDelta("response".to_string()),
+                ],
+                finalized_snapshot: TuiSnapshot {
+                    conversation_lines: vec![
+                        format!("user: {prompt}"),
+                        "assistant: runtime response".to_string(),
+                    ],
+                    memory_titles: vec!["Fresh Memory".to_string()],
+                    agenda_titles: vec!["Fresh Agenda".to_string()],
+                    codex_session_titles: vec!["Fresh Session".to_string()],
+                    status: Some("runtime updated".to_string()),
+                },
+                cancelled_snapshot: TuiSnapshot {
+                    conversation_lines: vec!["assistant: cancelled".to_string()],
+                    status: Some("cancelled".to_string()),
+                    ..TuiSnapshot::default()
+                },
+            }))
         }
 
         fn open_sidebar_item(
@@ -858,12 +1067,14 @@ mod tests {
     #[test]
     fn apply_key_event_appends_input_and_submits_prompt() {
         let mut app = TuiApp::bootstrap();
+        let mut pending = None;
 
         assert_eq!(
             apply_key_event(
                 &mut app,
                 KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE),
-                &mut FakeRuntime::default()
+                &mut FakeRuntime::default(),
+                &mut pending,
             ),
             TuiExit::Continue
         );
@@ -871,7 +1082,8 @@ mod tests {
             apply_key_event(
                 &mut app,
                 KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE),
-                &mut FakeRuntime::default()
+                &mut FakeRuntime::default(),
+                &mut pending,
             ),
             TuiExit::Continue
         );
@@ -881,12 +1093,14 @@ mod tests {
             apply_key_event(
                 &mut app,
                 KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-                &mut FakeRuntime::default()
+                &mut FakeRuntime::default(),
+                &mut pending,
             ),
             TuiExit::Continue
         );
-        assert!(app.status.contains("submitted prompt: hi"));
+        assert_eq!(app.status, "thinking...");
         assert!(app.input.is_empty());
+        assert!(pending.is_some());
     }
 
     #[test]
@@ -897,7 +1111,8 @@ mod tests {
             apply_key_event(
                 &mut app,
                 KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
-                &mut FakeRuntime::default()
+                &mut FakeRuntime::default(),
+                &mut None,
             ),
             TuiExit::Quit
         );
@@ -905,12 +1120,60 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_c_clears_input_when_no_stream_is_active() {
+        let mut app = TuiApp::bootstrap();
+        let mut runtime = FakeRuntime::default();
+        let mut pending = None;
+        app.input = "draft".to_string();
+
+        assert_eq!(
+            apply_key_event(
+                &mut app,
+                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+                &mut runtime,
+                &mut pending,
+            ),
+            TuiExit::Continue
+        );
+        assert_eq!(app.input, "");
+        assert_eq!(app.status, "cleared prompt");
+    }
+
+    #[test]
+    fn ctrl_c_cancels_active_stream_and_preserves_draft() {
+        let mut app = TuiApp::bootstrap();
+        let mut runtime = FakeRuntime::default();
+        let mut pending = None;
+        app.input = "hello".to_string();
+
+        apply_intent_with_runtime(&mut app, UiIntent::SubmitPrompt, &mut runtime, &mut pending);
+        app.input = "draft".to_string();
+
+        assert_eq!(
+            apply_key_event(
+                &mut app,
+                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+                &mut runtime,
+                &mut pending,
+            ),
+            TuiExit::Continue
+        );
+        assert_eq!(app.input, "draft");
+        assert_eq!(app.status, "Chat stream cancelled");
+        assert!(pending.is_none());
+    }
+
+    #[test]
     fn runtime_submit_replaces_snapshot_data() {
         let mut app = TuiApp::bootstrap();
         app.input = "hello runtime".to_string();
         let mut runtime = FakeRuntime::default();
+        let mut pending = None;
 
-        apply_intent_with_runtime(&mut app, UiIntent::SubmitPrompt, &mut runtime);
+        apply_intent_with_runtime(&mut app, UiIntent::SubmitPrompt, &mut runtime, &mut pending);
+        while pending.is_some() {
+            advance_prompt_stream(&mut app, &mut pending);
+        }
 
         assert_eq!(runtime.submitted_prompts, vec!["hello runtime".to_string()]);
         assert!(
@@ -928,8 +1191,9 @@ mod tests {
         app.memory_titles = vec!["Runner Notes".to_string()];
         app.handle_key("ctrl+m");
         let mut runtime = FakeRuntime::default();
+        let mut pending = None;
 
-        apply_intent_with_runtime(&mut app, UiIntent::OpenSelected, &mut runtime);
+        apply_intent_with_runtime(&mut app, UiIntent::OpenSelected, &mut runtime, &mut pending);
 
         assert_eq!(
             runtime.last_opened,
@@ -943,7 +1207,7 @@ mod tests {
 
         app.codex_session_titles = vec!["sample (completed) thread-123".to_string()];
         app.handle_key("s");
-        apply_intent_with_runtime(&mut app, UiIntent::OpenSelected, &mut runtime);
+        apply_intent_with_runtime(&mut app, UiIntent::OpenSelected, &mut runtime, &mut pending);
         assert_eq!(
             runtime.last_opened,
             Some((
@@ -959,8 +1223,14 @@ mod tests {
         app.memory_titles = vec!["Runner Notes".to_string()];
         app.handle_key("ctrl+m");
         let mut runtime = FakeRuntime::default();
+        let mut pending = None;
 
-        apply_intent_with_runtime(&mut app, UiIntent::ArchiveSelected, &mut runtime);
+        apply_intent_with_runtime(
+            &mut app,
+            UiIntent::ArchiveSelected,
+            &mut runtime,
+            &mut pending,
+        );
 
         assert_eq!(
             runtime.last_mutation,
@@ -976,5 +1246,72 @@ mod tests {
                 .any(|title| title == "After Mutation")
         );
         assert!(app.status.contains("updated selected"));
+    }
+
+    #[test]
+    fn runtime_stream_updates_conversation_before_final_snapshot() {
+        let mut app = TuiApp::bootstrap();
+        app.input = "hello runtime".to_string();
+        let mut runtime = FakeRuntime::default();
+        let mut pending = None;
+
+        apply_intent_with_runtime(&mut app, UiIntent::SubmitPrompt, &mut runtime, &mut pending);
+
+        assert_eq!(
+            app.conversation_lines.last().map(String::as_str),
+            Some("user: hello runtime")
+        );
+        advance_prompt_stream(&mut app, &mut pending);
+        assert_eq!(app.status, "thinking...");
+        advance_prompt_stream(&mut app, &mut pending);
+        advance_prompt_stream(&mut app, &mut pending);
+        assert_eq!(
+            app.conversation_lines.last().map(String::as_str),
+            Some("assistant: runtime response")
+        );
+        while pending.is_some() {
+            advance_prompt_stream(&mut app, &mut pending);
+        }
+        assert_eq!(app.status, "submitted prompt: hello runtime");
+    }
+
+    #[test]
+    fn submit_is_blocked_while_stream_is_active_and_input_stays_editable() {
+        let mut app = TuiApp::bootstrap();
+        app.input = "hello".to_string();
+        let mut runtime = FakeRuntime::default();
+        let mut pending = None;
+
+        apply_intent_with_runtime(&mut app, UiIntent::SubmitPrompt, &mut runtime, &mut pending);
+        app.input = "draft".to_string();
+        apply_intent_with_runtime(&mut app, UiIntent::SubmitPrompt, &mut runtime, &mut pending);
+
+        assert_eq!(app.input, "draft");
+        assert_eq!(
+            app.status,
+            "Wait for the current task to finish before sending another message."
+        );
+        assert_eq!(runtime.submitted_prompts, vec!["hello".to_string()]);
+    }
+
+    #[test]
+    fn cancel_prompt_preserves_draft_text_and_refreshes_snapshot() {
+        let mut app = TuiApp::bootstrap();
+        app.input = "hello".to_string();
+        let mut runtime = FakeRuntime::default();
+        let mut pending = None;
+
+        apply_intent_with_runtime(&mut app, UiIntent::SubmitPrompt, &mut runtime, &mut pending);
+        app.input = "draft".to_string();
+        apply_intent_with_runtime(&mut app, UiIntent::CancelPrompt, &mut runtime, &mut pending);
+
+        assert_eq!(app.input, "draft");
+        assert_eq!(app.status, "Chat stream cancelled");
+        assert!(pending.is_none());
+        assert!(
+            app.conversation_lines
+                .iter()
+                .any(|line| line.contains("assistant: cancelled"))
+        );
     }
 }

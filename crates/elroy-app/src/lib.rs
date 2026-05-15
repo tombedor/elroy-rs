@@ -117,6 +117,16 @@ impl PromptEventStream {
             .take()
             .unwrap_or_else(|| Err(AppError::Runtime("stream did not finalize".to_string())))
     }
+
+    pub fn cancel(mut self) -> Result<TuiSnapshot, AppError> {
+        if let Some(result) = self.finalized_snapshot.take() {
+            return result;
+        }
+        let Some(state) = self.state.take() else {
+            return Err(AppError::Runtime("stream did not finalize".to_string()));
+        };
+        cancel_prompt_event_stream(state)
+    }
 }
 
 impl Iterator for PromptEventStream {
@@ -457,6 +467,10 @@ fn finalize_prompt_event_stream(
         LOCAL_USER_TOKEN,
         &persisted_transcript,
     )?;
+    load_snapshot_from_connection(&mut state.connection)
+}
+
+fn cancel_prompt_event_stream(mut state: PromptEventStreamState) -> Result<TuiSnapshot, AppError> {
     load_snapshot_from_connection(&mut state.connection)
 }
 
