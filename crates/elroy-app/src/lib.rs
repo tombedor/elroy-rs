@@ -7,7 +7,11 @@ use elroy_agenda::{
     mark_agenda_item_completed, mark_agenda_item_deleted, rename_agenda_file, update_agenda_body,
     update_checklist_item,
 };
-use elroy_codex::{get_codex_session_by_thread_id, list_recent_codex_sessions};
+use elroy_codex::{
+    CodexSessionResult, dispatch_codex_session as run_codex_session,
+    dispatch_codex_session_with_bin, get_codex_session_by_thread_id, list_recent_codex_sessions,
+    resume_codex_session as continue_codex_session, resume_codex_session_with_bin,
+};
 use elroy_config::{AppConfig, LlmProvider};
 use elroy_core::{
     ConversationOrchestrator, LiveProviderModel, LocalToolExecutor, validated_transcript,
@@ -293,6 +297,13 @@ impl AppRuntime {
 }
 
 pub fn build_live_tool_registry(config: &AppConfig) -> ExecutableToolRegistry {
+    build_live_tool_registry_with_codex_bin(config, None)
+}
+
+fn build_live_tool_registry_with_codex_bin(
+    config: &AppConfig,
+    codex_bin_override: Option<PathBuf>,
+) -> ExecutableToolRegistry {
     let config_for_memory_write = config.clone();
     let create_memory = ExecutableTool::new(
         ToolSpec::new(
@@ -1196,6 +1207,120 @@ pub fn build_live_tool_registry(config: &AppConfig) -> ExecutableToolRegistry {
     );
 
     let database_path = config.database_path.clone();
+    let codex_bin_for_dispatch = codex_bin_override.clone();
+    let dispatch_codex_session = ExecutableTool::new(
+        ToolSpec::new(
+            "dispatch_codex_session",
+            "Launch a background Codex session against a repository and persist its running state.",
+            JsonSchema::object(
+                [
+                    ("prompt", json!({"type": "string"})),
+                    ("repo_path", json!({"type": "string"})),
+                    ("model", json!({"type": "string"})),
+                ],
+                ["prompt"],
+            ),
+        ),
+        move |arguments| {
+            let Some(prompt) = arguments.get("prompt").and_then(Value::as_str) else {
+                return ToolExecutionResult::error(
+                    "dispatch_codex_session requires a string prompt",
+                );
+            };
+            let repo_path = arguments.get("repo_path").and_then(Value::as_str);
+            let model = arguments.get("model").and_then(Value::as_str);
+            let mut connection = match open_sqlite_connection(&database_path) {
+                Ok(connection) => connection,
+                Err(error) => {
+                    return ToolExecutionResult::error(format!("failed to open database: {error}"));
+                }
+            };
+            if let Err(error) = run_migrations(&mut connection) {
+                return ToolExecutionResult::error(format!("failed to run migrations: {error}"));
+            }
+            drop(connection);
+
+            let result = if let Some(codex_bin) = codex_bin_for_dispatch.as_deref() {
+                dispatch_codex_session_with_bin(
+                    &database_path,
+                    LOCAL_USER_TOKEN,
+                    prompt,
+                    repo_path.map(Path::new),
+                    model,
+                    codex_bin,
+                )
+            } else {
+                run_codex_session(
+                    &database_path,
+                    LOCAL_USER_TOKEN,
+                    prompt,
+                    repo_path.map(Path::new),
+                    model,
+                )
+            };
+            match result {
+                Ok(result) => ToolExecutionResult::success(codex_session_result_payload(result)),
+                Err(error) => ToolExecutionResult::error(error.to_string()),
+            }
+        },
+    );
+
+    let database_path = config.database_path.clone();
+    let codex_bin_for_resume = codex_bin_override.clone();
+    let resume_codex_session = ExecutableTool::new(
+        ToolSpec::new(
+            "resume_codex_session",
+            "Resume a previously recorded Codex session and persist its running state.",
+            JsonSchema::object(
+                [
+                    ("session_id", json!({"type": "string"})),
+                    ("prompt", json!({"type": "string"})),
+                    ("model", json!({"type": "string"})),
+                ],
+                ["session_id", "prompt"],
+            ),
+        ),
+        move |arguments| {
+            let Some(session_id) = arguments.get("session_id").and_then(Value::as_str) else {
+                return ToolExecutionResult::error(
+                    "resume_codex_session requires a string session_id",
+                );
+            };
+            let Some(prompt) = arguments.get("prompt").and_then(Value::as_str) else {
+                return ToolExecutionResult::error("resume_codex_session requires a string prompt");
+            };
+            let model = arguments.get("model").and_then(Value::as_str);
+            let mut connection = match open_sqlite_connection(&database_path) {
+                Ok(connection) => connection,
+                Err(error) => {
+                    return ToolExecutionResult::error(format!("failed to open database: {error}"));
+                }
+            };
+            if let Err(error) = run_migrations(&mut connection) {
+                return ToolExecutionResult::error(format!("failed to run migrations: {error}"));
+            }
+            drop(connection);
+
+            let result = if let Some(codex_bin) = codex_bin_for_resume.as_deref() {
+                resume_codex_session_with_bin(
+                    &database_path,
+                    LOCAL_USER_TOKEN,
+                    session_id,
+                    prompt,
+                    model,
+                    codex_bin,
+                )
+            } else {
+                continue_codex_session(&database_path, LOCAL_USER_TOKEN, session_id, prompt, model)
+            };
+            match result {
+                Ok(result) => ToolExecutionResult::success(codex_session_result_payload(result)),
+                Err(error) => ToolExecutionResult::error(error.to_string()),
+            }
+        },
+    );
+
+    let database_path = config.database_path.clone();
     let list_codex_sessions = ExecutableTool::new(
         ToolSpec::new(
             "list_codex_sessions",
@@ -1612,6 +1737,8 @@ pub fn build_live_tool_registry(config: &AppConfig) -> ExecutableToolRegistry {
         get_user_preferred_name,
         set_user_full_name,
         get_user_full_name,
+        dispatch_codex_session,
+        resume_codex_session,
         list_codex_sessions,
         show_codex_session,
         update_task_text,
@@ -1935,6 +2062,33 @@ fn task_payload(item: AgendaItemRecord) -> Value {
     })
 }
 
+fn codex_session_result_payload(result: CodexSessionResult) -> String {
+    json!({
+        "session_id": result.session_id,
+        "repo_path": result.repo_path,
+        "worktree_path": result.worktree_path,
+        "session_branch": result.session_branch,
+        "target_branch": result.target_branch,
+        "status": result.status,
+        "final_message": result.final_message,
+        "summary": result.summary,
+        "touched_paths": result.touched_paths,
+        "dirty_paths_before": result.dirty_paths_before,
+        "dirty_paths_after": result.dirty_paths_after,
+        "commands": result.commands.into_iter().map(|command| {
+            json!({
+                "command": command.command,
+                "exit_code": command.exit_code,
+                "output_excerpt": command.output_excerpt,
+            })
+        }).collect::<Vec<_>>(),
+        "session_file_path": result.session_file_path,
+        "resume_command": result.resume_command,
+        "running_in_background": result.running_in_background,
+    })
+    .to_string()
+}
+
 fn due_item_context_messages(items: &[AgendaItemRecord]) -> Vec<ConversationMessage> {
     if items.is_empty() {
         return Vec::new();
@@ -2218,7 +2372,14 @@ pub fn provider_config_from_app_config(config: &AppConfig) -> Result<ProviderCon
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashSet, fs, path::PathBuf};
+    use std::{
+        collections::HashSet,
+        fs,
+        path::{Path, PathBuf},
+        process::Command,
+        thread,
+        time::{Duration, Instant},
+    };
 
     use elroy_agenda::create_agenda_file;
     use elroy_codex::{CodexCommandRecord, CodexSessionUpdate, upsert_codex_session};
@@ -2231,8 +2392,9 @@ mod tests {
     use elroy_memory::{create_memory_file, sanitize_filename};
 
     use super::{
-        AppRuntime, LOCAL_USER_TOKEN, argument_limit, build_live_tool_registry, build_recall_query,
-        due_item_context_messages, parse_recalled_memory_names, provider_config_from_app_config,
+        AppRuntime, LOCAL_USER_TOKEN, argument_limit, build_live_tool_registry,
+        build_live_tool_registry_with_codex_bin, build_recall_query, due_item_context_messages,
+        parse_recalled_memory_names, provider_config_from_app_config,
         recall_memory_context_messages, recalled_memory_names, recent_recall_context,
         select_recalled_memories, should_skip_memory_recall, significant_tokens,
         strip_transient_context_messages,
@@ -2854,6 +3016,75 @@ mod tests {
     }
 
     #[test]
+    fn live_tool_registry_can_dispatch_and_resume_codex_sessions() {
+        let unique = format!(
+            "elroy-rs-app-codex-dispatch-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let root = std::env::temp_dir().join(unique);
+        let repo_root = root.join("development").join("sample");
+        let bin_dir = root.join("bin");
+        let memory_dir = root.join("memories");
+        let agenda_dir = root.join("agenda");
+        let database_path = root.join("elroy.db");
+        fs::create_dir_all(&bin_dir).expect("bin dir should be created");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+        init_test_repo(&repo_root);
+        write_fake_codex_script(&bin_dir.join("codex"));
+
+        let mut config = AppConfig::defaults();
+        config.memory_dir = memory_dir;
+        config.agenda_dir = agenda_dir;
+        config.database_path = database_path.clone();
+
+        let registry =
+            build_live_tool_registry_with_codex_bin(&config, Some(bin_dir.join("codex")));
+        let dispatched = registry.invoke(
+            "dispatch_codex_session",
+            &format!(
+                "{{\"prompt\":\"update notes\",\"repo_path\":\"{}\"}}",
+                repo_root.display()
+            ),
+        );
+        assert!(!dispatched.is_error);
+        assert!(dispatched.content.contains("\"status\":\"running\""));
+        wait_for_codex_status(&database_path, "thread-123", "completed");
+
+        let resumed = registry.invoke(
+            "resume_codex_session",
+            "{\"session_id\":\"thread-123\",\"prompt\":\"follow up\"}",
+        );
+        assert!(!resumed.is_error);
+        assert!(resumed.content.contains("\"status\":\"running\""));
+        wait_for_codex_status(&database_path, "thread-123", "completed");
+
+        let shown = registry.invoke("show_codex_session", "{\"session_id\":\"thread-123\"}");
+        assert!(!shown.is_error);
+        assert!(shown.content.contains("resume complete"));
+
+        let agent_head = Command::new("git")
+            .args([
+                "-C",
+                &repo_root.display().to_string(),
+                "show",
+                "agent:notes.txt",
+            ])
+            .output()
+            .expect("git show should run");
+        assert!(agent_head.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&agent_head.stdout),
+            "after resume\n"
+        );
+
+        fs::remove_dir_all(root).expect("root should be removed");
+    }
+
+    #[test]
     fn live_tool_registry_can_update_rename_complete_and_delete_due_items() {
         let unique = format!(
             "elroy-rs-app-due-item-mutations-{}",
@@ -3145,5 +3376,88 @@ mod tests {
 
         assert_eq!(recalled.len(), 1);
         assert_eq!(recalled[0].name, "practice plan");
+    }
+
+    fn init_test_repo(repo_root: &Path) {
+        fs::create_dir_all(repo_root).expect("repo root should exist");
+        git(repo_root, ["init"]);
+        git(repo_root, ["config", "user.email", "test@example.com"]);
+        git(repo_root, ["config", "user.name", "Test User"]);
+        fs::write(repo_root.join("notes.txt"), "before\n").expect("notes should be written");
+        git(repo_root, ["add", "notes.txt"]);
+        git(repo_root, ["commit", "-m", "init"]);
+    }
+
+    fn git<const N: usize>(repo_root: &Path, args: [&str; N]) {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(repo_root)
+            .output()
+            .expect("git command should run");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn write_fake_codex_script(path: &Path) {
+        let script = r#"#!/bin/sh
+mode="dispatch"
+prompt=""
+for arg in "$@"; do
+  if [ "$arg" = "resume" ]; then
+    mode="resume"
+  fi
+  prompt="$arg"
+done
+
+if [ "$mode" = "resume" ]; then
+  printf "after resume\n" > notes.txt
+  echo '{"type":"thread.started","thread_id":"thread-123"}'
+  echo '{"type":"item.completed","item":{"id":"item_2","type":"agent_message","text":"resume complete"}}'
+  exit 0
+fi
+
+printf "after\n" > notes.txt
+pwd_out="$(pwd)"
+echo '{"type":"thread.started","thread_id":"thread-123"}'
+printf '{"type":"item.completed","item":{"id":"item_1","type":"command_execution","command":"/bin/zsh -lc pwd","aggregated_output":"%s\\n","exit_code":0,"status":"completed"}}\n' "$pwd_out"
+echo '{"type":"item.completed","item":{"id":"item_2","type":"agent_message","text":"updated notes"}}'
+"#;
+        fs::write(path, script).expect("script should be written");
+        let mut permissions = fs::metadata(path)
+            .expect("script metadata should load")
+            .permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            permissions.set_mode(0o755);
+        }
+        fs::set_permissions(path, permissions).expect("script should be executable");
+    }
+
+    fn wait_for_codex_status(database_path: &Path, session_id: &str, expected_status: &str) {
+        let started = Instant::now();
+        loop {
+            let connection = open_sqlite_connection(database_path).expect("database should open");
+            let record = elroy_codex::get_codex_session_by_thread_id(
+                &connection,
+                LOCAL_USER_TOKEN,
+                session_id,
+            )
+            .expect("session should query")
+            .expect("session should exist");
+            if record.status == expected_status {
+                break;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "timed out waiting for status {expected_status}, last status {}",
+                record.status
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
     }
 }
