@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::io;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::execute;
@@ -171,8 +171,19 @@ fn run_event_loop(
     runtime: &mut impl TuiRuntime,
     pending_prompt: &mut Option<PendingPrompt>,
 ) -> io::Result<()> {
+    let mut context_poll_ready = pending_prompt.is_none();
+    let mut last_context_poll = Instant::now();
+
     loop {
         advance_prompt_stream(app, runtime, pending_prompt);
+        if !context_poll_ready && pending_prompt.is_none() {
+            context_poll_ready = true;
+            last_context_poll = Instant::now();
+        }
+        if context_poll_ready && last_context_poll.elapsed() >= Duration::from_secs(1) {
+            poll_context_updates(app, runtime);
+            last_context_poll = Instant::now();
+        }
         terminal.draw(|frame| {
             app.render(frame.area(), frame.buffer_mut());
         })?;
@@ -398,6 +409,36 @@ fn advance_prompt_stream(
     }
 }
 
+fn poll_context_updates(app: &mut TuiApp, runtime: &mut impl TuiRuntime) {
+    let Ok(context_messages) = runtime.load_context_messages() else {
+        return;
+    };
+    let unseen_indices = context_messages
+        .iter()
+        .enumerate()
+        .filter_map(|(index, message)| {
+            (!app.rendered_context_message_ids.contains(&message.id)).then_some(index)
+        })
+        .collect::<Vec<_>>();
+    if unseen_indices.is_empty() {
+        return;
+    }
+
+    let first_unseen = unseen_indices[0];
+    if context_messages[first_unseen + 1..]
+        .iter()
+        .any(|message| app.rendered_context_message_ids.contains(&message.id))
+    {
+        app.mark_context_messages_rendered(&context_messages);
+        return;
+    }
+
+    let unseen_messages = context_messages[first_unseen..].to_vec();
+    if !unseen_messages.is_empty() {
+        app.render_new_context_messages(&unseen_messages);
+    }
+}
+
 fn apply_prompt_update(app: &mut TuiApp, update: PromptUpdate) {
     match update {
         PromptUpdate::AssistantDelta(delta) => {
@@ -499,6 +540,12 @@ impl TuiApp {
     pub fn mark_context_messages_rendered(&mut self, context_messages: &[TuiContextMessage]) {
         self.rendered_context_message_ids
             .extend(context_messages.iter().map(|message| message.id));
+    }
+
+    pub fn render_new_context_messages(&mut self, unseen_messages: &[TuiContextMessage]) {
+        self.conversation_lines
+            .extend(unseen_messages.iter().map(format_context_message_line));
+        self.mark_context_messages_rendered(unseen_messages);
     }
 
     pub fn mark_messages_rendered_after_bootstrap_stream(
@@ -832,6 +879,10 @@ impl TuiApp {
     }
 }
 
+fn format_context_message_line(message: &TuiContextMessage) -> String {
+    format!("{}: {}", message.role, message.content)
+}
+
 struct NoopRuntime;
 
 struct NoopPromptStream;
@@ -897,7 +948,7 @@ mod tests {
         CommandPane, FocusTarget, PromptUpdate, SidebarAction, SidebarSection, TuiApp,
         TuiContextMessage, TuiExit, TuiPromptStream, TuiRuntime, TuiSnapshot, UiIntent,
         advance_prompt_stream, apply_intent_with_runtime, apply_key_event, key_event_token,
-        start_startup_prompt_stream,
+        poll_context_updates, start_startup_prompt_stream,
     };
 
     #[derive(Default)]
@@ -1518,6 +1569,81 @@ mod tests {
         app.mark_messages_rendered_after_bootstrap_stream(&HashSet::new(), &context_messages);
 
         assert_eq!(app.rendered_context_message_ids, HashSet::from([22]));
+    }
+
+    #[test]
+    fn poll_context_updates_renders_trailing_unseen_messages() {
+        let mut app = TuiApp::from_snapshot(TuiSnapshot {
+            conversation_lines: vec!["user: hello".to_string()],
+            ..TuiSnapshot::default()
+        });
+        app.rendered_context_message_ids = HashSet::from([1]);
+        let mut runtime = FakeRuntime {
+            context_messages: vec![
+                TuiContextMessage {
+                    id: 1,
+                    role: "user".to_string(),
+                    content: "hello".to_string(),
+                },
+                TuiContextMessage {
+                    id: 2,
+                    role: "assistant".to_string(),
+                    content: "background update".to_string(),
+                },
+            ],
+            ..FakeRuntime::default()
+        };
+
+        poll_context_updates(&mut app, &mut runtime);
+
+        assert_eq!(
+            app.conversation_lines,
+            vec![
+                "user: hello".to_string(),
+                "assistant: background update".to_string()
+            ]
+        );
+        assert_eq!(app.rendered_context_message_ids, HashSet::from([1, 2]));
+    }
+
+    #[test]
+    fn poll_context_updates_marks_interleaved_messages_without_rendering_them() {
+        let mut app = TuiApp::from_snapshot(TuiSnapshot {
+            conversation_lines: vec!["assistant: existing".to_string()],
+            ..TuiSnapshot::default()
+        });
+        app.rendered_context_message_ids = HashSet::from([10, 12]);
+        let mut runtime = FakeRuntime {
+            context_messages: vec![
+                TuiContextMessage {
+                    id: 10,
+                    role: "assistant".to_string(),
+                    content: "existing".to_string(),
+                },
+                TuiContextMessage {
+                    id: 11,
+                    role: "assistant".to_string(),
+                    content: "unseen middle".to_string(),
+                },
+                TuiContextMessage {
+                    id: 12,
+                    role: "assistant".to_string(),
+                    content: "already rendered later".to_string(),
+                },
+            ],
+            ..FakeRuntime::default()
+        };
+
+        poll_context_updates(&mut app, &mut runtime);
+
+        assert_eq!(
+            app.conversation_lines,
+            vec!["assistant: existing".to_string()]
+        );
+        assert_eq!(
+            app.rendered_context_message_ids,
+            HashSet::from([10, 11, 12])
+        );
     }
 
     #[test]
