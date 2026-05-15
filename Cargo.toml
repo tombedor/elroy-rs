@@ -9,7 +9,9 @@ members = [
     "crates/elroy-llm",
     "crates/elroy-memory",
     "crates/elroy-tools",
+    "crates/elroy-tasks",
     "crates/elroy-tui",
+    "crates/elroy-user",
 ]
 resolver = "3"
 

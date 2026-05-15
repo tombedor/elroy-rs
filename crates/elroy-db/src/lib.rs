@@ -159,6 +159,17 @@ pub struct AgendaItemRecord {
     pub updated_at_unix: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserPreferenceRecord {
+    pub user_token: String,
+    pub assistant_name: Option<String>,
+    pub preferred_name: Option<String>,
+    pub full_name: Option<String>,
+    pub system_persona: Option<String>,
+    pub created_at_unix: i64,
+    pub updated_at_unix: i64,
+}
+
 #[derive(Debug)]
 pub enum BootstrapError {
     Io(std::io::Error),
@@ -797,6 +808,78 @@ pub fn replace_context_messages(
     transaction.commit()
 }
 
+pub fn load_user_preferences(
+    connection: &Connection,
+    user_token: &str,
+) -> rusqlite::Result<Option<UserPreferenceRecord>> {
+    let mut statement = connection.prepare(
+        "SELECT
+            user_token,
+            assistant_name,
+            preferred_name,
+            full_name,
+            system_persona,
+            created_at_unix,
+            updated_at_unix
+        FROM user_preferences
+        WHERE user_token = ?1",
+    )?;
+    let result = statement.query_row([user_token], |row| {
+        Ok(UserPreferenceRecord {
+            user_token: row.get(0)?,
+            assistant_name: row.get(1)?,
+            preferred_name: row.get(2)?,
+            full_name: row.get(3)?,
+            system_persona: row.get(4)?,
+            created_at_unix: row.get(5)?,
+            updated_at_unix: row.get(6)?,
+        })
+    });
+    match result {
+        Ok(record) => Ok(Some(record)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+pub fn save_user_preferences(
+    connection: &mut Connection,
+    record: &UserPreferenceRecord,
+) -> rusqlite::Result<()> {
+    let now = unix_timestamp_now();
+    let created_at = load_user_preferences(connection, &record.user_token)?
+        .map(|existing| existing.created_at_unix)
+        .unwrap_or(now);
+
+    connection.execute(
+        "INSERT INTO user_preferences (
+            user_token,
+            assistant_name,
+            preferred_name,
+            full_name,
+            system_persona,
+            created_at_unix,
+            updated_at_unix
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        ON CONFLICT(user_token) DO UPDATE SET
+            assistant_name = excluded.assistant_name,
+            preferred_name = excluded.preferred_name,
+            full_name = excluded.full_name,
+            system_persona = excluded.system_persona,
+            updated_at_unix = excluded.updated_at_unix",
+        params![
+            record.user_token,
+            record.assistant_name,
+            record.preferred_name,
+            record.full_name,
+            record.system_persona,
+            created_at,
+            now,
+        ],
+    )?;
+    Ok(())
+}
+
 fn get_or_create_context_message_set(
     connection: &mut Connection,
     user_token: &str,
@@ -1054,11 +1137,12 @@ mod tests {
     use std::fs;
 
     use super::{
-        BootstrapInventory, BootstrapPlan, bootstrap_database, bootstrap_documents, derived_counts,
-        find_active_agenda_item_by_name, find_active_memory_by_name, list_active_agenda_items,
-        list_active_due_items, list_active_memories, list_active_plain_agenda_items,
-        load_context_messages, markdown_files, open_sqlite_connection, persist_bootstrap_documents,
-        replace_context_messages, run_migrations, search_active_memories,
+        BootstrapInventory, BootstrapPlan, UserPreferenceRecord, bootstrap_database,
+        bootstrap_documents, derived_counts, find_active_agenda_item_by_name,
+        find_active_memory_by_name, list_active_agenda_items, list_active_due_items,
+        list_active_memories, list_active_plain_agenda_items, load_context_messages,
+        load_user_preferences, markdown_files, open_sqlite_connection, persist_bootstrap_documents,
+        replace_context_messages, run_migrations, save_user_preferences, search_active_memories,
         sync_derived_domain_tables,
     };
     use elroy_config::AppConfig;
@@ -1474,5 +1558,34 @@ mod tests {
         );
 
         fs::remove_dir_all(home).expect("temp directories should be removed");
+    }
+
+    #[test]
+    fn user_preferences_round_trip_for_user_token() {
+        let mut connection = Connection::open_in_memory().expect("sqlite should open");
+        run_migrations(&mut connection).expect("migrations should run");
+
+        save_user_preferences(
+            &mut connection,
+            &UserPreferenceRecord {
+                user_token: "local-user".to_string(),
+                assistant_name: Some("Nova".to_string()),
+                preferred_name: Some("Jimmy".to_string()),
+                full_name: Some("James Smith".to_string()),
+                system_persona: None,
+                created_at_unix: 0,
+                updated_at_unix: 0,
+            },
+        )
+        .expect("preferences should persist");
+
+        let loaded =
+            load_user_preferences(&connection, "local-user").expect("preferences should load");
+
+        assert!(loaded.is_some());
+        let loaded = loaded.expect("preferences should exist");
+        assert_eq!(loaded.assistant_name.as_deref(), Some("Nova"));
+        assert_eq!(loaded.preferred_name.as_deref(), Some("Jimmy"));
+        assert_eq!(loaded.full_name.as_deref(), Some("James Smith"));
     }
 }

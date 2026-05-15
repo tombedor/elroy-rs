@@ -47,6 +47,7 @@ The preferred approach is:
 - `M0` workspace bootstrap: completed
 - `M1` core runtime and session model: started
 - `M2` persistence and domain data model: started at the bootstrap-planning level
+- `M4` memory, recall, reminders, agenda: started with file-backed memory/agenda/task flows and persisted local-user naming/persona preferences
 - `M5` TUI and UX parity: started with a `ratatui` shell
 
 ### M0: Workspace Bootstrap

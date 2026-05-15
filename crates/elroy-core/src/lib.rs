@@ -221,6 +221,88 @@ impl ConversationOrchestrator {
     }
 }
 
+pub fn validated_transcript(messages: &[ConversationMessage]) -> Vec<ConversationMessage> {
+    let mut validated = Vec::new();
+
+    for (index, original) in messages.iter().enumerate() {
+        let mut message = original.clone();
+        normalize_message(&mut message);
+
+        if message.role == MessageRole::Assistant {
+            if let Some(tool_calls) = &message.tool_calls {
+                let following_tool_ids = contiguous_following_tool_ids(messages, index + 1);
+                let repaired_calls = tool_calls
+                    .iter()
+                    .filter(|call| following_tool_ids.iter().any(|id| id == &call.id))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                message.tool_calls = if repaired_calls.is_empty() {
+                    None
+                } else {
+                    Some(repaired_calls)
+                };
+            }
+            validated.push(message);
+            continue;
+        }
+
+        if message.role == MessageRole::Tool {
+            let Some(tool_call_id) = message.tool_call_id.as_deref() else {
+                continue;
+            };
+            if has_assistant_tool_call(&validated, tool_call_id) {
+                validated.push(message);
+            }
+            continue;
+        }
+
+        validated.push(message);
+    }
+
+    validated
+}
+
+fn normalize_message(message: &mut ConversationMessage) {
+    if !matches!(message.role, MessageRole::Assistant)
+        || message
+            .tool_calls
+            .as_ref()
+            .is_some_and(|calls| calls.is_empty())
+    {
+        message.tool_calls = None;
+    }
+
+    if !matches!(message.role, MessageRole::Tool) {
+        message.tool_call_id = None;
+    }
+}
+
+fn contiguous_following_tool_ids(
+    messages: &[ConversationMessage],
+    start_index: usize,
+) -> Vec<String> {
+    let mut ids = Vec::new();
+    for message in messages.iter().skip(start_index) {
+        if message.role != MessageRole::Tool {
+            break;
+        }
+        if let Some(tool_call_id) = message.tool_call_id.as_ref() {
+            ids.push(tool_call_id.clone());
+        }
+    }
+    ids
+}
+
+fn has_assistant_tool_call(messages: &[ConversationMessage], tool_call_id: &str) -> bool {
+    messages.iter().any(|message| {
+        message.role == MessageRole::Assistant
+            && message
+                .tool_calls
+                .as_ref()
+                .is_some_and(|calls| calls.iter().any(|call| call.id == tool_call_id))
+    })
+}
+
 fn tool_event_to_message(call: &ToolCall, event: &StreamEvent) -> ConversationMessage {
     match event {
         StreamEvent::AssistantToolResult { content, .. } => {
@@ -253,7 +335,10 @@ mod tests {
         ExecutableTool, ExecutableToolRegistry, JsonSchema, ToolExecutionResult, ToolSpec,
     };
 
-    use super::{ConversationOrchestrator, ConversationRequest, ModelClient, ToolExecutor};
+    use super::{
+        ConversationOrchestrator, ConversationRequest, ModelClient, ToolExecutor,
+        validated_transcript,
+    };
 
     struct FakeModel {
         responses: RefCell<Vec<Vec<StreamEvent>>>,
@@ -436,5 +521,36 @@ mod tests {
                 is_error: false,
             }
         );
+    }
+
+    #[test]
+    fn validated_transcript_drops_orphan_tool_messages() {
+        let validated = validated_transcript(&[
+            ConversationMessage::new(MessageRole::User, "hello"),
+            ConversationMessage::tool_result("missing-call", "{\"ok\":true}"),
+        ]);
+
+        assert_eq!(validated.len(), 1);
+        assert_eq!(validated[0].role, MessageRole::User);
+    }
+
+    #[test]
+    fn validated_transcript_repairs_missing_assistant_tool_calls() {
+        let validated = validated_transcript(&[
+            ConversationMessage::new(MessageRole::User, "hello"),
+            ConversationMessage::assistant_with_tool_calls(
+                "",
+                vec![ToolCall {
+                    id: "call-1".to_string(),
+                    name: "get_weather".to_string(),
+                    arguments_json: "{\"location\":\"Paris\"}".to_string(),
+                }],
+            ),
+            ConversationMessage::new(MessageRole::Assistant, "plain reply"),
+        ]);
+
+        assert_eq!(validated.len(), 3);
+        assert_eq!(validated[1].role, MessageRole::Assistant);
+        assert!(validated[1].tool_calls.is_none());
     }
 }

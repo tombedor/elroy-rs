@@ -1,24 +1,38 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
+use chrono::Utc;
 use elroy_agenda::{
     add_checklist_item, append_agenda_update, create_agenda_file, get_checklist,
     mark_agenda_item_completed, mark_agenda_item_deleted, rename_agenda_file, update_agenda_body,
     update_checklist_item,
 };
 use elroy_config::{AppConfig, LlmProvider};
-use elroy_core::{ConversationOrchestrator, LiveProviderModel, LocalToolExecutor};
+use elroy_core::{
+    ConversationOrchestrator, LiveProviderModel, LocalToolExecutor, validated_transcript,
+};
 use elroy_db::{
-    BootstrapPlan, find_active_agenda_item_by_name, find_active_memory_by_name,
-    list_active_due_items, list_active_memories, list_active_plain_agenda_items,
-    load_context_messages, open_sqlite_connection, replace_context_messages, run_migrations,
+    AgendaItemRecord, BootstrapPlan, UserPreferenceRecord, find_active_agenda_item_by_name,
+    find_active_memory_by_name, list_active_due_items, list_active_memories,
+    list_active_plain_agenda_items, load_context_messages, load_user_preferences,
+    open_sqlite_connection, replace_context_messages, run_migrations, save_user_preferences,
     search_active_memories,
 };
-use elroy_llm::{LiveModelClient, Provider, ProviderConfig, StreamEvent};
+use elroy_llm::{
+    ConversationMessage, LiveModelClient, MessageRole, Provider, ProviderConfig, StreamEvent,
+    ToolCall,
+};
 use elroy_memory::{archive_memory_file, create_memory_file, update_memory_body};
+use elroy_tasks::{
+    complete_task_file, create_task_file_with_schedule, delete_task_file, find_task_by_name,
+    list_active_tasks, list_due_tasks, list_today_tasks, list_triggered_tasks, rename_task_file,
+    update_task_text_file,
+};
 use elroy_tools::{
     ExecutableTool, ExecutableToolRegistry, JsonSchema, ToolExecutionResult, ToolRegistry, ToolSpec,
 };
 use elroy_tui::{SidebarAction, SidebarSection, TuiSnapshot};
+use elroy_user::{effective_persona, effective_user_full_name, effective_user_preferred_name};
 use serde_json::{Value, json};
 
 const LOCAL_USER_TOKEN: &str = "local-user";
@@ -132,23 +146,54 @@ impl AppRuntime {
             .map_err(|error| AppError::Runtime(error.to_string()))?;
         let executable_tools = build_live_tool_registry(&self.config);
         let tools = ToolRegistry::new(executable_tools.specs());
-        let model =
-            LiveProviderModel::new(client, format!("You are {}.", self.config.assistant_name));
+        let preferences = load_user_preferences(&connection, LOCAL_USER_TOKEN)?;
+        let model = LiveProviderModel::new(
+            client,
+            effective_persona(preferences.as_ref(), &self.config.assistant_name),
+        );
         let orchestrator = ConversationOrchestrator::new(2);
         let tool_executor = LocalToolExecutor::new(executable_tools);
-        let existing_transcript = load_context_messages(&mut connection, LOCAL_USER_TOKEN)?;
+        let existing_transcript =
+            validated_transcript(&load_context_messages(&mut connection, LOCAL_USER_TOKEN)?);
+        let recall_context = recall_memory_context_messages(
+            prompt,
+            &existing_transcript,
+            &list_active_memories(&connection, 50)?,
+        );
+        let due_item_context = due_item_context_messages(&list_active_due_items(&connection, 20)?);
+        let mut model_transcript = existing_transcript.clone();
+        model_transcript.extend(recall_context.iter().cloned());
+        model_transcript.extend(due_item_context.iter().cloned());
 
         let turn_run = orchestrator.run_turn_with_transcript(
             &model,
             tools.specs(),
             &tool_executor,
-            &existing_transcript,
+            &model_transcript,
             prompt,
         )?;
-        replace_context_messages(&mut connection, LOCAL_USER_TOKEN, &turn_run.transcript)?;
+        let persisted_transcript = strip_transient_context_messages(
+            turn_run.transcript.clone(),
+            existing_transcript.len(),
+            recall_context.len() + due_item_context.len(),
+        );
+        replace_context_messages(&mut connection, LOCAL_USER_TOKEN, &persisted_transcript)?;
+
+        let mut events = Vec::new();
+        if !recall_context.is_empty() {
+            events.push(StreamEvent::StatusUpdate {
+                content: "fetching memories...".to_string(),
+            });
+        }
+        if !due_item_context.is_empty() {
+            events.push(StreamEvent::StatusUpdate {
+                content: "surfacing due items...".to_string(),
+            });
+        }
+        events.extend(turn_run.events);
 
         Ok(PromptRunResult {
-            events: turn_run.events,
+            events,
             snapshot: self.load_snapshot()?,
         })
     }
@@ -256,6 +301,9 @@ pub fn build_live_tool_registry(config: &AppConfig) -> ExecutableToolRegistry {
                 [
                     ("name", json!({"type": "string"})),
                     ("text", json!({"type": "string"})),
+                    ("date", json!({"type": "string"})),
+                    ("trigger_datetime", json!({"type": "string"})),
+                    ("trigger_context", json!({"type": "string"})),
                 ],
                 ["name", "text"],
             ),
@@ -340,6 +388,50 @@ pub fn build_live_tool_registry(config: &AppConfig) -> ExecutableToolRegistry {
                 Err(error) => {
                     ToolExecutionResult::error(format!("failed to create agenda item: {error}"))
                 }
+            }
+        },
+    );
+
+    let config_for_task_write = config.clone();
+    let create_task = ExecutableTool::new(
+        ToolSpec::new(
+            "create_task",
+            "Create a new agenda-backed task and rebuild derived state.",
+            JsonSchema::object(
+                [
+                    ("name", json!({"type": "string"})),
+                    ("text", json!({"type": "string"})),
+                ],
+                ["name", "text"],
+            ),
+        ),
+        move |arguments| {
+            let Some(name) = arguments.get("name").and_then(Value::as_str) else {
+                return ToolExecutionResult::error("create_task requires a string name");
+            };
+            let Some(text) = arguments.get("text").and_then(Value::as_str) else {
+                return ToolExecutionResult::error("create_task requires string text");
+            };
+            let date = arguments.get("date").and_then(Value::as_str);
+            let trigger_datetime = arguments.get("trigger_datetime").and_then(Value::as_str);
+            let trigger_context = arguments.get("trigger_context").and_then(Value::as_str);
+            match create_task_file_with_schedule(
+                &config_for_task_write.agenda_dir,
+                name,
+                text,
+                date,
+                trigger_datetime,
+                trigger_context,
+            )
+            .and_then(|path| {
+                elroy_db::bootstrap_database(&BootstrapPlan::from_config(&config_for_task_write))
+                    .map_err(|error| std::io::Error::other(error.to_string()))?;
+                Ok(path)
+            }) {
+                Ok(path) => ToolExecutionResult::success(
+                    json!({"created": true, "file_path": path.display().to_string()}).to_string(),
+                ),
+                Err(error) => ToolExecutionResult::error(format!("failed to create task: {error}")),
             }
         },
     );
@@ -430,6 +522,32 @@ pub fn build_live_tool_registry(config: &AppConfig) -> ExecutableToolRegistry {
         },
     );
 
+    let config_for_task_text = config.clone();
+    let update_task_text = ExecutableTool::new(
+        ToolSpec::new(
+            "update_task_text",
+            "Replace the body text of one active task.",
+            JsonSchema::object(
+                [
+                    ("name", json!({"type": "string"})),
+                    ("text", json!({"type": "string"})),
+                ],
+                ["name", "text"],
+            ),
+        ),
+        move |arguments| {
+            let Some(name) = arguments.get("name").and_then(Value::as_str) else {
+                return ToolExecutionResult::error("update_task_text requires a string name");
+            };
+            let Some(text) = arguments.get("text").and_then(Value::as_str) else {
+                return ToolExecutionResult::error("update_task_text requires string text");
+            };
+            mutate_task_file_from_config(&config_for_task_text, name, |path| {
+                update_task_text_file(path, text)
+            })
+        },
+    );
+
     let config_for_due_item_rename = config.clone();
     let rename_due_item = ExecutableTool::new(
         ToolSpec::new(
@@ -461,6 +579,36 @@ pub fn build_live_tool_registry(config: &AppConfig) -> ExecutableToolRegistry {
         },
     );
 
+    let config_for_task_rename = config.clone();
+    let rename_task = ExecutableTool::new(
+        ToolSpec::new(
+            "rename_task",
+            "Rename one active task.",
+            JsonSchema::object(
+                [
+                    ("name", json!({"type": "string"})),
+                    ("new_name", json!({"type": "string"})),
+                ],
+                ["name", "new_name"],
+            ),
+        ),
+        move |arguments| {
+            let Some(name) = arguments.get("name").and_then(Value::as_str) else {
+                return ToolExecutionResult::error("rename_task requires a string name");
+            };
+            let Some(new_name) = arguments.get("new_name").and_then(Value::as_str) else {
+                return ToolExecutionResult::error("rename_task requires string new_name");
+            };
+            mutate_task_file_from_config_with_result(&config_for_task_rename, name, |path| {
+                let renamed = rename_task_file(path, new_name)?;
+                Ok(
+                    json!({"updated": true, "new_file_path": renamed.display().to_string()})
+                        .to_string(),
+                )
+            })
+        },
+    );
+
     let config_for_due_item_complete = config.clone();
     let complete_due_item = ExecutableTool::new(
         ToolSpec::new(
@@ -485,6 +633,30 @@ pub fn build_live_tool_registry(config: &AppConfig) -> ExecutableToolRegistry {
         },
     );
 
+    let config_for_task_complete = config.clone();
+    let complete_task = ExecutableTool::new(
+        ToolSpec::new(
+            "complete_task",
+            "Mark one active task completed.",
+            JsonSchema::object(
+                [
+                    ("name", json!({"type": "string"})),
+                    ("closing_comment", json!({"type": "string"})),
+                ],
+                ["name"],
+            ),
+        ),
+        move |arguments| {
+            let Some(name) = arguments.get("name").and_then(Value::as_str) else {
+                return ToolExecutionResult::error("complete_task requires a string name");
+            };
+            let closing_comment = arguments.get("closing_comment").and_then(Value::as_str);
+            mutate_task_file_from_config(&config_for_task_complete, name, |path| {
+                complete_task_file(path, closing_comment)
+            })
+        },
+    );
+
     let config_for_due_item_delete = config.clone();
     let delete_due_item = ExecutableTool::new(
         ToolSpec::new(
@@ -501,6 +673,24 @@ pub fn build_live_tool_registry(config: &AppConfig) -> ExecutableToolRegistry {
                 name,
                 mark_agenda_item_deleted,
             )
+        },
+    );
+
+    let config_for_task_delete = config.clone();
+    let delete_task = ExecutableTool::new(
+        ToolSpec::new(
+            "delete_task",
+            "Mark one active task deleted.",
+            JsonSchema::object([("name", json!({"type": "string"}))], ["name"]),
+        ),
+        move |arguments| {
+            let Some(name) = arguments.get("name").and_then(Value::as_str) else {
+                return ToolExecutionResult::error("delete_task requires a string name");
+            };
+            let closing_comment = arguments.get("closing_comment").and_then(Value::as_str);
+            mutate_task_file_from_config(&config_for_task_delete, name, |path| {
+                delete_task_file(path, closing_comment)
+            })
         },
     );
 
@@ -826,6 +1016,266 @@ pub fn build_live_tool_registry(config: &AppConfig) -> ExecutableToolRegistry {
     );
 
     let database_path = config.database_path.clone();
+    let set_assistant_name = ExecutableTool::new(
+        ToolSpec::new(
+            "set_assistant_name",
+            "Set the assistant name for this local user.",
+            JsonSchema::object(
+                [("assistant_name", json!({"type": "string"}))],
+                ["assistant_name"],
+            ),
+        ),
+        move |arguments| {
+            let Some(assistant_name) = arguments.get("assistant_name").and_then(Value::as_str)
+            else {
+                return ToolExecutionResult::error(
+                    "set_assistant_name requires string assistant_name",
+                );
+            };
+            mutate_user_preferences_at_path(&database_path, |record| {
+                record.assistant_name = Some(assistant_name.to_string());
+                Ok(format!("Assistant name updated to {assistant_name}."))
+            })
+        },
+    );
+
+    let database_path = config.database_path.clone();
+    let set_persona = ExecutableTool::new(
+        ToolSpec::new(
+            "set_persona",
+            "Set the system persona template for this local user.",
+            JsonSchema::object(
+                [("system_persona", json!({"type": "string"}))],
+                ["system_persona"],
+            ),
+        ),
+        move |arguments| {
+            let Some(system_persona) = arguments.get("system_persona").and_then(Value::as_str)
+            else {
+                return ToolExecutionResult::error("set_persona requires string system_persona");
+            };
+            let system_persona = system_persona.trim();
+            if system_persona.is_empty() {
+                return ToolExecutionResult::error("System persona cannot be blank.");
+            }
+            mutate_user_preferences_at_path(&database_path, |record| {
+                if record.system_persona.as_deref() == Some(system_persona) {
+                    return Ok("New system persona and old system persona are identical".into());
+                }
+                record.system_persona = Some(system_persona.to_string());
+                Ok("System persona updated.".into())
+            })
+        },
+    );
+
+    let database_path = config.database_path.clone();
+    let reset_system_persona = ExecutableTool::new(
+        ToolSpec::new(
+            "reset_system_persona",
+            "Clear the persisted system persona for this local user.",
+            JsonSchema::object(Vec::<(String, Value)>::new(), [] as [&str; 0]),
+        ),
+        move |_| {
+            mutate_user_preferences_at_path(&database_path, |record| {
+                record.system_persona = None;
+                Ok("System persona cleared, will now use default persona.".into())
+            })
+        },
+    );
+
+    let database_path = config.database_path.clone();
+    let set_user_preferred_name = ExecutableTool::new(
+        ToolSpec::new(
+            "set_user_preferred_name",
+            "Set the preferred name for this local user.",
+            JsonSchema::object(
+                [
+                    ("preferred_name", json!({"type": "string"})),
+                    ("override_existing", json!({"type": "boolean"})),
+                ],
+                ["preferred_name"],
+            ),
+        ),
+        move |arguments| {
+            let Some(preferred_name) = arguments.get("preferred_name").and_then(Value::as_str)
+            else {
+                return ToolExecutionResult::error(
+                    "set_user_preferred_name requires string preferred_name",
+                );
+            };
+            let override_existing = arguments
+                .get("override_existing")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            mutate_user_preferences_at_path(&database_path, |record| {
+                let existing = effective_user_preferred_name(Some(record));
+                if existing != elroy_user::DEFAULT_USER_PREFERRED_NAME && !override_existing {
+                    return Ok(format!(
+                        "Preferred name already set to {}. If this should be changed, use override_existing=true.",
+                        existing
+                    ));
+                }
+                record.preferred_name = Some(preferred_name.to_string());
+                Ok(format!(
+                    "Set user preferred name to {}. Was {}.",
+                    preferred_name, existing
+                ))
+            })
+        },
+    );
+
+    let database_path = config.database_path.clone();
+    let get_user_preferred_name = ExecutableTool::new(
+        ToolSpec::new(
+            "get_user_preferred_name",
+            "Return the preferred name for this local user.",
+            JsonSchema::object(Vec::<(String, Value)>::new(), [] as [&str; 0]),
+        ),
+        move |_| {
+            with_user_preferences_at_path(&database_path, |record| {
+                Ok(ToolExecutionResult::success(effective_user_preferred_name(
+                    record.as_ref(),
+                )))
+            })
+        },
+    );
+
+    let database_path = config.database_path.clone();
+    let set_user_full_name = ExecutableTool::new(
+        ToolSpec::new(
+            "set_user_full_name",
+            "Set the full name for this local user.",
+            JsonSchema::object(
+                [
+                    ("full_name", json!({"type": "string"})),
+                    ("override_existing", json!({"type": "boolean"})),
+                ],
+                ["full_name"],
+            ),
+        ),
+        move |arguments| {
+            let Some(full_name) = arguments.get("full_name").and_then(Value::as_str) else {
+                return ToolExecutionResult::error("set_user_full_name requires string full_name");
+            };
+            let override_existing = arguments
+                .get("override_existing")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            mutate_user_preferences_at_path(&database_path, |record| {
+                let existing = effective_user_full_name(Some(record));
+                if existing != elroy_user::UNKNOWN_FULL_NAME && !override_existing {
+                    return Ok(format!(
+                        "Full name already set to {}. If this should be changed, set override_existing=true.",
+                        existing
+                    ));
+                }
+                record.full_name = Some(full_name.to_string());
+                Ok(format!(
+                    "Full name set to {}. Previous value was {}.",
+                    full_name, existing
+                ))
+            })
+        },
+    );
+
+    let database_path = config.database_path.clone();
+    let get_user_full_name = ExecutableTool::new(
+        ToolSpec::new(
+            "get_user_full_name",
+            "Return the full name for this local user.",
+            JsonSchema::object(Vec::<(String, Value)>::new(), [] as [&str; 0]),
+        ),
+        move |_| {
+            with_user_preferences_at_path(&database_path, |record| {
+                Ok(ToolExecutionResult::success(effective_user_full_name(
+                    record.as_ref(),
+                )))
+            })
+        },
+    );
+
+    let database_path = config.database_path.clone();
+    let list_tasks = ExecutableTool::new(
+        ToolSpec::new(
+            "list_tasks",
+            "List active agenda-backed tasks.",
+            JsonSchema::object([("limit", json!({"type": "integer"}))], [] as [&str; 0]),
+        ),
+        move |arguments| {
+            let limit = argument_limit(&arguments, 10);
+            with_tool_connection(&database_path, |connection| {
+                let items = list_active_tasks(connection, limit)?;
+                let payload = items.into_iter().map(task_payload).collect::<Vec<_>>();
+                Ok(ToolExecutionResult::success(
+                    serde_json::to_string_pretty(&payload).expect("task payload should serialize"),
+                ))
+            })
+        },
+    );
+
+    let database_path = config.database_path.clone();
+    let list_triggered_tasks_tool = ExecutableTool::new(
+        ToolSpec::new(
+            "list_triggered_tasks",
+            "List active tasks that have trigger metadata.",
+            JsonSchema::object([("limit", json!({"type": "integer"}))], [] as [&str; 0]),
+        ),
+        move |arguments| {
+            let limit = argument_limit(&arguments, 10);
+            with_tool_connection(&database_path, |connection| {
+                let items = list_triggered_tasks(connection, limit)?;
+                let payload = items.into_iter().map(task_payload).collect::<Vec<_>>();
+                Ok(ToolExecutionResult::success(
+                    serde_json::to_string_pretty(&payload)
+                        .expect("triggered task payload should serialize"),
+                ))
+            })
+        },
+    );
+
+    let database_path = config.database_path.clone();
+    let list_due_tasks_tool = ExecutableTool::new(
+        ToolSpec::new(
+            "list_due_tasks",
+            "List active tasks whose trigger time is due.",
+            JsonSchema::object([("limit", json!({"type": "integer"}))], [] as [&str; 0]),
+        ),
+        move |arguments| {
+            let limit = argument_limit(&arguments, 10);
+            let now = Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string();
+            with_tool_connection(&database_path, |connection| {
+                let items = list_due_tasks(connection, limit, &now)?;
+                let payload = items.into_iter().map(task_payload).collect::<Vec<_>>();
+                Ok(ToolExecutionResult::success(
+                    serde_json::to_string_pretty(&payload)
+                        .expect("due task payload should serialize"),
+                ))
+            })
+        },
+    );
+
+    let database_path = config.database_path.clone();
+    let list_today_tasks_tool = ExecutableTool::new(
+        ToolSpec::new(
+            "list_today_tasks",
+            "List active tasks scheduled for today.",
+            JsonSchema::object([("limit", json!({"type": "integer"}))], [] as [&str; 0]),
+        ),
+        move |arguments| {
+            let limit = argument_limit(&arguments, 10);
+            let today = Utc::now().date_naive().format("%Y-%m-%d").to_string();
+            with_tool_connection(&database_path, |connection| {
+                let items = list_today_tasks(connection, limit, &today)?;
+                let payload = items.into_iter().map(task_payload).collect::<Vec<_>>();
+                Ok(ToolExecutionResult::success(
+                    serde_json::to_string_pretty(&payload)
+                        .expect("today task payload should serialize"),
+                ))
+            })
+        },
+    );
+
+    let database_path = config.database_path.clone();
     let list_memories = ExecutableTool::new(
         ToolSpec::new(
             "list_memories",
@@ -963,6 +1413,28 @@ pub fn build_live_tool_registry(config: &AppConfig) -> ExecutableToolRegistry {
     );
 
     let database_path = config.database_path.clone();
+    let show_task = ExecutableTool::new(
+        ToolSpec::new(
+            "show_task",
+            "Show one active task by exact name.",
+            JsonSchema::object([("name", json!({"type": "string"}))], ["name"]),
+        ),
+        move |arguments| {
+            let Some(name) = arguments.get("name").and_then(Value::as_str) else {
+                return ToolExecutionResult::error("show_task requires a string name");
+            };
+            with_tool_connection(&database_path, |connection| {
+                let Some(item) = find_task_by_name(connection, name)? else {
+                    return Ok(ToolExecutionResult::error(format!(
+                        "task not found: {name}"
+                    )));
+                };
+                Ok(ToolExecutionResult::success(task_payload(item).to_string()))
+            })
+        },
+    );
+
+    let database_path = config.database_path.clone();
     let show_memory = ExecutableTool::new(
         ToolSpec::new(
             "show_memory",
@@ -1030,10 +1502,22 @@ pub fn build_live_tool_registry(config: &AppConfig) -> ExecutableToolRegistry {
     ExecutableToolRegistry::new(vec![
         create_memory,
         add_agenda_item,
+        create_task,
         create_due_item,
+        set_assistant_name,
+        set_persona,
+        reset_system_persona,
+        set_user_preferred_name,
+        get_user_preferred_name,
+        set_user_full_name,
+        get_user_full_name,
+        update_task_text,
         update_due_item_text,
+        rename_task,
         rename_due_item,
+        complete_task,
         complete_due_item,
+        delete_task,
         delete_due_item,
         update_memory,
         archive_memory,
@@ -1045,10 +1529,15 @@ pub fn build_live_tool_registry(config: &AppConfig) -> ExecutableToolRegistry {
         complete_agenda_checklist_item,
         show_context_messages,
         clear_context_messages,
+        list_tasks,
+        list_triggered_tasks_tool,
+        list_due_tasks_tool,
+        list_today_tasks_tool,
         list_memories,
         search_memories,
         list_agenda,
         list_due_items,
+        show_task,
         show_memory,
         show_agenda_item,
     ])
@@ -1058,6 +1547,60 @@ pub fn argument_limit(arguments: &Value, default_limit: usize) -> usize {
     match arguments.get("limit").and_then(Value::as_u64) {
         Some(0) | None => default_limit,
         Some(value) => value.clamp(1, 50) as usize,
+    }
+}
+
+fn with_user_preferences_at_path(
+    database_path: &Path,
+    operation: impl FnOnce(Option<UserPreferenceRecord>) -> rusqlite::Result<ToolExecutionResult>,
+) -> ToolExecutionResult {
+    let mut connection = match open_sqlite_connection(database_path) {
+        Ok(connection) => connection,
+        Err(error) => {
+            return ToolExecutionResult::error(format!("failed to open database: {error}"));
+        }
+    };
+    if let Err(error) = run_migrations(&mut connection) {
+        return ToolExecutionResult::error(format!("failed to run migrations: {error}"));
+    }
+    match load_user_preferences(&connection, LOCAL_USER_TOKEN).and_then(operation) {
+        Ok(result) => result,
+        Err(error) => ToolExecutionResult::error(format!("database query failed: {error}")),
+    }
+}
+
+fn mutate_user_preferences_at_path(
+    database_path: &Path,
+    operation: impl FnOnce(&mut UserPreferenceRecord) -> rusqlite::Result<String>,
+) -> ToolExecutionResult {
+    let mut connection = match open_sqlite_connection(database_path) {
+        Ok(connection) => connection,
+        Err(error) => {
+            return ToolExecutionResult::error(format!("failed to open database: {error}"));
+        }
+    };
+    if let Err(error) = run_migrations(&mut connection) {
+        return ToolExecutionResult::error(format!("failed to run migrations: {error}"));
+    }
+    let mut record = load_user_preferences(&connection, LOCAL_USER_TOKEN)
+        .ok()
+        .flatten()
+        .unwrap_or(UserPreferenceRecord {
+            user_token: LOCAL_USER_TOKEN.to_string(),
+            assistant_name: None,
+            preferred_name: None,
+            full_name: None,
+            system_persona: None,
+            created_at_unix: 0,
+            updated_at_unix: 0,
+        });
+
+    match operation(&mut record).and_then(|message| {
+        save_user_preferences(&mut connection, &record)?;
+        Ok(message)
+    }) {
+        Ok(message) => ToolExecutionResult::success(message),
+        Err(error) => ToolExecutionResult::error(format!("user preference update failed: {error}")),
     }
 }
 
@@ -1090,6 +1633,66 @@ fn mutate_memory_file_from_config(
                 .to_string(),
         ),
         Err(error) => ToolExecutionResult::error(format!("memory mutation failed: {error}")),
+    }
+}
+
+fn mutate_task_file_from_config(
+    config: &AppConfig,
+    name: &str,
+    operation: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> ToolExecutionResult {
+    let mut connection = match open_sqlite_connection(&config.database_path) {
+        Ok(connection) => connection,
+        Err(error) => {
+            return ToolExecutionResult::error(format!("failed to open database: {error}"));
+        }
+    };
+    if let Err(error) = run_migrations(&mut connection) {
+        return ToolExecutionResult::error(format!("failed to run migrations: {error}"));
+    }
+    let task = match find_task_by_name(&connection, name) {
+        Ok(Some(task)) => task,
+        Ok(None) => return ToolExecutionResult::error(format!("task not found: {name}")),
+        Err(error) => return ToolExecutionResult::error(format!("database query failed: {error}")),
+    };
+    match operation(Path::new(&task.file_path)).and_then(|()| {
+        elroy_db::bootstrap_database(&BootstrapPlan::from_config(config))
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        Ok(())
+    }) {
+        Ok(()) => ToolExecutionResult::success(
+            json!({"updated": true, "name": task.name, "file_path": task.file_path}).to_string(),
+        ),
+        Err(error) => ToolExecutionResult::error(format!("task mutation failed: {error}")),
+    }
+}
+
+fn mutate_task_file_from_config_with_result(
+    config: &AppConfig,
+    name: &str,
+    operation: impl FnOnce(&Path) -> std::io::Result<String>,
+) -> ToolExecutionResult {
+    let mut connection = match open_sqlite_connection(&config.database_path) {
+        Ok(connection) => connection,
+        Err(error) => {
+            return ToolExecutionResult::error(format!("failed to open database: {error}"));
+        }
+    };
+    if let Err(error) = run_migrations(&mut connection) {
+        return ToolExecutionResult::error(format!("failed to run migrations: {error}"));
+    }
+    let task = match find_task_by_name(&connection, name) {
+        Ok(Some(task)) => task,
+        Ok(None) => return ToolExecutionResult::error(format!("task not found: {name}")),
+        Err(error) => return ToolExecutionResult::error(format!("database query failed: {error}")),
+    };
+    match operation(Path::new(&task.file_path)).and_then(|payload| {
+        elroy_db::bootstrap_database(&BootstrapPlan::from_config(config))
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        Ok(payload)
+    }) {
+        Ok(payload) => ToolExecutionResult::success(payload),
+        Err(error) => ToolExecutionResult::error(format!("task mutation failed: {error}")),
     }
 }
 
@@ -1215,6 +1818,266 @@ fn excerpt(body: &str, max_chars: usize) -> String {
     format!("{shortened}...")
 }
 
+fn task_payload(item: AgendaItemRecord) -> Value {
+    json!({
+        "name": item.name,
+        "file_path": item.file_path,
+        "agenda_date": item.agenda_date,
+        "trigger_datetime": item.trigger_datetime,
+        "trigger_context": item.trigger_context,
+        "status": item.status,
+        "checklist_total": item.checklist_total,
+        "checklist_completed": item.checklist_completed,
+        "body": item.body,
+    })
+}
+
+fn due_item_context_messages(items: &[AgendaItemRecord]) -> Vec<ConversationMessage> {
+    if items.is_empty() {
+        return Vec::new();
+    }
+
+    let payload = items
+        .iter()
+        .map(|item| {
+            json!({
+                "name": item.name,
+                "agenda_date": item.agenda_date,
+                "trigger_datetime": item.trigger_datetime,
+                "trigger_context": item.trigger_context,
+                "status": item.status,
+                "checklist_total": item.checklist_total,
+                "checklist_completed": item.checklist_completed,
+                "excerpt": excerpt(&item.body, 180),
+            })
+        })
+        .collect::<Vec<_>>();
+    let arguments_json = serde_json::to_string(&json!({ "limit": items.len() }))
+        .expect("due item args should serialize");
+    let content =
+        serde_json::to_string_pretty(&payload).expect("due item payload should serialize");
+
+    vec![
+        ConversationMessage::assistant_with_tool_calls(
+            "",
+            vec![ToolCall {
+                id: "bootstrap-due-items".to_string(),
+                name: "list_due_items".to_string(),
+                arguments_json,
+            }],
+        ),
+        ConversationMessage::tool_result("bootstrap-due-items", content),
+    ]
+}
+
+fn recall_memory_context_messages(
+    prompt: &str,
+    transcript: &[ConversationMessage],
+    memories: &[elroy_db::MemoryRecord],
+) -> Vec<ConversationMessage> {
+    if should_skip_memory_recall(prompt) {
+        return Vec::new();
+    }
+
+    let recall_query = build_recall_query(prompt, transcript, 4);
+    let already_recalled = recalled_memory_names(transcript);
+    let recalled = select_recalled_memories(&recall_query, memories, &already_recalled, 3);
+    if recalled.is_empty() {
+        return Vec::new();
+    }
+
+    let payload = recalled
+        .iter()
+        .map(|memory| {
+            json!({
+                "name": memory.name,
+                "file_path": memory.file_path,
+                "excerpt": excerpt(&memory.body, 180),
+                "updated_at_unix": memory.updated_at_unix,
+            })
+        })
+        .collect::<Vec<_>>();
+    let content =
+        serde_json::to_string_pretty(&payload).expect("memory recall payload should serialize");
+
+    vec![
+        ConversationMessage::assistant_with_tool_calls(
+            "",
+            vec![ToolCall {
+                id: "bootstrap-memory-recall".to_string(),
+                name: "search_memories".to_string(),
+                arguments_json: json!({
+                    "query": recall_query,
+                    "limit": recalled.len(),
+                })
+                .to_string(),
+            }],
+        ),
+        ConversationMessage::tool_result("bootstrap-memory-recall", content),
+    ]
+}
+
+fn should_skip_memory_recall(prompt: &str) -> bool {
+    let normalized = prompt.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return true;
+    }
+
+    const SIMPLE_SHORT: &[&str] = &[
+        "ok",
+        "okay",
+        "yes",
+        "no",
+        "thanks",
+        "thank you",
+        "sure",
+        "got it",
+        "k",
+        "yep",
+        "nope",
+    ];
+    const GREETINGS: &[&str] = &[
+        "hi",
+        "hello",
+        "hey",
+        "good morning",
+        "good afternoon",
+        "good evening",
+        "goodbye",
+        "bye",
+    ];
+
+    (normalized.len() < 10 && SIMPLE_SHORT.contains(&normalized.as_str()))
+        || GREETINGS.contains(&normalized.as_str())
+}
+
+fn build_recall_query(prompt: &str, transcript: &[ConversationMessage], window: usize) -> String {
+    let mut parts = recent_recall_context(transcript, window);
+    parts.push(prompt.trim().to_string());
+    parts.retain(|part| !part.is_empty());
+    parts.join("\n")
+}
+
+fn recent_recall_context(transcript: &[ConversationMessage], window: usize) -> Vec<String> {
+    transcript
+        .iter()
+        .rev()
+        .filter(|message| {
+            matches!(message.role, MessageRole::User | MessageRole::Assistant)
+                && !message
+                    .content
+                    .as_deref()
+                    .unwrap_or_default()
+                    .trim()
+                    .is_empty()
+        })
+        .take(window)
+        .filter_map(|message| message.content.clone())
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect()
+}
+
+fn recalled_memory_names(transcript: &[ConversationMessage]) -> HashSet<String> {
+    transcript
+        .iter()
+        .filter(|message| message.role == MessageRole::Tool)
+        .filter_map(|message| {
+            (message.tool_call_id.as_deref() == Some("bootstrap-memory-recall"))
+                .then_some(message.content.as_deref())
+                .flatten()
+        })
+        .flat_map(parse_recalled_memory_names)
+        .collect()
+}
+
+fn parse_recalled_memory_names(content: &str) -> Vec<String> {
+    serde_json::from_str::<serde_json::Value>(content)
+        .ok()
+        .and_then(|value| value.as_array().cloned())
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|item| {
+            item.get("name")
+                .and_then(serde_json::Value::as_str)
+                .map(|name| name.to_ascii_lowercase())
+        })
+        .collect()
+}
+
+fn select_recalled_memories<'a>(
+    prompt: &str,
+    memories: &'a [elroy_db::MemoryRecord],
+    already_recalled: &HashSet<String>,
+    limit: usize,
+) -> Vec<&'a elroy_db::MemoryRecord> {
+    let prompt_tokens = significant_tokens(prompt);
+    if prompt_tokens.is_empty() {
+        return Vec::new();
+    }
+
+    let mut scored = memories
+        .iter()
+        .filter_map(|memory| {
+            if already_recalled.contains(&memory.name.to_ascii_lowercase()) {
+                return None;
+            }
+            let mut haystack = String::with_capacity(memory.name.len() + memory.body.len() + 1);
+            haystack.push_str(&memory.name);
+            haystack.push(' ');
+            haystack.push_str(&memory.body);
+            let memory_tokens = significant_tokens(&haystack);
+            let overlap = prompt_tokens.intersection(&memory_tokens).count();
+            (overlap > 0).then_some((overlap, memory.updated_at_unix, memory))
+        })
+        .collect::<Vec<_>>();
+
+    scored.sort_by(|left, right| {
+        right
+            .0
+            .cmp(&left.0)
+            .then_with(|| right.1.cmp(&left.1))
+            .then_with(|| left.2.name.cmp(&right.2.name))
+    });
+    scored
+        .into_iter()
+        .take(limit)
+        .map(|(_, _, memory)| memory)
+        .collect()
+}
+
+fn significant_tokens(text: &str) -> HashSet<String> {
+    const STOPWORDS: &[&str] = &[
+        "a", "an", "and", "are", "at", "be", "but", "by", "for", "from", "i", "if", "im", "in",
+        "is", "it", "its", "me", "my", "of", "on", "or", "so", "that", "the", "this", "to", "was",
+        "we", "with", "you",
+    ];
+
+    text.split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter_map(|token| {
+            let normalized = token.trim().to_ascii_lowercase();
+            if normalized.len() < 3 || STOPWORDS.contains(&normalized.as_str()) {
+                None
+            } else {
+                Some(normalized)
+            }
+        })
+        .collect()
+}
+
+fn strip_transient_context_messages(
+    mut transcript: Vec<ConversationMessage>,
+    persistent_prefix_len: usize,
+    transient_len: usize,
+) -> Vec<ConversationMessage> {
+    if transient_len == 0 {
+        return transcript;
+    }
+    transcript.drain(persistent_prefix_len..persistent_prefix_len + transient_len);
+    transcript
+}
+
 pub fn provider_config_from_app_config(config: &AppConfig) -> Result<ProviderConfig, String> {
     match config.llm_provider() {
         LlmProvider::OpenAi => {
@@ -1252,16 +2115,20 @@ pub fn provider_config_from_app_config(config: &AppConfig) -> Result<ProviderCon
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{collections::HashSet, fs};
 
     use elroy_agenda::create_agenda_file;
     use elroy_config::{AppConfig, LlmProvider};
+    use elroy_db::{AgendaItemRecord, MemoryRecord, load_user_preferences, open_sqlite_connection};
     use elroy_llm::{ConversationMessage, MessageRole, Provider};
     use elroy_memory::{create_memory_file, sanitize_filename};
 
     use super::{
-        AppRuntime, LOCAL_USER_TOKEN, argument_limit, build_live_tool_registry,
-        provider_config_from_app_config,
+        AppRuntime, LOCAL_USER_TOKEN, argument_limit, build_live_tool_registry, build_recall_query,
+        due_item_context_messages, parse_recalled_memory_names, provider_config_from_app_config,
+        recall_memory_context_messages, recalled_memory_names, recent_recall_context,
+        select_recalled_memories, should_skip_memory_recall, significant_tokens,
+        strip_transient_context_messages,
     };
 
     #[test]
@@ -1654,6 +2521,162 @@ mod tests {
     }
 
     #[test]
+    fn live_tool_registry_can_manage_user_preferences() {
+        let unique = format!(
+            "elroy-rs-app-user-preferences-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+
+        let mut config = AppConfig::defaults();
+        config.memory_dir = memory_dir;
+        config.agenda_dir = agenda_dir;
+        config.database_path = database_path;
+
+        let registry = build_live_tool_registry(&config);
+        let default_name = registry.invoke("get_user_preferred_name", "{}");
+        assert!(!default_name.is_error);
+        assert_eq!(default_name.content, "User");
+
+        let preferred =
+            registry.invoke("set_user_preferred_name", "{\"preferred_name\":\"Jimmy\"}");
+        assert!(!preferred.is_error);
+        assert!(preferred.content.contains("Jimmy"));
+
+        let duplicate =
+            registry.invoke("set_user_preferred_name", "{\"preferred_name\":\"James\"}");
+        assert!(!duplicate.is_error);
+        assert!(duplicate.content.contains("already set"));
+
+        let assistant = registry.invoke("set_assistant_name", "{\"assistant_name\":\"Nova\"}");
+        assert!(!assistant.is_error);
+        assert!(assistant.content.contains("Nova"));
+
+        let full_name = registry.invoke("set_user_full_name", "{\"full_name\":\"James Smith\"}");
+        assert!(!full_name.is_error);
+
+        let get_full_name = registry.invoke("get_user_full_name", "{}");
+        assert!(!get_full_name.is_error);
+        assert_eq!(get_full_name.content, "James Smith");
+
+        let persona = registry.invoke(
+            "set_persona",
+            "{\"system_persona\":\"You are $ASSISTANT_ALIAS helping $USER_ALIAS.\"}",
+        );
+        assert!(!persona.is_error);
+        assert_eq!(persona.content, "System persona updated.");
+
+        let connection =
+            open_sqlite_connection(&config.database_path).expect("database should open");
+        let persisted = load_user_preferences(&connection, LOCAL_USER_TOKEN)
+            .expect("preferences should load")
+            .expect("preferences should exist");
+        assert_eq!(
+            persisted.system_persona.as_deref(),
+            Some("You are $ASSISTANT_ALIAS helping $USER_ALIAS.")
+        );
+
+        let reset = registry.invoke("reset_system_persona", "{}");
+        assert!(!reset.is_error);
+        assert_eq!(
+            reset.content,
+            "System persona cleared, will now use default persona."
+        );
+
+        let cleared = load_user_preferences(&connection, LOCAL_USER_TOKEN)
+            .expect("preferences should load")
+            .expect("preferences should exist");
+        assert_eq!(cleared.system_persona, None);
+
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
+    fn live_tool_registry_can_manage_tasks() {
+        let unique = format!(
+            "elroy-rs-app-tasks-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+
+        let mut config = AppConfig::defaults();
+        config.memory_dir = memory_dir;
+        config.agenda_dir = agenda_dir.clone();
+        config.database_path = database_path;
+
+        let registry = build_live_tool_registry(&config);
+        let created = registry.invoke(
+            "create_task",
+            "{\"name\":\"Job Search\",\"text\":\"Reach out to three contacts\",\"date\":\"2026-05-20\",\"trigger_context\":\"after breakfast\"}",
+        );
+        assert!(!created.is_error);
+        assert!(agenda_dir.join("job_search.md").exists());
+
+        let triggered = registry.invoke("list_triggered_tasks", "{\"limit\":10}");
+        assert!(!triggered.is_error);
+        assert!(triggered.content.contains("job search"));
+        assert!(triggered.content.contains("after breakfast"));
+
+        let today = registry.invoke("list_today_tasks", "{\"limit\":10}");
+        assert!(!today.is_error);
+        assert!(!today.content.contains("job search"));
+
+        let updated = registry.invoke(
+            "update_task_text",
+            "{\"name\":\"job search\",\"text\":\"Reach out to four contacts\"}",
+        );
+        assert!(!updated.is_error);
+
+        let renamed = registry.invoke(
+            "rename_task",
+            "{\"name\":\"job search\",\"new_name\":\"Career Search\"}",
+        );
+        assert!(!renamed.is_error);
+        assert!(agenda_dir.join("career_search.md").exists());
+
+        let listed = registry.invoke("list_tasks", "{\"limit\":10}");
+        assert!(!listed.is_error);
+        assert!(listed.content.contains("career search"));
+
+        let shown = registry.invoke("show_task", "{\"name\":\"career search\"}");
+        assert!(!shown.is_error);
+        assert!(shown.content.contains("Reach out to four contacts"));
+
+        let completed = registry.invoke("complete_task", "{\"name\":\"career search\"}");
+        assert!(!completed.is_error);
+
+        let deleted_created = registry.invoke(
+            "create_task",
+            "{\"name\":\"Inbox Zero\",\"text\":\"Clear email backlog\"}",
+        );
+        assert!(!deleted_created.is_error);
+        let deleted = registry.invoke("delete_task", "{\"name\":\"inbox zero\"}");
+        assert!(!deleted.is_error);
+
+        let deleted_text =
+            fs::read_to_string(agenda_dir.join("inbox_zero.md")).expect("task file should read");
+        assert!(deleted_text.contains("status: deleted"));
+
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
     fn live_tool_registry_can_update_rename_complete_and_delete_due_items() {
         let unique = format!(
             "elroy-rs-app-due-item-mutations-{}",
@@ -1716,5 +2739,234 @@ mod tests {
         let deleted_text =
             fs::read_to_string(agenda_dir.join("pay_bill.md")).expect("due item should read");
         assert!(deleted_text.contains("status: deleted"));
+    }
+
+    #[test]
+    fn due_item_context_messages_create_synthetic_tool_context() {
+        let messages = due_item_context_messages(&[AgendaItemRecord {
+            id: 1,
+            legacy_frontmatter_id: None,
+            name: "call mom".to_string(),
+            file_path: "/tmp/call_mom.md".to_string(),
+            agenda_date: Some("unscheduled".to_string()),
+            is_completed: false,
+            status: Some("created".to_string()),
+            trigger_datetime: None,
+            trigger_context: Some("after dinner".to_string()),
+            closing_comment: None,
+            checklist_total: 0,
+            checklist_completed: 0,
+            body: "Call mom tonight".to_string(),
+            is_active: true,
+            updated_at_unix: 1,
+        }]);
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, MessageRole::Assistant);
+        assert_eq!(
+            messages[0]
+                .tool_calls
+                .as_ref()
+                .map(|calls| calls[0].name.as_str()),
+            Some("list_due_items")
+        );
+        assert_eq!(messages[1].role, MessageRole::Tool);
+        assert!(
+            messages[1]
+                .content
+                .as_deref()
+                .is_some_and(|content| content.contains("after dinner"))
+        );
+    }
+
+    #[test]
+    fn strip_transient_context_messages_removes_injected_due_item_context() {
+        let transcript = vec![
+            ConversationMessage::new(MessageRole::Assistant, "earlier reply"),
+            ConversationMessage::assistant_with_tool_calls(
+                "",
+                vec![elroy_llm::ToolCall {
+                    id: "bootstrap-due-items".to_string(),
+                    name: "list_due_items".to_string(),
+                    arguments_json: "{\"limit\":1}".to_string(),
+                }],
+            ),
+            ConversationMessage::tool_result("bootstrap-due-items", "[]"),
+            ConversationMessage::new(MessageRole::User, "hello"),
+            ConversationMessage::new(MessageRole::Assistant, "hi"),
+        ];
+
+        let stripped = strip_transient_context_messages(transcript, 1, 2);
+
+        assert_eq!(stripped.len(), 3);
+        assert_eq!(stripped[0].content.as_deref(), Some("earlier reply"));
+        assert_eq!(stripped[1].role, MessageRole::User);
+        assert_eq!(stripped[2].role, MessageRole::Assistant);
+    }
+
+    #[test]
+    fn trivial_messages_skip_memory_recall() {
+        assert!(should_skip_memory_recall("hi"));
+        assert!(should_skip_memory_recall("thanks"));
+        assert!(!should_skip_memory_recall("I am going running tomorrow"));
+    }
+
+    #[test]
+    fn significant_tokens_drop_short_words_and_stopwords() {
+        let tokens = significant_tokens("I'm going to play basketball at the park");
+        assert!(tokens.contains("going"));
+        assert!(tokens.contains("play"));
+        assert!(tokens.contains("basketball"));
+        assert!(!tokens.contains("the"));
+        assert!(!tokens.contains("to"));
+    }
+
+    #[test]
+    fn select_recalled_memories_prefers_overlap() {
+        let memories = vec![
+            MemoryRecord {
+                id: 1,
+                legacy_frontmatter_id: None,
+                name: "basketball form".to_string(),
+                file_path: "/tmp/basketball.md".to_string(),
+                body: "Remember to follow through on your shot".to_string(),
+                is_active: true,
+                updated_at_unix: 10,
+            },
+            MemoryRecord {
+                id: 2,
+                legacy_frontmatter_id: None,
+                name: "grocery list".to_string(),
+                file_path: "/tmp/grocery.md".to_string(),
+                body: "Buy apples and milk".to_string(),
+                is_active: true,
+                updated_at_unix: 20,
+            },
+        ];
+
+        let recalled = select_recalled_memories(
+            "I am heading to basketball practice",
+            &memories,
+            &HashSet::new(),
+            3,
+        );
+
+        assert_eq!(recalled.len(), 1);
+        assert_eq!(recalled[0].name, "basketball form");
+    }
+
+    #[test]
+    fn recall_memory_context_messages_create_synthetic_tool_context() {
+        let messages = recall_memory_context_messages(
+            "I am heading to basketball practice",
+            &[],
+            &[MemoryRecord {
+                id: 1,
+                legacy_frontmatter_id: None,
+                name: "basketball form".to_string(),
+                file_path: "/tmp/basketball.md".to_string(),
+                body: "Remember to follow through on your shot".to_string(),
+                is_active: true,
+                updated_at_unix: 10,
+            }],
+        );
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, MessageRole::Assistant);
+        assert_eq!(
+            messages[0]
+                .tool_calls
+                .as_ref()
+                .map(|calls| calls[0].name.as_str()),
+            Some("search_memories")
+        );
+        assert_eq!(messages[1].role, MessageRole::Tool);
+        assert!(
+            messages[1]
+                .content
+                .as_deref()
+                .is_some_and(|content| content.contains("basketball form"))
+        );
+    }
+
+    #[test]
+    fn recent_recall_context_uses_recent_user_and_assistant_messages() {
+        let transcript = vec![
+            ConversationMessage::new(MessageRole::System, "system"),
+            ConversationMessage::new(MessageRole::User, "I am training for basketball"),
+            ConversationMessage::new(MessageRole::Assistant, "How is practice going?"),
+            ConversationMessage::tool_result("bootstrap-memory-recall", "[]"),
+            ConversationMessage::new(MessageRole::User, "My jump shot is inconsistent"),
+        ];
+
+        let context = recent_recall_context(&transcript, 3);
+
+        assert_eq!(context.len(), 3);
+        assert_eq!(context[0], "I am training for basketball");
+        assert_eq!(context[2], "My jump shot is inconsistent");
+    }
+
+    #[test]
+    fn build_recall_query_includes_recent_context_and_prompt() {
+        let transcript = vec![
+            ConversationMessage::new(MessageRole::User, "I am training for basketball"),
+            ConversationMessage::new(MessageRole::Assistant, "How is practice going?"),
+        ];
+
+        let query = build_recall_query("What should I focus on?", &transcript, 4);
+
+        assert!(query.contains("I am training for basketball"));
+        assert!(query.contains("What should I focus on?"));
+    }
+
+    #[test]
+    fn parse_and_collect_recalled_memory_names_from_transcript() {
+        let transcript = vec![ConversationMessage::tool_result(
+            "bootstrap-memory-recall",
+            r#"[{"name":"Basketball Form"},{"name":"Sleep Routine"}]"#,
+        )];
+
+        let parsed =
+            parse_recalled_memory_names(r#"[{"name":"Basketball Form"},{"name":"Sleep Routine"}]"#);
+        let names = recalled_memory_names(&transcript);
+
+        assert_eq!(parsed.len(), 2);
+        assert!(names.contains("basketball form"));
+        assert!(names.contains("sleep routine"));
+    }
+
+    #[test]
+    fn select_recalled_memories_skips_already_recalled_names() {
+        let memories = vec![
+            MemoryRecord {
+                id: 1,
+                legacy_frontmatter_id: None,
+                name: "basketball form".to_string(),
+                file_path: "/tmp/basketball.md".to_string(),
+                body: "Remember to follow through on your shot".to_string(),
+                is_active: true,
+                updated_at_unix: 10,
+            },
+            MemoryRecord {
+                id: 2,
+                legacy_frontmatter_id: None,
+                name: "practice plan".to_string(),
+                file_path: "/tmp/practice.md".to_string(),
+                body: "Warm up before basketball drills".to_string(),
+                is_active: true,
+                updated_at_unix: 9,
+            },
+        ];
+        let already_recalled = HashSet::from([String::from("basketball form")]);
+
+        let recalled = select_recalled_memories(
+            "I am heading to basketball practice",
+            &memories,
+            &already_recalled,
+            3,
+        );
+
+        assert_eq!(recalled.len(), 1);
+        assert_eq!(recalled[0].name, "practice plan");
     }
 }

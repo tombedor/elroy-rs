@@ -1,0 +1,13 @@
+[package]
+name = "elroy-user"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+elroy-db = { path = "../elroy-db" }
