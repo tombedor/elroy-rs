@@ -70,14 +70,14 @@ fn prompt_arg(args: &[String]) -> Option<String> {
 }
 
 fn run_live_prompt(runtime: &AppRuntime, prompt: &str) {
-    let prompt_run = runtime
-        .process_message(prompt, MessageProcessOptions::default())
+    let prompt_stream = runtime
+        .process_message_stream(prompt, MessageProcessOptions::default())
         .unwrap_or_else(|error| {
             eprintln!("{error}");
             std::process::exit(1);
         });
 
-    for event in prompt_run.events {
+    for event in prompt_stream {
         match event {
             StreamEvent::AssistantResponse { content } => println!("{content}"),
             StreamEvent::AssistantInternalThought { content } => eprintln!("thinking: {content}"),

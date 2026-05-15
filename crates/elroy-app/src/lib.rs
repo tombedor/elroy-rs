@@ -99,6 +99,30 @@ pub struct PromptRunResult {
     pub snapshot: TuiSnapshot,
 }
 
+#[derive(Debug, Clone)]
+pub struct PromptEventStream {
+    events: std::vec::IntoIter<StreamEvent>,
+    snapshot: TuiSnapshot,
+}
+
+impl PromptEventStream {
+    pub fn snapshot(&self) -> &TuiSnapshot {
+        &self.snapshot
+    }
+
+    pub fn into_snapshot(self) -> TuiSnapshot {
+        self.snapshot
+    }
+}
+
+impl Iterator for PromptEventStream {
+    type Item = StreamEvent;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.events.next()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MessageProcessOptions {
     pub role: MessageRole,
@@ -172,6 +196,18 @@ impl AppRuntime {
 
     pub fn submit_prompt(&self, prompt: &str) -> Result<PromptRunResult, AppError> {
         self.process_message(prompt, MessageProcessOptions::default())
+    }
+
+    pub fn process_message_stream(
+        &self,
+        prompt: &str,
+        options: MessageProcessOptions,
+    ) -> Result<PromptEventStream, AppError> {
+        let result = self.process_message(prompt, options)?;
+        Ok(PromptEventStream {
+            events: result.events.into_iter(),
+            snapshot: result.snapshot,
+        })
     }
 
     pub fn process_message(
@@ -2616,6 +2652,7 @@ mod tests {
     use elroy_llm::{ConversationMessage, MessageRole, Provider, StreamEvent};
     use elroy_memory::{create_memory_file, sanitize_filename};
     use elroy_tools::ExecutableToolRegistry;
+    use elroy_tui::TuiSnapshot;
 
     use super::{
         AppRuntime, LOCAL_USER_TOKEN, argument_limit, build_live_tool_registry,
@@ -3683,6 +3720,28 @@ mod tests {
                 .contains("Requested tool missing_tool not available")
         );
         fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
+    fn prompt_event_stream_yields_events_and_keeps_snapshot() {
+        let stream = super::PromptEventStream {
+            events: vec![StreamEvent::StatusUpdate {
+                content: "thinking".to_string(),
+            }]
+            .into_iter(),
+            snapshot: TuiSnapshot {
+                status: Some("done".to_string()),
+                ..TuiSnapshot::default()
+            },
+        };
+
+        let mut collected = stream.clone();
+        assert!(matches!(
+            collected.next(),
+            Some(StreamEvent::StatusUpdate { content }) if content == "thinking"
+        ));
+        assert_eq!(collected.snapshot().status.as_deref(), Some("done"));
+        assert_eq!(stream.into_snapshot().status.as_deref(), Some("done"));
     }
 
     #[test]
