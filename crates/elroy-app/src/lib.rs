@@ -620,12 +620,11 @@ fn run_prompt_with_model_and_registry(
     );
     replace_context_messages(connection, LOCAL_USER_TOKEN, &persisted_transcript)?;
 
-    let mut events = Vec::new();
-    if !recall_context.is_empty() {
-        events.push(StreamEvent::StatusUpdate {
-            content: "fetching memories...".to_string(),
-        });
-    }
+    let mut events = memory_recall_status_updates(
+        options.memory_recall_classifier_enabled,
+        prompt,
+        !recall_context.is_empty(),
+    );
     if !due_item_context.is_empty() {
         events.push(StreamEvent::StatusUpdate {
             content: "surfacing due items...".to_string(),
@@ -678,12 +677,11 @@ fn run_prompt_with_model_and_registry_stream(
         prompt,
     )?;
 
-    let mut prelude_events = VecDeque::new();
-    if !recall_context.is_empty() {
-        prelude_events.push_back(StreamEvent::StatusUpdate {
-            content: "fetching memories...".to_string(),
-        });
-    }
+    let mut prelude_events = VecDeque::from(memory_recall_status_updates(
+        options.memory_recall_classifier_enabled,
+        prompt,
+        !recall_context.is_empty(),
+    ));
     if !due_item_context.is_empty() {
         prelude_events.push_back(StreamEvent::StatusUpdate {
             content: "surfacing due items...".to_string(),
@@ -2660,6 +2658,26 @@ fn recall_memory_context_messages(
     ]
 }
 
+fn memory_recall_status_updates(
+    memory_recall_classifier_enabled: bool,
+    prompt: &str,
+    fetched_memories: bool,
+) -> Vec<StreamEvent> {
+    let mut events = Vec::new();
+    let skipped = should_skip_memory_recall(prompt);
+    if memory_recall_classifier_enabled && !skipped {
+        events.push(StreamEvent::StatusUpdate {
+            content: "classifying recall...".to_string(),
+        });
+    }
+    if fetched_memories {
+        events.push(StreamEvent::StatusUpdate {
+            content: "fetching memories...".to_string(),
+        });
+    }
+    events
+}
+
 fn should_skip_memory_recall(prompt: &str) -> bool {
     let normalized = prompt.trim().to_ascii_lowercase();
     if normalized.is_empty() {
@@ -2890,12 +2908,12 @@ mod tests {
     use super::{
         AppRuntime, LOCAL_USER_TOKEN, PromptExecutionOptions, argument_limit,
         build_live_tool_registry, build_live_tool_registry_with_codex_bin_and_hook,
-        build_recall_query, due_item_context_messages, parse_recalled_memory_names,
-        provider_config_from_app_config, recall_memory_context_messages, recalled_memory_names,
-        recent_recall_context, run_prompt_with_model_and_registry,
-        run_prompt_with_model_and_registry_stream, select_recalled_memories, should_offer_greeting,
-        should_skip_memory_recall, significant_tokens, strip_input_message_for_persistence,
-        strip_transient_context_messages,
+        build_recall_query, due_item_context_messages, memory_recall_status_updates,
+        parse_recalled_memory_names, provider_config_from_app_config,
+        recall_memory_context_messages, recalled_memory_names, recent_recall_context,
+        run_prompt_with_model_and_registry, run_prompt_with_model_and_registry_stream,
+        select_recalled_memories, should_offer_greeting, should_skip_memory_recall,
+        significant_tokens, strip_input_message_for_persistence, strip_transient_context_messages,
     };
     use elroy_agenda::create_agenda_file;
     use elroy_codex::{
@@ -4416,6 +4434,42 @@ mod tests {
 
         assert!(narrow_messages.is_empty());
         assert_eq!(wide_messages.len(), 2);
+    }
+
+    #[test]
+    fn memory_recall_status_updates_classify_before_fetch_when_enabled() {
+        let events = memory_recall_status_updates(true, "What should I focus on?", true);
+
+        assert_eq!(
+            events,
+            vec![
+                StreamEvent::StatusUpdate {
+                    content: "classifying recall...".to_string(),
+                },
+                StreamEvent::StatusUpdate {
+                    content: "fetching memories...".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn memory_recall_status_updates_skip_classify_for_trivial_prompt() {
+        let events = memory_recall_status_updates(true, "hi", false);
+
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn memory_recall_status_updates_skip_classify_when_classifier_disabled() {
+        let events = memory_recall_status_updates(false, "What should I focus on?", true);
+
+        assert_eq!(
+            events,
+            vec![StreamEvent::StatusUpdate {
+                content: "fetching memories...".to_string(),
+            }]
+        );
     }
 
     #[test]
