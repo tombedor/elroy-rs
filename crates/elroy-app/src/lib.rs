@@ -2,7 +2,7 @@ use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use chrono::Utc;
+use chrono::{NaiveDateTime, Utc};
 use elroy_agenda::{
     add_checklist_item, append_agenda_update, create_agenda_file, get_checklist,
     mark_agenda_item_completed, mark_agenda_item_deleted, rename_agenda_file, update_agenda_body,
@@ -353,7 +353,7 @@ impl AppRuntime {
                 ))
             }
             SidebarSection::Agenda => {
-                let Some(item) = find_active_agenda_item_by_name(&connection, title)? else {
+                let Some(item) = resolve_agenda_sidebar_item(&connection, title)? else {
                     return Err(AppError::Runtime(format!("agenda item not found: {title}")));
                 };
                 let mut lines = vec![
@@ -438,12 +438,37 @@ impl AppRuntime {
             (SidebarSection::Memories, SidebarAction::Archive) => {
                 registry.invoke("archive_memory", &json!({ "name": title }).to_string())
             }
-            (SidebarSection::Agenda, SidebarAction::Complete) => registry.invoke(
-                "complete_agenda_item",
-                &json!({ "name": title }).to_string(),
-            ),
+            (SidebarSection::Agenda, SidebarAction::Complete) => {
+                let connection = self.open_read_connection()?;
+                let Some(item) = resolve_agenda_sidebar_item(&connection, title)? else {
+                    return Err(AppError::Runtime(format!("agenda item not found: {title}")));
+                };
+                if item.status.as_deref() != Some("created") {
+                    return Err(AppError::Runtime(format!(
+                        "agenda item cannot be completed from the sidebar: {}",
+                        item.name
+                    )));
+                }
+                registry.invoke(
+                    "complete_agenda_item",
+                    &json!({ "name": item.name }).to_string(),
+                )
+            }
             (SidebarSection::Agenda, SidebarAction::Delete) => {
-                registry.invoke("delete_agenda_item", &json!({ "name": title }).to_string())
+                let connection = self.open_read_connection()?;
+                let Some(item) = resolve_agenda_sidebar_item(&connection, title)? else {
+                    return Err(AppError::Runtime(format!("agenda item not found: {title}")));
+                };
+                if item.trigger_datetime.is_none() && item.trigger_context.is_none() {
+                    return Err(AppError::Runtime(format!(
+                        "agenda item is not deletable from the sidebar: {}",
+                        item.name
+                    )));
+                }
+                registry.invoke(
+                    "delete_agenda_item",
+                    &json!({ "name": item.name }).to_string(),
+                )
             }
             (SidebarSection::CodexSessions, _) => {
                 return Err(AppError::Runtime(
@@ -499,9 +524,10 @@ fn load_snapshot_from_connection(
         .into_iter()
         .map(|memory| memory.name)
         .collect::<Vec<_>>();
-    let agenda_titles = list_active_plain_agenda_items(connection, 15)?
+    let now = Utc::now().naive_utc();
+    let agenda_titles = list_active_tasks(connection, 15)?
         .into_iter()
-        .map(|item| item.name)
+        .map(|item| format_agenda_sidebar_title(&item, now))
         .collect::<Vec<_>>();
     let codex_session_titles = list_recent_codex_sessions(connection, LOCAL_USER_TOKEN, None, 15)?
         .into_iter()
@@ -516,6 +542,41 @@ fn load_snapshot_from_connection(
         model_name: None,
         status: Some("loaded persisted transcript and sidebar data".to_string()),
     })
+}
+
+fn format_agenda_sidebar_title(item: &AgendaItemRecord, now: NaiveDateTime) -> String {
+    let mut title = item.name.clone();
+    if let Some(trigger_datetime) = item
+        .trigger_datetime
+        .as_deref()
+        .and_then(parse_sidebar_trigger_datetime)
+    {
+        title = format!("{} [{}]", title, trigger_datetime.format("%Y-%m-%d %H:%M"));
+        if trigger_datetime <= now {
+            title.push_str(" (Due)");
+        }
+    }
+    title
+}
+
+fn parse_sidebar_trigger_datetime(value: &str) -> Option<NaiveDateTime> {
+    NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M:%S")
+        .ok()
+        .or_else(|| NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M").ok())
+}
+
+fn resolve_agenda_sidebar_item(
+    connection: &rusqlite::Connection,
+    title: &str,
+) -> rusqlite::Result<Option<AgendaItemRecord>> {
+    if let Some(item) = find_active_agenda_item_by_name(connection, title)? {
+        return Ok(Some(item));
+    }
+
+    let now = Utc::now().naive_utc();
+    Ok(list_active_tasks(connection, 200)?
+        .into_iter()
+        .find(|item| format_agenda_sidebar_title(item, now) == title))
 }
 
 fn should_offer_greeting(
@@ -3085,7 +3146,7 @@ mod tests {
         .expect("memory file should be written");
         fs::write(
             agenda_dir.join("doctor_visit.md"),
-            "---\ndate: 2026-05-15\ncompleted: false\n---\n\nbring forms\n",
+            "---\ndate: 2026-05-15\ncompleted: false\nstatus: created\ntrigger_datetime: 2000-01-01T09:00:00\n---\n\nbring forms\n",
         )
         .expect("agenda file should be written");
 
@@ -3134,6 +3195,12 @@ mod tests {
         let memory_detail = runtime
             .open_sidebar_item(elroy_tui::SidebarSection::Memories, "runner notes")
             .expect("memory detail should open");
+        let agenda_detail = runtime
+            .open_sidebar_item(
+                elroy_tui::SidebarSection::Agenda,
+                "doctor visit [2000-01-01 09:00] (Due)",
+            )
+            .expect("agenda detail should open");
         let codex_detail = runtime
             .open_sidebar_item(
                 elroy_tui::SidebarSection::CodexSessions,
@@ -3155,11 +3222,18 @@ mod tests {
         );
         assert!(
             snapshot
+                .agenda_titles
+                .iter()
+                .any(|item| item == "doctor visit [2000-01-01 09:00] (Due)")
+        );
+        assert!(
+            snapshot
                 .codex_session_titles
                 .iter()
                 .any(|item| item == "sample (completed) thread-123")
         );
         assert!(memory_detail.contains("remember the hill workout"));
+        assert!(agenda_detail.contains("trigger_datetime: 2000-01-01T09:00:00"));
         assert!(codex_detail.contains("Codex inspected the parser state."));
         assert!(codex_detail.contains("Parser inspection complete."));
 
@@ -3316,6 +3390,52 @@ mod tests {
         let deleted_text =
             fs::read_to_string(agenda_dir.join("call_mom.md")).expect("agenda should read");
         assert!(deleted_text.contains("status: deleted"));
+
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
+    fn agenda_sidebar_delete_rejects_plain_agenda_items() {
+        let unique = format!(
+            "elroy-rs-app-sidebar-agenda-delete-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+        fs::write(
+            agenda_dir.join("call_mom.md"),
+            "---\ndate: 2026-05-16\ncompleted: false\nstatus: created\n---\n\ncall mom\n",
+        )
+        .expect("agenda file should be written");
+
+        let mut config = AppConfig::defaults();
+        config.memory_dir = memory_dir;
+        config.agenda_dir = agenda_dir;
+        config.database_path = database_path;
+        elroy_db::bootstrap_database(&elroy_db::BootstrapPlan::from_config(&config))
+            .expect("bootstrap should succeed");
+
+        let runtime = AppRuntime::new(config);
+        let error = runtime
+            .mutate_sidebar_item(
+                elroy_tui::SidebarSection::Agenda,
+                "call mom",
+                elroy_tui::SidebarAction::Delete,
+            )
+            .expect_err("plain agenda item should not be deletable");
+
+        assert!(
+            error
+                .to_string()
+                .contains("agenda item is not deletable from the sidebar")
+        );
 
         fs::remove_dir_all(home).expect("home should be removed");
     }
