@@ -1,0 +1,23 @@
+[package]
+name = "elroy-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+elroy-agenda = { path = "../elroy-agenda" }
+elroy-config = { path = "../elroy-config" }
+elroy-core = { path = "../elroy-core" }
+elroy-db = { path = "../elroy-db" }
+elroy-llm = { path = "../elroy-llm" }
+elroy-memory = { path = "../elroy-memory" }
+elroy-tools = { path = "../elroy-tools" }
+elroy-tui = { path = "../elroy-tui" }
+rusqlite = { version = "0.37", features = ["bundled"] }
+refinery = { version = "0.9", features = ["rusqlite"] }
+serde_json = "1"

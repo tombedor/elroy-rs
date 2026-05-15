@@ -1,0 +1,18 @@
+[package]
+name = "elroy-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+elroy-app = { path = "../elroy-app" }
+elroy-config = { path = "../elroy-config" }
+elroy-core = { path = "../elroy-core" }
+elroy-db = { path = "../elroy-db" }
+elroy-llm = { path = "../elroy-llm" }
+elroy-tui = { path = "../elroy-tui" }

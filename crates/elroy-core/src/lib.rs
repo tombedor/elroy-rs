@@ -1,0 +1,440 @@
+use elroy_config::AppConfig;
+use elroy_llm::{
+    CompletionRequest, ConversationMessage, LiveModelClient, LlmError, MessageRole, StreamEvent,
+    ToolCall,
+};
+use elroy_tools::{ExecutableToolRegistry, ToolRegistry, ToolSpec};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppSession {
+    pub user_id: String,
+    pub assistant_name: String,
+}
+
+impl AppSession {
+    pub fn new(user_id: impl Into<String>, assistant_name: impl Into<String>) -> Self {
+        Self {
+            user_id: user_id.into(),
+            assistant_name: assistant_name.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnContext {
+    pub request_id: String,
+    pub session: AppSession,
+    pub config: AppConfig,
+}
+
+impl TurnContext {
+    pub fn new(request_id: impl Into<String>, session: AppSession, config: AppConfig) -> Self {
+        Self {
+            request_id: request_id.into(),
+            session,
+            config,
+        }
+    }
+
+    pub fn memory_dir(&self) -> &std::path::Path {
+        &self.config.memory_dir
+    }
+}
+
+pub struct ConversationRequest<'a> {
+    pub user_message: &'a str,
+    pub tools: &'a [ToolSpec],
+    pub transcript: &'a [ConversationMessage],
+}
+
+pub trait ModelClient {
+    fn next_events(
+        &self,
+        request: ConversationRequest<'_>,
+    ) -> Result<Vec<StreamEvent>, ModelClientError>;
+}
+
+pub trait ToolExecutor {
+    fn execute(&self, call: &ToolCall) -> StreamEvent;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConversationOrchestrator {
+    pub max_tool_rounds: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnRun {
+    pub events: Vec<StreamEvent>,
+    pub transcript: Vec<ConversationMessage>,
+}
+
+#[derive(Debug)]
+pub enum ModelClientError {
+    Provider(LlmError),
+}
+
+impl std::fmt::Display for ModelClientError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Provider(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for ModelClientError {}
+
+impl From<LlmError> for ModelClientError {
+    fn from(value: LlmError) -> Self {
+        Self::Provider(value)
+    }
+}
+
+#[derive(Debug)]
+pub struct LiveProviderModel {
+    client: LiveModelClient,
+    system_prompt: String,
+}
+
+impl LiveProviderModel {
+    pub fn new(client: LiveModelClient, system_prompt: impl Into<String>) -> Self {
+        Self {
+            client,
+            system_prompt: system_prompt.into(),
+        }
+    }
+}
+
+impl ModelClient for LiveProviderModel {
+    fn next_events(
+        &self,
+        request: ConversationRequest<'_>,
+    ) -> Result<Vec<StreamEvent>, ModelClientError> {
+        let tools = ToolRegistry::new(request.tools.to_vec());
+        self.client
+            .query(CompletionRequest {
+                system_prompt: &self.system_prompt,
+                messages: request.transcript,
+                tools: &tools,
+            })
+            .map_err(ModelClientError::from)
+    }
+}
+
+#[derive(Clone)]
+pub struct LocalToolExecutor {
+    registry: ExecutableToolRegistry,
+}
+
+impl LocalToolExecutor {
+    pub fn new(registry: ExecutableToolRegistry) -> Self {
+        Self { registry }
+    }
+}
+
+impl ToolExecutor for LocalToolExecutor {
+    fn execute(&self, call: &ToolCall) -> StreamEvent {
+        let result = self.registry.invoke(&call.name, &call.arguments_json);
+        StreamEvent::AssistantToolResult {
+            content: result.content,
+            is_error: result.is_error,
+        }
+    }
+}
+
+impl ConversationOrchestrator {
+    pub fn new(max_tool_rounds: usize) -> Self {
+        Self { max_tool_rounds }
+    }
+
+    pub fn run_turn(
+        &self,
+        model: &dyn ModelClient,
+        tools: &[ToolSpec],
+        tool_executor: &dyn ToolExecutor,
+        user_message: &str,
+    ) -> Result<TurnRun, ModelClientError> {
+        self.run_turn_with_transcript(model, tools, tool_executor, &[], user_message)
+    }
+
+    pub fn run_turn_with_transcript(
+        &self,
+        model: &dyn ModelClient,
+        tools: &[ToolSpec],
+        tool_executor: &dyn ToolExecutor,
+        existing_transcript: &[ConversationMessage],
+        user_message: &str,
+    ) -> Result<TurnRun, ModelClientError> {
+        let mut events = Vec::new();
+        let mut transcript = existing_transcript.to_vec();
+        transcript.push(ConversationMessage::new(MessageRole::User, user_message));
+
+        for _ in 0..=self.max_tool_rounds {
+            let model_events = model.next_events(ConversationRequest {
+                user_message,
+                tools,
+                transcript: &transcript,
+            })?;
+
+            let mut saw_tool_call = false;
+
+            for event in model_events {
+                match event {
+                    StreamEvent::ToolCallRequested(call) => {
+                        saw_tool_call = true;
+                        events.push(StreamEvent::ToolCallRequested(call.clone()));
+                        transcript.push(ConversationMessage::assistant_with_tool_calls(
+                            "",
+                            vec![call.clone()],
+                        ));
+
+                        let tool_event = tool_executor.execute(&call);
+                        transcript.push(tool_event_to_message(&call, &tool_event));
+                        events.push(tool_event);
+                    }
+                    StreamEvent::AssistantResponse { content } => {
+                        transcript.push(ConversationMessage::new(MessageRole::Assistant, &content));
+                        events.push(StreamEvent::AssistantResponse { content });
+                    }
+                    StreamEvent::AssistantInternalThought { content } => {
+                        events.push(StreamEvent::AssistantInternalThought { content });
+                    }
+                    StreamEvent::AssistantToolResult { content, is_error } => {
+                        transcript.push(ConversationMessage::tool_result(
+                            "model-generated-tool-result",
+                            &content,
+                        ));
+                        events.push(StreamEvent::AssistantToolResult { content, is_error });
+                    }
+                    StreamEvent::StatusUpdate { content } => {
+                        events.push(StreamEvent::StatusUpdate { content });
+                    }
+                }
+            }
+
+            if !saw_tool_call {
+                break;
+            }
+        }
+
+        Ok(TurnRun { events, transcript })
+    }
+}
+
+fn tool_event_to_message(call: &ToolCall, event: &StreamEvent) -> ConversationMessage {
+    match event {
+        StreamEvent::AssistantToolResult { content, .. } => {
+            ConversationMessage::tool_result(call.id.clone(), content)
+        }
+        StreamEvent::AssistantResponse { content } => {
+            ConversationMessage::tool_result(call.id.clone(), content)
+        }
+        StreamEvent::AssistantInternalThought { content } => {
+            ConversationMessage::tool_result(call.id.clone(), content)
+        }
+        StreamEvent::StatusUpdate { content } => {
+            ConversationMessage::tool_result(call.id.clone(), content)
+        }
+        StreamEvent::ToolCallRequested(_) => ConversationMessage::tool_result(
+            call.id.clone(),
+            "tool executor requested another tool",
+        ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+
+    use super::{AppSession, TurnContext};
+    use elroy_config::AppConfig;
+    use elroy_llm::{ConversationMessage, MessageRole, StreamEvent, ToolCall};
+    use elroy_tools::{
+        ExecutableTool, ExecutableToolRegistry, JsonSchema, ToolExecutionResult, ToolSpec,
+    };
+
+    use super::{ConversationOrchestrator, ConversationRequest, ModelClient, ToolExecutor};
+
+    struct FakeModel {
+        responses: RefCell<Vec<Vec<StreamEvent>>>,
+    }
+
+    impl FakeModel {
+        fn new(responses: Vec<Vec<StreamEvent>>) -> Self {
+            Self {
+                responses: RefCell::new(responses),
+            }
+        }
+    }
+
+    impl ModelClient for FakeModel {
+        fn next_events(
+            &self,
+            _request: ConversationRequest<'_>,
+        ) -> Result<Vec<StreamEvent>, super::ModelClientError> {
+            Ok(self.responses.borrow_mut().remove(0))
+        }
+    }
+
+    struct FakeToolExecutor;
+
+    impl ToolExecutor for FakeToolExecutor {
+        fn execute(&self, call: &ToolCall) -> StreamEvent {
+            StreamEvent::AssistantToolResult {
+                content: format!("tool:{}:{}", call.name, call.arguments_json),
+                is_error: false,
+            }
+        }
+    }
+
+    fn weather_tool() -> ToolSpec {
+        ToolSpec::new(
+            "get_weather",
+            "Get the weather for a location.",
+            JsonSchema::object(
+                [("location", serde_json::json!({"type": "string"}))],
+                ["location"],
+            ),
+        )
+    }
+
+    #[test]
+    fn turn_context_exposes_memory_dir_from_config() {
+        let session = AppSession::new("user-1", "Elroy");
+        let config = AppConfig::defaults();
+        let turn = TurnContext::new("req-1", session, config.clone());
+
+        assert_eq!(turn.memory_dir(), config.memory_dir.as_path());
+    }
+
+    #[test]
+    fn session_and_turn_have_separate_lifetimes() {
+        let session = AppSession::new("user-1", "Elroy");
+        let turn = TurnContext::new("req-1", session.clone(), AppConfig::defaults());
+
+        assert_eq!(turn.session, session);
+        assert_eq!(turn.request_id, "req-1");
+    }
+
+    #[test]
+    fn orchestrator_runs_model_then_tools_then_followup_model_turn() {
+        let model = FakeModel::new(vec![
+            vec![
+                StreamEvent::StatusUpdate {
+                    content: "thinking".to_string(),
+                },
+                StreamEvent::ToolCallRequested(ToolCall {
+                    id: "call-1".to_string(),
+                    name: "get_weather".to_string(),
+                    arguments_json: "{\"location\":\"Paris\"}".to_string(),
+                }),
+            ],
+            vec![StreamEvent::AssistantResponse {
+                content: "The weather in Paris is sunny.".to_string(),
+            }],
+        ]);
+        let orchestrator = ConversationOrchestrator::new(2);
+        let turn_run = orchestrator
+            .run_turn(&model, &[weather_tool()], &FakeToolExecutor, "weather?")
+            .expect("turn should succeed");
+
+        assert_eq!(
+            turn_run.events,
+            vec![
+                StreamEvent::StatusUpdate {
+                    content: "thinking".to_string(),
+                },
+                StreamEvent::ToolCallRequested(ToolCall {
+                    id: "call-1".to_string(),
+                    name: "get_weather".to_string(),
+                    arguments_json: "{\"location\":\"Paris\"}".to_string(),
+                }),
+                StreamEvent::AssistantToolResult {
+                    content: "tool:get_weather:{\"location\":\"Paris\"}".to_string(),
+                    is_error: false,
+                },
+                StreamEvent::AssistantResponse {
+                    content: "The weather in Paris is sunny.".to_string(),
+                },
+            ]
+        );
+        assert_eq!(turn_run.transcript[0].role, MessageRole::User);
+        assert_eq!(
+            turn_run.transcript[1].tool_calls.as_ref().map(Vec::len),
+            Some(1)
+        );
+        assert_eq!(turn_run.transcript[2].role, MessageRole::Tool);
+        assert_eq!(turn_run.transcript[3].role, MessageRole::Assistant);
+    }
+
+    #[test]
+    fn orchestrator_returns_direct_response_without_tools() {
+        let model = FakeModel::new(vec![vec![StreamEvent::AssistantResponse {
+            content: "Hello.".to_string(),
+        }]]);
+        let orchestrator = ConversationOrchestrator::new(1);
+        let turn_run = orchestrator
+            .run_turn(&model, &[weather_tool()], &FakeToolExecutor, "hi")
+            .expect("turn should succeed");
+
+        assert_eq!(
+            turn_run.events,
+            vec![StreamEvent::AssistantResponse {
+                content: "Hello.".to_string(),
+            }]
+        );
+        assert_eq!(turn_run.transcript.len(), 2);
+        assert_eq!(turn_run.transcript[0].role, MessageRole::User);
+        assert_eq!(turn_run.transcript[1].role, MessageRole::Assistant);
+    }
+
+    #[test]
+    fn orchestrator_can_continue_from_existing_transcript() {
+        let model = FakeModel::new(vec![vec![StreamEvent::AssistantResponse {
+            content: "Welcome back.".to_string(),
+        }]]);
+        let orchestrator = ConversationOrchestrator::new(1);
+        let existing = vec![ConversationMessage::new(
+            MessageRole::Assistant,
+            "Earlier reply",
+        )];
+
+        let turn_run = orchestrator
+            .run_turn_with_transcript(
+                &model,
+                &[weather_tool()],
+                &FakeToolExecutor,
+                &existing,
+                "hi",
+            )
+            .expect("turn should succeed");
+
+        assert_eq!(turn_run.transcript.len(), 3);
+        assert_eq!(turn_run.transcript[0].role, MessageRole::Assistant);
+        assert_eq!(turn_run.transcript[1].role, MessageRole::User);
+        assert_eq!(turn_run.transcript[2].role, MessageRole::Assistant);
+    }
+
+    #[test]
+    fn local_tool_executor_uses_executable_registry_results() {
+        let registry =
+            ExecutableToolRegistry::new(vec![ExecutableTool::new(weather_tool(), |_| {
+                ToolExecutionResult::success("sunny")
+            })]);
+        let executor = super::LocalToolExecutor::new(registry);
+
+        let result = executor.execute(&ToolCall {
+            id: "call-1".to_string(),
+            name: "get_weather".to_string(),
+            arguments_json: "{\"location\":\"Paris\"}".to_string(),
+        });
+
+        assert_eq!(
+            result,
+            StreamEvent::AssistantToolResult {
+                content: "sunny".to_string(),
+                is_error: false,
+            }
+        );
+    }
+}
