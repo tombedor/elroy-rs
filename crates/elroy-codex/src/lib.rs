@@ -4,6 +4,7 @@ use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, ChildStdout, Command, Stdio};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 
@@ -14,6 +15,7 @@ const AGENT_BRANCH: &str = "agent";
 const WORKTREE_ROOT_DIRNAME: &str = ".elroy-codex-worktrees";
 const MAX_COMMAND_OUTPUT_CHARS: usize = 400;
 static SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
+pub type CompletionHook = Arc<dyn Fn(CodexSessionResult) + Send + Sync>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodexCommandRecord {
@@ -151,10 +153,17 @@ struct BackgroundRunContext {
     workspace: SessionWorkspace,
     before: RepoSnapshot,
     session_search_root: Option<PathBuf>,
+    completion_hook: Option<CompletionHook>,
     child: Child,
     stdout: ChildOutputReader,
     stderr: Option<ChildStderr>,
     initial_stdout: String,
+}
+
+#[derive(Clone, Default)]
+struct RunHooks {
+    session_search_root: Option<PathBuf>,
+    completion_hook: Option<CompletionHook>,
 }
 
 pub fn get_codex_session_by_thread_id(
@@ -354,6 +363,17 @@ pub fn dispatch_codex_session(
     repo_path: Option<&Path>,
     model: Option<&str>,
 ) -> Result<CodexSessionResult, CodexWorkflowError> {
+    dispatch_codex_session_with_hook(database_path, user_token, prompt, repo_path, model, None)
+}
+
+pub fn dispatch_codex_session_with_hook(
+    database_path: &Path,
+    user_token: &str,
+    prompt: &str,
+    repo_path: Option<&Path>,
+    model: Option<&str>,
+    completion_hook: Option<CompletionHook>,
+) -> Result<CodexSessionResult, CodexWorkflowError> {
     dispatch_codex_session_with_bin(
         database_path,
         user_token,
@@ -361,6 +381,7 @@ pub fn dispatch_codex_session(
         repo_path,
         model,
         &codex_bin(),
+        completion_hook,
     )
 }
 
@@ -371,6 +392,7 @@ pub fn dispatch_codex_session_with_bin(
     repo_path: Option<&Path>,
     model: Option<&str>,
     codex_bin: &Path,
+    completion_hook: Option<CompletionHook>,
 ) -> Result<CodexSessionResult, CodexWorkflowError> {
     dispatch_codex_session_with_bin_and_search_root(
         database_path,
@@ -379,7 +401,10 @@ pub fn dispatch_codex_session_with_bin(
         repo_path,
         model,
         codex_bin,
-        None,
+        RunHooks {
+            completion_hook,
+            ..RunHooks::default()
+        },
     )
 }
 
@@ -390,7 +415,7 @@ fn dispatch_codex_session_with_bin_and_search_root(
     repo_path: Option<&Path>,
     model: Option<&str>,
     codex_bin: &Path,
-    session_search_root: Option<&Path>,
+    mut hooks: RunHooks,
 ) -> Result<CodexSessionResult, CodexWorkflowError> {
     let source_repo_root = resolve_repo_path(repo_path)?;
     let workspace = create_session_workspace(&source_repo_root)?;
@@ -400,7 +425,7 @@ fn dispatch_codex_session_with_bin_and_search_root(
         codex_bin,
         &args,
         &workspace.worktree_root,
-        session_search_root,
+        hooks.session_search_root.as_deref(),
     )?;
     let (resolved_session_id, initial_stdout) = read_until_thread_started(stdout.take_reader())?;
 
@@ -413,7 +438,8 @@ fn dispatch_codex_session_with_bin_and_search_root(
         prompt: prompt.to_string(),
         workspace,
         before,
-        session_search_root: session_search_root.map(Path::to_path_buf),
+        session_search_root: hooks.session_search_root.take(),
+        completion_hook: hooks.completion_hook.take(),
         child,
         stdout,
         stderr,
@@ -433,6 +459,17 @@ pub fn resume_codex_session(
     prompt: &str,
     model: Option<&str>,
 ) -> Result<CodexSessionResult, CodexWorkflowError> {
+    resume_codex_session_with_hook(database_path, user_token, session_id, prompt, model, None)
+}
+
+pub fn resume_codex_session_with_hook(
+    database_path: &Path,
+    user_token: &str,
+    session_id: &str,
+    prompt: &str,
+    model: Option<&str>,
+    completion_hook: Option<CompletionHook>,
+) -> Result<CodexSessionResult, CodexWorkflowError> {
     resume_codex_session_with_bin(
         database_path,
         user_token,
@@ -440,6 +477,7 @@ pub fn resume_codex_session(
         prompt,
         model,
         &codex_bin(),
+        completion_hook,
     )
 }
 
@@ -450,6 +488,7 @@ pub fn resume_codex_session_with_bin(
     prompt: &str,
     model: Option<&str>,
     codex_bin: &Path,
+    completion_hook: Option<CompletionHook>,
 ) -> Result<CodexSessionResult, CodexWorkflowError> {
     resume_codex_session_with_bin_and_search_root(
         database_path,
@@ -458,7 +497,10 @@ pub fn resume_codex_session_with_bin(
         prompt,
         model,
         codex_bin,
-        None,
+        RunHooks {
+            completion_hook,
+            ..RunHooks::default()
+        },
     )
 }
 
@@ -469,7 +511,7 @@ fn resume_codex_session_with_bin_and_search_root(
     prompt: &str,
     model: Option<&str>,
     codex_bin: &Path,
-    session_search_root: Option<&Path>,
+    mut hooks: RunHooks,
 ) -> Result<CodexSessionResult, CodexWorkflowError> {
     let connection = Connection::open(database_path)?;
     let Some(record) = get_codex_session_by_thread_id(&connection, user_token, session_id)? else {
@@ -513,7 +555,7 @@ fn resume_codex_session_with_bin_and_search_root(
         codex_bin,
         &args,
         &workspace.worktree_root,
-        session_search_root,
+        hooks.session_search_root.as_deref(),
     )?;
     let (resolved_session_id, initial_stdout) = read_until_thread_started(stdout.take_reader())?;
 
@@ -526,7 +568,8 @@ fn resume_codex_session_with_bin_and_search_root(
         prompt: prompt.to_string(),
         workspace,
         before,
-        session_search_root: session_search_root.map(Path::to_path_buf),
+        session_search_root: hooks.session_search_root.take(),
+        completion_hook: hooks.completion_hook.take(),
         child,
         stdout,
         stderr,
@@ -603,6 +646,9 @@ fn complete_codex_session_in_background(mut context: BackgroundRunContext) {
         &context.prompt,
         &final_result,
     );
+    if let Some(completion_hook) = context.completion_hook {
+        completion_hook(final_result);
+    }
 }
 
 fn persist_codex_result(
@@ -1406,7 +1452,7 @@ mod tests {
     use rusqlite::Connection;
 
     use super::{
-        CodexCommandRecord, CodexSessionUpdate, dispatch_codex_session_with_bin,
+        CodexCommandRecord, CodexSessionUpdate, RunHooks, dispatch_codex_session_with_bin,
         dispatch_codex_session_with_bin_and_search_root, get_codex_session_by_thread_id,
         list_recent_codex_sessions, resume_codex_session_with_bin,
         resume_codex_session_with_bin_and_search_root, upsert_codex_session,
@@ -1570,7 +1616,10 @@ mod tests {
             Some(&repo_root),
             None,
             &bin_dir.join("codex"),
-            Some(&session_root),
+            RunHooks {
+                session_search_root: Some(session_root.clone()),
+                completion_hook: None,
+            },
         )
         .expect("dispatch should succeed");
 
@@ -1633,7 +1682,10 @@ mod tests {
             Some(&repo_root),
             None,
             &bin_dir.join("codex"),
-            Some(&session_root),
+            RunHooks {
+                session_search_root: Some(session_root.clone()),
+                completion_hook: None,
+            },
         )
         .expect("initial dispatch should succeed");
         let _ = wait_for_status(&database_path, "local-user", "thread-123", "completed");
@@ -1645,7 +1697,10 @@ mod tests {
             "follow up",
             None,
             &bin_dir.join("codex"),
-            Some(&session_root),
+            RunHooks {
+                session_search_root: Some(session_root.clone()),
+                completion_hook: None,
+            },
         )
         .expect("resume should succeed");
         let completed = wait_for_status(&database_path, "local-user", "thread-123", "completed");
@@ -1713,6 +1768,7 @@ mod tests {
             Some(&repo_root),
             None,
             &bin_dir.join("codex"),
+            None,
         )
         .expect("dispatch should succeed");
         assert_eq!(dispatched.status, "running");
@@ -1724,6 +1780,7 @@ mod tests {
             "follow up",
             None,
             &bin_dir.join("codex"),
+            None,
         )
         .expect_err("resume should reject running session");
         assert!(error.to_string().contains("still running"));
@@ -1755,6 +1812,7 @@ mod tests {
             Some(&repo_root),
             None,
             &bin_dir.join("codex"),
+            None,
         )
         .expect("first dispatch should succeed");
         let second = dispatch_codex_session_with_bin(
@@ -1764,6 +1822,7 @@ mod tests {
             Some(&repo_root),
             None,
             &bin_dir.join("codex"),
+            None,
         )
         .expect("second dispatch should succeed");
         let listed = list_recent_codex_sessions(

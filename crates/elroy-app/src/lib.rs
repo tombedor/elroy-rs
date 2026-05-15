@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use chrono::Utc;
 use elroy_agenda::{
@@ -8,13 +9,14 @@ use elroy_agenda::{
     update_checklist_item,
 };
 use elroy_codex::{
-    CodexSessionResult, dispatch_codex_session as run_codex_session,
-    dispatch_codex_session_with_bin, get_codex_session_by_thread_id, list_recent_codex_sessions,
-    resume_codex_session as continue_codex_session, resume_codex_session_with_bin,
+    CodexSessionResult, dispatch_codex_session_with_bin, dispatch_codex_session_with_hook,
+    get_codex_session_by_thread_id, list_recent_codex_sessions, resume_codex_session_with_bin,
+    resume_codex_session_with_hook,
 };
 use elroy_config::{AppConfig, LlmProvider};
 use elroy_core::{
-    ConversationOrchestrator, LiveProviderModel, LocalToolExecutor, validated_transcript,
+    ConversationOrchestrator, LiveProviderModel, LocalToolExecutor, ModelClient,
+    validated_transcript,
 };
 use elroy_db::{
     AgendaItemRecord, BootstrapPlan, UserPreferenceRecord, find_active_agenda_item_by_name,
@@ -151,57 +153,15 @@ impl AppRuntime {
 
     pub fn submit_prompt(&self, prompt: &str) -> Result<PromptRunResult, AppError> {
         let mut connection = self.open_connection()?;
-        let provider_config =
-            provider_config_from_app_config(&self.config).map_err(AppError::ProviderConfig)?;
-        let client = LiveModelClient::new(provider_config)
-            .map_err(|error| AppError::Runtime(error.to_string()))?;
-        let executable_tools = build_live_tool_registry(&self.config);
-        let tools = ToolRegistry::new(executable_tools.specs());
         let preferences = load_user_preferences(&connection, LOCAL_USER_TOKEN)?;
-        let model = LiveProviderModel::new(
-            client,
-            effective_persona(preferences.as_ref(), &self.config.assistant_name),
-        );
-        let orchestrator = ConversationOrchestrator::new(2);
-        let tool_executor = LocalToolExecutor::new(executable_tools);
-        let existing_transcript =
-            validated_transcript(&load_context_messages(&mut connection, LOCAL_USER_TOKEN)?);
-        let recall_context = recall_memory_context_messages(
+        let model = live_provider_model(&self.config, preferences.as_ref())?;
+        let events = run_prompt_with_model_and_registry(
+            &mut connection,
             prompt,
-            &existing_transcript,
-            &list_active_memories(&connection, 50)?,
-        );
-        let due_item_context = due_item_context_messages(&list_active_due_items(&connection, 20)?);
-        let mut model_transcript = existing_transcript.clone();
-        model_transcript.extend(recall_context.iter().cloned());
-        model_transcript.extend(due_item_context.iter().cloned());
-
-        let turn_run = orchestrator.run_turn_with_transcript(
             &model,
-            tools.specs(),
-            &tool_executor,
-            &model_transcript,
-            prompt,
+            build_live_tool_registry(&self.config),
+            true,
         )?;
-        let persisted_transcript = strip_transient_context_messages(
-            turn_run.transcript.clone(),
-            existing_transcript.len(),
-            recall_context.len() + due_item_context.len(),
-        );
-        replace_context_messages(&mut connection, LOCAL_USER_TOKEN, &persisted_transcript)?;
-
-        let mut events = Vec::new();
-        if !recall_context.is_empty() {
-            events.push(StreamEvent::StatusUpdate {
-                content: "fetching memories...".to_string(),
-            });
-        }
-        if !due_item_context.is_empty() {
-            events.push(StreamEvent::StatusUpdate {
-                content: "surfacing due items...".to_string(),
-            });
-        }
-        events.extend(turn_run.events);
 
         Ok(PromptRunResult {
             events,
@@ -352,14 +312,130 @@ impl AppRuntime {
     }
 }
 
-pub fn build_live_tool_registry(config: &AppConfig) -> ExecutableToolRegistry {
-    build_live_tool_registry_with_codex_bin(config, None)
+fn live_provider_model(
+    config: &AppConfig,
+    preferences: Option<&UserPreferenceRecord>,
+) -> Result<LiveProviderModel, AppError> {
+    let provider_config =
+        provider_config_from_app_config(config).map_err(AppError::ProviderConfig)?;
+    let client = LiveModelClient::new(provider_config)
+        .map_err(|error| AppError::Runtime(error.to_string()))?;
+    Ok(LiveProviderModel::new(
+        client,
+        effective_persona(preferences, &config.assistant_name),
+    ))
 }
 
-fn build_live_tool_registry_with_codex_bin(
+fn run_prompt_with_model_and_registry(
+    connection: &mut rusqlite::Connection,
+    prompt: &str,
+    model: &dyn ModelClient,
+    executable_tools: ExecutableToolRegistry,
+    persist_input_message: bool,
+) -> Result<Vec<StreamEvent>, AppError> {
+    let tools = ToolRegistry::new(executable_tools.specs());
+    let orchestrator = ConversationOrchestrator::new(2);
+    let tool_executor = LocalToolExecutor::new(executable_tools);
+    let existing_transcript =
+        validated_transcript(&load_context_messages(connection, LOCAL_USER_TOKEN)?);
+    let recall_context = recall_memory_context_messages(
+        prompt,
+        &existing_transcript,
+        &list_active_memories(connection, 50)?,
+    );
+    let due_item_context = due_item_context_messages(&list_active_due_items(connection, 20)?);
+    let mut model_transcript = existing_transcript.clone();
+    model_transcript.extend(recall_context.iter().cloned());
+    model_transcript.extend(due_item_context.iter().cloned());
+
+    let turn_run = orchestrator.run_turn_with_transcript(
+        model,
+        tools.specs(),
+        &tool_executor,
+        &model_transcript,
+        prompt,
+    )?;
+    let persisted_transcript = strip_input_message_for_persistence(
+        strip_transient_context_messages(
+            turn_run.transcript.clone(),
+            existing_transcript.len(),
+            recall_context.len() + due_item_context.len(),
+        ),
+        existing_transcript.len(),
+        persist_input_message,
+    );
+    replace_context_messages(connection, LOCAL_USER_TOKEN, &persisted_transcript)?;
+
+    let mut events = Vec::new();
+    if !recall_context.is_empty() {
+        events.push(StreamEvent::StatusUpdate {
+            content: "fetching memories...".to_string(),
+        });
+    }
+    if !due_item_context.is_empty() {
+        events.push(StreamEvent::StatusUpdate {
+            content: "surfacing due items...".to_string(),
+        });
+    }
+    events.extend(turn_run.events);
+    Ok(events)
+}
+
+fn run_background_codex_completion_followup(
+    config: &AppConfig,
+    result: &CodexSessionResult,
+) -> Result<(), AppError> {
+    let mut connection = open_sqlite_connection(&config.database_path)?;
+    run_migrations(&mut connection)?;
+    let preferences = load_user_preferences(&connection, LOCAL_USER_TOKEN)?;
+    let model = live_provider_model(config, preferences.as_ref())?;
+    let prompt = codex_completion_followup_prompt(result);
+    run_prompt_with_model_and_registry(
+        &mut connection,
+        &prompt,
+        &model,
+        build_live_tool_registry(config),
+        false,
+    )?;
+    Ok(())
+}
+
+fn codex_completion_followup_prompt(result: &CodexSessionResult) -> String {
+    format!(
+        "A background Codex session completed.\n\nSession: {}\nRepository: {}\nWorktree: {}\nSession branch: {}\nTarget branch: {}\nStatus: {}\nSummary:\n{}\n\nRespond to the user about the outcome and decide whether any follow-up action is needed.",
+        result.session_id,
+        result.repo_path,
+        result.worktree_path.as_deref().unwrap_or("n/a"),
+        result.session_branch.as_deref().unwrap_or("n/a"),
+        result.target_branch.as_deref().unwrap_or("n/a"),
+        result.status,
+        result.summary,
+    )
+}
+
+pub fn build_live_tool_registry(config: &AppConfig) -> ExecutableToolRegistry {
+    build_live_tool_registry_with_codex_bin_and_hook(config, None, None)
+}
+
+fn build_live_tool_registry_with_codex_bin_and_hook(
     config: &AppConfig,
     codex_bin_override: Option<PathBuf>,
+    codex_completion_hook_override: Option<Arc<dyn Fn(CodexSessionResult) + Send + Sync>>,
 ) -> ExecutableToolRegistry {
+    let config_for_codex_completion = config.clone();
+    let codex_completion_hook = codex_completion_hook_override.unwrap_or_else(|| {
+        Arc::new(move |result| {
+            if let Err(error) =
+                run_background_codex_completion_followup(&config_for_codex_completion, &result)
+            {
+                eprintln!(
+                    "failed to run background codex completion follow-up for {}: {}",
+                    result.session_id, error
+                );
+            }
+        })
+    });
+
     let config_for_memory_write = config.clone();
     let create_memory = ExecutableTool::new(
         ToolSpec::new(
@@ -1264,6 +1340,7 @@ fn build_live_tool_registry_with_codex_bin(
 
     let database_path = config.database_path.clone();
     let codex_bin_for_dispatch = codex_bin_override.clone();
+    let codex_completion_hook_for_dispatch = codex_completion_hook.clone();
     let dispatch_codex_session = ExecutableTool::new(
         ToolSpec::new(
             "dispatch_codex_session",
@@ -1304,14 +1381,16 @@ fn build_live_tool_registry_with_codex_bin(
                     repo_path.map(Path::new),
                     model,
                     codex_bin,
+                    Some(codex_completion_hook_for_dispatch.clone()),
                 )
             } else {
-                run_codex_session(
+                dispatch_codex_session_with_hook(
                     &database_path,
                     LOCAL_USER_TOKEN,
                     prompt,
                     repo_path.map(Path::new),
                     model,
+                    Some(codex_completion_hook_for_dispatch.clone()),
                 )
             };
             match result {
@@ -1323,6 +1402,7 @@ fn build_live_tool_registry_with_codex_bin(
 
     let database_path = config.database_path.clone();
     let codex_bin_for_resume = codex_bin_override.clone();
+    let codex_completion_hook_for_resume = codex_completion_hook.clone();
     let resume_codex_session = ExecutableTool::new(
         ToolSpec::new(
             "resume_codex_session",
@@ -1365,9 +1445,17 @@ fn build_live_tool_registry_with_codex_bin(
                     prompt,
                     model,
                     codex_bin,
+                    Some(codex_completion_hook_for_resume.clone()),
                 )
             } else {
-                continue_codex_session(&database_path, LOCAL_USER_TOKEN, session_id, prompt, model)
+                resume_codex_session_with_hook(
+                    &database_path,
+                    LOCAL_USER_TOKEN,
+                    session_id,
+                    prompt,
+                    model,
+                    Some(codex_completion_hook_for_resume.clone()),
+                )
             };
             match result {
                 Ok(result) => ToolExecutionResult::success(codex_session_result_payload(result)),
@@ -2399,6 +2487,23 @@ fn strip_transient_context_messages(
     transcript
 }
 
+fn strip_input_message_for_persistence(
+    mut transcript: Vec<ConversationMessage>,
+    persistent_prefix_len: usize,
+    persist_input_message: bool,
+) -> Vec<ConversationMessage> {
+    if persist_input_message {
+        return transcript;
+    }
+    if transcript
+        .get(persistent_prefix_len)
+        .is_some_and(|message| message.role == MessageRole::User)
+    {
+        transcript.remove(persistent_prefix_len);
+    }
+    transcript
+}
+
 pub fn provider_config_from_app_config(config: &AppConfig) -> Result<ProviderConfig, String> {
     match config.llm_provider() {
         LlmProvider::OpenAi => {
@@ -2437,32 +2542,59 @@ pub fn provider_config_from_app_config(config: &AppConfig) -> Result<ProviderCon
 #[cfg(test)]
 mod tests {
     use std::{
+        cell::RefCell,
         collections::HashSet,
         fs,
         path::{Path, PathBuf},
         process::Command,
+        sync::Arc,
         thread,
         time::{Duration, Instant},
     };
 
     use elroy_agenda::create_agenda_file;
-    use elroy_codex::{CodexCommandRecord, CodexSessionUpdate, upsert_codex_session};
+    use elroy_codex::{
+        CodexCommandRecord, CodexSessionResult, CodexSessionUpdate, upsert_codex_session,
+    };
     use elroy_config::{AppConfig, LlmProvider};
+    use elroy_core::{ConversationRequest, ModelClient};
     use elroy_db::{
         AgendaItemRecord, MemoryRecord, load_user_preferences, open_sqlite_connection,
         run_migrations,
     };
-    use elroy_llm::{ConversationMessage, MessageRole, Provider};
+    use elroy_llm::{ConversationMessage, MessageRole, Provider, StreamEvent};
     use elroy_memory::{create_memory_file, sanitize_filename};
+    use elroy_tools::ExecutableToolRegistry;
 
     use super::{
         AppRuntime, LOCAL_USER_TOKEN, argument_limit, build_live_tool_registry,
-        build_live_tool_registry_with_codex_bin, build_recall_query, due_item_context_messages,
-        parse_recalled_memory_names, provider_config_from_app_config,
+        build_live_tool_registry_with_codex_bin_and_hook, build_recall_query,
+        due_item_context_messages, parse_recalled_memory_names, provider_config_from_app_config,
         recall_memory_context_messages, recalled_memory_names, recent_recall_context,
-        select_recalled_memories, should_skip_memory_recall, significant_tokens,
-        strip_transient_context_messages,
+        run_prompt_with_model_and_registry, select_recalled_memories, should_skip_memory_recall,
+        significant_tokens, strip_input_message_for_persistence, strip_transient_context_messages,
     };
+
+    struct FakeModel {
+        responses: RefCell<Vec<Vec<StreamEvent>>>,
+    }
+
+    impl FakeModel {
+        fn new(responses: Vec<Vec<StreamEvent>>) -> Self {
+            Self {
+                responses: RefCell::new(responses),
+            }
+        }
+    }
+
+    impl ModelClient for FakeModel {
+        fn next_events(
+            &self,
+            _request: ConversationRequest<'_>,
+        ) -> Result<Vec<StreamEvent>, elroy_core::ModelClientError> {
+            Ok(self.responses.borrow_mut().remove(0))
+        }
+    }
 
     #[test]
     fn provider_config_uses_openai_when_model_is_not_claude() {
@@ -3140,8 +3272,26 @@ mod tests {
         config.agenda_dir = agenda_dir;
         config.database_path = database_path.clone();
 
-        let registry =
-            build_live_tool_registry_with_codex_bin(&config, Some(bin_dir.join("codex")));
+        let followup_database_path = database_path.clone();
+        let followup_hook = Arc::new(move |result: CodexSessionResult| {
+            let mut connection =
+                open_sqlite_connection(&followup_database_path).expect("database should open");
+            run_migrations(&mut connection).expect("migrations should run");
+            let mut transcript = elroy_db::load_context_messages(&mut connection, LOCAL_USER_TOKEN)
+                .expect("messages should load");
+            transcript.push(ConversationMessage::new(
+                MessageRole::Assistant,
+                format!("Background hook for {}", result.session_id),
+            ));
+            elroy_db::replace_context_messages(&mut connection, LOCAL_USER_TOKEN, &transcript)
+                .expect("messages should persist");
+        });
+
+        let registry = build_live_tool_registry_with_codex_bin_and_hook(
+            &config,
+            Some(bin_dir.join("codex")),
+            Some(followup_hook),
+        );
         let dispatched = registry.invoke(
             "dispatch_codex_session",
             &format!(
@@ -3164,6 +3314,13 @@ mod tests {
         let shown = registry.invoke("show_codex_session", "{\"session_id\":\"thread-123\"}");
         assert!(!shown.is_error);
         assert!(shown.content.contains("resume complete"));
+        let mut connection = open_sqlite_connection(&database_path).expect("database should open");
+        let transcript =
+            elroy_db::load_context_messages(&mut connection, LOCAL_USER_TOKEN).expect("load ok");
+        assert!(transcript.iter().any(|message| {
+            message.role == MessageRole::Assistant
+                && message.content.as_deref() == Some("Background hook for thread-123")
+        }));
 
         let agent_head = Command::new("git")
             .args([
@@ -3309,6 +3466,85 @@ mod tests {
         assert_eq!(stripped[0].content.as_deref(), Some("earlier reply"));
         assert_eq!(stripped[1].role, MessageRole::User);
         assert_eq!(stripped[2].role, MessageRole::Assistant);
+    }
+
+    #[test]
+    fn strip_input_message_for_persistence_can_drop_new_user_message() {
+        let transcript = vec![
+            ConversationMessage::new(MessageRole::Assistant, "earlier reply"),
+            ConversationMessage::new(MessageRole::User, "background follow-up"),
+            ConversationMessage::new(MessageRole::Assistant, "all set"),
+        ];
+
+        let stripped = strip_input_message_for_persistence(transcript, 1, false);
+
+        assert_eq!(stripped.len(), 2);
+        assert_eq!(stripped[0].role, MessageRole::Assistant);
+        assert_eq!(stripped[1].role, MessageRole::Assistant);
+        assert_eq!(stripped[1].content.as_deref(), Some("all set"));
+    }
+
+    #[test]
+    fn run_prompt_with_model_and_registry_can_skip_persisting_input_message() {
+        let unique = format!(
+            "elroy-rs-app-background-followup-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+
+        let mut config = AppConfig::defaults();
+        config.memory_dir = memory_dir;
+        config.agenda_dir = agenda_dir;
+        config.database_path = database_path.clone();
+
+        let mut connection = open_sqlite_connection(&database_path).expect("database should open");
+        run_migrations(&mut connection).expect("migrations should run");
+        elroy_db::replace_context_messages(
+            &mut connection,
+            LOCAL_USER_TOKEN,
+            &[ConversationMessage::new(
+                MessageRole::Assistant,
+                "existing transcript",
+            )],
+        )
+        .expect("messages should persist");
+
+        let model = FakeModel::new(vec![vec![StreamEvent::AssistantResponse {
+            content: "Background review complete.".to_string(),
+        }]]);
+        let events = run_prompt_with_model_and_registry(
+            &mut connection,
+            "A background Codex session completed.",
+            &model,
+            ExecutableToolRegistry::new(vec![]),
+            false,
+        )
+        .expect("background follow-up should succeed");
+        let stored =
+            elroy_db::load_context_messages(&mut connection, LOCAL_USER_TOKEN).expect("load ok");
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::AssistantResponse { content } if content == "Background review complete."
+        )));
+        assert!(!stored.iter().any(|message| {
+            message.role == MessageRole::User
+                && message.content.as_deref() == Some("A background Codex session completed.")
+        }));
+        assert!(stored.iter().any(|message| {
+            message.role == MessageRole::Assistant
+                && message.content.as_deref() == Some("Background review complete.")
+        }));
+
+        fs::remove_dir_all(home).expect("home should be removed");
     }
 
     #[test]
