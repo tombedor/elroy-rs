@@ -509,6 +509,10 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
     codex_bin_override: Option<PathBuf>,
     codex_completion_hook_override: Option<Arc<dyn Fn(CodexSessionResult) + Send + Sync>>,
 ) -> ExecutableToolRegistry {
+    if !config.include_base_tools {
+        return ExecutableToolRegistry::new(vec![]);
+    }
+
     let config_for_codex_completion = config.clone();
     let codex_completion_hook = codex_completion_hook_override.unwrap_or_else(|| {
         Arc::new(move |result| {
@@ -3184,6 +3188,39 @@ mod tests {
             .expect("preferences should exist");
         assert_eq!(cleared.system_persona, None);
 
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
+    fn live_tool_registry_can_disable_base_tools_from_config() {
+        let unique = format!(
+            "elroy-rs-app-no-base-tools-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+
+        let mut config = AppConfig::defaults();
+        config.memory_dir = memory_dir;
+        config.agenda_dir = agenda_dir;
+        config.database_path = database_path;
+        config.include_base_tools = false;
+
+        let registry = build_live_tool_registry(&config);
+        let result = registry.invoke(
+            "create_memory",
+            "{\"name\":\"Runner Notes\",\"text\":\"Remember the hill workout\"}",
+        );
+
+        assert!(result.is_error);
+        assert!(result.content.contains("unknown tool"));
         fs::remove_dir_all(home).expect("home should be removed");
     }
 

@@ -15,6 +15,7 @@ pub struct AppConfig {
     pub database_path: PathBuf,
     pub chat_model: String,
     pub assistant_name: String,
+    pub include_base_tools: bool,
     pub async_runtime_enabled: bool,
     pub openai_api_key: Option<String>,
     pub openai_base_url: String,
@@ -68,6 +69,7 @@ impl AppConfig {
             database_path,
             chat_model: "gpt-5".to_string(),
             assistant_name: "Elroy".to_string(),
+            include_base_tools: true,
             async_runtime_enabled: true,
             openai_api_key: None,
             openai_base_url: "https://api.openai.com/v1/responses".to_string(),
@@ -92,6 +94,9 @@ impl AppConfig {
         }
         if let Some(assistant_name) = file_config.default_assistant_name {
             self.assistant_name = assistant_name;
+        }
+        if let Some(include_base_tools) = file_config.include_base_tools {
+            self.include_base_tools = include_base_tools;
         }
         if let Some(openai_api_key) = file_config.openai_api_key {
             self.openai_api_key = Some(openai_api_key);
@@ -126,6 +131,9 @@ impl AppConfig {
         if let Some(assistant_name) = env.get("ELROY_DEFAULT_ASSISTANT_NAME") {
             self.assistant_name = assistant_name.clone();
         }
+        if let Some(include_base_tools) = env.get("ELROY_INCLUDE_BASE_TOOLS") {
+            self.include_base_tools = parse_bool(include_base_tools);
+        }
         if let Some(async_runtime_enabled) = env.get("ELROY_ASYNC_RUNTIME") {
             self.async_runtime_enabled = parse_bool(async_runtime_enabled);
         }
@@ -155,6 +163,7 @@ impl AppConfig {
 struct FileConfig {
     chat_model: Option<String>,
     default_assistant_name: Option<String>,
+    include_base_tools: Option<bool>,
     memory_dir: Option<String>,
     agenda_dir: Option<String>,
     database_url: Option<String>,
@@ -276,6 +285,7 @@ mod tests {
         let config = AppConfig::defaults();
 
         assert!(config.async_runtime_enabled);
+        assert!(config.include_base_tools);
     }
 
     #[test]
@@ -317,6 +327,7 @@ mod tests {
         assert_eq!(config.database_path, PathBuf::from("/tmp/elroy.db"));
         assert_eq!(config.config_path, config_path);
         assert_eq!(config.llm_provider(), LlmProvider::OpenAi);
+        assert!(config.include_base_tools);
 
         fs::remove_dir_all(home_dir).expect("temp home dir should be removed");
     }
@@ -354,6 +365,7 @@ mod tests {
                 "ELROY_DATABASE_URL".to_string(),
                 "sqlite:////tmp/env.db".to_string(),
             ),
+            ("ELROY_INCLUDE_BASE_TOOLS".to_string(), "false".to_string()),
             ("ELROY_ASYNC_RUNTIME".to_string(), "false".to_string()),
             ("OPENAI_API_KEY".to_string(), "openai-test-key".to_string()),
             (
@@ -380,6 +392,7 @@ mod tests {
         assert_eq!(config.memory_dir, PathBuf::from("/tmp/env-memories"));
         assert_eq!(config.agenda_dir, PathBuf::from("/tmp/env-agenda"));
         assert_eq!(config.database_path, PathBuf::from("/tmp/env.db"));
+        assert!(!config.include_base_tools);
         assert!(!config.async_runtime_enabled);
         assert_eq!(config.openai_api_key.as_deref(), Some("openai-test-key"));
         assert_eq!(
