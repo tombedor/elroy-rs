@@ -99,6 +99,21 @@ pub struct PromptRunResult {
     pub snapshot: TuiSnapshot,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MessageProcessOptions {
+    pub enable_tools: bool,
+    pub persist_input_message: bool,
+}
+
+impl Default for MessageProcessOptions {
+    fn default() -> Self {
+        Self {
+            enable_tools: true,
+            persist_input_message: true,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct AppRuntime {
     config: AppConfig,
@@ -152,15 +167,28 @@ impl AppRuntime {
     }
 
     pub fn submit_prompt(&self, prompt: &str) -> Result<PromptRunResult, AppError> {
+        self.process_message(prompt, MessageProcessOptions::default())
+    }
+
+    pub fn process_message(
+        &self,
+        prompt: &str,
+        options: MessageProcessOptions,
+    ) -> Result<PromptRunResult, AppError> {
         let mut connection = self.open_connection()?;
         let preferences = load_user_preferences(&connection, LOCAL_USER_TOKEN)?;
         let model = live_provider_model(&self.config, preferences.as_ref())?;
+        let executable_tools = if options.enable_tools {
+            build_live_tool_registry(&self.config)
+        } else {
+            ExecutableToolRegistry::new(vec![])
+        };
         let events = run_prompt_with_model_and_registry(
             &mut connection,
             prompt,
             &model,
-            build_live_tool_registry(&self.config),
-            true,
+            executable_tools,
+            options.persist_input_message,
         )?;
 
         Ok(PromptRunResult {

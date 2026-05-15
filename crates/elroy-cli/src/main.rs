@@ -1,6 +1,6 @@
 use std::env;
 
-use elroy_app::AppRuntime;
+use elroy_app::{AppRuntime, MessageProcessOptions};
 use elroy_config::AppConfig;
 use elroy_core::{AppSession, TurnContext};
 use elroy_db::{BootstrapInventory, BootstrapPlan, bootstrap_database};
@@ -70,10 +70,12 @@ fn prompt_arg(args: &[String]) -> Option<String> {
 }
 
 fn run_live_prompt(runtime: &AppRuntime, prompt: &str) {
-    let prompt_run = runtime.submit_prompt(prompt).unwrap_or_else(|error| {
-        eprintln!("{error}");
-        std::process::exit(1);
-    });
+    let prompt_run = runtime
+        .process_message(prompt, MessageProcessOptions::default())
+        .unwrap_or_else(|error| {
+            eprintln!("{error}");
+            std::process::exit(1);
+        });
 
     for event in prompt_run.events {
         match event {
@@ -108,7 +110,7 @@ impl CliTuiRuntime {
 impl TuiRuntime for CliTuiRuntime {
     fn submit_prompt(&mut self, prompt: &str) -> Result<elroy_tui::TuiSnapshot, String> {
         self.runtime
-            .submit_prompt(prompt)
+            .process_message(prompt, MessageProcessOptions::default())
             .map(|result| result.snapshot)
             .map_err(|error| error.to_string())
     }
