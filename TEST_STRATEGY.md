@@ -107,5 +107,6 @@ Current implemented coverage:
 - `elroy-tui`: layout shell, focus-mode state machine, terminal key mapping, event-loop action transitions, runtime-backed prompt submission, runtime-backed sidebar opening, runtime-backed sidebar mutation actions, and snapshot rendering
 - `elroy-codex` + `elroy-app`: persisted Codex-session upsert/get/list behavior, async dispatch/resume workflow orchestration with isolated git worktrees, and live session launch/resume/inspection tools
 - `elroy-tui` + `elroy-app`: read-only Codex-session sidebar rendering, section switching, and detail opening through the shared runtime
+- Direct Python-scenario ports now exist for selected messaging/Codex/UI behaviors, including `persist_input_message=False`, force-tool request plumbing, Codex background completion persistence, Codex resume/list flows, and Codex sidebar visibility
 
 This is only bootstrap-level coverage. It does not yet prove product parity.
