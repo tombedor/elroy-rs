@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::io;
 use std::time::Duration;
 
@@ -64,6 +65,7 @@ pub struct TuiApp {
     pub agenda_titles: Vec<String>,
     pub codex_session_titles: Vec<String>,
     pub selected_sidebar_index: usize,
+    pub rendered_context_message_ids: HashSet<i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,6 +96,13 @@ pub enum PromptUpdate {
     Status(String),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TuiContextMessage {
+    pub id: i64,
+    pub role: String,
+    pub content: String,
+}
+
 pub trait TuiPromptStream {
     fn next_update(&mut self) -> Result<Option<PromptUpdate>, String>;
     fn finalize(self: Box<Self>) -> Result<TuiSnapshot, String>;
@@ -104,6 +113,7 @@ pub trait TuiRuntime {
     fn submit_prompt(&mut self, prompt: &str) -> Result<TuiSnapshot, String>;
     fn start_prompt_stream(&mut self, prompt: &str) -> Result<Box<dyn TuiPromptStream>, String>;
     fn start_startup_prompt_stream(&mut self) -> Result<Option<Box<dyn TuiPromptStream>>, String>;
+    fn load_context_messages(&mut self) -> Result<Vec<TuiContextMessage>, String>;
     fn open_sidebar_item(&mut self, section: SidebarSection, title: &str)
     -> Result<String, String>;
     fn mutate_sidebar_item(
@@ -142,6 +152,9 @@ pub fn run_with_snapshot_and_runtime<R: TuiRuntime>(
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     let mut app = TuiApp::from_snapshot(snapshot);
+    if let Ok(context_messages) = runtime.load_context_messages() {
+        app.mark_context_messages_rendered(&context_messages);
+    }
     let mut pending_prompt = start_startup_prompt_stream(&mut app, runtime);
     let result = run_event_loop(&mut terminal, &mut app, runtime, &mut pending_prompt);
 
@@ -159,7 +172,7 @@ fn run_event_loop(
     pending_prompt: &mut Option<PendingPrompt>,
 ) -> io::Result<()> {
     loop {
-        advance_prompt_stream(app, pending_prompt);
+        advance_prompt_stream(app, runtime, pending_prompt);
         terminal.draw(|frame| {
             app.render(frame.area(), frame.buffer_mut());
         })?;
@@ -191,6 +204,7 @@ fn start_startup_prompt_stream(
             app.status = "thinking...".to_string();
             Some(PendingPrompt {
                 submitted_prompt: None,
+                before_ids: app.rendered_context_message_ids.clone(),
                 stream,
             })
         }
@@ -267,6 +281,7 @@ fn apply_intent_with_runtime(
                     app.status = "thinking...".to_string();
                     *pending_prompt = Some(PendingPrompt {
                         submitted_prompt: Some(submitted),
+                        before_ids: app.rendered_context_message_ids.clone(),
                         stream,
                     });
                 }
@@ -337,10 +352,15 @@ fn apply_intent_with_runtime(
 
 struct PendingPrompt {
     submitted_prompt: Option<String>,
+    before_ids: HashSet<i64>,
     stream: Box<dyn TuiPromptStream>,
 }
 
-fn advance_prompt_stream(app: &mut TuiApp, pending_prompt: &mut Option<PendingPrompt>) {
+fn advance_prompt_stream(
+    app: &mut TuiApp,
+    runtime: &mut impl TuiRuntime,
+    pending_prompt: &mut Option<PendingPrompt>,
+) {
     let Some(pending) = pending_prompt.as_mut() else {
         return;
     };
@@ -351,8 +371,19 @@ fn advance_prompt_stream(app: &mut TuiApp, pending_prompt: &mut Option<PendingPr
             match pending.stream.finalize() {
                 Ok(snapshot) => {
                     app.apply_snapshot(snapshot);
+                    let context_messages = runtime.load_context_messages().unwrap_or_default();
                     if let Some(submitted_prompt) = pending.submitted_prompt {
+                        app.mark_messages_rendered_after_chat_turn(
+                            &submitted_prompt,
+                            &pending.before_ids,
+                            &context_messages,
+                        );
                         app.status = format!("submitted prompt: {submitted_prompt}");
+                    } else {
+                        app.mark_messages_rendered_after_bootstrap_stream(
+                            &pending.before_ids,
+                            &context_messages,
+                        );
                     }
                 }
                 Err(error) => {
@@ -439,6 +470,7 @@ impl TuiApp {
             agenda_titles: Vec::new(),
             codex_session_titles: Vec::new(),
             selected_sidebar_index: 0,
+            rendered_context_message_ids: HashSet::new(),
         }
     }
 
@@ -462,6 +494,61 @@ impl TuiApp {
         if self.selected_sidebar_index >= active_len {
             self.selected_sidebar_index = active_len.saturating_sub(1);
         }
+    }
+
+    pub fn mark_context_messages_rendered(&mut self, context_messages: &[TuiContextMessage]) {
+        self.rendered_context_message_ids
+            .extend(context_messages.iter().map(|message| message.id));
+    }
+
+    pub fn mark_messages_rendered_after_bootstrap_stream(
+        &mut self,
+        before_ids: &HashSet<i64>,
+        context_messages: &[TuiContextMessage],
+    ) {
+        self.mark_trailing_context_messages_rendered(before_ids, context_messages, None, None);
+    }
+
+    pub fn mark_messages_rendered_after_chat_turn(
+        &mut self,
+        text: &str,
+        before_ids: &HashSet<i64>,
+        context_messages: &[TuiContextMessage],
+    ) {
+        self.mark_trailing_context_messages_rendered(
+            before_ids,
+            context_messages,
+            Some("user"),
+            Some(text),
+        );
+    }
+
+    fn mark_trailing_context_messages_rendered(
+        &mut self,
+        before_ids: &HashSet<i64>,
+        context_messages: &[TuiContextMessage],
+        anchor_role: Option<&str>,
+        anchor_content: Option<&str>,
+    ) {
+        let new_messages = context_messages
+            .iter()
+            .filter(|message| !before_ids.contains(&message.id))
+            .cloned()
+            .collect::<Vec<_>>();
+        if new_messages.is_empty() {
+            return;
+        }
+
+        let mut start_index = 0usize;
+        if let (Some(anchor_role), Some(anchor_content)) = (anchor_role, anchor_content) {
+            let Some(index) = new_messages.iter().rposition(|message| {
+                message.role == anchor_role && message.content == anchor_content
+            }) else {
+                return;
+            };
+            start_index = index;
+        }
+        self.mark_context_messages_rendered(&new_messages[start_index..]);
     }
 
     pub fn render(&self, area: Rect, buf: &mut Buffer) {
@@ -776,6 +863,10 @@ impl TuiRuntime for NoopRuntime {
         Ok(None)
     }
 
+    fn load_context_messages(&mut self) -> Result<Vec<TuiContextMessage>, String> {
+        Ok(vec![])
+    }
+
     fn open_sidebar_item(
         &mut self,
         _section: SidebarSection,
@@ -796,14 +887,17 @@ impl TuiRuntime for NoopRuntime {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::buffer::Buffer;
     use ratatui::layout::Rect;
 
     use super::{
-        CommandPane, FocusTarget, PromptUpdate, SidebarAction, SidebarSection, TuiApp, TuiExit,
-        TuiPromptStream, TuiRuntime, TuiSnapshot, UiIntent, advance_prompt_stream,
-        apply_intent_with_runtime, apply_key_event, key_event_token, start_startup_prompt_stream,
+        CommandPane, FocusTarget, PromptUpdate, SidebarAction, SidebarSection, TuiApp,
+        TuiContextMessage, TuiExit, TuiPromptStream, TuiRuntime, TuiSnapshot, UiIntent,
+        advance_prompt_stream, apply_intent_with_runtime, apply_key_event, key_event_token,
+        start_startup_prompt_stream,
     };
 
     #[derive(Default)]
@@ -812,6 +906,7 @@ mod tests {
         last_opened: Option<(SidebarSection, String)>,
         last_mutation: Option<(SidebarSection, String, SidebarAction)>,
         startup_stream: Option<FakePromptStream>,
+        context_messages: Vec<TuiContextMessage>,
     }
 
     struct FakePromptStream {
@@ -889,6 +984,10 @@ mod tests {
                 .startup_stream
                 .take()
                 .map(|stream| Box::new(stream) as Box<dyn TuiPromptStream>))
+        }
+
+        fn load_context_messages(&mut self) -> Result<Vec<TuiContextMessage>, String> {
+            Ok(self.context_messages.clone())
         }
 
         fn open_sidebar_item(
@@ -1210,7 +1309,7 @@ mod tests {
 
         apply_intent_with_runtime(&mut app, UiIntent::SubmitPrompt, &mut runtime, &mut pending);
         while pending.is_some() {
-            advance_prompt_stream(&mut app, &mut pending);
+            advance_prompt_stream(&mut app, &mut runtime, &mut pending);
         }
 
         assert_eq!(runtime.submitted_prompts, vec!["hello runtime".to_string()]);
@@ -1299,16 +1398,16 @@ mod tests {
             app.conversation_lines.last().map(String::as_str),
             Some("user: hello runtime")
         );
-        advance_prompt_stream(&mut app, &mut pending);
+        advance_prompt_stream(&mut app, &mut runtime, &mut pending);
         assert_eq!(app.status, "thinking...");
-        advance_prompt_stream(&mut app, &mut pending);
-        advance_prompt_stream(&mut app, &mut pending);
+        advance_prompt_stream(&mut app, &mut runtime, &mut pending);
+        advance_prompt_stream(&mut app, &mut runtime, &mut pending);
         assert_eq!(
             app.conversation_lines.last().map(String::as_str),
             Some("assistant: runtime response")
         );
         while pending.is_some() {
-            advance_prompt_stream(&mut app, &mut pending);
+            advance_prompt_stream(&mut app, &mut runtime, &mut pending);
         }
         assert_eq!(app.status, "submitted prompt: hello runtime");
     }
@@ -1330,23 +1429,29 @@ mod tests {
                 },
                 cancelled_snapshot: TuiSnapshot::default(),
             }),
+            context_messages: vec![TuiContextMessage {
+                id: 22,
+                role: "assistant".to_string(),
+                content: "welcome back".to_string(),
+            }],
             ..FakeRuntime::default()
         };
 
         let mut pending = start_startup_prompt_stream(&mut app, &mut runtime);
         assert_eq!(app.status, "thinking...");
         assert!(pending.is_some());
-        advance_prompt_stream(&mut app, &mut pending);
-        advance_prompt_stream(&mut app, &mut pending);
-        advance_prompt_stream(&mut app, &mut pending);
+        advance_prompt_stream(&mut app, &mut runtime, &mut pending);
+        advance_prompt_stream(&mut app, &mut runtime, &mut pending);
+        advance_prompt_stream(&mut app, &mut runtime, &mut pending);
         assert_eq!(
             app.conversation_lines.last().map(String::as_str),
             Some("assistant: welcome back")
         );
         while pending.is_some() {
-            advance_prompt_stream(&mut app, &mut pending);
+            advance_prompt_stream(&mut app, &mut runtime, &mut pending);
         }
         assert_eq!(app.status, "loaded startup");
+        assert_eq!(app.rendered_context_message_ids, HashSet::from([22]));
         assert!(
             !app.conversation_lines
                 .iter()
@@ -1371,6 +1476,48 @@ mod tests {
             "Wait for the current task to finish before sending another message."
         );
         assert_eq!(runtime.submitted_prompts, vec!["hello".to_string()]);
+    }
+
+    #[test]
+    fn mark_messages_rendered_after_chat_turn_skips_earlier_background_messages() {
+        let mut app = TuiApp::bootstrap();
+        let context_messages = vec![
+            TuiContextMessage {
+                id: 11,
+                role: "assistant".to_string(),
+                content: "background update".to_string(),
+            },
+            TuiContextMessage {
+                id: 12,
+                role: "user".to_string(),
+                content: "hello".to_string(),
+            },
+            TuiContextMessage {
+                id: 13,
+                role: "assistant".to_string(),
+                content: "foreground reply".to_string(),
+            },
+        ];
+
+        app.mark_messages_rendered_after_chat_turn("hello", &HashSet::new(), &context_messages);
+
+        assert!(!app.rendered_context_message_ids.contains(&11));
+        assert!(app.rendered_context_message_ids.contains(&12));
+        assert!(app.rendered_context_message_ids.contains(&13));
+    }
+
+    #[test]
+    fn mark_messages_rendered_after_bootstrap_stream_marks_new_messages() {
+        let mut app = TuiApp::bootstrap();
+        let context_messages = vec![TuiContextMessage {
+            id: 22,
+            role: "assistant".to_string(),
+            content: "welcome back".to_string(),
+        }];
+
+        app.mark_messages_rendered_after_bootstrap_stream(&HashSet::new(), &context_messages);
+
+        assert_eq!(app.rendered_context_message_ids, HashSet::from([22]));
     }
 
     #[test]

@@ -6,7 +6,7 @@ use elroy_core::{AppSession, TurnContext};
 use elroy_db::{BootstrapInventory, BootstrapPlan, bootstrap_database};
 use elroy_llm::StreamEvent;
 use elroy_tui::{
-    PromptUpdate, SidebarAction, SidebarSection, TuiPromptStream, TuiRuntime,
+    PromptUpdate, SidebarAction, SidebarSection, TuiContextMessage, TuiPromptStream, TuiRuntime,
     run_with_snapshot_and_runtime,
 };
 
@@ -142,6 +142,29 @@ impl TuiRuntime for CliTuiRuntime {
             .startup_prompt_stream(restart_resume_message.as_deref())
             .map(|stream| {
                 stream.map(|inner| Box::new(CliPromptStream { inner }) as Box<dyn TuiPromptStream>)
+            })
+            .map_err(|error| error.to_string())
+    }
+
+    fn load_context_messages(&mut self) -> Result<Vec<TuiContextMessage>, String> {
+        self.runtime
+            .load_context_messages()
+            .map(|messages| {
+                messages
+                    .into_iter()
+                    .filter_map(|message| {
+                        Some(TuiContextMessage {
+                            id: message.id?,
+                            role: match message.role {
+                                elroy_llm::MessageRole::System => "system".to_string(),
+                                elroy_llm::MessageRole::User => "user".to_string(),
+                                elroy_llm::MessageRole::Assistant => "assistant".to_string(),
+                                elroy_llm::MessageRole::Tool => "tool".to_string(),
+                            },
+                            content: message.content.unwrap_or_default(),
+                        })
+                    })
+                    .collect()
             })
             .map_err(|error| error.to_string())
     }

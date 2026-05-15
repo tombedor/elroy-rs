@@ -201,6 +201,11 @@ impl AppRuntime {
         load_snapshot_from_connection(&mut connection)
     }
 
+    pub fn load_context_messages(&self) -> Result<Vec<ConversationMessage>, AppError> {
+        let mut connection = self.open_connection()?;
+        load_context_messages(&mut connection, LOCAL_USER_TOKEN).map_err(AppError::from)
+    }
+
     pub fn submit_prompt(&self, prompt: &str) -> Result<PromptRunResult, AppError> {
         self.process_message(prompt, MessageProcessOptions::default())
     }
