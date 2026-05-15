@@ -154,7 +154,14 @@ impl ConversationOrchestrator {
         tool_executor: &dyn ToolExecutor,
         user_message: &str,
     ) -> Result<TurnRun, ModelClientError> {
-        self.run_turn_with_transcript(model, tools, tool_executor, &[], user_message)
+        self.run_turn_with_transcript_and_role(
+            model,
+            tools,
+            tool_executor,
+            &[],
+            MessageRole::User,
+            user_message,
+        )
     }
 
     pub fn run_turn_with_transcript(
@@ -165,13 +172,32 @@ impl ConversationOrchestrator {
         existing_transcript: &[ConversationMessage],
         user_message: &str,
     ) -> Result<TurnRun, ModelClientError> {
+        self.run_turn_with_transcript_and_role(
+            model,
+            tools,
+            tool_executor,
+            existing_transcript,
+            MessageRole::User,
+            user_message,
+        )
+    }
+
+    pub fn run_turn_with_transcript_and_role(
+        &self,
+        model: &dyn ModelClient,
+        tools: &[ToolSpec],
+        tool_executor: &dyn ToolExecutor,
+        existing_transcript: &[ConversationMessage],
+        role: MessageRole,
+        message: &str,
+    ) -> Result<TurnRun, ModelClientError> {
         let mut events = Vec::new();
         let mut transcript = existing_transcript.to_vec();
-        transcript.push(ConversationMessage::new(MessageRole::User, user_message));
+        transcript.push(ConversationMessage::new(role, message));
 
         for _ in 0..=self.max_tool_rounds {
             let model_events = model.next_events(ConversationRequest {
-                user_message,
+                user_message: message,
                 tools,
                 transcript: &transcript,
             })?;
@@ -498,6 +524,33 @@ mod tests {
         assert_eq!(turn_run.transcript[0].role, MessageRole::Assistant);
         assert_eq!(turn_run.transcript[1].role, MessageRole::User);
         assert_eq!(turn_run.transcript[2].role, MessageRole::Assistant);
+    }
+
+    #[test]
+    fn orchestrator_can_append_non_user_input_roles() {
+        let model = FakeModel::new(vec![vec![StreamEvent::AssistantResponse {
+            content: "Acknowledged.".to_string(),
+        }]]);
+        let orchestrator = ConversationOrchestrator::new(0);
+
+        let turn_run = orchestrator
+            .run_turn_with_transcript_and_role(
+                &model,
+                &[],
+                &FakeToolExecutor,
+                &[],
+                MessageRole::System,
+                "system bootstrap",
+            )
+            .expect("turn should succeed");
+
+        assert_eq!(turn_run.transcript.len(), 2);
+        assert_eq!(turn_run.transcript[0].role, MessageRole::System);
+        assert_eq!(
+            turn_run.transcript[0].content.as_deref(),
+            Some("system bootstrap")
+        );
+        assert_eq!(turn_run.transcript[1].role, MessageRole::Assistant);
     }
 
     #[test]

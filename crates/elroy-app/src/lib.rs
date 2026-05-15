@@ -99,8 +99,9 @@ pub struct PromptRunResult {
     pub snapshot: TuiSnapshot,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MessageProcessOptions {
+    pub role: MessageRole,
     pub enable_tools: bool,
     pub persist_input_message: bool,
 }
@@ -108,6 +109,7 @@ pub struct MessageProcessOptions {
 impl Default for MessageProcessOptions {
     fn default() -> Self {
         Self {
+            role: MessageRole::User,
             enable_tools: true,
             persist_input_message: true,
         }
@@ -186,6 +188,7 @@ impl AppRuntime {
         let events = run_prompt_with_model_and_registry(
             &mut connection,
             prompt,
+            options.role,
             &model,
             executable_tools,
             options.persist_input_message,
@@ -357,6 +360,7 @@ fn live_provider_model(
 fn run_prompt_with_model_and_registry(
     connection: &mut rusqlite::Connection,
     prompt: &str,
+    role: MessageRole,
     model: &dyn ModelClient,
     executable_tools: ExecutableToolRegistry,
     persist_input_message: bool,
@@ -376,11 +380,12 @@ fn run_prompt_with_model_and_registry(
     model_transcript.extend(recall_context.iter().cloned());
     model_transcript.extend(due_item_context.iter().cloned());
 
-    let turn_run = orchestrator.run_turn_with_transcript(
+    let turn_run = orchestrator.run_turn_with_transcript_and_role(
         model,
         tools.specs(),
         &tool_executor,
         &model_transcript,
+        role,
         prompt,
     )?;
     let persisted_transcript = strip_input_message_for_persistence(
@@ -421,6 +426,7 @@ fn run_background_codex_completion_followup(
     run_prompt_with_model_and_registry(
         &mut connection,
         &prompt,
+        MessageRole::User,
         &model,
         build_live_tool_registry(config),
         false,
@@ -3551,6 +3557,7 @@ mod tests {
         let events = run_prompt_with_model_and_registry(
             &mut connection,
             "A background Codex session completed.",
+            MessageRole::User,
             &model,
             ExecutableToolRegistry::new(vec![]),
             false,
@@ -3571,6 +3578,51 @@ mod tests {
             message.role == MessageRole::Assistant
                 && message.content.as_deref() == Some("Background review complete.")
         }));
+
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
+    fn run_prompt_with_model_and_registry_can_persist_non_user_roles() {
+        let unique = format!(
+            "elroy-rs-app-system-role-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+
+        let mut connection = open_sqlite_connection(&database_path).expect("database should open");
+        run_migrations(&mut connection).expect("migrations should run");
+
+        let model = FakeModel::new(vec![vec![StreamEvent::AssistantResponse {
+            content: "Acknowledged system bootstrap.".to_string(),
+        }]]);
+        run_prompt_with_model_and_registry(
+            &mut connection,
+            "System bootstrap message",
+            MessageRole::System,
+            &model,
+            ExecutableToolRegistry::new(vec![]),
+            true,
+        )
+        .expect("system-role prompt should succeed");
+        let stored =
+            elroy_db::load_context_messages(&mut connection, LOCAL_USER_TOKEN).expect("load ok");
+
+        assert_eq!(stored.len(), 2);
+        assert_eq!(stored[0].role, MessageRole::System);
+        assert_eq!(
+            stored[0].content.as_deref(),
+            Some("System bootstrap message")
+        );
+        assert_eq!(stored[1].role, MessageRole::Assistant);
 
         fs::remove_dir_all(home).expect("home should be removed");
     }
