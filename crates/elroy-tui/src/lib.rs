@@ -103,6 +103,7 @@ pub trait TuiPromptStream {
 pub trait TuiRuntime {
     fn submit_prompt(&mut self, prompt: &str) -> Result<TuiSnapshot, String>;
     fn start_prompt_stream(&mut self, prompt: &str) -> Result<Box<dyn TuiPromptStream>, String>;
+    fn start_startup_prompt_stream(&mut self) -> Result<Option<Box<dyn TuiPromptStream>>, String>;
     fn open_sidebar_item(&mut self, section: SidebarSection, title: &str)
     -> Result<String, String>;
     fn mutate_sidebar_item(
@@ -141,7 +142,8 @@ pub fn run_with_snapshot_and_runtime<R: TuiRuntime>(
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     let mut app = TuiApp::from_snapshot(snapshot);
-    let result = run_event_loop(&mut terminal, &mut app, runtime);
+    let mut pending_prompt = start_startup_prompt_stream(&mut app, runtime);
+    let result = run_event_loop(&mut terminal, &mut app, runtime, &mut pending_prompt);
 
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
@@ -154,10 +156,10 @@ fn run_event_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut TuiApp,
     runtime: &mut impl TuiRuntime,
+    pending_prompt: &mut Option<PendingPrompt>,
 ) -> io::Result<()> {
-    let mut pending_prompt = None;
     loop {
-        advance_prompt_stream(app, &mut pending_prompt);
+        advance_prompt_stream(app, pending_prompt);
         terminal.draw(|frame| {
             app.render(frame.area(), frame.buffer_mut());
         })?;
@@ -168,7 +170,7 @@ fn run_event_loop(
 
         match event::read()? {
             Event::Key(key) => {
-                if apply_key_event(app, key, runtime, &mut pending_prompt) == TuiExit::Quit {
+                if apply_key_event(app, key, runtime, pending_prompt) == TuiExit::Quit {
                     return Ok(());
                 }
             }
@@ -176,6 +178,26 @@ fn run_event_loop(
                 app.status = "terminal resized".to_string();
             }
             _ => {}
+        }
+    }
+}
+
+fn start_startup_prompt_stream(
+    app: &mut TuiApp,
+    runtime: &mut impl TuiRuntime,
+) -> Option<PendingPrompt> {
+    match runtime.start_startup_prompt_stream() {
+        Ok(Some(stream)) => {
+            app.status = "thinking...".to_string();
+            Some(PendingPrompt {
+                submitted_prompt: None,
+                stream,
+            })
+        }
+        Ok(None) => None,
+        Err(error) => {
+            app.status = format!("startup failed: {error}");
+            None
         }
     }
 }
@@ -244,7 +266,7 @@ fn apply_intent_with_runtime(
                     app.input.clear();
                     app.status = "thinking...".to_string();
                     *pending_prompt = Some(PendingPrompt {
-                        submitted_prompt: submitted,
+                        submitted_prompt: Some(submitted),
                         stream,
                     });
                 }
@@ -314,7 +336,7 @@ fn apply_intent_with_runtime(
 }
 
 struct PendingPrompt {
-    submitted_prompt: String,
+    submitted_prompt: Option<String>,
     stream: Box<dyn TuiPromptStream>,
 }
 
@@ -329,7 +351,9 @@ fn advance_prompt_stream(app: &mut TuiApp, pending_prompt: &mut Option<PendingPr
             match pending.stream.finalize() {
                 Ok(snapshot) => {
                     app.apply_snapshot(snapshot);
-                    app.status = format!("submitted prompt: {}", pending.submitted_prompt);
+                    if let Some(submitted_prompt) = pending.submitted_prompt {
+                        app.status = format!("submitted prompt: {submitted_prompt}");
+                    }
                 }
                 Err(error) => {
                     app.status = format!("prompt failed: {error}");
@@ -748,6 +772,10 @@ impl TuiRuntime for NoopRuntime {
         Ok(Box::new(NoopPromptStream))
     }
 
+    fn start_startup_prompt_stream(&mut self) -> Result<Option<Box<dyn TuiPromptStream>>, String> {
+        Ok(None)
+    }
+
     fn open_sidebar_item(
         &mut self,
         _section: SidebarSection,
@@ -775,7 +803,7 @@ mod tests {
     use super::{
         CommandPane, FocusTarget, PromptUpdate, SidebarAction, SidebarSection, TuiApp, TuiExit,
         TuiPromptStream, TuiRuntime, TuiSnapshot, UiIntent, advance_prompt_stream,
-        apply_intent_with_runtime, apply_key_event, key_event_token,
+        apply_intent_with_runtime, apply_key_event, key_event_token, start_startup_prompt_stream,
     };
 
     #[derive(Default)]
@@ -783,6 +811,7 @@ mod tests {
         submitted_prompts: Vec<String>,
         last_opened: Option<(SidebarSection, String)>,
         last_mutation: Option<(SidebarSection, String, SidebarAction)>,
+        startup_stream: Option<FakePromptStream>,
     }
 
     struct FakePromptStream {
@@ -851,6 +880,15 @@ mod tests {
                     ..TuiSnapshot::default()
                 },
             }))
+        }
+
+        fn start_startup_prompt_stream(
+            &mut self,
+        ) -> Result<Option<Box<dyn TuiPromptStream>>, String> {
+            Ok(self
+                .startup_stream
+                .take()
+                .map(|stream| Box::new(stream) as Box<dyn TuiPromptStream>))
         }
 
         fn open_sidebar_item(
@@ -1273,6 +1311,47 @@ mod tests {
             advance_prompt_stream(&mut app, &mut pending);
         }
         assert_eq!(app.status, "submitted prompt: hello runtime");
+    }
+
+    #[test]
+    fn startup_prompt_stream_runs_without_rendering_user_line() {
+        let mut app = TuiApp::bootstrap();
+        let mut runtime = FakeRuntime {
+            startup_stream: Some(FakePromptStream {
+                updates: vec![
+                    PromptUpdate::Status("thinking...".to_string()),
+                    PromptUpdate::AssistantDelta("welcome ".to_string()),
+                    PromptUpdate::AssistantDelta("back".to_string()),
+                ],
+                finalized_snapshot: TuiSnapshot {
+                    conversation_lines: vec!["assistant: welcome back".to_string()],
+                    status: Some("loaded startup".to_string()),
+                    ..TuiSnapshot::default()
+                },
+                cancelled_snapshot: TuiSnapshot::default(),
+            }),
+            ..FakeRuntime::default()
+        };
+
+        let mut pending = start_startup_prompt_stream(&mut app, &mut runtime);
+        assert_eq!(app.status, "thinking...");
+        assert!(pending.is_some());
+        advance_prompt_stream(&mut app, &mut pending);
+        advance_prompt_stream(&mut app, &mut pending);
+        advance_prompt_stream(&mut app, &mut pending);
+        assert_eq!(
+            app.conversation_lines.last().map(String::as_str),
+            Some("assistant: welcome back")
+        );
+        while pending.is_some() {
+            advance_prompt_stream(&mut app, &mut pending);
+        }
+        assert_eq!(app.status, "loaded startup");
+        assert!(
+            !app.conversation_lines
+                .iter()
+                .any(|line| line.starts_with("user:"))
+        );
     }
 
     #[test]

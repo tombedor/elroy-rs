@@ -268,6 +268,46 @@ impl AppRuntime {
         })
     }
 
+    pub fn startup_prompt_stream(
+        &self,
+        restart_resume_message: Option<&str>,
+    ) -> Result<Option<PromptEventStream>, AppError> {
+        if let Some(prompt) = restart_resume_message {
+            return self
+                .process_message_stream(
+                    prompt,
+                    MessageProcessOptions {
+                        enable_tools: false,
+                        persist_input_message: false,
+                        ..MessageProcessOptions::default()
+                    },
+                )
+                .map(Some);
+        }
+
+        if !self.config.enable_assistant_greeting {
+            return Ok(None);
+        }
+
+        let mut connection = self.open_connection()?;
+        if !should_offer_greeting(
+            &load_context_messages(&mut connection, LOCAL_USER_TOKEN)?,
+            self.config.min_convo_age_for_greeting_minutes,
+        ) {
+            return Ok(None);
+        }
+        drop(connection);
+
+        self.process_message_stream(
+            "<Empty user response>",
+            MessageProcessOptions {
+                enable_tools: false,
+                ..MessageProcessOptions::default()
+            },
+        )
+        .map(Some)
+    }
+
     pub fn open_sidebar_item(
         &self,
         section: SidebarSection,
@@ -447,6 +487,23 @@ fn load_snapshot_from_connection(
         codex_session_titles,
         status: Some("loaded persisted transcript and sidebar data".to_string()),
     })
+}
+
+fn should_offer_greeting(
+    context_messages: &[ConversationMessage],
+    min_convo_age_for_greeting_minutes: f64,
+) -> bool {
+    let Some(last_user_message) = context_messages
+        .iter()
+        .rev()
+        .find(|message| message.role == MessageRole::User)
+    else {
+        return false;
+    };
+
+    let age_seconds = Utc::now().timestamp() - last_user_message.created_at_unix;
+    let min_age_seconds = (min_convo_age_for_greeting_minutes * 60.0) as i64;
+    age_seconds >= min_age_seconds
 }
 
 fn finalize_prompt_event_stream(
@@ -2784,6 +2841,7 @@ pub fn provider_config_from_app_config(config: &AppConfig) -> Result<ProviderCon
 
 #[cfg(test)]
 mod tests {
+    use chrono::Utc;
     use std::{
         cell::RefCell,
         collections::HashSet,
@@ -2801,8 +2859,8 @@ mod tests {
         due_item_context_messages, parse_recalled_memory_names, provider_config_from_app_config,
         recall_memory_context_messages, recalled_memory_names, recent_recall_context,
         run_prompt_with_model_and_registry, run_prompt_with_model_and_registry_stream,
-        select_recalled_memories, should_skip_memory_recall, significant_tokens,
-        strip_input_message_for_persistence, strip_transient_context_messages,
+        select_recalled_memories, should_offer_greeting, should_skip_memory_recall,
+        significant_tokens, strip_input_message_for_persistence, strip_transient_context_messages,
     };
     use elroy_agenda::create_agenda_file;
     use elroy_codex::{
@@ -3972,6 +4030,177 @@ mod tests {
             snapshot.status.as_deref(),
             Some("loaded persisted transcript and sidebar data")
         );
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
+    fn should_offer_greeting_requires_recent_user_message_to_be_old_enough() {
+        let now = Utc::now().timestamp();
+        let recent = vec![ConversationMessage {
+            role: MessageRole::User,
+            content: Some("hello".to_string()),
+            chat_model: None,
+            id: None,
+            created_at_unix: now - 60,
+            tool_calls: None,
+            tool_call_id: None,
+        }];
+        let stale = vec![ConversationMessage {
+            role: MessageRole::User,
+            content: Some("hello".to_string()),
+            chat_model: None,
+            id: None,
+            created_at_unix: now - 600,
+            tool_calls: None,
+            tool_call_id: None,
+        }];
+
+        assert!(!should_offer_greeting(&[], 5.0));
+        assert!(!should_offer_greeting(&recent, 5.0));
+        assert!(should_offer_greeting(&stale, 5.0));
+    }
+
+    #[test]
+    fn startup_prompt_stream_can_run_restart_prompt_without_persisting_input() {
+        let unique = format!(
+            "elroy-rs-app-startup-restart-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        fs::create_dir_all(home.join("memories")).expect("memory dir should be created");
+        fs::create_dir_all(home.join("agenda")).expect("agenda dir should be created");
+
+        let mut server = mockito::Server::new();
+        let _mock = server
+            .mock("POST", "/responses")
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_body(concat!(
+                "event: response.output_text.delta\n",
+                "data: {\"delta\":\"Restarted successfully. Ready to continue.\"}\n\n",
+                "data: [DONE]\n\n"
+            ))
+            .create();
+
+        let mut config = AppConfig::defaults();
+        config.home_dir = home.clone();
+        config.config_path = home.join("elroy.conf.yaml");
+        config.memory_dir = home.join("memories");
+        config.agenda_dir = home.join("agenda");
+        config.database_path = home.join("elroy.db");
+        config.openai_api_key = Some("test-key".to_string());
+        config.openai_base_url = format!("{}/responses", server.url());
+
+        let runtime = AppRuntime::new(config.clone());
+        let mut connection =
+            open_sqlite_connection(&config.database_path).expect("database should open");
+        run_migrations(&mut connection).expect("migrations should run");
+        elroy_db::replace_context_messages(
+            &mut connection,
+            LOCAL_USER_TOKEN,
+            &[ConversationMessage::new(
+                MessageRole::Assistant,
+                "existing transcript",
+            )],
+        )
+        .expect("messages should persist");
+        drop(connection);
+
+        let mut stream = runtime
+            .startup_prompt_stream(Some("Restarted successfully. Ready to continue."))
+            .expect("startup prompt should start")
+            .expect("restart stream should be present");
+        while stream.next().is_some() {}
+        let _ = stream.into_snapshot().expect("snapshot should finalize");
+
+        let mut connection =
+            open_sqlite_connection(&config.database_path).expect("database should reopen");
+        let stored =
+            elroy_db::load_context_messages(&mut connection, LOCAL_USER_TOKEN).expect("load ok");
+        assert!(!stored.iter().any(|message| {
+            message.role == MessageRole::User
+                && message.content.as_deref() == Some("Restarted successfully. Ready to continue.")
+        }));
+        assert!(stored.iter().any(|message| {
+            message.role == MessageRole::Assistant
+                && message.content.as_deref() == Some("Restarted successfully. Ready to continue.")
+        }));
+
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
+    fn startup_prompt_stream_can_offer_greeting_when_user_message_is_old() {
+        let unique = format!(
+            "elroy-rs-app-startup-greeting-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        fs::create_dir_all(home.join("memories")).expect("memory dir should be created");
+        fs::create_dir_all(home.join("agenda")).expect("agenda dir should be created");
+
+        let mut server = mockito::Server::new();
+        let _mock = server
+            .mock("POST", "/responses")
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_body(concat!(
+                "event: response.output_text.delta\n",
+                "data: {\"delta\":\"Good to see you again.\"}\n\n",
+                "data: [DONE]\n\n"
+            ))
+            .create();
+
+        let mut config = AppConfig::defaults();
+        config.home_dir = home.clone();
+        config.config_path = home.join("elroy.conf.yaml");
+        config.memory_dir = home.join("memories");
+        config.agenda_dir = home.join("agenda");
+        config.database_path = home.join("elroy.db");
+        config.openai_api_key = Some("test-key".to_string());
+        config.openai_base_url = format!("{}/responses", server.url());
+        config.enable_assistant_greeting = true;
+        config.min_convo_age_for_greeting_minutes = 5.0;
+
+        let runtime = AppRuntime::new(config.clone());
+        let mut connection =
+            open_sqlite_connection(&config.database_path).expect("database should open");
+        run_migrations(&mut connection).expect("migrations should run");
+        let stale_user = ConversationMessage {
+            role: MessageRole::User,
+            content: Some("hello".to_string()),
+            chat_model: None,
+            id: None,
+            created_at_unix: Utc::now().timestamp() - 600,
+            tool_calls: None,
+            tool_call_id: None,
+        };
+        elroy_db::replace_context_messages(&mut connection, LOCAL_USER_TOKEN, &[stale_user])
+            .expect("messages should persist");
+        drop(connection);
+
+        let mut stream = runtime
+            .startup_prompt_stream(None)
+            .expect("startup prompt should evaluate")
+            .expect("greeting stream should be present");
+        while stream.next().is_some() {}
+        let _ = stream.into_snapshot().expect("snapshot should finalize");
+
+        let mut connection =
+            open_sqlite_connection(&config.database_path).expect("database should reopen");
+        let stored =
+            elroy_db::load_context_messages(&mut connection, LOCAL_USER_TOKEN).expect("load ok");
+        assert!(stored.iter().any(|message| {
+            message.role == MessageRole::Assistant
+                && message.content.as_deref() == Some("Good to see you again.")
+        }));
+
         fs::remove_dir_all(home).expect("home should be removed");
     }
 

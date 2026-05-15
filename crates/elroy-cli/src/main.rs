@@ -10,6 +10,8 @@ use elroy_tui::{
     run_with_snapshot_and_runtime,
 };
 
+const RESTART_RESUME_MESSAGE_ENV: &str = "ELROY_RESTART_RESUME_MESSAGE";
+
 fn main() {
     let args = env::args().skip(1).collect::<Vec<_>>();
     let config = AppConfig::load().unwrap_or_else(|error| {
@@ -131,6 +133,16 @@ impl TuiRuntime for CliTuiRuntime {
         self.runtime
             .process_message_stream(prompt, MessageProcessOptions::default())
             .map(|inner| Box::new(CliPromptStream { inner }) as Box<dyn TuiPromptStream>)
+            .map_err(|error| error.to_string())
+    }
+
+    fn start_startup_prompt_stream(&mut self) -> Result<Option<Box<dyn TuiPromptStream>>, String> {
+        let restart_resume_message = std::env::var(RESTART_RESUME_MESSAGE_ENV).ok();
+        self.runtime
+            .startup_prompt_stream(restart_resume_message.as_deref())
+            .map(|stream| {
+                stream.map(|inner| Box::new(CliPromptStream { inner }) as Box<dyn TuiPromptStream>)
+            })
             .map_err(|error| error.to_string())
     }
 

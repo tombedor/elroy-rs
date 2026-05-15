@@ -6,7 +6,7 @@ use serde::Deserialize;
 
 const SQLITE_URL_PREFIX: &str = "sqlite:///";
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AppConfig {
     pub home_dir: PathBuf,
     pub config_path: PathBuf,
@@ -15,6 +15,8 @@ pub struct AppConfig {
     pub database_path: PathBuf,
     pub chat_model: String,
     pub assistant_name: String,
+    pub enable_assistant_greeting: bool,
+    pub min_convo_age_for_greeting_minutes: f64,
     pub include_base_tools: bool,
     pub async_runtime_enabled: bool,
     pub openai_api_key: Option<String>,
@@ -69,6 +71,8 @@ impl AppConfig {
             database_path,
             chat_model: "gpt-5".to_string(),
             assistant_name: "Elroy".to_string(),
+            enable_assistant_greeting: false,
+            min_convo_age_for_greeting_minutes: 5.0,
             include_base_tools: true,
             async_runtime_enabled: true,
             openai_api_key: None,
@@ -94,6 +98,14 @@ impl AppConfig {
         }
         if let Some(assistant_name) = file_config.default_assistant_name {
             self.assistant_name = assistant_name;
+        }
+        if let Some(enable_assistant_greeting) = file_config.enable_assistant_greeting {
+            self.enable_assistant_greeting = enable_assistant_greeting;
+        }
+        if let Some(min_convo_age_for_greeting_minutes) =
+            file_config.min_convo_age_for_greeting_minutes
+        {
+            self.min_convo_age_for_greeting_minutes = min_convo_age_for_greeting_minutes;
         }
         if let Some(include_base_tools) = file_config.include_base_tools {
             self.include_base_tools = include_base_tools;
@@ -131,6 +143,14 @@ impl AppConfig {
         if let Some(assistant_name) = env.get("ELROY_DEFAULT_ASSISTANT_NAME") {
             self.assistant_name = assistant_name.clone();
         }
+        if let Some(enable_assistant_greeting) = env.get("ELROY_ENABLE_ASSISTANT_GREETING") {
+            self.enable_assistant_greeting = parse_bool(enable_assistant_greeting);
+        }
+        if let Some(min_convo_age_for_greeting_minutes) =
+            env.get("ELROY_MIN_CONVO_AGE_FOR_GREETING_MINUTES")
+        {
+            self.min_convo_age_for_greeting_minutes = parse_f64(min_convo_age_for_greeting_minutes);
+        }
         if let Some(include_base_tools) = env.get("ELROY_INCLUDE_BASE_TOOLS") {
             self.include_base_tools = parse_bool(include_base_tools);
         }
@@ -163,6 +183,8 @@ impl AppConfig {
 struct FileConfig {
     chat_model: Option<String>,
     default_assistant_name: Option<String>,
+    enable_assistant_greeting: Option<bool>,
+    min_convo_age_for_greeting_minutes: Option<f64>,
     include_base_tools: Option<bool>,
     memory_dir: Option<String>,
     agenda_dir: Option<String>,
@@ -260,6 +282,10 @@ fn parse_bool(value: &str) -> bool {
     )
 }
 
+fn parse_f64(value: &str) -> f64 {
+    value.trim().parse::<f64>().unwrap_or(0.0)
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -286,6 +312,8 @@ mod tests {
 
         assert!(config.async_runtime_enabled);
         assert!(config.include_base_tools);
+        assert!(!config.enable_assistant_greeting);
+        assert_eq!(config.min_convo_age_for_greeting_minutes, 5.0);
     }
 
     #[test]
@@ -314,7 +342,7 @@ mod tests {
         let config_path = home_dir.join("elroy.conf.yaml");
         fs::write(
             &config_path,
-            "chat_model: gpt-5-nano\nmemory_dir: /tmp/elroy-memories\nagenda_dir: /tmp/elroy-agenda\ndatabase_url: sqlite:////tmp/elroy.db\nirrelevant_key: ignored\n",
+            "chat_model: gpt-5-nano\nenable_assistant_greeting: true\nmin_convo_age_for_greeting_minutes: 15.5\nmemory_dir: /tmp/elroy-memories\nagenda_dir: /tmp/elroy-agenda\ndatabase_url: sqlite:////tmp/elroy.db\nirrelevant_key: ignored\n",
         )
         .expect("config fixture should be written");
 
@@ -327,6 +355,8 @@ mod tests {
         assert_eq!(config.database_path, PathBuf::from("/tmp/elroy.db"));
         assert_eq!(config.config_path, config_path);
         assert_eq!(config.llm_provider(), LlmProvider::OpenAi);
+        assert!(config.enable_assistant_greeting);
+        assert_eq!(config.min_convo_age_for_greeting_minutes, 15.5);
         assert!(config.include_base_tools);
 
         fs::remove_dir_all(home_dir).expect("temp home dir should be removed");
@@ -352,6 +382,14 @@ mod tests {
             (
                 "ELROY_DEFAULT_ASSISTANT_NAME".to_string(),
                 "EnvElroy".to_string(),
+            ),
+            (
+                "ELROY_ENABLE_ASSISTANT_GREETING".to_string(),
+                "true".to_string(),
+            ),
+            (
+                "ELROY_MIN_CONVO_AGE_FOR_GREETING_MINUTES".to_string(),
+                "2.5".to_string(),
             ),
             (
                 "ELROY_MEMORY_DIR".to_string(),
@@ -389,6 +427,8 @@ mod tests {
 
         assert_eq!(config.chat_model, "claude-sonnet-4-5-20250929");
         assert_eq!(config.assistant_name, "EnvElroy");
+        assert!(config.enable_assistant_greeting);
+        assert_eq!(config.min_convo_age_for_greeting_minutes, 2.5);
         assert_eq!(config.memory_dir, PathBuf::from("/tmp/env-memories"));
         assert_eq!(config.agenda_dir, PathBuf::from("/tmp/env-agenda"));
         assert_eq!(config.database_path, PathBuf::from("/tmp/env.db"));

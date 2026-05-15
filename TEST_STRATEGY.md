@@ -94,7 +94,7 @@ Each subsystem should make it easy to answer:
 
 Current implemented coverage:
 
-- `elroy-config`: defaults, YAML parsing, unknown-key tolerance, env override precedence
+- `elroy-config`: defaults, YAML parsing, unknown-key tolerance, env override precedence, and greeting-bootstrap controls
 - `elroy-core`: session and turn boundaries plus provider-neutral conversation/tool-loop orchestration with normalized transcript accumulation, lazy streamed tool-loop support, and live-provider runtime wiring
 - `elroy-db`: bootstrap planning, recursive markdown discovery, migration execution, frontmatter parsing, persisted bootstrap inventory, derived memory/agenda table rebuilds, and context-message persistence
 - `elroy-memory`: file-backed memory filename handling plus create/update/archive operations
@@ -102,11 +102,11 @@ Current implemented coverage:
 - `elroy-db`: agenda-only vs due-item query separation plus derived checklist counts
 - `elroy-app` + `elroy-db` + `elroy-agenda`: active due-item query behavior plus file-backed due-item create/update/rename/complete/delete flows
 - `elroy-llm`: stream event model, partial tool-call accumulation, validated context-message rules, provider request payload building, live HTTP client request shaping, non-streaming response parsing, and SSE-backed OpenAI/Anthropic stream parsing
-- `elroy-app`: shared runtime behavior for provider config translation, snapshot loading, prompt execution, DB-backed sidebar-detail loading, and file-backed memory/agenda mutation tools
+- `elroy-app`: shared runtime behavior for provider config translation, snapshot loading, prompt execution, startup restart/greeting stream handling, DB-backed sidebar-detail loading, and file-backed memory/agenda mutation tools
 - `elroy-tools`: canonical tool schema, provider adapter projections, and executable local registry behavior including DB-backed read/write tools in the shared runtime
-- `elroy-tui`: layout shell, focus-mode state machine, terminal key mapping, event-loop action transitions, runtime-backed prompt submission, live prompt-stream consumption with blocked resubmit and `Ctrl+C` clear/cancel behavior, runtime-backed sidebar opening, runtime-backed sidebar mutation actions, and snapshot rendering
+- `elroy-tui`: layout shell, focus-mode state machine, terminal key mapping, event-loop action transitions, runtime-backed prompt submission, startup restart/greeting stream handling, live prompt-stream consumption with blocked resubmit and `Ctrl+C` clear/cancel behavior, runtime-backed sidebar opening, runtime-backed sidebar mutation actions, and snapshot rendering
 - `elroy-codex` + `elroy-app`: persisted Codex-session upsert/get/list behavior, async dispatch/resume workflow orchestration with isolated git worktrees, and live session launch/resume/inspection tools
 - `elroy-tui` + `elroy-app`: read-only Codex-session sidebar rendering, section switching, and detail opening through the shared runtime
-- Direct Python-scenario ports now exist for selected messaging/Codex/UI behaviors, including `persist_input_message=False`, force-tool request plumbing, incremental provider-stream parsing and streamed tool-loop orchestration, TUI draft-editability/cancel behavior during prompt streams, Codex background completion persistence, Codex resume/list flows, and Codex sidebar visibility
+- Direct Python-scenario ports now exist for selected messaging/Codex/UI behaviors, including `persist_input_message=False`, force-tool request plumbing, incremental provider-stream parsing and streamed tool-loop orchestration, startup restart/greeting stream handling, TUI draft-editability/cancel behavior during prompt streams, Codex background completion persistence, Codex resume/list flows, and Codex sidebar visibility
 
 This is only bootstrap-level coverage. It does not yet prove product parity.

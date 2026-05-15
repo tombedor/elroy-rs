@@ -22,7 +22,7 @@ impl AppSession {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TurnContext {
     pub request_id: String,
     pub session: AppSession,
