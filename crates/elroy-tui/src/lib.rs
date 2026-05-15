@@ -19,6 +19,7 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 pub enum SidebarSection {
     Memories,
     Agenda,
+    CodexSessions,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,6 +61,7 @@ pub struct TuiApp {
     pub conversation_lines: Vec<String>,
     pub memory_titles: Vec<String>,
     pub agenda_titles: Vec<String>,
+    pub codex_session_titles: Vec<String>,
     pub selected_sidebar_index: usize,
 }
 
@@ -97,6 +99,7 @@ pub struct TuiSnapshot {
     pub conversation_lines: Vec<String>,
     pub memory_titles: Vec<String>,
     pub agenda_titles: Vec<String>,
+    pub codex_session_titles: Vec<String>,
     pub status: Option<String>,
 }
 
@@ -278,6 +281,7 @@ impl TuiApp {
             conversation_lines: vec!["Conversation history and streaming output".to_string()],
             memory_titles: Vec::new(),
             agenda_titles: Vec::new(),
+            codex_session_titles: Vec::new(),
             selected_sidebar_index: 0,
         }
     }
@@ -294,6 +298,7 @@ impl TuiApp {
         }
         self.memory_titles = snapshot.memory_titles;
         self.agenda_titles = snapshot.agenda_titles;
+        self.codex_session_titles = snapshot.codex_session_titles;
         if let Some(status) = snapshot.status {
             self.status = status;
         }
@@ -347,8 +352,9 @@ impl TuiApp {
 
     fn sidebar_header(&self) -> String {
         match self.sidebar_section {
-            SidebarSection::Memories => "Memories [active] | Agenda".to_string(),
-            SidebarSection::Agenda => "Memories | Agenda [active]".to_string(),
+            SidebarSection::Memories => "Memories [active] | Agenda | Codex".to_string(),
+            SidebarSection::Agenda => "Memories | Agenda [active] | Codex".to_string(),
+            SidebarSection::CodexSessions => "Memories | Agenda | Codex [active]".to_string(),
         }
     }
 
@@ -375,12 +381,15 @@ impl TuiApp {
         match self.sidebar_section {
             SidebarSection::Memories => &self.memory_titles,
             SidebarSection::Agenda => &self.agenda_titles,
+            SidebarSection::CodexSessions => &self.codex_session_titles,
         }
     }
 
     pub fn footer_hints(&self) -> &'static str {
         match self.focus {
-            FocusTarget::Input => "Esc command mode  Ctrl+M memories  Ctrl+A agenda  Ctrl+D quit",
+            FocusTarget::Input => {
+                "Esc command mode  Ctrl+M memories  Ctrl+A agenda  s codex sessions  Ctrl+D quit"
+            }
             FocusTarget::Command(_) => {
                 "Tab switch pane  j/k move  Enter open  c complete  d archive/delete  i/a/Esc chat mode"
             }
@@ -403,6 +412,12 @@ impl TuiApp {
             }
             "ctrl+a" => {
                 self.sidebar_section = SidebarSection::Agenda;
+                self.focus = FocusTarget::Command(CommandPane::Sidebar);
+                self.last_command_pane = CommandPane::Sidebar;
+                UiIntent::Noop
+            }
+            "s" => {
+                self.sidebar_section = SidebarSection::CodexSessions;
                 self.focus = FocusTarget::Command(CommandPane::Sidebar);
                 self.last_command_pane = CommandPane::Sidebar;
                 UiIntent::Noop
@@ -512,6 +527,12 @@ impl TuiApp {
                 self.last_command_pane = CommandPane::Sidebar;
                 UiIntent::Noop
             }
+            "s" => {
+                self.sidebar_section = SidebarSection::CodexSessions;
+                self.focus = FocusTarget::Command(CommandPane::Sidebar);
+                self.last_command_pane = CommandPane::Sidebar;
+                UiIntent::Noop
+            }
             "enter" => {
                 if self.focus == FocusTarget::Command(CommandPane::Sidebar) {
                     UiIntent::OpenSelected
@@ -533,6 +554,7 @@ impl TuiApp {
                     match self.sidebar_section {
                         SidebarSection::Memories => UiIntent::ArchiveSelected,
                         SidebarSection::Agenda => UiIntent::DeleteSelected,
+                        SidebarSection::CodexSessions => UiIntent::Noop,
                     }
                 } else {
                     UiIntent::Noop
@@ -617,6 +639,7 @@ mod tests {
                 ],
                 memory_titles: vec!["Fresh Memory".to_string()],
                 agenda_titles: vec!["Fresh Agenda".to_string()],
+                codex_session_titles: vec!["Fresh Session".to_string()],
                 status: Some("runtime updated".to_string()),
             })
         }
@@ -641,6 +664,7 @@ mod tests {
                 conversation_lines: vec!["assistant: refreshed".to_string()],
                 memory_titles: vec!["After Mutation".to_string()],
                 agenda_titles: vec!["Agenda After Mutation".to_string()],
+                codex_session_titles: vec!["Session After Mutation".to_string()],
                 status: Some("mutation updated".to_string()),
             })
         }
@@ -680,7 +704,7 @@ mod tests {
 
         assert!(text.contains("Elroy"));
         assert!(text.contains("Relevant Context"));
-        assert!(text.contains("Memories [active] | Agenda"));
+        assert!(text.contains("Memories [active] | Agenda | Codex"));
         assert!(text.contains("Input"));
         assert!(text.contains("bootstrap"));
         assert!(text.contains("Esc command mode"));
@@ -692,7 +716,16 @@ mod tests {
         app.sidebar_section = SidebarSection::Agenda;
         let text = rendered_text(&app);
 
-        assert!(text.contains("Memories | Agenda [active]"));
+        assert!(text.contains("Memories | Agenda [active] | Codex"));
+    }
+
+    #[test]
+    fn render_switches_sidebar_label_when_codex_sessions_are_active() {
+        let mut app = TuiApp::bootstrap();
+        app.sidebar_section = SidebarSection::CodexSessions;
+        let text = rendered_text(&app);
+
+        assert!(text.contains("Memories | Agenda | Codex [active]"));
     }
 
     #[test]
@@ -701,6 +734,7 @@ mod tests {
             conversation_lines: vec!["user: hello".to_string(), "assistant: hi".to_string()],
             memory_titles: vec!["Runner Notes".to_string()],
             agenda_titles: vec!["Doctor Visit".to_string()],
+            codex_session_titles: vec!["sample (completed) thread-123".to_string()],
             status: Some("loaded snapshot".to_string()),
         });
         let text = rendered_text(&app);
@@ -731,6 +765,10 @@ mod tests {
 
         app.handle_key("ctrl+m");
         assert_eq!(app.sidebar_section, SidebarSection::Memories);
+        assert_eq!(app.focus, FocusTarget::Command(CommandPane::Sidebar));
+
+        app.handle_key("s");
+        assert_eq!(app.sidebar_section, SidebarSection::CodexSessions);
         assert_eq!(app.focus, FocusTarget::Command(CommandPane::Sidebar));
     }
 
@@ -767,6 +805,9 @@ mod tests {
         app.handle_key("ctrl+a");
         assert_eq!(app.handle_key("c"), UiIntent::CompleteSelected);
         assert_eq!(app.handle_key("d"), UiIntent::DeleteSelected);
+
+        app.handle_key("s");
+        assert_eq!(app.handle_key("d"), UiIntent::Noop);
     }
 
     #[test]
@@ -898,6 +939,17 @@ mod tests {
             app.conversation_lines
                 .iter()
                 .any(|line| line.contains("opened detail for Runner Notes"))
+        );
+
+        app.codex_session_titles = vec!["sample (completed) thread-123".to_string()];
+        app.handle_key("s");
+        apply_intent_with_runtime(&mut app, UiIntent::OpenSelected, &mut runtime);
+        assert_eq!(
+            runtime.last_opened,
+            Some((
+                SidebarSection::CodexSessions,
+                "sample (completed) thread-123".to_string()
+            ))
         );
     }
 

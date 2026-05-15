@@ -134,11 +134,17 @@ impl AppRuntime {
             .into_iter()
             .map(|item| item.name)
             .collect::<Vec<_>>();
+        let codex_session_titles =
+            list_recent_codex_sessions(&connection, LOCAL_USER_TOKEN, None, 15)?
+                .into_iter()
+                .map(|session| format_codex_session_title(&session))
+                .collect::<Vec<_>>();
 
         Ok(TuiSnapshot {
             conversation_lines,
             memory_titles,
             agenda_titles,
+            codex_session_titles,
             status: Some("loaded persisted transcript and sidebar data".to_string()),
         })
     }
@@ -246,6 +252,51 @@ impl AppRuntime {
                 lines.push(item.body);
                 Ok(lines.join("\n"))
             }
+            SidebarSection::CodexSessions => {
+                let thread_id = title
+                    .rsplit(' ')
+                    .next()
+                    .filter(|value| !value.trim().is_empty())
+                    .ok_or_else(|| {
+                        AppError::Runtime(format!("invalid codex session title: {title}"))
+                    })?;
+                let Some(session) =
+                    get_codex_session_by_thread_id(&connection, LOCAL_USER_TOKEN, thread_id)?
+                else {
+                    return Err(AppError::Runtime(format!(
+                        "codex session not found: {thread_id}"
+                    )));
+                };
+
+                let mut lines = vec![
+                    format!("codex_session: {}", session.thread_id),
+                    format!("repo_path: {}", session.repo_path),
+                    format!("status: {}", session.status),
+                ];
+                if let Some(worktree_path) = session.worktree_path {
+                    lines.push(format!("worktree_path: {worktree_path}"));
+                }
+                if let Some(session_branch) = session.session_branch {
+                    lines.push(format!("session_branch: {session_branch}"));
+                }
+                if let Some(target_branch) = session.target_branch {
+                    lines.push(format!("target_branch: {target_branch}"));
+                }
+                if let Some(session_file_path) = session.session_file_path {
+                    lines.push(format!("session_file_path: {session_file_path}"));
+                }
+                lines.push(String::new());
+                lines.push(
+                    session
+                        .latest_summary
+                        .unwrap_or_else(|| "(No summary recorded.)".to_string()),
+                );
+                if let Some(agent_message) = session.latest_agent_message {
+                    lines.push(String::new());
+                    lines.push(agent_message);
+                }
+                Ok(lines.join("\n"))
+            }
         }
     }
 
@@ -266,6 +317,11 @@ impl AppRuntime {
             ),
             (SidebarSection::Agenda, SidebarAction::Delete) => {
                 registry.invoke("delete_agenda_item", &json!({ "name": title }).to_string())
+            }
+            (SidebarSection::CodexSessions, _) => {
+                return Err(AppError::Runtime(
+                    "codex sessions are read-only in the sidebar".to_string(),
+                ));
             }
             (SidebarSection::Memories, SidebarAction::Complete | SidebarAction::Delete) => {
                 return Err(AppError::Runtime(
@@ -2062,6 +2118,14 @@ fn task_payload(item: AgendaItemRecord) -> Value {
     })
 }
 
+fn format_codex_session_title(session: &elroy_codex::CodexSessionRecord) -> String {
+    let repo_name = Path::new(&session.repo_path)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or(&session.repo_path);
+    format!("{repo_name} ({}) {}", session.status, session.thread_id)
+}
+
 fn codex_session_result_payload(result: CodexSessionResult) -> String {
     json!({
         "session_id": result.session_id,
@@ -2519,12 +2583,39 @@ mod tests {
             )],
         )
         .expect("messages should persist");
+        upsert_codex_session(
+            &mut connection,
+            LOCAL_USER_TOKEN,
+            "thread-123",
+            &CodexSessionUpdate {
+                repo_path: PathBuf::from("/tmp/sample"),
+                worktree_path: Some(PathBuf::from("/tmp/.elroy-codex-worktrees/sample")),
+                session_branch: Some("elroy-codex-abcd1234".to_string()),
+                target_branch: Some("agent".to_string()),
+                prompt: "Inspect the parser".to_string(),
+                summary: "Codex inspected the parser state.".to_string(),
+                agent_message: "Parser inspection complete.".to_string(),
+                status: "completed".to_string(),
+                commands: vec![],
+                touched_paths: vec!["src/parser.rs".to_string()],
+                dirty_paths_before: vec![],
+                dirty_paths_after: vec![],
+                session_file_path: None,
+            },
+        )
+        .expect("codex session should persist");
 
         let runtime = AppRuntime::new(config);
         let snapshot = runtime.load_snapshot().expect("snapshot should load");
-        let detail = runtime
+        let memory_detail = runtime
             .open_sidebar_item(elroy_tui::SidebarSection::Memories, "runner notes")
             .expect("memory detail should open");
+        let codex_detail = runtime
+            .open_sidebar_item(
+                elroy_tui::SidebarSection::CodexSessions,
+                "sample (completed) thread-123",
+            )
+            .expect("codex detail should open");
 
         assert!(
             snapshot
@@ -2538,7 +2629,15 @@ mod tests {
                 .iter()
                 .any(|item| item == "runner notes")
         );
-        assert!(detail.contains("remember the hill workout"));
+        assert!(
+            snapshot
+                .codex_session_titles
+                .iter()
+                .any(|item| item == "sample (completed) thread-123")
+        );
+        assert!(memory_detail.contains("remember the hill workout"));
+        assert!(codex_detail.contains("Codex inspected the parser state."));
+        assert!(codex_detail.contains("Parser inspection complete."));
 
         fs::remove_dir_all(home).expect("home should be removed");
     }
