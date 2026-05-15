@@ -25,6 +25,10 @@ use elroy_db::{
     open_sqlite_connection, replace_context_messages, run_migrations, save_user_preferences,
     search_active_memories,
 };
+use elroy_feature_requests::{
+    FeatureRequestRecord, get_feature_request, is_active_feature_request, list_feature_requests,
+    list_self_reflection_feature_requests, update_feature_request,
+};
 use elroy_llm::{
     ConversationMessage, LiveModelClient, MessageRole, Provider, ProviderConfig, StreamEvent,
     ToolCall,
@@ -155,6 +159,7 @@ impl Iterator for PromptEventStream {
 }
 
 struct PromptEventStreamState {
+    home_dir: PathBuf,
     connection: rusqlite::Connection,
     turn_stream: TurnEventStream,
     existing_transcript_len: usize,
@@ -207,7 +212,7 @@ impl AppRuntime {
 
     pub fn load_snapshot(&self) -> Result<TuiSnapshot, AppError> {
         let mut connection = self.open_connection()?;
-        let mut snapshot = load_snapshot_from_connection(&mut connection)?;
+        let mut snapshot = load_snapshot_from_connection(&mut connection, &self.config.home_dir)?;
         snapshot.model_name = Some(self.config.chat_model.clone());
         Ok(snapshot)
     }
@@ -245,6 +250,7 @@ impl AppRuntime {
         };
         run_prompt_with_model_and_registry_stream(
             connection,
+            self.config.home_dir.clone(),
             prompt,
             PromptExecutionOptions {
                 role: options.role,
@@ -292,7 +298,7 @@ impl AppRuntime {
 
         Ok(PromptRunResult {
             events,
-            snapshot: load_snapshot_from_connection(&mut connection)?,
+            snapshot: load_snapshot_from_connection(&mut connection, &self.config.home_dir)?,
         })
     }
 
@@ -445,6 +451,23 @@ impl AppRuntime {
                     destructive_label: None,
                 })
             }
+            SidebarSection::Improvements | SidebarSection::FeatureRequests => {
+                let Some(record) =
+                    resolve_feature_request_sidebar_item(&self.config.home_dir, section, title)
+                        .map_err(AppError::Io)?
+                else {
+                    return Err(AppError::Runtime(format!(
+                        "feature request not found: {title}"
+                    )));
+                };
+                Ok(TuiSidebarDetail {
+                    title: record.title.clone(),
+                    content: feature_request_detail_content(&record),
+                    can_complete: is_active_feature_request(&record),
+                    destructive_action: None,
+                    destructive_label: None,
+                })
+            }
         }
     }
 
@@ -496,6 +519,33 @@ impl AppRuntime {
                     "codex sessions are read-only in the sidebar".to_string(),
                 ));
             }
+            (
+                SidebarSection::Improvements | SidebarSection::FeatureRequests,
+                SidebarAction::Complete,
+            ) => {
+                let Some(record) =
+                    resolve_feature_request_sidebar_item(&self.config.home_dir, section, title)
+                        .map_err(AppError::Io)?
+                else {
+                    return Err(AppError::Runtime(format!(
+                        "feature request not found: {title}"
+                    )));
+                };
+                if !is_active_feature_request(&record) {
+                    return Err(AppError::Runtime(format!(
+                        "feature request cannot be completed from the sidebar: {}",
+                        record.title
+                    )));
+                }
+                update_feature_request(&record, None, Some("closed"), None, None, None, None)
+                    .map_err(AppError::Io)?;
+                ToolExecutionResult::success("closed feature request".to_string())
+            }
+            (SidebarSection::Improvements | SidebarSection::FeatureRequests, _) => {
+                return Err(AppError::Runtime(
+                    "unsupported feature request sidebar action".to_string(),
+                ));
+            }
             (SidebarSection::Memories, SidebarAction::Complete | SidebarAction::Delete) => {
                 return Err(AppError::Runtime(
                     "unsupported memory sidebar action".to_string(),
@@ -527,6 +577,7 @@ impl AppRuntime {
 
 fn load_snapshot_from_connection(
     connection: &mut rusqlite::Connection,
+    home_dir: &Path,
 ) -> Result<TuiSnapshot, AppError> {
     let conversation_lines = load_context_messages(connection, LOCAL_USER_TOKEN)?
         .into_iter()
@@ -550,6 +601,18 @@ fn load_snapshot_from_connection(
         .into_iter()
         .map(|item| format_agenda_sidebar_title(&item, now))
         .collect::<Vec<_>>();
+    let improvement_titles = list_self_reflection_feature_requests(home_dir, true)
+        .map_err(AppError::Io)?
+        .into_iter()
+        .take(15)
+        .map(format_feature_request_sidebar_title)
+        .collect::<Vec<_>>();
+    let feature_request_titles = list_feature_requests(home_dir)
+        .map_err(AppError::Io)?
+        .into_iter()
+        .take(15)
+        .map(format_feature_request_sidebar_title)
+        .collect::<Vec<_>>();
     let codex_session_titles = list_recent_codex_sessions(connection, LOCAL_USER_TOKEN, None, 15)?
         .into_iter()
         .map(|session| format_codex_session_title(&session))
@@ -559,6 +622,8 @@ fn load_snapshot_from_connection(
         conversation_lines,
         memory_titles,
         agenda_titles,
+        improvement_titles,
+        feature_request_titles,
         codex_session_titles,
         model_name: None,
         status: Some("loaded persisted transcript and sidebar data".to_string()),
@@ -600,6 +665,66 @@ fn resolve_agenda_sidebar_item(
         .find(|item| format_agenda_sidebar_title(item, now) == title))
 }
 
+fn format_feature_request_sidebar_title(record: FeatureRequestRecord) -> String {
+    format!("{} ({})", record.title, record.status)
+}
+
+fn feature_request_detail_content(record: &FeatureRequestRecord) -> String {
+    let source_label = if record.source == "self_reflection" {
+        "Self-reflection".to_string()
+    } else {
+        record
+            .source
+            .replace('_', " ")
+            .split(' ')
+            .map(capitalize_word)
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let mut lines = vec![
+        format!("Status: {}", record.status),
+        format!("Source: {source_label}"),
+        String::new(),
+        "Summary:".to_string(),
+        record.summary.clone(),
+    ];
+    if let Some(rationale) = &record.rationale {
+        lines.push(String::new());
+        lines.push("Why It Matters:".to_string());
+        lines.push(rationale.clone());
+    }
+    if let Some(supporting_context) = &record.supporting_context {
+        lines.push(String::new());
+        lines.push("Supporting Context:".to_string());
+        lines.push(supporting_context.clone());
+    }
+    lines.join("\n")
+}
+
+fn capitalize_word(word: &str) -> String {
+    let mut chars = word.chars();
+    match chars.next() {
+        Some(first) => format!("{}{}", first.to_ascii_uppercase(), chars.as_str()),
+        None => String::new(),
+    }
+}
+
+fn resolve_feature_request_sidebar_item(
+    home_dir: &Path,
+    section: SidebarSection,
+    title: &str,
+) -> std::io::Result<Option<FeatureRequestRecord>> {
+    let records = match section {
+        SidebarSection::Improvements => list_self_reflection_feature_requests(home_dir, true)?,
+        SidebarSection::FeatureRequests => list_feature_requests(home_dir)?,
+        _ => return Ok(None),
+    };
+    Ok(records
+        .into_iter()
+        .find(|record| format_feature_request_sidebar_title(record.clone()) == title)
+        .or_else(|| get_feature_request(home_dir, title).ok().flatten()))
+}
+
 fn should_offer_greeting(
     context_messages: &[ConversationMessage],
     min_convo_age_for_greeting_minutes: f64,
@@ -635,11 +760,11 @@ fn finalize_prompt_event_stream(
         LOCAL_USER_TOKEN,
         &persisted_transcript,
     )?;
-    load_snapshot_from_connection(&mut state.connection)
+    load_snapshot_from_connection(&mut state.connection, &state.home_dir)
 }
 
 fn cancel_prompt_event_stream(mut state: PromptEventStreamState) -> Result<TuiSnapshot, AppError> {
-    load_snapshot_from_connection(&mut state.connection)
+    load_snapshot_from_connection(&mut state.connection, &state.home_dir)
 }
 
 fn live_provider_model(
@@ -721,6 +846,7 @@ fn run_prompt_with_model_and_registry(
 
 fn run_prompt_with_model_and_registry_stream(
     mut connection: rusqlite::Connection,
+    home_dir: PathBuf,
     prompt: &str,
     options: PromptExecutionOptions<'_>,
     model: Box<dyn StreamingModelClient>,
@@ -771,6 +897,7 @@ fn run_prompt_with_model_and_registry_stream(
 
     Ok(PromptEventStream {
         state: Some(PromptEventStreamState {
+            home_dir,
             connection,
             turn_stream,
             existing_transcript_len: existing_transcript.len(),
@@ -3032,6 +3159,7 @@ mod tests {
         AgendaItemRecord, MemoryRecord, load_user_preferences, open_sqlite_connection,
         run_migrations,
     };
+    use elroy_feature_requests::{list_feature_requests, write_new_feature_request};
     use elroy_llm::{ConversationMessage, MessageRole, Provider, StreamEvent};
     use elroy_memory::{create_memory_file, sanitize_filename};
     use elroy_tools::ExecutableToolRegistry;
@@ -3270,6 +3398,106 @@ mod tests {
                 .contains("Codex inspected the parser state.")
         );
         assert!(codex_detail.content.contains("Parser inspection complete."));
+
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
+    fn app_runtime_loads_feature_request_sidebar_sections_and_can_close_improvement() {
+        let unique = format!(
+            "elroy-rs-app-feature-request-sidebar-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+
+        write_new_feature_request(
+            &home,
+            "Improve correction handling",
+            "Recover more directly after user corrections.",
+            Some("Reflection found a correction handling gap."),
+            Some("- Reflected at: 2026-05-12T00:00:00+00:00\n- Trigger phrase: correction\n- Recent user feedback: please fix corrections"),
+            "self_reflection",
+        )
+        .expect("improvement should be created");
+        write_new_feature_request(
+            &home,
+            "General export feature",
+            "Export notes to markdown.",
+            Some("Users want portable notes."),
+            None,
+            "user_request",
+        )
+        .expect("feature request should be created");
+
+        let mut config = AppConfig::defaults();
+        config.home_dir = home.clone();
+        config.memory_dir = memory_dir;
+        config.agenda_dir = agenda_dir;
+        config.database_path = database_path;
+        elroy_db::bootstrap_database(&elroy_db::BootstrapPlan::from_config(&config))
+            .expect("bootstrap should succeed");
+
+        let runtime = AppRuntime::new(config.clone());
+        let snapshot = runtime.load_snapshot().expect("snapshot should load");
+        let improvement_detail = runtime
+            .open_sidebar_item(
+                elroy_tui::SidebarSection::Improvements,
+                "Improve correction handling (open)",
+            )
+            .expect("improvement detail should open");
+        let feature_request_detail = runtime
+            .open_sidebar_item(
+                elroy_tui::SidebarSection::FeatureRequests,
+                "General export feature (open)",
+            )
+            .expect("feature request detail should open");
+
+        assert_eq!(
+            snapshot.improvement_titles,
+            vec!["Improve correction handling (open)".to_string()]
+        );
+        assert_eq!(
+            snapshot.feature_request_titles,
+            vec![
+                "General export feature (open)".to_string(),
+                "Improve correction handling (open)".to_string()
+            ]
+        );
+        assert!(improvement_detail.can_complete);
+        assert!(
+            improvement_detail
+                .content
+                .contains("Source: Self-reflection")
+        );
+        assert!(
+            feature_request_detail
+                .content
+                .contains("Source: User Request")
+        );
+
+        let refreshed = runtime
+            .mutate_sidebar_item(
+                elroy_tui::SidebarSection::Improvements,
+                "Improve correction handling (open)",
+                elroy_tui::SidebarAction::Complete,
+            )
+            .expect("improvement should close");
+
+        assert!(refreshed.improvement_titles.is_empty());
+        let records = list_feature_requests(&home).expect("feature requests should list");
+        let improvement = records
+            .into_iter()
+            .find(|record| record.title == "Improve correction handling")
+            .expect("improvement should remain on disk");
+        assert_eq!(improvement.status, "closed");
 
         fs::remove_dir_all(home).expect("home should be removed");
     }
@@ -4251,6 +4479,7 @@ mod tests {
         let config = AppConfig::defaults();
         let mut stream = run_prompt_with_model_and_registry_stream(
             connection,
+            home.clone(),
             "hello",
             PromptExecutionOptions {
                 role: MessageRole::User,

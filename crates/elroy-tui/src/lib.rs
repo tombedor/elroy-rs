@@ -20,6 +20,8 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 pub enum SidebarSection {
     Memories,
     Agenda,
+    Improvements,
+    FeatureRequests,
     CodexSessions,
 }
 
@@ -67,6 +69,8 @@ pub struct TuiApp {
     pub conversation_lines: Vec<String>,
     pub memory_titles: Vec<String>,
     pub agenda_titles: Vec<String>,
+    pub improvement_titles: Vec<String>,
+    pub feature_request_titles: Vec<String>,
     pub codex_session_titles: Vec<String>,
     pub selected_sidebar_index: usize,
     pub rendered_context_message_ids: HashSet<i64>,
@@ -160,6 +164,8 @@ pub struct TuiSnapshot {
     pub conversation_lines: Vec<String>,
     pub memory_titles: Vec<String>,
     pub agenda_titles: Vec<String>,
+    pub improvement_titles: Vec<String>,
+    pub feature_request_titles: Vec<String>,
     pub codex_session_titles: Vec<String>,
     pub model_name: Option<String>,
     pub status: Option<String>,
@@ -552,6 +558,8 @@ impl TuiApp {
             conversation_lines: vec!["Conversation history and streaming output".to_string()],
             memory_titles: Vec::new(),
             agenda_titles: Vec::new(),
+            improvement_titles: Vec::new(),
+            feature_request_titles: Vec::new(),
             codex_session_titles: Vec::new(),
             selected_sidebar_index: 0,
             rendered_context_message_ids: HashSet::new(),
@@ -570,6 +578,8 @@ impl TuiApp {
         }
         self.memory_titles = snapshot.memory_titles;
         self.agenda_titles = snapshot.agenda_titles;
+        self.improvement_titles = snapshot.improvement_titles;
+        self.feature_request_titles = snapshot.feature_request_titles;
         self.codex_session_titles = snapshot.codex_session_titles;
         if let Some(model_name) = snapshot.model_name {
             self.model_name = model_name;
@@ -690,16 +700,36 @@ impl TuiApp {
         }
     }
 
-    fn sidebar_header(&self) -> String {
+    fn sidebar_header_lines(&self) -> Vec<String> {
         match self.sidebar_section {
-            SidebarSection::Memories => "Memories [active] | Agenda | Codex".to_string(),
-            SidebarSection::Agenda => "Memories | Agenda [active] | Codex".to_string(),
-            SidebarSection::CodexSessions => "Memories | Agenda | Codex [active]".to_string(),
+            SidebarSection::Memories => vec![
+                "Memories [active] | Agenda".to_string(),
+                "Improvements | Requests | Codex".to_string(),
+            ],
+            SidebarSection::Agenda => vec![
+                "Memories | Agenda [active]".to_string(),
+                "Improvements | Requests | Codex".to_string(),
+            ],
+            SidebarSection::Improvements => vec![
+                "Memories | Agenda".to_string(),
+                "Improvements [active] | Requests".to_string(),
+                "Codex".to_string(),
+            ],
+            SidebarSection::FeatureRequests => vec![
+                "Memories | Agenda".to_string(),
+                "Improvements | Requests [active]".to_string(),
+                "Codex".to_string(),
+            ],
+            SidebarSection::CodexSessions => vec![
+                "Memories | Agenda".to_string(),
+                "Improvements | Requests".to_string(),
+                "Codex [active]".to_string(),
+            ],
         }
     }
 
     fn sidebar_text(&self) -> String {
-        let mut lines = vec![self.sidebar_header()];
+        let mut lines = self.sidebar_header_lines();
         let items = self.active_sidebar_items();
         if items.is_empty() {
             lines.push("No entries loaded".to_string());
@@ -721,6 +751,8 @@ impl TuiApp {
         match self.sidebar_section {
             SidebarSection::Memories => &self.memory_titles,
             SidebarSection::Agenda => &self.agenda_titles,
+            SidebarSection::Improvements => &self.improvement_titles,
+            SidebarSection::FeatureRequests => &self.feature_request_titles,
             SidebarSection::CodexSessions => &self.codex_session_titles,
         }
     }
@@ -728,7 +760,7 @@ impl TuiApp {
     pub fn footer_hints(&self) -> &'static str {
         match self.focus {
             FocusTarget::Input => {
-                "Esc command mode  Ctrl+C clear/cancel  Ctrl+M memories  Ctrl+A agenda  s codex sessions  Ctrl+D quit"
+                "Esc command mode  Ctrl+C clear/cancel  Ctrl+M memories  Ctrl+A agenda  r improvements  f requests  s codex sessions  Ctrl+D quit"
             }
             FocusTarget::Command(_) => {
                 "Tab switch pane  j/k move  Enter open  c complete  d archive/delete  i/a/Esc chat mode"
@@ -826,6 +858,18 @@ impl TuiApp {
             }
             "ctrl+a" => {
                 self.sidebar_section = SidebarSection::Agenda;
+                self.focus = FocusTarget::Command(CommandPane::Sidebar);
+                self.last_command_pane = CommandPane::Sidebar;
+                UiIntent::Noop
+            }
+            "r" => {
+                self.sidebar_section = SidebarSection::Improvements;
+                self.focus = FocusTarget::Command(CommandPane::Sidebar);
+                self.last_command_pane = CommandPane::Sidebar;
+                UiIntent::Noop
+            }
+            "f" => {
+                self.sidebar_section = SidebarSection::FeatureRequests;
                 self.focus = FocusTarget::Command(CommandPane::Sidebar);
                 self.last_command_pane = CommandPane::Sidebar;
                 UiIntent::Noop
@@ -944,10 +988,34 @@ impl TuiApp {
                 self.last_command_pane = CommandPane::Sidebar;
                 UiIntent::Noop
             }
+            "r" => {
+                self.sidebar_section = SidebarSection::Improvements;
+                self.focus = FocusTarget::Command(CommandPane::Sidebar);
+                self.last_command_pane = CommandPane::Sidebar;
+                UiIntent::Noop
+            }
+            "f" => {
+                self.sidebar_section = SidebarSection::FeatureRequests;
+                self.focus = FocusTarget::Command(CommandPane::Sidebar);
+                self.last_command_pane = CommandPane::Sidebar;
+                UiIntent::Noop
+            }
             "s" => {
                 self.sidebar_section = SidebarSection::CodexSessions;
                 self.focus = FocusTarget::Command(CommandPane::Sidebar);
                 self.last_command_pane = CommandPane::Sidebar;
+                UiIntent::Noop
+            }
+            "left" => {
+                if self.focus == FocusTarget::Command(CommandPane::Sidebar) {
+                    self.move_sidebar_section(-1);
+                }
+                UiIntent::Noop
+            }
+            "right" => {
+                if self.focus == FocusTarget::Command(CommandPane::Sidebar) {
+                    self.move_sidebar_section(1);
+                }
                 UiIntent::Noop
             }
             "enter" => {
@@ -958,10 +1026,13 @@ impl TuiApp {
                 }
             }
             "c" => {
-                if self.focus == FocusTarget::Command(CommandPane::Sidebar)
-                    && self.sidebar_section == SidebarSection::Agenda
-                {
-                    UiIntent::CompleteSelected
+                if self.focus == FocusTarget::Command(CommandPane::Sidebar) {
+                    match self.sidebar_section {
+                        SidebarSection::Agenda
+                        | SidebarSection::Improvements
+                        | SidebarSection::FeatureRequests => UiIntent::CompleteSelected,
+                        SidebarSection::Memories | SidebarSection::CodexSessions => UiIntent::Noop,
+                    }
                 } else {
                     UiIntent::Noop
                 }
@@ -971,6 +1042,9 @@ impl TuiApp {
                     match self.sidebar_section {
                         SidebarSection::Memories => UiIntent::ArchiveSelected,
                         SidebarSection::Agenda => UiIntent::DeleteSelected,
+                        SidebarSection::Improvements | SidebarSection::FeatureRequests => {
+                            UiIntent::Noop
+                        }
                         SidebarSection::CodexSessions => UiIntent::Noop,
                     }
                 } else {
@@ -1000,6 +1074,24 @@ impl TuiApp {
             }
             _ => FocusTarget::Command(self.last_command_pane),
         };
+    }
+
+    fn move_sidebar_section(&mut self, delta: isize) {
+        const ORDER: [SidebarSection; 5] = [
+            SidebarSection::Memories,
+            SidebarSection::Agenda,
+            SidebarSection::Improvements,
+            SidebarSection::FeatureRequests,
+            SidebarSection::CodexSessions,
+        ];
+        let current_index = ORDER
+            .iter()
+            .position(|section| *section == self.sidebar_section)
+            .unwrap_or(0) as isize;
+        let next_index = (current_index + delta).rem_euclid(ORDER.len() as isize) as usize;
+        self.sidebar_section = ORDER[next_index];
+        self.focus = FocusTarget::Command(CommandPane::Sidebar);
+        self.last_command_pane = CommandPane::Sidebar;
     }
 }
 
@@ -1178,6 +1270,8 @@ mod tests {
                 ],
                 memory_titles: vec!["Fresh Memory".to_string()],
                 agenda_titles: vec!["Fresh Agenda".to_string()],
+                improvement_titles: vec!["Fresh Improvement".to_string()],
+                feature_request_titles: vec!["Fresh Request".to_string()],
                 codex_session_titles: vec!["Fresh Session".to_string()],
                 model_name: None,
                 status: Some("runtime updated".to_string()),
@@ -1202,6 +1296,8 @@ mod tests {
                     ],
                     memory_titles: vec!["Fresh Memory".to_string()],
                     agenda_titles: vec!["Fresh Agenda".to_string()],
+                    improvement_titles: vec!["Fresh Improvement".to_string()],
+                    feature_request_titles: vec!["Fresh Request".to_string()],
                     codex_session_titles: vec!["Fresh Session".to_string()],
                     model_name: None,
                     status: Some("runtime updated".to_string()),
@@ -1248,6 +1344,9 @@ mod tests {
                     Some(SidebarAction::Delete),
                     Some("delete".to_string()),
                 ),
+                SidebarSection::Improvements | SidebarSection::FeatureRequests => {
+                    (true, None, None)
+                }
                 SidebarSection::CodexSessions => (false, None, None),
             };
             Ok(TuiSidebarDetail {
@@ -1270,6 +1369,8 @@ mod tests {
                 conversation_lines: vec!["assistant: refreshed".to_string()],
                 memory_titles: vec!["After Mutation".to_string()],
                 agenda_titles: vec!["Agenda After Mutation".to_string()],
+                improvement_titles: vec!["Improvement After Mutation".to_string()],
+                feature_request_titles: vec!["Request After Mutation".to_string()],
                 codex_session_titles: vec!["Session After Mutation".to_string()],
                 model_name: None,
                 status: Some("mutation updated".to_string()),
@@ -1312,7 +1413,8 @@ mod tests {
 
         assert!(text.contains("Elroy"));
         assert!(text.contains("Relevant Context"));
-        assert!(text.contains("Memories [active] | Agenda | Codex"));
+        assert!(text.contains("Memories [active] | Agenda"));
+        assert!(text.contains("Improvements | Requests | Codex"));
         assert!(text.contains("Input"));
         assert!(text.contains("● gpt-5"));
         assert!(text.contains("Esc command mode"));
@@ -1324,7 +1426,30 @@ mod tests {
         app.sidebar_section = SidebarSection::Agenda;
         let text = rendered_text(&app);
 
-        assert!(text.contains("Memories | Agenda [active] | Codex"));
+        assert!(text.contains("Memories | Agenda [active]"));
+        assert!(text.contains("Improvements | Requests | Codex"));
+    }
+
+    #[test]
+    fn render_switches_sidebar_label_when_improvements_are_active() {
+        let mut app = TuiApp::bootstrap();
+        app.sidebar_section = SidebarSection::Improvements;
+        let text = rendered_text(&app);
+
+        assert!(text.contains("Memories | Agenda"));
+        assert!(text.contains("Improvements [active] | Requests"));
+        assert!(text.contains("Codex"));
+    }
+
+    #[test]
+    fn render_switches_sidebar_label_when_feature_requests_are_active() {
+        let mut app = TuiApp::bootstrap();
+        app.sidebar_section = SidebarSection::FeatureRequests;
+        let text = rendered_text(&app);
+
+        assert!(text.contains("Memories | Agenda"));
+        assert!(text.contains("Improvements | Requests [active]"));
+        assert!(text.contains("Codex"));
     }
 
     #[test]
@@ -1333,7 +1458,9 @@ mod tests {
         app.sidebar_section = SidebarSection::CodexSessions;
         let text = rendered_text(&app);
 
-        assert!(text.contains("Memories | Agenda | Codex [active]"));
+        assert!(text.contains("Memories | Agenda"));
+        assert!(text.contains("Improvements | Requests"));
+        assert!(text.contains("Codex [active]"));
     }
 
     #[test]
@@ -1342,6 +1469,8 @@ mod tests {
             conversation_lines: vec!["user: hello".to_string(), "assistant: hi".to_string()],
             memory_titles: vec!["Runner Notes".to_string()],
             agenda_titles: vec!["Doctor Visit".to_string()],
+            improvement_titles: vec!["Improve correction handling (open)".to_string()],
+            feature_request_titles: vec!["General export feature (open)".to_string()],
             codex_session_titles: vec!["sample (completed) thread-123".to_string()],
             model_name: Some("gpt-test".to_string()),
             status: Some("loaded snapshot".to_string()),
@@ -1376,9 +1505,34 @@ mod tests {
         assert_eq!(app.sidebar_section, SidebarSection::Memories);
         assert_eq!(app.focus, FocusTarget::Command(CommandPane::Sidebar));
 
+        app.handle_key("r");
+        assert_eq!(app.sidebar_section, SidebarSection::Improvements);
+        assert_eq!(app.focus, FocusTarget::Command(CommandPane::Sidebar));
+
+        app.handle_key("f");
+        assert_eq!(app.sidebar_section, SidebarSection::FeatureRequests);
+        assert_eq!(app.focus, FocusTarget::Command(CommandPane::Sidebar));
+
         app.handle_key("s");
         assert_eq!(app.sidebar_section, SidebarSection::CodexSessions);
         assert_eq!(app.focus, FocusTarget::Command(CommandPane::Sidebar));
+    }
+
+    #[test]
+    fn sidebar_left_right_switch_sections_in_order() {
+        let mut app = TuiApp::bootstrap();
+        app.handle_key("ctrl+m");
+
+        app.handle_key("right");
+        assert_eq!(app.sidebar_section, SidebarSection::Agenda);
+        app.handle_key("right");
+        assert_eq!(app.sidebar_section, SidebarSection::Improvements);
+        app.handle_key("right");
+        assert_eq!(app.sidebar_section, SidebarSection::FeatureRequests);
+        app.handle_key("right");
+        assert_eq!(app.sidebar_section, SidebarSection::CodexSessions);
+        app.handle_key("left");
+        assert_eq!(app.sidebar_section, SidebarSection::FeatureRequests);
     }
 
     #[test]
@@ -1414,6 +1568,10 @@ mod tests {
         app.handle_key("ctrl+a");
         assert_eq!(app.handle_key("c"), UiIntent::CompleteSelected);
         assert_eq!(app.handle_key("d"), UiIntent::DeleteSelected);
+
+        app.handle_key("r");
+        assert_eq!(app.handle_key("c"), UiIntent::CompleteSelected);
+        assert_eq!(app.handle_key("d"), UiIntent::Noop);
 
         app.handle_key("s");
         assert_eq!(app.handle_key("d"), UiIntent::Noop);

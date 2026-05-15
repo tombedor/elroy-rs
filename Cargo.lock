@@ -321,6 +321,7 @@ dependencies = [
  "elroy-config",
  "elroy-core",
  "elroy-db",
+ "elroy-feature-requests",
  "elroy-llm",
  "elroy-memory",
  "elroy-tasks",
@@ -380,6 +381,14 @@ dependencies = [
  "refinery",
  "rusqlite",
  "serde_json",
+ "serde_yaml",
+]
+
+[[package]]
+name = "elroy-feature-requests"
+version = "0.1.0"
+dependencies = [
+ "elroy-memory",
  "serde_yaml",
 ]
 

@@ -7,6 +7,7 @@ members = [
     "crates/elroy-core",
     "crates/elroy-codex",
     "crates/elroy-db",
+    "crates/elroy-feature-requests",
     "crates/elroy-llm",
     "crates/elroy-memory",
     "crates/elroy-tools",

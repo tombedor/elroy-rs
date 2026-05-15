@@ -15,6 +15,7 @@ elroy-codex = { path = "../elroy-codex" }
 elroy-config = { path = "../elroy-config" }
 elroy-core = { path = "../elroy-core" }
 elroy-db = { path = "../elroy-db" }
+elroy-feature-requests = { path = "../elroy-feature-requests" }
 elroy-llm = { path = "../elroy-llm" }
 elroy-memory = { path = "../elroy-memory" }
 elroy-tasks = { path = "../elroy-tasks" }
