@@ -10,6 +10,7 @@ members = [
     "crates/elroy-feature-requests",
     "crates/elroy-llm",
     "crates/elroy-memory",
+    "crates/elroy-self-reflection",
     "crates/elroy-tools",
     "crates/elroy-tasks",
     "crates/elroy-tui",

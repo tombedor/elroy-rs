@@ -324,6 +324,7 @@ dependencies = [
  "elroy-feature-requests",
  "elroy-llm",
  "elroy-memory",
+ "elroy-self-reflection",
  "elroy-tasks",
  "elroy-tools",
  "elroy-tui",
@@ -407,6 +408,15 @@ dependencies = [
 [[package]]
 name = "elroy-memory"
 version = "0.1.0"
+
+[[package]]
+name = "elroy-self-reflection"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "elroy-feature-requests",
+ "elroy-llm",
+]
 
 [[package]]
 name = "elroy-tasks"

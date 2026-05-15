@@ -35,6 +35,7 @@ use elroy_llm::{
     ToolCall,
 };
 use elroy_memory::{archive_memory_file, create_memory_file, update_memory_body};
+use elroy_self_reflection::{SelfReflectionConfig, SelfReflectionOrchestrator};
 use elroy_tasks::{
     complete_task_file, create_task_file_with_schedule, delete_task_file, find_task_by_name,
     list_active_tasks, list_due_tasks, list_today_tasks, list_triggered_tasks, rename_task_file,
@@ -166,6 +167,7 @@ struct PromptEventStreamState {
     existing_transcript_len: usize,
     transient_context_count: usize,
     persist_input_message: bool,
+    messages_between_self_reflection: usize,
     prelude_events: VecDeque<StreamEvent>,
 }
 
@@ -193,6 +195,8 @@ struct PromptExecutionOptions<'a> {
     role: MessageRole,
     persist_input_message: bool,
     force_tool: Option<&'a str>,
+    home_dir: &'a Path,
+    messages_between_self_reflection: usize,
     memory_recall_classifier_enabled: bool,
     memory_recall_classifier_window: usize,
 }
@@ -257,6 +261,8 @@ impl AppRuntime {
                 role: options.role,
                 persist_input_message: options.persist_input_message,
                 force_tool,
+                home_dir: &self.config.home_dir,
+                messages_between_self_reflection: self.config.messages_between_self_reflection,
                 memory_recall_classifier_enabled: self.config.memory_recall_classifier_enabled,
                 memory_recall_classifier_window: self.config.memory_recall_classifier_window,
             },
@@ -292,6 +298,8 @@ impl AppRuntime {
                 role: options.role,
                 persist_input_message: options.persist_input_message,
                 force_tool,
+                home_dir: &self.config.home_dir,
+                messages_between_self_reflection: self.config.messages_between_self_reflection,
                 memory_recall_classifier_enabled: self.config.memory_recall_classifier_enabled,
                 memory_recall_classifier_window: self.config.memory_recall_classifier_window,
             },
@@ -825,6 +833,11 @@ fn finalize_prompt_event_stream(
         LOCAL_USER_TOKEN,
         &persisted_transcript,
     )?;
+    run_self_reflection_if_needed(
+        &state.home_dir,
+        persisted_transcript.as_slice(),
+        state.messages_between_self_reflection,
+    )?;
     load_snapshot_from_connection(&mut state.connection, &state.home_dir)
 }
 
@@ -898,6 +911,11 @@ fn run_prompt_with_model_and_registry(
         options.persist_input_message,
     );
     replace_context_messages(connection, LOCAL_USER_TOKEN, &persisted_transcript)?;
+    run_self_reflection_if_needed(
+        options.home_dir,
+        persisted_transcript.as_slice(),
+        options.messages_between_self_reflection,
+    )?;
 
     let mut events = prompt_prelude_status_updates(
         options.memory_recall_classifier_enabled,
@@ -968,10 +986,23 @@ fn run_prompt_with_model_and_registry_stream(
             existing_transcript_len: existing_transcript.len(),
             transient_context_count: recall_context.len() + due_item_context.len(),
             persist_input_message: options.persist_input_message,
+            messages_between_self_reflection: options.messages_between_self_reflection,
             prelude_events,
         }),
         finalized_snapshot: None,
     })
+}
+
+fn run_self_reflection_if_needed(
+    home_dir: &Path,
+    transcript: &[ConversationMessage],
+    messages_between_self_reflection: usize,
+) -> Result<(), AppError> {
+    SelfReflectionOrchestrator::new(SelfReflectionConfig {
+        messages_between_self_reflection,
+    })
+    .run(home_dir, transcript)?;
+    Ok(())
 }
 
 fn run_background_codex_completion_followup(
@@ -992,6 +1023,8 @@ fn run_background_codex_completion_followup(
             role: MessageRole::User,
             persist_input_message: false,
             force_tool: None,
+            home_dir: &config.home_dir,
+            messages_between_self_reflection: config.messages_between_self_reflection,
             memory_recall_classifier_enabled: config.memory_recall_classifier_enabled,
             memory_recall_classifier_window: config.memory_recall_classifier_window,
         },
@@ -4683,6 +4716,8 @@ mod tests {
                 role: MessageRole::User,
                 persist_input_message: false,
                 force_tool: None,
+                home_dir: &home,
+                messages_between_self_reflection: config.messages_between_self_reflection,
                 memory_recall_classifier_enabled: config.memory_recall_classifier_enabled,
                 memory_recall_classifier_window: config.memory_recall_classifier_window,
             },
@@ -4739,6 +4774,8 @@ mod tests {
                 role: MessageRole::System,
                 persist_input_message: true,
                 force_tool: None,
+                home_dir: &home,
+                messages_between_self_reflection: config.messages_between_self_reflection,
                 memory_recall_classifier_enabled: config.memory_recall_classifier_enabled,
                 memory_recall_classifier_window: config.memory_recall_classifier_window,
             },
@@ -4754,6 +4791,74 @@ mod tests {
             Some("System bootstrap message")
         );
         assert_eq!(stored[1].role, MessageRole::Assistant);
+
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
+    fn run_prompt_with_model_and_registry_triggers_self_reflection_feature_request() {
+        let unique = format!(
+            "elroy-rs-app-self-reflection-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+
+        let mut connection = open_sqlite_connection(&database_path).expect("database should open");
+        run_migrations(&mut connection).expect("migrations should run");
+        elroy_db::replace_context_messages(
+            &mut connection,
+            LOCAL_USER_TOKEN,
+            &[
+                ConversationMessage::new(MessageRole::User, "Draft a reply to this message."),
+                ConversationMessage::new(MessageRole::Assistant, "Here is a draft."),
+            ],
+        )
+        .expect("messages should persist");
+
+        let model = FakeModel::new(vec![vec![StreamEvent::AssistantResponse {
+            content: "I will revise it.".to_string(),
+        }]]);
+        let mut config = AppConfig::defaults();
+        config.home_dir = home.clone();
+        config.memory_dir = memory_dir;
+        config.agenda_dir = agenda_dir;
+        config.database_path = database_path;
+        config.messages_between_self_reflection = 2;
+
+        run_prompt_with_model_and_registry(
+            &mut connection,
+            "That's wrong. You forgot the main deadline.",
+            &model,
+            ExecutableToolRegistry::new(vec![]),
+            PromptExecutionOptions {
+                role: MessageRole::User,
+                persist_input_message: true,
+                force_tool: None,
+                home_dir: &home,
+                messages_between_self_reflection: config.messages_between_self_reflection,
+                memory_recall_classifier_enabled: config.memory_recall_classifier_enabled,
+                memory_recall_classifier_window: config.memory_recall_classifier_window,
+            },
+        )
+        .expect("prompt should succeed");
+
+        let records = list_feature_requests(&home).expect("feature requests should load");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].source, "self_reflection");
+        assert!(
+            records[0]
+                .supporting_context
+                .as_deref()
+                .is_some_and(|value| value.contains("You forgot the main deadline."))
+        );
 
         fs::remove_dir_all(home).expect("home should be removed");
     }
@@ -4788,6 +4893,8 @@ mod tests {
                 role: MessageRole::User,
                 persist_input_message: true,
                 force_tool: Some("missing_tool"),
+                home_dir: &home,
+                messages_between_self_reflection: config.messages_between_self_reflection,
                 memory_recall_classifier_enabled: config.memory_recall_classifier_enabled,
                 memory_recall_classifier_window: config.memory_recall_classifier_window,
             },
@@ -4831,6 +4938,8 @@ mod tests {
                 role: MessageRole::User,
                 persist_input_message: true,
                 force_tool: None,
+                home_dir: &home,
+                messages_between_self_reflection: config.messages_between_self_reflection,
                 memory_recall_classifier_enabled: config.memory_recall_classifier_enabled,
                 memory_recall_classifier_window: config.memory_recall_classifier_window,
             },

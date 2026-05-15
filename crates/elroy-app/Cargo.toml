@@ -18,6 +18,7 @@ elroy-db = { path = "../elroy-db" }
 elroy-feature-requests = { path = "../elroy-feature-requests" }
 elroy-llm = { path = "../elroy-llm" }
 elroy-memory = { path = "../elroy-memory" }
+elroy-self-reflection = { path = "../elroy-self-reflection" }
 elroy-tasks = { path = "../elroy-tasks" }
 elroy-tools = { path = "../elroy-tools" }
 elroy-tui = { path = "../elroy-tui" }
