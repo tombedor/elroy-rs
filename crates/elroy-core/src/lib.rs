@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::sync::{Mutex, OnceLock};
 
 use elroy_config::AppConfig;
 use elroy_llm::{
@@ -6,6 +7,8 @@ use elroy_llm::{
     ToolCall,
 };
 use elroy_tools::{ExecutableToolRegistry, ToolRegistry, ToolSpec};
+
+static BACKGROUND_STATUSES: OnceLock<Mutex<Vec<(String, String)>>> = OnceLock::new();
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppSession {
@@ -41,6 +44,33 @@ impl TurnContext {
     pub fn memory_dir(&self) -> &std::path::Path {
         &self.config.memory_dir
     }
+}
+
+pub fn set_background_status(key: impl Into<String>, message: impl Into<String>) {
+    let statuses = BACKGROUND_STATUSES.get_or_init(|| Mutex::new(Vec::new()));
+    let mut statuses = statuses.lock().expect("background status lock should work");
+    let key = key.into();
+    let message = message.into();
+    if let Some((_, existing_message)) = statuses
+        .iter_mut()
+        .find(|(existing_key, _)| *existing_key == key)
+    {
+        *existing_message = message;
+    } else {
+        statuses.push((key, message));
+    }
+}
+
+pub fn clear_background_status(key: &str) {
+    let statuses = BACKGROUND_STATUSES.get_or_init(|| Mutex::new(Vec::new()));
+    let mut statuses = statuses.lock().expect("background status lock should work");
+    statuses.retain(|(existing_key, _)| existing_key != key);
+}
+
+pub fn get_background_status() -> Option<String> {
+    let statuses = BACKGROUND_STATUSES.get_or_init(|| Mutex::new(Vec::new()));
+    let statuses = statuses.lock().expect("background status lock should work");
+    statuses.first().map(|(_, message)| message.clone())
 }
 
 pub struct ConversationRequest<'a> {
@@ -617,7 +647,10 @@ fn tool_event_to_message(call: &ToolCall, event: &StreamEvent) -> ConversationMe
 mod tests {
     use std::cell::RefCell;
 
-    use super::{AppSession, TurnContext};
+    use super::{
+        AppSession, TurnContext, clear_background_status, get_background_status,
+        set_background_status,
+    };
     use elroy_config::AppConfig;
     use elroy_llm::{ConversationMessage, MessageRole, StreamEvent, ToolCall};
     use elroy_tools::{
@@ -1045,5 +1078,33 @@ mod tests {
         assert_eq!(validated.len(), 3);
         assert_eq!(validated[1].role, MessageRole::Assistant);
         assert!(validated[1].tool_calls.is_none());
+    }
+
+    #[test]
+    fn background_status_registry_tracks_first_active_message() {
+        clear_background_status("memory-sync");
+        clear_background_status("other");
+        assert!(get_background_status().is_none());
+
+        set_background_status("memory-sync", "syncing memories...");
+        assert_eq!(
+            get_background_status().as_deref(),
+            Some("syncing memories...")
+        );
+
+        set_background_status("other", "other background task");
+        assert_eq!(
+            get_background_status().as_deref(),
+            Some("syncing memories...")
+        );
+
+        clear_background_status("memory-sync");
+        assert_eq!(
+            get_background_status().as_deref(),
+            Some("other background task")
+        );
+
+        clear_background_status("other");
+        assert!(get_background_status().is_none());
     }
 }

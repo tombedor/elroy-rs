@@ -169,6 +169,10 @@ impl TuiRuntime for CliTuiRuntime {
             .map_err(|error| error.to_string())
     }
 
+    fn background_status(&mut self) -> Result<Option<String>, String> {
+        Ok(self.runtime.background_status())
+    }
+
     fn open_sidebar_item(
         &mut self,
         section: SidebarSection,

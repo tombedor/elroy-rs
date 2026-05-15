@@ -16,7 +16,7 @@ use elroy_codex::{
 use elroy_config::{AppConfig, LlmProvider};
 use elroy_core::{
     ConversationOrchestrator, LiveProviderModel, LocalToolExecutor, ModelClient,
-    StreamingModelClient, TurnEventStream, validated_transcript,
+    StreamingModelClient, TurnEventStream, get_background_status, validated_transcript,
 };
 use elroy_db::{
     AgendaItemRecord, BootstrapPlan, UserPreferenceRecord, find_active_agenda_item_by_name,
@@ -207,12 +207,18 @@ impl AppRuntime {
 
     pub fn load_snapshot(&self) -> Result<TuiSnapshot, AppError> {
         let mut connection = self.open_connection()?;
-        load_snapshot_from_connection(&mut connection)
+        let mut snapshot = load_snapshot_from_connection(&mut connection)?;
+        snapshot.model_name = Some(self.config.chat_model.clone());
+        Ok(snapshot)
     }
 
     pub fn load_context_messages(&self) -> Result<Vec<ConversationMessage>, AppError> {
         let mut connection = self.open_connection()?;
         load_context_messages(&mut connection, LOCAL_USER_TOKEN).map_err(AppError::from)
+    }
+
+    pub fn background_status(&self) -> Option<String> {
+        get_background_status()
     }
 
     pub fn submit_prompt(&self, prompt: &str) -> Result<PromptRunResult, AppError> {
@@ -507,6 +513,7 @@ fn load_snapshot_from_connection(
         memory_titles,
         agenda_titles,
         codex_session_titles,
+        model_name: None,
         status: Some("loaded persisted transcript and sidebar data".to_string()),
     })
 }

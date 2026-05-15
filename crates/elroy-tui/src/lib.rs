@@ -55,7 +55,10 @@ pub enum UiIntent {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TuiApp {
     pub title: String,
+    pub model_name: String,
     pub status: String,
+    pub prompt_active: bool,
+    pub background_status: Option<String>,
     pub input: String,
     pub sidebar_section: SidebarSection,
     pub focus: FocusTarget,
@@ -114,6 +117,7 @@ pub trait TuiRuntime {
     fn start_prompt_stream(&mut self, prompt: &str) -> Result<Box<dyn TuiPromptStream>, String>;
     fn start_startup_prompt_stream(&mut self) -> Result<Option<Box<dyn TuiPromptStream>>, String>;
     fn load_context_messages(&mut self) -> Result<Vec<TuiContextMessage>, String>;
+    fn background_status(&mut self) -> Result<Option<String>, String>;
     fn open_sidebar_item(&mut self, section: SidebarSection, title: &str)
     -> Result<String, String>;
     fn mutate_sidebar_item(
@@ -134,6 +138,7 @@ pub struct TuiSnapshot {
     pub memory_titles: Vec<String>,
     pub agenda_titles: Vec<String>,
     pub codex_session_titles: Vec<String>,
+    pub model_name: Option<String>,
     pub status: Option<String>,
 }
 
@@ -176,6 +181,8 @@ fn run_event_loop(
 
     loop {
         advance_prompt_stream(app, runtime, pending_prompt);
+        app.prompt_active = pending_prompt.is_some();
+        app.background_status = runtime.background_status().unwrap_or(None);
         if !context_poll_ready && pending_prompt.is_none() {
             context_poll_ready = true;
             last_context_poll = Instant::now();
@@ -501,7 +508,10 @@ impl TuiApp {
     pub fn bootstrap() -> Self {
         Self {
             title: "Elroy".to_string(),
+            model_name: "gpt-5".to_string(),
             status: "bootstrap".to_string(),
+            prompt_active: false,
+            background_status: None,
             input: String::new(),
             sidebar_section: SidebarSection::Memories,
             focus: FocusTarget::Input,
@@ -528,6 +538,9 @@ impl TuiApp {
         self.memory_titles = snapshot.memory_titles;
         self.agenda_titles = snapshot.agenda_titles;
         self.codex_session_titles = snapshot.codex_session_titles;
+        if let Some(model_name) = snapshot.model_name {
+            self.model_name = model_name;
+        }
         if let Some(status) = snapshot.status {
             self.status = status;
         }
@@ -632,7 +645,7 @@ impl TuiApp {
             .block(Block::default().title("Input").borders(Borders::ALL))
             .render(vertical[1], buf);
 
-        let footer = format!("{} | {}", self.status, self.footer_hints());
+        let footer = format!("{} | {}", self.footer_status_text(), self.footer_hints());
         Paragraph::new(Line::styled(
             footer,
             Style::default().add_modifier(Modifier::BOLD),
@@ -685,6 +698,16 @@ impl TuiApp {
             }
             FocusTarget::Unknown => "Recovering focus",
         }
+    }
+
+    pub fn footer_status_text(&self) -> String {
+        if self.prompt_active {
+            return self.status.clone();
+        }
+        if let Some(background_status) = &self.background_status {
+            return format!("● {}  ⟳ {}", self.model_name, background_status);
+        }
+        format!("● {}", self.model_name)
     }
 
     pub fn handle_key(&mut self, key: &str) -> UiIntent {
@@ -918,6 +941,10 @@ impl TuiRuntime for NoopRuntime {
         Ok(vec![])
     }
 
+    fn background_status(&mut self) -> Result<Option<String>, String> {
+        Ok(None)
+    }
+
     fn open_sidebar_item(
         &mut self,
         _section: SidebarSection,
@@ -958,6 +985,7 @@ mod tests {
         last_mutation: Option<(SidebarSection, String, SidebarAction)>,
         startup_stream: Option<FakePromptStream>,
         context_messages: Vec<TuiContextMessage>,
+        background_status: Option<String>,
     }
 
     struct FakePromptStream {
@@ -995,6 +1023,7 @@ mod tests {
                 memory_titles: vec!["Fresh Memory".to_string()],
                 agenda_titles: vec!["Fresh Agenda".to_string()],
                 codex_session_titles: vec!["Fresh Session".to_string()],
+                model_name: None,
                 status: Some("runtime updated".to_string()),
             })
         }
@@ -1018,6 +1047,7 @@ mod tests {
                     memory_titles: vec!["Fresh Memory".to_string()],
                     agenda_titles: vec!["Fresh Agenda".to_string()],
                     codex_session_titles: vec!["Fresh Session".to_string()],
+                    model_name: None,
                     status: Some("runtime updated".to_string()),
                 },
                 cancelled_snapshot: TuiSnapshot {
@@ -1041,6 +1071,10 @@ mod tests {
             Ok(self.context_messages.clone())
         }
 
+        fn background_status(&mut self) -> Result<Option<String>, String> {
+            Ok(self.background_status.clone())
+        }
+
         fn open_sidebar_item(
             &mut self,
             section: SidebarSection,
@@ -1062,6 +1096,7 @@ mod tests {
                 memory_titles: vec!["After Mutation".to_string()],
                 agenda_titles: vec!["Agenda After Mutation".to_string()],
                 codex_session_titles: vec!["Session After Mutation".to_string()],
+                model_name: None,
                 status: Some("mutation updated".to_string()),
             })
         }
@@ -1092,6 +1127,7 @@ mod tests {
         assert_eq!(app.sidebar_section, SidebarSection::Memories);
         assert_eq!(app.status, "bootstrap");
         assert_eq!(app.focus, FocusTarget::Input);
+        assert_eq!(app.model_name, "gpt-5");
     }
 
     #[test]
@@ -1103,7 +1139,7 @@ mod tests {
         assert!(text.contains("Relevant Context"));
         assert!(text.contains("Memories [active] | Agenda | Codex"));
         assert!(text.contains("Input"));
-        assert!(text.contains("bootstrap"));
+        assert!(text.contains("● gpt-5"));
         assert!(text.contains("Esc command mode"));
     }
 
@@ -1132,6 +1168,7 @@ mod tests {
             memory_titles: vec!["Runner Notes".to_string()],
             agenda_titles: vec!["Doctor Visit".to_string()],
             codex_session_titles: vec!["sample (completed) thread-123".to_string()],
+            model_name: Some("gpt-test".to_string()),
             status: Some("loaded snapshot".to_string()),
         });
         let text = rendered_text(&app);
@@ -1139,7 +1176,7 @@ mod tests {
         assert!(text.contains("user: hello"));
         assert!(text.contains("assistant: hi"));
         assert!(text.contains("> Runner Notes"));
-        assert!(text.contains("loaded snapshot"));
+        assert!(text.contains("● gpt-test"));
     }
 
     #[test]
@@ -1234,6 +1271,28 @@ mod tests {
 
         app.handle_key("escape");
         assert!(app.footer_hints().contains("Tab switch pane"));
+    }
+
+    #[test]
+    fn footer_status_text_prefers_background_status_when_idle() {
+        let mut app = TuiApp::bootstrap();
+        app.model_name = "gpt-test".to_string();
+        app.background_status = Some("syncing memories...".to_string());
+
+        assert_eq!(
+            app.footer_status_text(),
+            "● gpt-test  ⟳ syncing memories..."
+        );
+    }
+
+    #[test]
+    fn footer_status_text_prefers_active_status_during_prompt() {
+        let mut app = TuiApp::bootstrap();
+        app.prompt_active = true;
+        app.status = "thinking...".to_string();
+        app.background_status = Some("syncing memories...".to_string());
+
+        assert_eq!(app.footer_status_text(), "thinking...");
     }
 
     #[test]
