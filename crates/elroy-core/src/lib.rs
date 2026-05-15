@@ -45,6 +45,22 @@ pub struct ConversationRequest<'a> {
     pub user_message: &'a str,
     pub tools: &'a [ToolSpec],
     pub transcript: &'a [ConversationMessage],
+    pub force_tool: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConversationOptions<'a> {
+    pub role: MessageRole,
+    pub force_tool: Option<&'a str>,
+}
+
+impl Default for ConversationOptions<'_> {
+    fn default() -> Self {
+        Self {
+            role: MessageRole::User,
+            force_tool: None,
+        }
+    }
 }
 
 pub trait ModelClient {
@@ -116,6 +132,7 @@ impl ModelClient for LiveProviderModel {
                 system_prompt: &self.system_prompt,
                 messages: request.transcript,
                 tools: &tools,
+                force_tool: request.force_tool,
             })
             .map_err(ModelClientError::from)
     }
@@ -191,15 +208,38 @@ impl ConversationOrchestrator {
         role: MessageRole,
         message: &str,
     ) -> Result<TurnRun, ModelClientError> {
+        self.run_turn_with_transcript_and_options(
+            model,
+            tools,
+            tool_executor,
+            existing_transcript,
+            ConversationOptions {
+                role,
+                force_tool: None,
+            },
+            message,
+        )
+    }
+
+    pub fn run_turn_with_transcript_and_options(
+        &self,
+        model: &dyn ModelClient,
+        tools: &[ToolSpec],
+        tool_executor: &dyn ToolExecutor,
+        existing_transcript: &[ConversationMessage],
+        options: ConversationOptions<'_>,
+        message: &str,
+    ) -> Result<TurnRun, ModelClientError> {
         let mut events = Vec::new();
         let mut transcript = existing_transcript.to_vec();
-        transcript.push(ConversationMessage::new(role, message));
+        transcript.push(ConversationMessage::new(options.role, message));
 
         for _ in 0..=self.max_tool_rounds {
             let model_events = model.next_events(ConversationRequest {
                 user_message: message,
                 tools,
                 transcript: &transcript,
+                force_tool: options.force_tool,
             })?;
 
             let mut saw_tool_call = false;
@@ -387,6 +427,30 @@ mod tests {
         }
     }
 
+    struct InspectingModel {
+        force_tool: RefCell<Option<String>>,
+    }
+
+    impl InspectingModel {
+        fn new() -> Self {
+            Self {
+                force_tool: RefCell::new(None),
+            }
+        }
+    }
+
+    impl ModelClient for InspectingModel {
+        fn next_events(
+            &self,
+            request: ConversationRequest<'_>,
+        ) -> Result<Vec<StreamEvent>, super::ModelClientError> {
+            *self.force_tool.borrow_mut() = request.force_tool.map(str::to_string);
+            Ok(vec![StreamEvent::AssistantResponse {
+                content: "Forced tool acknowledged.".to_string(),
+            }])
+        }
+    }
+
     struct FakeToolExecutor;
 
     impl ToolExecutor for FakeToolExecutor {
@@ -551,6 +615,28 @@ mod tests {
             Some("system bootstrap")
         );
         assert_eq!(turn_run.transcript[1].role, MessageRole::Assistant);
+    }
+
+    #[test]
+    fn orchestrator_passes_force_tool_to_model_request() {
+        let model = InspectingModel::new();
+        let orchestrator = ConversationOrchestrator::new(0);
+
+        let _ = orchestrator
+            .run_turn_with_transcript_and_options(
+                &model,
+                &[weather_tool()],
+                &FakeToolExecutor,
+                &[],
+                super::ConversationOptions {
+                    role: MessageRole::User,
+                    force_tool: Some("get_weather"),
+                },
+                "weather now",
+            )
+            .expect("turn should succeed");
+
+        assert_eq!(model.force_tool.borrow().as_deref(), Some("get_weather"));
     }
 
     #[test]

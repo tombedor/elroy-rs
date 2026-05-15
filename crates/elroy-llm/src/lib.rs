@@ -273,6 +273,7 @@ pub struct CompletionRequest<'a> {
     pub system_prompt: &'a str,
     pub messages: &'a [ConversationMessage],
     pub tools: &'a ToolRegistry,
+    pub force_tool: Option<&'a str>,
 }
 
 #[derive(Debug)]
@@ -302,6 +303,7 @@ impl LiveModelClient {
                     request.messages,
                     request.tools,
                     self.config.max_output_tokens,
+                    request.force_tool,
                 ))
                 .send()
                 .map_err(LlmError::HttpRequest)?,
@@ -322,6 +324,7 @@ impl LiveModelClient {
                     request.messages,
                     request.tools,
                     self.config.max_output_tokens,
+                    request.force_tool,
                 ))
                 .send()
                 .map_err(LlmError::HttpRequest)?,
@@ -400,22 +403,28 @@ pub fn build_openai_request(
     system_prompt: &str,
     messages: &[ConversationMessage],
     tools: &ToolRegistry,
+    force_tool: Option<&str>,
 ) -> Value {
     let mut request_messages = vec![json!({"role": "system", "content": system_prompt})];
     request_messages.extend(messages.iter().map(ConversationMessage::to_openai_message));
 
-    json!({
+    let mut request = json!({
         "messages": request_messages,
         "tools": tools.openai_definitions(),
-    })
+    });
+    if let Some(force_tool) = force_tool {
+        request["tool_choice"] = json!({"type": "function", "name": force_tool});
+    }
+    request
 }
 
 pub fn build_anthropic_request(
     system_prompt: &str,
     messages: &[ConversationMessage],
     tools: &ToolRegistry,
+    force_tool: Option<&str>,
 ) -> Value {
-    json!({
+    let mut request = json!({
         "system": system_prompt,
         "messages": messages
             .iter()
@@ -423,7 +432,11 @@ pub fn build_anthropic_request(
             .map(ConversationMessage::to_anthropic_message)
             .collect::<Vec<_>>(),
         "tools": tools.anthropic_definitions(),
-    })
+    });
+    if let Some(force_tool) = force_tool {
+        request["tool_choice"] = json!({"type": "tool", "name": force_tool});
+    }
+    request
 }
 
 pub fn build_openai_responses_request(
@@ -432,6 +445,7 @@ pub fn build_openai_responses_request(
     messages: &[ConversationMessage],
     tools: &ToolRegistry,
     max_output_tokens: u32,
+    force_tool: Option<&str>,
 ) -> Value {
     let mut input = Vec::new();
     if !system_prompt.is_empty() {
@@ -444,13 +458,17 @@ pub fn build_openai_responses_request(
         input.extend(openai_input_items(message));
     }
 
-    json!({
+    let mut request = json!({
         "model": model,
         "input": input,
         "tools": tools.openai_definitions(),
         "parallel_tool_calls": false,
         "max_output_tokens": max_output_tokens,
-    })
+    });
+    if let Some(force_tool) = force_tool {
+        request["tool_choice"] = json!({"type": "function", "name": force_tool});
+    }
+    request
 }
 
 pub fn build_anthropic_messages_request(
@@ -459,8 +477,9 @@ pub fn build_anthropic_messages_request(
     messages: &[ConversationMessage],
     tools: &ToolRegistry,
     max_output_tokens: u32,
+    force_tool: Option<&str>,
 ) -> Value {
-    json!({
+    let mut request = json!({
         "model": model,
         "max_tokens": max_output_tokens,
         "system": system_prompt,
@@ -470,7 +489,11 @@ pub fn build_anthropic_messages_request(
             .map(ConversationMessage::to_anthropic_message)
             .collect::<Vec<_>>(),
         "tools": tools.anthropic_definitions(),
-    })
+    });
+    if let Some(force_tool) = force_tool {
+        request["tool_choice"] = json!({"type": "tool", "name": force_tool});
+    }
+    request
 }
 
 fn openai_input_items(message: &ConversationMessage) -> Vec<Value> {
@@ -712,6 +735,7 @@ mod tests {
             "You are Elroy.",
             &[ConversationMessage::new(MessageRole::User, "Hello")],
             &weather_registry(),
+            None,
         );
 
         assert_eq!(request["messages"][0]["role"], "system");
@@ -725,6 +749,7 @@ mod tests {
             "You are Elroy.",
             &[ConversationMessage::tool_result("call-1", "{\"temp\":25}")],
             &weather_registry(),
+            None,
         );
 
         assert_eq!(request["system"], "You are Elroy.");
@@ -746,6 +771,7 @@ mod tests {
                 }],
             )],
             &weather_registry(),
+            None,
         );
 
         assert_eq!(request["messages"][0]["role"], "assistant");
@@ -783,7 +809,8 @@ mod tests {
         );
         message.content = None;
 
-        let request = build_anthropic_request("You are Elroy.", &[message], &weather_registry());
+        let request =
+            build_anthropic_request("You are Elroy.", &[message], &weather_registry(), None);
 
         assert_eq!(
             request["messages"][0]["content"].as_array().map(Vec::len),
@@ -811,6 +838,7 @@ mod tests {
             ],
             &weather_registry(),
             1024,
+            None,
         );
 
         assert_eq!(request["model"], "gpt-5.4");
@@ -822,6 +850,21 @@ mod tests {
     }
 
     #[test]
+    fn openai_responses_request_can_force_specific_tool() {
+        let request = build_openai_responses_request(
+            "gpt-5.4",
+            "You are Elroy.",
+            &[ConversationMessage::new(MessageRole::User, "Hello")],
+            &weather_registry(),
+            1024,
+            Some("get_weather"),
+        );
+
+        assert_eq!(request["tool_choice"]["type"], "function");
+        assert_eq!(request["tool_choice"]["name"], "get_weather");
+    }
+
+    #[test]
     fn anthropic_messages_request_includes_model_and_max_tokens() {
         let request = build_anthropic_messages_request(
             "claude-sonnet-4-20250514",
@@ -829,11 +872,27 @@ mod tests {
             &[ConversationMessage::new(MessageRole::User, "Hello")],
             &weather_registry(),
             2048,
+            None,
         );
 
         assert_eq!(request["model"], "claude-sonnet-4-20250514");
         assert_eq!(request["max_tokens"], 2048);
         assert_eq!(request["system"], "You are Elroy.");
+    }
+
+    #[test]
+    fn anthropic_messages_request_can_force_specific_tool() {
+        let request = build_anthropic_messages_request(
+            "claude-sonnet-4-20250514",
+            "You are Elroy.",
+            &[ConversationMessage::new(MessageRole::User, "Hello")],
+            &weather_registry(),
+            2048,
+            Some("get_weather"),
+        );
+
+        assert_eq!(request["tool_choice"]["type"], "tool");
+        assert_eq!(request["tool_choice"]["name"], "get_weather");
     }
 
     #[test]
@@ -913,6 +972,7 @@ mod tests {
                 system_prompt: "You are Elroy.",
                 messages: &[ConversationMessage::new(MessageRole::User, "Hello")],
                 tools: &weather_registry(),
+                force_tool: None,
             })
             .expect("request should succeed");
 
@@ -963,6 +1023,7 @@ mod tests {
                 system_prompt: "You are Elroy.",
                 messages: &[ConversationMessage::new(MessageRole::User, "Hello")],
                 tools: &weather_registry(),
+                force_tool: None,
             })
             .expect("request should succeed");
 
@@ -996,6 +1057,7 @@ mod tests {
                 system_prompt: "You are Elroy.",
                 messages: &[ConversationMessage::new(MessageRole::User, "Hello")],
                 tools: &weather_registry(),
+                force_tool: None,
             })
             .expect_err("request should fail");
 

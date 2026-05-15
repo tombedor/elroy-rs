@@ -104,6 +104,7 @@ pub struct MessageProcessOptions {
     pub role: MessageRole,
     pub enable_tools: bool,
     pub persist_input_message: bool,
+    pub force_tool: Option<String>,
 }
 
 impl Default for MessageProcessOptions {
@@ -112,6 +113,7 @@ impl Default for MessageProcessOptions {
             role: MessageRole::User,
             enable_tools: true,
             persist_input_message: true,
+            force_tool: None,
         }
     }
 }
@@ -185,6 +187,11 @@ impl AppRuntime {
         } else {
             ExecutableToolRegistry::new(vec![])
         };
+        let force_tool = if options.enable_tools {
+            options.force_tool.as_deref()
+        } else {
+            None
+        };
         let events = run_prompt_with_model_and_registry(
             &mut connection,
             prompt,
@@ -192,6 +199,7 @@ impl AppRuntime {
             &model,
             executable_tools,
             options.persist_input_message,
+            force_tool,
         )?;
 
         Ok(PromptRunResult {
@@ -364,8 +372,16 @@ fn run_prompt_with_model_and_registry(
     model: &dyn ModelClient,
     executable_tools: ExecutableToolRegistry,
     persist_input_message: bool,
+    force_tool: Option<&str>,
 ) -> Result<Vec<StreamEvent>, AppError> {
     let tools = ToolRegistry::new(executable_tools.specs());
+    if let Some(force_tool) = force_tool
+        && !tools.specs().iter().any(|tool| tool.name == force_tool)
+    {
+        return Err(AppError::Runtime(format!(
+            "Requested tool {force_tool} not available."
+        )));
+    }
     let orchestrator = ConversationOrchestrator::new(2);
     let tool_executor = LocalToolExecutor::new(executable_tools);
     let existing_transcript =
@@ -380,12 +396,12 @@ fn run_prompt_with_model_and_registry(
     model_transcript.extend(recall_context.iter().cloned());
     model_transcript.extend(due_item_context.iter().cloned());
 
-    let turn_run = orchestrator.run_turn_with_transcript_and_role(
+    let turn_run = orchestrator.run_turn_with_transcript_and_options(
         model,
         tools.specs(),
         &tool_executor,
         &model_transcript,
-        role,
+        elroy_core::ConversationOptions { role, force_tool },
         prompt,
     )?;
     let persisted_transcript = strip_input_message_for_persistence(
@@ -430,6 +446,7 @@ fn run_background_codex_completion_followup(
         &model,
         build_live_tool_registry(config),
         false,
+        None,
     )?;
     Ok(())
 }
@@ -3561,6 +3578,7 @@ mod tests {
             &model,
             ExecutableToolRegistry::new(vec![]),
             false,
+            None,
         )
         .expect("background follow-up should succeed");
         let stored =
@@ -3611,6 +3629,7 @@ mod tests {
             &model,
             ExecutableToolRegistry::new(vec![]),
             true,
+            None,
         )
         .expect("system-role prompt should succeed");
         let stored =
@@ -3624,6 +3643,45 @@ mod tests {
         );
         assert_eq!(stored[1].role, MessageRole::Assistant);
 
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
+    fn run_prompt_with_model_and_registry_rejects_unknown_force_tool() {
+        let unique = format!(
+            "elroy-rs-app-force-tool-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+
+        let mut connection = open_sqlite_connection(&database_path).expect("database should open");
+        run_migrations(&mut connection).expect("migrations should run");
+
+        let model = FakeModel::new(vec![]);
+        let error = run_prompt_with_model_and_registry(
+            &mut connection,
+            "Hello",
+            MessageRole::User,
+            &model,
+            ExecutableToolRegistry::new(vec![]),
+            true,
+            Some("missing_tool"),
+        )
+        .expect_err("missing force tool should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("Requested tool missing_tool not available")
+        );
         fs::remove_dir_all(home).expect("home should be removed");
     }
 
