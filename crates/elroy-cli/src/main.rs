@@ -7,7 +7,7 @@ use elroy_db::{BootstrapInventory, BootstrapPlan, bootstrap_database};
 use elroy_llm::StreamEvent;
 use elroy_tui::{
     PromptUpdate, SidebarAction, SidebarSection, TuiContextMessage, TuiPromptStream, TuiRuntime,
-    run_with_snapshot_and_runtime,
+    TuiSidebarDetail, run_with_snapshot_and_runtime,
 };
 
 const RESTART_RESUME_MESSAGE_ENV: &str = "ELROY_RESTART_RESUME_MESSAGE";
@@ -177,7 +177,7 @@ impl TuiRuntime for CliTuiRuntime {
         &mut self,
         section: SidebarSection,
         title: &str,
-    ) -> Result<String, String> {
+    ) -> Result<TuiSidebarDetail, String> {
         self.runtime
             .open_sidebar_item(section, title)
             .map_err(|error| error.to_string())

@@ -14,7 +14,7 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::prelude::Widget;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::Line;
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SidebarSection {
@@ -60,6 +60,7 @@ pub struct TuiApp {
     pub prompt_active: bool,
     pub background_status: Option<String>,
     pub input: String,
+    pub detail_modal: Option<DetailModalState>,
     pub sidebar_section: SidebarSection,
     pub focus: FocusTarget,
     pub last_command_pane: CommandPane,
@@ -82,6 +83,25 @@ pub enum SidebarAction {
     Archive,
     Complete,
     Delete,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TuiSidebarDetail {
+    pub title: String,
+    pub content: String,
+    pub can_complete: bool,
+    pub destructive_action: Option<SidebarAction>,
+    pub destructive_label: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DetailModalState {
+    pub title: String,
+    pub content: String,
+    pub can_complete: bool,
+    pub destructive_action: Option<SidebarAction>,
+    pub destructive_label: Option<String>,
+    pub confirming_destructive: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -118,8 +138,11 @@ pub trait TuiRuntime {
     fn start_startup_prompt_stream(&mut self) -> Result<Option<Box<dyn TuiPromptStream>>, String>;
     fn load_context_messages(&mut self) -> Result<Vec<TuiContextMessage>, String>;
     fn background_status(&mut self) -> Result<Option<String>, String>;
-    fn open_sidebar_item(&mut self, section: SidebarSection, title: &str)
-    -> Result<String, String>;
+    fn open_sidebar_item(
+        &mut self,
+        section: SidebarSection,
+        title: &str,
+    ) -> Result<TuiSidebarDetail, String>;
     fn mutate_sidebar_item(
         &mut self,
         section: SidebarSection,
@@ -250,6 +273,14 @@ fn apply_key_event(
         return TuiExit::Continue;
     }
 
+    if app.detail_modal.is_some() {
+        if let Some(token) = modal_key_token(key) {
+            let intent = app.handle_modal_key(token);
+            apply_intent_with_runtime(app, intent, runtime, pending_prompt);
+        }
+        return TuiExit::Continue;
+    }
+
     if app.focus == FocusTarget::Input {
         match key.code {
             KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -334,7 +365,7 @@ fn apply_intent_with_runtime(
                 .unwrap_or_else(|| "unknown entry".to_string());
             match runtime.open_sidebar_item(app.sidebar_section, &label) {
                 Ok(detail) => {
-                    app.conversation_lines.push(detail);
+                    app.open_detail_modal(detail);
                     app.status = format!("open selected {label}");
                 }
                 Err(error) => {
@@ -357,6 +388,7 @@ fn apply_intent_with_runtime(
             match runtime.mutate_sidebar_item(app.sidebar_section, &label, action) {
                 Ok(snapshot) => {
                     app.apply_snapshot(snapshot);
+                    app.detail_modal = None;
                     app.status = format!("updated selected {label}");
                 }
                 Err(error) => {
@@ -513,6 +545,7 @@ impl TuiApp {
             prompt_active: false,
             background_status: None,
             input: String::new(),
+            detail_modal: None,
             sidebar_section: SidebarSection::Memories,
             focus: FocusTarget::Input,
             last_command_pane: CommandPane::Conversation,
@@ -651,6 +684,10 @@ impl TuiApp {
             Style::default().add_modifier(Modifier::BOLD),
         ))
         .render(vertical[2], buf);
+
+        if let Some(detail_modal) = &self.detail_modal {
+            self.render_detail_modal(detail_modal, area, buf);
+        }
     }
 
     fn sidebar_header(&self) -> String {
@@ -708,6 +745,70 @@ impl TuiApp {
             return format!("● {}  ⟳ {}", self.model_name, background_status);
         }
         format!("● {}", self.model_name)
+    }
+
+    fn render_detail_modal(&self, detail_modal: &DetailModalState, area: Rect, buf: &mut Buffer) {
+        let modal_area = centered_rect(area, 72, 60);
+        Clear.render(modal_area, buf);
+        let sections = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(1), Constraint::Length(1)])
+            .split(modal_area);
+        Paragraph::new(detail_modal.content.as_str())
+            .block(
+                Block::default()
+                    .title(detail_modal.title.as_str())
+                    .borders(Borders::ALL),
+            )
+            .render(sections[0], buf);
+        Paragraph::new(detail_modal.footer_text())
+            .block(Block::default().borders(Borders::LEFT | Borders::RIGHT | Borders::BOTTOM))
+            .render(sections[1], buf);
+    }
+
+    pub fn open_detail_modal(&mut self, detail: TuiSidebarDetail) {
+        self.detail_modal = Some(DetailModalState {
+            title: detail.title,
+            content: detail.content,
+            can_complete: detail.can_complete,
+            destructive_action: detail.destructive_action,
+            destructive_label: detail.destructive_label,
+            confirming_destructive: false,
+        });
+    }
+
+    pub fn handle_modal_key(&mut self, key: &str) -> UiIntent {
+        let Some(detail_modal) = self.detail_modal.as_mut() else {
+            return UiIntent::Noop;
+        };
+
+        match key {
+            "escape" | "enter" | "q" => {
+                self.detail_modal = None;
+                UiIntent::Noop
+            }
+            "c" if detail_modal.can_complete => UiIntent::CompleteSelected,
+            "d" => {
+                let Some(action) = detail_modal.destructive_action else {
+                    return UiIntent::Noop;
+                };
+                if detail_modal.confirming_destructive {
+                    return match action {
+                        SidebarAction::Archive => UiIntent::ArchiveSelected,
+                        SidebarAction::Delete => UiIntent::DeleteSelected,
+                        SidebarAction::Complete => UiIntent::CompleteSelected,
+                    };
+                }
+                detail_modal.confirming_destructive = true;
+                UiIntent::Noop
+            }
+            _ => {
+                if detail_modal.confirming_destructive {
+                    detail_modal.confirming_destructive = false;
+                }
+                UiIntent::Noop
+            }
+        }
     }
 
     pub fn handle_key(&mut self, key: &str) -> UiIntent {
@@ -902,6 +1003,55 @@ impl TuiApp {
     }
 }
 
+impl DetailModalState {
+    fn footer_text(&self) -> String {
+        if self.confirming_destructive {
+            return "Press D again to confirm deletion, any other key to cancel".to_string();
+        }
+
+        let mut actions = Vec::new();
+        if self.can_complete {
+            actions.push("C: complete".to_string());
+        }
+        if let Some(label) = &self.destructive_label {
+            actions.push(format!("D: {label}"));
+        }
+        actions.push("Escape/Enter/Q: close".to_string());
+        actions.join("  |  ")
+    }
+}
+
+fn centered_rect(area: Rect, width_percent: u16, height_percent: u16) -> Rect {
+    let popup_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - height_percent) / 2),
+            Constraint::Percentage(height_percent),
+            Constraint::Percentage((100 - height_percent) / 2),
+        ])
+        .split(area);
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - width_percent) / 2),
+            Constraint::Percentage(width_percent),
+            Constraint::Percentage((100 - width_percent) / 2),
+        ])
+        .split(popup_layout[1])[1]
+}
+
+fn modal_key_token(key: KeyEvent) -> Option<&'static str> {
+    match key.code {
+        KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => match ch {
+            'c' => Some("c"),
+            'd' => Some("d"),
+            'q' => Some("q"),
+            _ => Some("other"),
+        },
+        _ => key_event_token(key),
+    }
+}
+
 fn format_context_message_line(message: &TuiContextMessage) -> String {
     format!("{}: {}", message.role, message.content)
 }
@@ -949,8 +1099,14 @@ impl TuiRuntime for NoopRuntime {
         &mut self,
         _section: SidebarSection,
         _title: &str,
-    ) -> Result<String, String> {
-        Ok("sidebar detail unavailable".to_string())
+    ) -> Result<TuiSidebarDetail, String> {
+        Ok(TuiSidebarDetail {
+            title: "sidebar detail".to_string(),
+            content: "sidebar detail unavailable".to_string(),
+            can_complete: false,
+            destructive_action: None,
+            destructive_label: None,
+        })
     }
 
     fn mutate_sidebar_item(
@@ -973,9 +1129,9 @@ mod tests {
 
     use super::{
         CommandPane, FocusTarget, PromptUpdate, SidebarAction, SidebarSection, TuiApp,
-        TuiContextMessage, TuiExit, TuiPromptStream, TuiRuntime, TuiSnapshot, UiIntent,
-        advance_prompt_stream, apply_intent_with_runtime, apply_key_event, key_event_token,
-        poll_context_updates, start_startup_prompt_stream,
+        TuiContextMessage, TuiExit, TuiPromptStream, TuiRuntime, TuiSidebarDetail, TuiSnapshot,
+        UiIntent, advance_prompt_stream, apply_intent_with_runtime, apply_key_event,
+        key_event_token, poll_context_updates, start_startup_prompt_stream,
     };
 
     #[derive(Default)]
@@ -1079,9 +1235,28 @@ mod tests {
             &mut self,
             section: SidebarSection,
             title: &str,
-        ) -> Result<String, String> {
+        ) -> Result<TuiSidebarDetail, String> {
             self.last_opened = Some((section, title.to_string()));
-            Ok(format!("opened detail for {title}"))
+            let (can_complete, destructive_action, destructive_label) = match section {
+                SidebarSection::Memories => (
+                    false,
+                    Some(SidebarAction::Archive),
+                    Some("archive".to_string()),
+                ),
+                SidebarSection::Agenda => (
+                    true,
+                    Some(SidebarAction::Delete),
+                    Some("delete".to_string()),
+                ),
+                SidebarSection::CodexSessions => (false, None, None),
+            };
+            Ok(TuiSidebarDetail {
+                title: title.to_string(),
+                content: format!("opened detail for {title}"),
+                can_complete,
+                destructive_action,
+                destructive_label,
+            })
         }
 
         fn mutate_sidebar_item(
@@ -1433,7 +1608,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_open_appends_detail_to_conversation() {
+    fn runtime_open_shows_detail_modal() {
         let mut app = TuiApp::bootstrap();
         app.memory_titles = vec!["Runner Notes".to_string()];
         app.handle_key("ctrl+m");
@@ -1446,10 +1621,11 @@ mod tests {
             runtime.last_opened,
             Some((SidebarSection::Memories, "Runner Notes".to_string()))
         );
-        assert!(
-            app.conversation_lines
-                .iter()
-                .any(|line| line.contains("opened detail for Runner Notes"))
+        let detail_modal = app.detail_modal.as_ref().expect("detail modal should open");
+        assert_eq!(detail_modal.title, "Runner Notes");
+        assert_eq!(
+            detail_modal.footer_text(),
+            "D: archive  |  Escape/Enter/Q: close"
         );
 
         app.codex_session_titles = vec!["sample (completed) thread-123".to_string()];
@@ -1462,6 +1638,8 @@ mod tests {
                 "sample (completed) thread-123".to_string()
             ))
         );
+        let detail_modal = app.detail_modal.as_ref().expect("codex modal should open");
+        assert_eq!(detail_modal.footer_text(), "Escape/Enter/Q: close");
     }
 
     #[test]
@@ -1493,6 +1671,113 @@ mod tests {
                 .any(|title| title == "After Mutation")
         );
         assert!(app.status.contains("updated selected"));
+        assert!(app.detail_modal.is_none());
+    }
+
+    #[test]
+    fn agenda_detail_modal_supports_complete_and_delete_confirmation() {
+        let mut app = TuiApp::bootstrap();
+        app.agenda_titles = vec!["Pay rent [2000-01-01 09:00] (Due)".to_string()];
+        app.handle_key("ctrl+a");
+        let mut runtime = FakeRuntime::default();
+        let mut pending = None;
+
+        apply_intent_with_runtime(&mut app, UiIntent::OpenSelected, &mut runtime, &mut pending);
+        let detail_modal = app.detail_modal.as_ref().expect("detail modal should open");
+        assert_eq!(
+            detail_modal.footer_text(),
+            "C: complete  |  D: delete  |  Escape/Enter/Q: close"
+        );
+
+        assert_eq!(
+            apply_key_event(
+                &mut app,
+                KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+                &mut runtime,
+                &mut pending,
+            ),
+            TuiExit::Continue
+        );
+        let detail_modal = app
+            .detail_modal
+            .as_ref()
+            .expect("detail modal should still be open");
+        assert_eq!(
+            detail_modal.footer_text(),
+            "Press D again to confirm deletion, any other key to cancel"
+        );
+
+        assert_eq!(
+            apply_key_event(
+                &mut app,
+                KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+                &mut runtime,
+                &mut pending,
+            ),
+            TuiExit::Continue
+        );
+        let detail_modal = app
+            .detail_modal
+            .as_ref()
+            .expect("detail modal should remain open");
+        assert_eq!(
+            detail_modal.footer_text(),
+            "C: complete  |  D: delete  |  Escape/Enter/Q: close"
+        );
+
+        assert_eq!(
+            apply_key_event(
+                &mut app,
+                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
+                &mut runtime,
+                &mut pending,
+            ),
+            TuiExit::Continue
+        );
+        assert_eq!(
+            runtime.last_mutation,
+            Some((
+                SidebarSection::Agenda,
+                "Pay rent [2000-01-01 09:00] (Due)".to_string(),
+                SidebarAction::Complete
+            ))
+        );
+        assert!(app.detail_modal.is_none());
+    }
+
+    #[test]
+    fn detail_modal_confirms_destructive_action_before_mutating() {
+        let mut app = TuiApp::bootstrap();
+        app.memory_titles = vec!["Runner Notes".to_string()];
+        app.handle_key("ctrl+m");
+        let mut runtime = FakeRuntime::default();
+        let mut pending = None;
+
+        apply_intent_with_runtime(&mut app, UiIntent::OpenSelected, &mut runtime, &mut pending);
+
+        apply_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+            &mut runtime,
+            &mut pending,
+        );
+        assert_eq!(runtime.last_mutation, None);
+
+        apply_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+            &mut runtime,
+            &mut pending,
+        );
+        assert_eq!(
+            runtime.last_mutation,
+            Some((
+                SidebarSection::Memories,
+                "Runner Notes".to_string(),
+                SidebarAction::Archive
+            ))
+        );
+        assert!(app.detail_modal.is_none());
     }
 
     #[test]

@@ -38,7 +38,7 @@ use elroy_tasks::{
 use elroy_tools::{
     ExecutableTool, ExecutableToolRegistry, JsonSchema, ToolExecutionResult, ToolRegistry, ToolSpec,
 };
-use elroy_tui::{SidebarAction, SidebarSection, TuiSnapshot};
+use elroy_tui::{SidebarAction, SidebarSection, TuiSidebarDetail, TuiSnapshot};
 use elroy_user::{effective_persona, effective_user_full_name, effective_user_preferred_name};
 use serde_json::{Value, json};
 
@@ -340,22 +340,30 @@ impl AppRuntime {
         &self,
         section: SidebarSection,
         title: &str,
-    ) -> Result<String, AppError> {
+    ) -> Result<TuiSidebarDetail, AppError> {
         let connection = self.open_read_connection()?;
         match section {
             SidebarSection::Memories => {
                 let Some(memory) = find_active_memory_by_name(&connection, title)? else {
                     return Err(AppError::Runtime(format!("memory not found: {title}")));
                 };
-                Ok(format!(
-                    "memory: {}\npath: {}\n\n{}",
-                    memory.name, memory.file_path, memory.body
-                ))
+                let memory_name = memory.name.clone();
+                Ok(TuiSidebarDetail {
+                    title: memory_name.clone(),
+                    content: format!(
+                        "memory: {}\npath: {}\n\n{}",
+                        memory_name, memory.file_path, memory.body
+                    ),
+                    can_complete: false,
+                    destructive_action: Some(SidebarAction::Archive),
+                    destructive_label: Some("archive".to_string()),
+                })
             }
             SidebarSection::Agenda => {
                 let Some(item) = resolve_agenda_sidebar_item(&connection, title)? else {
                     return Err(AppError::Runtime(format!("agenda item not found: {title}")));
                 };
+                let can_delete = item.trigger_datetime.is_some() || item.trigger_context.is_some();
                 let mut lines = vec![
                     format!("agenda: {}", item.name),
                     format!("path: {}", item.file_path),
@@ -363,10 +371,10 @@ impl AppRuntime {
                 if let Some(date) = item.agenda_date {
                     lines.push(format!("date: {date}"));
                 }
-                if let Some(trigger_datetime) = item.trigger_datetime {
+                if let Some(trigger_datetime) = item.trigger_datetime.as_ref() {
                     lines.push(format!("trigger_datetime: {trigger_datetime}"));
                 }
-                if let Some(trigger_context) = item.trigger_context {
+                if let Some(trigger_context) = item.trigger_context.as_ref() {
                     lines.push(format!("trigger_context: {trigger_context}"));
                 }
                 if item.checklist_total > 0 {
@@ -377,7 +385,13 @@ impl AppRuntime {
                 }
                 lines.push(String::new());
                 lines.push(item.body);
-                Ok(lines.join("\n"))
+                Ok(TuiSidebarDetail {
+                    title: item.name,
+                    content: lines.join("\n"),
+                    can_complete: item.status.as_deref() == Some("created"),
+                    destructive_action: can_delete.then_some(SidebarAction::Delete),
+                    destructive_label: can_delete.then_some("delete".to_string()),
+                })
             }
             SidebarSection::CodexSessions => {
                 let thread_id = title
@@ -400,29 +414,36 @@ impl AppRuntime {
                     format!("repo_path: {}", session.repo_path),
                     format!("status: {}", session.status),
                 ];
-                if let Some(worktree_path) = session.worktree_path {
+                if let Some(worktree_path) = session.worktree_path.as_ref() {
                     lines.push(format!("worktree_path: {worktree_path}"));
                 }
-                if let Some(session_branch) = session.session_branch {
+                if let Some(session_branch) = session.session_branch.as_ref() {
                     lines.push(format!("session_branch: {session_branch}"));
                 }
-                if let Some(target_branch) = session.target_branch {
+                if let Some(target_branch) = session.target_branch.as_ref() {
                     lines.push(format!("target_branch: {target_branch}"));
                 }
-                if let Some(session_file_path) = session.session_file_path {
+                if let Some(session_file_path) = session.session_file_path.as_ref() {
                     lines.push(format!("session_file_path: {session_file_path}"));
                 }
                 lines.push(String::new());
                 lines.push(
                     session
                         .latest_summary
+                        .clone()
                         .unwrap_or_else(|| "(No summary recorded.)".to_string()),
                 );
-                if let Some(agent_message) = session.latest_agent_message {
+                if let Some(agent_message) = session.latest_agent_message.as_ref() {
                     lines.push(String::new());
-                    lines.push(agent_message);
+                    lines.push(agent_message.clone());
                 }
-                Ok(lines.join("\n"))
+                Ok(TuiSidebarDetail {
+                    title: format_codex_session_title(&session),
+                    content: lines.join("\n"),
+                    can_complete: false,
+                    destructive_action: None,
+                    destructive_label: None,
+                })
             }
         }
     }
@@ -3232,10 +3253,23 @@ mod tests {
                 .iter()
                 .any(|item| item == "sample (completed) thread-123")
         );
-        assert!(memory_detail.contains("remember the hill workout"));
-        assert!(agenda_detail.contains("trigger_datetime: 2000-01-01T09:00:00"));
-        assert!(codex_detail.contains("Codex inspected the parser state."));
-        assert!(codex_detail.contains("Parser inspection complete."));
+        assert_eq!(memory_detail.title, "runner notes");
+        assert_eq!(memory_detail.destructive_label.as_deref(), Some("archive"));
+        assert!(memory_detail.content.contains("remember the hill workout"));
+        assert_eq!(agenda_detail.title, "doctor visit");
+        assert!(agenda_detail.can_complete);
+        assert_eq!(agenda_detail.destructive_label.as_deref(), Some("delete"));
+        assert!(
+            agenda_detail
+                .content
+                .contains("trigger_datetime: 2000-01-01T09:00:00")
+        );
+        assert!(
+            codex_detail
+                .content
+                .contains("Codex inspected the parser state.")
+        );
+        assert!(codex_detail.content.contains("Parser inspection complete."));
 
         fs::remove_dir_all(home).expect("home should be removed");
     }
