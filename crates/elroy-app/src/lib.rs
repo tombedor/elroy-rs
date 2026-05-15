@@ -183,6 +183,15 @@ impl Default for MessageProcessOptions {
 }
 
 #[derive(Debug, Clone)]
+struct PromptExecutionOptions<'a> {
+    role: MessageRole,
+    persist_input_message: bool,
+    force_tool: Option<&'a str>,
+    memory_recall_classifier_enabled: bool,
+    memory_recall_classifier_window: usize,
+}
+
+#[derive(Debug, Clone)]
 pub struct AppRuntime {
     config: AppConfig,
 }
@@ -231,11 +240,15 @@ impl AppRuntime {
         run_prompt_with_model_and_registry_stream(
             connection,
             prompt,
-            options.role,
+            PromptExecutionOptions {
+                role: options.role,
+                persist_input_message: options.persist_input_message,
+                force_tool,
+                memory_recall_classifier_enabled: self.config.memory_recall_classifier_enabled,
+                memory_recall_classifier_window: self.config.memory_recall_classifier_window,
+            },
             Box::new(model),
             executable_tools,
-            options.persist_input_message,
-            force_tool,
         )
     }
 
@@ -260,11 +273,15 @@ impl AppRuntime {
         let events = run_prompt_with_model_and_registry(
             &mut connection,
             prompt,
-            options.role,
             &model,
             executable_tools,
-            options.persist_input_message,
-            force_tool,
+            PromptExecutionOptions {
+                role: options.role,
+                persist_input_message: options.persist_input_message,
+                force_tool,
+                memory_recall_classifier_enabled: self.config.memory_recall_classifier_enabled,
+                memory_recall_classifier_window: self.config.memory_recall_classifier_window,
+            },
         )?;
 
         Ok(PromptRunResult {
@@ -553,14 +570,12 @@ fn live_provider_model(
 fn run_prompt_with_model_and_registry(
     connection: &mut rusqlite::Connection,
     prompt: &str,
-    role: MessageRole,
     model: &dyn ModelClient,
     executable_tools: ExecutableToolRegistry,
-    persist_input_message: bool,
-    force_tool: Option<&str>,
+    options: PromptExecutionOptions<'_>,
 ) -> Result<Vec<StreamEvent>, AppError> {
     let tools = ToolRegistry::new(executable_tools.specs());
-    if let Some(force_tool) = force_tool
+    if let Some(force_tool) = options.force_tool
         && !tools.specs().iter().any(|tool| tool.name == force_tool)
     {
         return Err(AppError::Runtime(format!(
@@ -572,6 +587,8 @@ fn run_prompt_with_model_and_registry(
     let existing_transcript =
         validated_transcript(&load_context_messages(connection, LOCAL_USER_TOKEN)?);
     let recall_context = recall_memory_context_messages(
+        options.memory_recall_classifier_enabled,
+        options.memory_recall_classifier_window,
         prompt,
         &existing_transcript,
         &list_active_memories(connection, 50)?,
@@ -586,7 +603,10 @@ fn run_prompt_with_model_and_registry(
         tools.specs(),
         &tool_executor,
         &model_transcript,
-        elroy_core::ConversationOptions { role, force_tool },
+        elroy_core::ConversationOptions {
+            role: options.role,
+            force_tool: options.force_tool,
+        },
         prompt,
     )?;
     let persisted_transcript = strip_input_message_for_persistence(
@@ -596,7 +616,7 @@ fn run_prompt_with_model_and_registry(
             recall_context.len() + due_item_context.len(),
         ),
         existing_transcript.len(),
-        persist_input_message,
+        options.persist_input_message,
     );
     replace_context_messages(connection, LOCAL_USER_TOKEN, &persisted_transcript)?;
 
@@ -618,14 +638,12 @@ fn run_prompt_with_model_and_registry(
 fn run_prompt_with_model_and_registry_stream(
     mut connection: rusqlite::Connection,
     prompt: &str,
-    role: MessageRole,
+    options: PromptExecutionOptions<'_>,
     model: Box<dyn StreamingModelClient>,
     executable_tools: ExecutableToolRegistry,
-    persist_input_message: bool,
-    force_tool: Option<&str>,
 ) -> Result<PromptEventStream, AppError> {
     let tools = ToolRegistry::new(executable_tools.specs());
-    if let Some(force_tool) = force_tool
+    if let Some(force_tool) = options.force_tool
         && !tools.specs().iter().any(|tool| tool.name == force_tool)
     {
         return Err(AppError::Runtime(format!(
@@ -637,6 +655,8 @@ fn run_prompt_with_model_and_registry_stream(
     let existing_transcript =
         validated_transcript(&load_context_messages(&mut connection, LOCAL_USER_TOKEN)?);
     let recall_context = recall_memory_context_messages(
+        options.memory_recall_classifier_enabled,
+        options.memory_recall_classifier_window,
         prompt,
         &existing_transcript,
         &list_active_memories(&connection, 50)?,
@@ -651,7 +671,10 @@ fn run_prompt_with_model_and_registry_stream(
         tools.specs().to_vec(),
         tool_executor,
         &model_transcript,
-        elroy_core::ConversationOptions { role, force_tool },
+        elroy_core::ConversationOptions {
+            role: options.role,
+            force_tool: options.force_tool,
+        },
         prompt,
     )?;
 
@@ -673,7 +696,7 @@ fn run_prompt_with_model_and_registry_stream(
             turn_stream,
             existing_transcript_len: existing_transcript.len(),
             transient_context_count: recall_context.len() + due_item_context.len(),
-            persist_input_message,
+            persist_input_message: options.persist_input_message,
             prelude_events,
         }),
         finalized_snapshot: None,
@@ -692,11 +715,15 @@ fn run_background_codex_completion_followup(
     run_prompt_with_model_and_registry(
         &mut connection,
         &prompt,
-        MessageRole::User,
         &model,
         build_live_tool_registry(config),
-        false,
-        None,
+        PromptExecutionOptions {
+            role: MessageRole::User,
+            persist_input_message: false,
+            force_tool: None,
+            memory_recall_classifier_enabled: config.memory_recall_classifier_enabled,
+            memory_recall_classifier_window: config.memory_recall_classifier_window,
+        },
     )?;
     Ok(())
 }
@@ -2585,15 +2612,17 @@ fn due_item_context_messages(items: &[AgendaItemRecord]) -> Vec<ConversationMess
 }
 
 fn recall_memory_context_messages(
+    memory_recall_classifier_enabled: bool,
+    memory_recall_classifier_window: usize,
     prompt: &str,
     transcript: &[ConversationMessage],
     memories: &[elroy_db::MemoryRecord],
 ) -> Vec<ConversationMessage> {
-    if should_skip_memory_recall(prompt) {
+    if memory_recall_classifier_enabled && should_skip_memory_recall(prompt) {
         return Vec::new();
     }
 
-    let recall_query = build_recall_query(prompt, transcript, 4);
+    let recall_query = build_recall_query(prompt, transcript, memory_recall_classifier_window);
     let already_recalled = recalled_memory_names(transcript);
     let recalled = select_recalled_memories(&recall_query, memories, &already_recalled, 3);
     if recalled.is_empty() {
@@ -2859,13 +2888,14 @@ mod tests {
     };
 
     use super::{
-        AppRuntime, LOCAL_USER_TOKEN, argument_limit, build_live_tool_registry,
-        build_live_tool_registry_with_codex_bin_and_hook, build_recall_query,
-        due_item_context_messages, parse_recalled_memory_names, provider_config_from_app_config,
-        recall_memory_context_messages, recalled_memory_names, recent_recall_context,
-        run_prompt_with_model_and_registry, run_prompt_with_model_and_registry_stream,
-        select_recalled_memories, should_offer_greeting, should_skip_memory_recall,
-        significant_tokens, strip_input_message_for_persistence, strip_transient_context_messages,
+        AppRuntime, LOCAL_USER_TOKEN, PromptExecutionOptions, argument_limit,
+        build_live_tool_registry, build_live_tool_registry_with_codex_bin_and_hook,
+        build_recall_query, due_item_context_messages, parse_recalled_memory_names,
+        provider_config_from_app_config, recall_memory_context_messages, recalled_memory_names,
+        recent_recall_context, run_prompt_with_model_and_registry,
+        run_prompt_with_model_and_registry_stream, select_recalled_memories, should_offer_greeting,
+        should_skip_memory_recall, significant_tokens, strip_input_message_for_persistence,
+        strip_transient_context_messages,
     };
     use elroy_agenda::create_agenda_file;
     use elroy_codex::{
@@ -3872,14 +3902,19 @@ mod tests {
         let model = FakeModel::new(vec![vec![StreamEvent::AssistantResponse {
             content: "Background review complete.".to_string(),
         }]]);
+        let config = AppConfig::defaults();
         let events = run_prompt_with_model_and_registry(
             &mut connection,
             "A background Codex session completed.",
-            MessageRole::User,
             &model,
             ExecutableToolRegistry::new(vec![]),
-            false,
-            None,
+            PromptExecutionOptions {
+                role: MessageRole::User,
+                persist_input_message: false,
+                force_tool: None,
+                memory_recall_classifier_enabled: config.memory_recall_classifier_enabled,
+                memory_recall_classifier_window: config.memory_recall_classifier_window,
+            },
         )
         .expect("background follow-up should succeed");
         let stored =
@@ -3923,14 +3958,19 @@ mod tests {
         let model = FakeModel::new(vec![vec![StreamEvent::AssistantResponse {
             content: "Acknowledged system bootstrap.".to_string(),
         }]]);
+        let config = AppConfig::defaults();
         run_prompt_with_model_and_registry(
             &mut connection,
             "System bootstrap message",
-            MessageRole::System,
             &model,
             ExecutableToolRegistry::new(vec![]),
-            true,
-            None,
+            PromptExecutionOptions {
+                role: MessageRole::System,
+                persist_input_message: true,
+                force_tool: None,
+                memory_recall_classifier_enabled: config.memory_recall_classifier_enabled,
+                memory_recall_classifier_window: config.memory_recall_classifier_window,
+            },
         )
         .expect("system-role prompt should succeed");
         let stored =
@@ -3967,14 +4007,19 @@ mod tests {
         run_migrations(&mut connection).expect("migrations should run");
 
         let model = FakeModel::new(vec![]);
+        let config = AppConfig::defaults();
         let error = run_prompt_with_model_and_registry(
             &mut connection,
             "Hello",
-            MessageRole::User,
             &model,
             ExecutableToolRegistry::new(vec![]),
-            true,
-            Some("missing_tool"),
+            PromptExecutionOptions {
+                role: MessageRole::User,
+                persist_input_message: true,
+                force_tool: Some("missing_tool"),
+                memory_recall_classifier_enabled: config.memory_recall_classifier_enabled,
+                memory_recall_classifier_window: config.memory_recall_classifier_window,
+            },
         )
         .expect_err("missing force tool should fail");
 
@@ -4006,14 +4051,19 @@ mod tests {
         let model = FakeModel::new(vec![vec![StreamEvent::AssistantResponse {
             content: "streamed hello".to_string(),
         }]]);
+        let config = AppConfig::defaults();
         let mut stream = run_prompt_with_model_and_registry_stream(
             connection,
             "hello",
-            MessageRole::User,
+            PromptExecutionOptions {
+                role: MessageRole::User,
+                persist_input_message: true,
+                force_tool: None,
+                memory_recall_classifier_enabled: config.memory_recall_classifier_enabled,
+                memory_recall_classifier_window: config.memory_recall_classifier_window,
+            },
             Box::new(model),
             ExecutableToolRegistry::new(vec![]),
-            true,
-            None,
         )
         .expect("stream should start");
 
@@ -4262,7 +4312,10 @@ mod tests {
 
     #[test]
     fn recall_memory_context_messages_create_synthetic_tool_context() {
+        let config = AppConfig::defaults();
         let messages = recall_memory_context_messages(
+            config.memory_recall_classifier_enabled,
+            config.memory_recall_classifier_window,
             "I am heading to basketball practice",
             &[],
             &[MemoryRecord {
@@ -4292,6 +4345,77 @@ mod tests {
                 .as_deref()
                 .is_some_and(|content| content.contains("basketball form"))
         );
+    }
+
+    #[test]
+    fn recall_memory_context_messages_can_bypass_classifier_when_disabled() {
+        let mut config = AppConfig::defaults();
+        config.memory_recall_classifier_enabled = false;
+        let transcript = vec![ConversationMessage::new(
+            MessageRole::User,
+            "I am training for basketball",
+        )];
+
+        let messages = recall_memory_context_messages(
+            config.memory_recall_classifier_enabled,
+            config.memory_recall_classifier_window,
+            "hi",
+            &transcript,
+            &[MemoryRecord {
+                id: 1,
+                legacy_frontmatter_id: None,
+                name: "practice plan".to_string(),
+                file_path: "/tmp/practice.md".to_string(),
+                body: "Warm up before basketball drills".to_string(),
+                is_active: true,
+                updated_at_unix: 10,
+            }],
+        );
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, MessageRole::Assistant);
+        assert_eq!(messages[1].role, MessageRole::Tool);
+    }
+
+    #[test]
+    fn recall_memory_context_messages_respect_configured_window() {
+        let transcript = vec![
+            ConversationMessage::new(MessageRole::User, "I am training for basketball"),
+            ConversationMessage::new(MessageRole::Assistant, "How is practice going?"),
+            ConversationMessage::new(MessageRole::User, "My sleep schedule is rough"),
+        ];
+        let memories = vec![MemoryRecord {
+            id: 1,
+            legacy_frontmatter_id: None,
+            name: "practice plan".to_string(),
+            file_path: "/tmp/practice.md".to_string(),
+            body: "Warm up before basketball drills".to_string(),
+            is_active: true,
+            updated_at_unix: 10,
+        }];
+
+        let mut narrow = AppConfig::defaults();
+        narrow.memory_recall_classifier_window = 1;
+        let narrow_messages = recall_memory_context_messages(
+            narrow.memory_recall_classifier_enabled,
+            narrow.memory_recall_classifier_window,
+            "What should I focus on?",
+            &transcript,
+            &memories,
+        );
+
+        let mut wide = AppConfig::defaults();
+        wide.memory_recall_classifier_window = 3;
+        let wide_messages = recall_memory_context_messages(
+            wide.memory_recall_classifier_enabled,
+            wide.memory_recall_classifier_window,
+            "What should I focus on?",
+            &transcript,
+            &memories,
+        );
+
+        assert!(narrow_messages.is_empty());
+        assert_eq!(wide_messages.len(), 2);
     }
 
     #[test]

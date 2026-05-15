@@ -50,7 +50,7 @@ The preferred approach is:
 - `M3` tool system and conversation loop: started with a messenger-style shared runtime surface for prompt processing and background follow-up turns, and now includes a live incremental provider-stream path through the shared messenger runtime
 - `M4` terminal UI shell: now consumes the shared messenger stream incrementally with editable-draft, blocked-resubmit, and `Ctrl+C` clear/cancel behavior, but still lacks broader bootstrap/session workflow parity
 - `M4` terminal UI shell: now consumes the shared messenger stream incrementally with editable-draft, blocked-resubmit, `Ctrl+C` clear/cancel behavior, startup restart/greeting stream handling, Python-style rendered-message bookkeeping after bootstrap/chat turns, and polled rendering of newly arrived background context-message tails, but still lacks broader mutation and background-status parity
-- `M4` memory, recall, reminders, agenda: started with file-backed memory/agenda/task flows and persisted local-user naming/persona preferences
+- `M4` memory, recall, reminders, agenda: started with file-backed memory/agenda/task flows, persisted local-user naming/persona preferences, and Python-style recall-classifier config gating/window controls on the shared prompt-time memory recall path
 - `M6` agent workflow and operational polish: started with persisted Codex-session metadata, async dispatch/resume orchestration, session-file discovery, background follow-up messaging, and session-inspection tools
 - `M5` TUI and UX parity: started with a `ratatui` shell
 

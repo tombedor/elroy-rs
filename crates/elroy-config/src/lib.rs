@@ -17,6 +17,8 @@ pub struct AppConfig {
     pub assistant_name: String,
     pub enable_assistant_greeting: bool,
     pub min_convo_age_for_greeting_minutes: f64,
+    pub memory_recall_classifier_enabled: bool,
+    pub memory_recall_classifier_window: usize,
     pub include_base_tools: bool,
     pub async_runtime_enabled: bool,
     pub openai_api_key: Option<String>,
@@ -73,6 +75,8 @@ impl AppConfig {
             assistant_name: "Elroy".to_string(),
             enable_assistant_greeting: false,
             min_convo_age_for_greeting_minutes: 5.0,
+            memory_recall_classifier_enabled: true,
+            memory_recall_classifier_window: 3,
             include_base_tools: true,
             async_runtime_enabled: true,
             openai_api_key: None,
@@ -106,6 +110,13 @@ impl AppConfig {
             file_config.min_convo_age_for_greeting_minutes
         {
             self.min_convo_age_for_greeting_minutes = min_convo_age_for_greeting_minutes;
+        }
+        if let Some(memory_recall_classifier_enabled) = file_config.memory_recall_classifier_enabled
+        {
+            self.memory_recall_classifier_enabled = memory_recall_classifier_enabled;
+        }
+        if let Some(memory_recall_classifier_window) = file_config.memory_recall_classifier_window {
+            self.memory_recall_classifier_window = memory_recall_classifier_window;
         }
         if let Some(include_base_tools) = file_config.include_base_tools {
             self.include_base_tools = include_base_tools;
@@ -151,6 +162,16 @@ impl AppConfig {
         {
             self.min_convo_age_for_greeting_minutes = parse_f64(min_convo_age_for_greeting_minutes);
         }
+        if let Some(memory_recall_classifier_enabled) =
+            env.get("ELROY_MEMORY_RECALL_CLASSIFIER_ENABLED")
+        {
+            self.memory_recall_classifier_enabled = parse_bool(memory_recall_classifier_enabled);
+        }
+        if let Some(memory_recall_classifier_window) =
+            env.get("ELROY_MEMORY_RECALL_CLASSIFIER_WINDOW")
+        {
+            self.memory_recall_classifier_window = parse_usize(memory_recall_classifier_window);
+        }
         if let Some(include_base_tools) = env.get("ELROY_INCLUDE_BASE_TOOLS") {
             self.include_base_tools = parse_bool(include_base_tools);
         }
@@ -185,6 +206,8 @@ struct FileConfig {
     default_assistant_name: Option<String>,
     enable_assistant_greeting: Option<bool>,
     min_convo_age_for_greeting_minutes: Option<f64>,
+    memory_recall_classifier_enabled: Option<bool>,
+    memory_recall_classifier_window: Option<usize>,
     include_base_tools: Option<bool>,
     memory_dir: Option<String>,
     agenda_dir: Option<String>,
@@ -286,6 +309,10 @@ fn parse_f64(value: &str) -> f64 {
     value.trim().parse::<f64>().unwrap_or(0.0)
 }
 
+fn parse_usize(value: &str) -> usize {
+    value.trim().parse::<usize>().unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -314,6 +341,8 @@ mod tests {
         assert!(config.include_base_tools);
         assert!(!config.enable_assistant_greeting);
         assert_eq!(config.min_convo_age_for_greeting_minutes, 5.0);
+        assert!(config.memory_recall_classifier_enabled);
+        assert_eq!(config.memory_recall_classifier_window, 3);
     }
 
     #[test]
@@ -342,7 +371,7 @@ mod tests {
         let config_path = home_dir.join("elroy.conf.yaml");
         fs::write(
             &config_path,
-            "chat_model: gpt-5-nano\nenable_assistant_greeting: true\nmin_convo_age_for_greeting_minutes: 15.5\nmemory_dir: /tmp/elroy-memories\nagenda_dir: /tmp/elroy-agenda\ndatabase_url: sqlite:////tmp/elroy.db\nirrelevant_key: ignored\n",
+            "chat_model: gpt-5-nano\nenable_assistant_greeting: true\nmin_convo_age_for_greeting_minutes: 15.5\nmemory_recall_classifier_enabled: false\nmemory_recall_classifier_window: 7\nmemory_dir: /tmp/elroy-memories\nagenda_dir: /tmp/elroy-agenda\ndatabase_url: sqlite:////tmp/elroy.db\nirrelevant_key: ignored\n",
         )
         .expect("config fixture should be written");
 
@@ -357,6 +386,8 @@ mod tests {
         assert_eq!(config.llm_provider(), LlmProvider::OpenAi);
         assert!(config.enable_assistant_greeting);
         assert_eq!(config.min_convo_age_for_greeting_minutes, 15.5);
+        assert!(!config.memory_recall_classifier_enabled);
+        assert_eq!(config.memory_recall_classifier_window, 7);
         assert!(config.include_base_tools);
 
         fs::remove_dir_all(home_dir).expect("temp home dir should be removed");
@@ -390,6 +421,14 @@ mod tests {
             (
                 "ELROY_MIN_CONVO_AGE_FOR_GREETING_MINUTES".to_string(),
                 "2.5".to_string(),
+            ),
+            (
+                "ELROY_MEMORY_RECALL_CLASSIFIER_ENABLED".to_string(),
+                "false".to_string(),
+            ),
+            (
+                "ELROY_MEMORY_RECALL_CLASSIFIER_WINDOW".to_string(),
+                "9".to_string(),
             ),
             (
                 "ELROY_MEMORY_DIR".to_string(),
@@ -429,6 +468,8 @@ mod tests {
         assert_eq!(config.assistant_name, "EnvElroy");
         assert!(config.enable_assistant_greeting);
         assert_eq!(config.min_convo_age_for_greeting_minutes, 2.5);
+        assert!(!config.memory_recall_classifier_enabled);
+        assert_eq!(config.memory_recall_classifier_window, 9);
         assert_eq!(config.memory_dir, PathBuf::from("/tmp/env-memories"));
         assert_eq!(config.agenda_dir, PathBuf::from("/tmp/env-agenda"));
         assert_eq!(config.database_path, PathBuf::from("/tmp/env.db"));
