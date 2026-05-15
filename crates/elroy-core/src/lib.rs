@@ -301,9 +301,15 @@ impl ConversationOrchestrator {
                             vec![call.clone()],
                         ));
 
+                        events.push(StreamEvent::StatusUpdate {
+                            content: format!("running {}...", call.name),
+                        });
                         let tool_event = tool_executor.execute(&call);
                         transcript.push(tool_event_to_message(&call, &tool_event));
                         events.push(tool_event);
+                        events.push(StreamEvent::StatusUpdate {
+                            content: "thinking...".to_string(),
+                        });
                     }
                     StreamEvent::AssistantResponse { content } => {
                         transcript.push(ConversationMessage::new(MessageRole::Assistant, &content));
@@ -395,12 +401,24 @@ impl TurnEventStream {
                     .push(StreamEvent::ToolCallRequested(call.clone()));
                 self.pending
                     .push_back(Ok(StreamEvent::ToolCallRequested(call.clone())));
+                self.events.push(StreamEvent::StatusUpdate {
+                    content: format!("running {}...", call.name),
+                });
+                self.pending.push_back(Ok(StreamEvent::StatusUpdate {
+                    content: format!("running {}...", call.name),
+                }));
 
                 let tool_event = self.tool_executor.execute(&call);
                 self.transcript
                     .push(tool_event_to_message(&call, &tool_event));
                 self.events.push(tool_event.clone());
                 self.pending.push_back(Ok(tool_event));
+                self.events.push(StreamEvent::StatusUpdate {
+                    content: "thinking...".to_string(),
+                });
+                self.pending.push_back(Ok(StreamEvent::StatusUpdate {
+                    content: "thinking...".to_string(),
+                }));
             }
             StreamEvent::AssistantResponse { content } => {
                 self.transcript
@@ -742,9 +760,15 @@ mod tests {
                     name: "get_weather".to_string(),
                     arguments_json: "{\"location\":\"Paris\"}".to_string(),
                 }),
+                StreamEvent::StatusUpdate {
+                    content: "running get_weather...".to_string(),
+                },
                 StreamEvent::AssistantToolResult {
                     content: "tool:get_weather:{\"location\":\"Paris\"}".to_string(),
                     is_error: false,
+                },
+                StreamEvent::StatusUpdate {
+                    content: "thinking...".to_string(),
                 },
                 StreamEvent::AssistantResponse {
                     content: "The weather in Paris is sunny.".to_string(),
@@ -801,9 +825,15 @@ mod tests {
                     name: "get_weather".to_string(),
                     arguments_json: "{\"location\":\"Paris\"}".to_string(),
                 }),
+                StreamEvent::StatusUpdate {
+                    content: "running get_weather...".to_string(),
+                },
                 StreamEvent::AssistantToolResult {
                     content: "tool:get_weather:{\"location\":\"Paris\"}".to_string(),
                     is_error: false,
+                },
+                StreamEvent::StatusUpdate {
+                    content: "thinking...".to_string(),
                 },
                 StreamEvent::AssistantResponse {
                     content: "The weather in Paris is sunny.".to_string(),
@@ -817,6 +847,53 @@ mod tests {
         );
         assert_eq!(turn_run.transcript[2].role, MessageRole::Tool);
         assert_eq!(turn_run.transcript[3].role, MessageRole::Assistant);
+    }
+
+    #[test]
+    fn streaming_turn_yields_tool_status_updates_in_order() {
+        let model = FakeModel::new(vec![
+            vec![StreamEvent::ToolCallRequested(ToolCall {
+                id: "call-1".to_string(),
+                name: "get_weather".to_string(),
+                arguments_json: "{\"location\":\"Paris\"}".to_string(),
+            })],
+            vec![StreamEvent::AssistantResponse {
+                content: "Done.".to_string(),
+            }],
+        ]);
+        let orchestrator = ConversationOrchestrator::new(1);
+        let mut stream = orchestrator
+            .stream_turn_with_transcript_and_options(
+                Box::new(model),
+                vec![weather_tool()],
+                Box::new(FakeToolExecutor),
+                &[],
+                super::ConversationOptions::default(),
+                "weather?",
+            )
+            .expect("stream should start");
+
+        assert!(matches!(
+            stream.next(),
+            Some(Ok(StreamEvent::ToolCallRequested(call))) if call.name == "get_weather"
+        ));
+        assert!(matches!(
+            stream.next(),
+            Some(Ok(StreamEvent::StatusUpdate { content })) if content == "running get_weather..."
+        ));
+        assert!(matches!(
+            stream.next(),
+            Some(Ok(StreamEvent::AssistantToolResult { content, is_error }))
+                if content == "tool:get_weather:{\"location\":\"Paris\"}" && !is_error
+        ));
+        assert!(matches!(
+            stream.next(),
+            Some(Ok(StreamEvent::StatusUpdate { content })) if content == "thinking..."
+        ));
+        assert!(matches!(
+            stream.next(),
+            Some(Ok(StreamEvent::AssistantResponse { content })) if content == "Done."
+        ));
     }
 
     #[test]
