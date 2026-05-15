@@ -3504,6 +3504,7 @@ mod tests {
         let script = r#"#!/bin/sh
 mode="dispatch"
 prompt=""
+session_root="${ELROY_CODEX_SESSION_SEARCH_ROOT:-}"
 for arg in "$@"; do
   if [ "$arg" = "resume" ]; then
     mode="resume"
@@ -3511,8 +3512,16 @@ for arg in "$@"; do
   prompt="$arg"
 done
 
+write_session_file() {
+  if [ -n "$session_root" ]; then
+    mkdir -p "$session_root/nested"
+    printf '{"thread_id":"thread-123"}\n' > "$session_root/nested/thread-123.jsonl"
+  fi
+}
+
 if [ "$mode" = "resume" ]; then
   printf "after resume\n" > notes.txt
+  write_session_file
   echo '{"type":"thread.started","thread_id":"thread-123"}'
   echo '{"type":"item.completed","item":{"id":"item_2","type":"agent_message","text":"resume complete"}}'
   exit 0
@@ -3520,6 +3529,7 @@ fi
 
 printf "after\n" > notes.txt
 pwd_out="$(pwd)"
+write_session_file
 echo '{"type":"thread.started","thread_id":"thread-123"}'
 printf '{"type":"item.completed","item":{"id":"item_1","type":"command_execution","command":"/bin/zsh -lc pwd","aggregated_output":"%s\\n","exit_code":0,"status":"completed"}}\n' "$pwd_out"
 echo '{"type":"item.completed","item":{"id":"item_2","type":"agent_message","text":"updated notes"}}'

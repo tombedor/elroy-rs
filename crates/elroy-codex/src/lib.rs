@@ -150,6 +150,7 @@ struct BackgroundRunContext {
     prompt: String,
     workspace: SessionWorkspace,
     before: RepoSnapshot,
+    session_search_root: Option<PathBuf>,
     child: Child,
     stdout: ChildOutputReader,
     stderr: Option<ChildStderr>,
@@ -371,12 +372,36 @@ pub fn dispatch_codex_session_with_bin(
     model: Option<&str>,
     codex_bin: &Path,
 ) -> Result<CodexSessionResult, CodexWorkflowError> {
+    dispatch_codex_session_with_bin_and_search_root(
+        database_path,
+        user_token,
+        prompt,
+        repo_path,
+        model,
+        codex_bin,
+        None,
+    )
+}
+
+fn dispatch_codex_session_with_bin_and_search_root(
+    database_path: &Path,
+    user_token: &str,
+    prompt: &str,
+    repo_path: Option<&Path>,
+    model: Option<&str>,
+    codex_bin: &Path,
+    session_search_root: Option<&Path>,
+) -> Result<CodexSessionResult, CodexWorkflowError> {
     let source_repo_root = resolve_repo_path(repo_path)?;
     let workspace = create_session_workspace(&source_repo_root)?;
     let before = snapshot_repo(&workspace.worktree_root)?;
     let args = build_codex_args(prompt, &workspace.worktree_root, None, model);
-    let (child, mut stdout, stderr) =
-        spawn_codex_process(codex_bin, &args, &workspace.worktree_root)?;
+    let (child, mut stdout, stderr) = spawn_codex_process(
+        codex_bin,
+        &args,
+        &workspace.worktree_root,
+        session_search_root,
+    )?;
     let (resolved_session_id, initial_stdout) = read_until_thread_started(stdout.take_reader())?;
 
     let running_result = build_running_result(&resolved_session_id, &workspace, &before);
@@ -388,6 +413,7 @@ pub fn dispatch_codex_session_with_bin(
         prompt: prompt.to_string(),
         workspace,
         before,
+        session_search_root: session_search_root.map(Path::to_path_buf),
         child,
         stdout,
         stderr,
@@ -424,6 +450,26 @@ pub fn resume_codex_session_with_bin(
     prompt: &str,
     model: Option<&str>,
     codex_bin: &Path,
+) -> Result<CodexSessionResult, CodexWorkflowError> {
+    resume_codex_session_with_bin_and_search_root(
+        database_path,
+        user_token,
+        session_id,
+        prompt,
+        model,
+        codex_bin,
+        None,
+    )
+}
+
+fn resume_codex_session_with_bin_and_search_root(
+    database_path: &Path,
+    user_token: &str,
+    session_id: &str,
+    prompt: &str,
+    model: Option<&str>,
+    codex_bin: &Path,
+    session_search_root: Option<&Path>,
 ) -> Result<CodexSessionResult, CodexWorkflowError> {
     let connection = Connection::open(database_path)?;
     let Some(record) = get_codex_session_by_thread_id(&connection, user_token, session_id)? else {
@@ -463,8 +509,12 @@ pub fn resume_codex_session_with_bin(
 
     let before = snapshot_repo(&workspace.worktree_root)?;
     let args = build_codex_args(prompt, &workspace.worktree_root, Some(session_id), model);
-    let (child, mut stdout, stderr) =
-        spawn_codex_process(codex_bin, &args, &workspace.worktree_root)?;
+    let (child, mut stdout, stderr) = spawn_codex_process(
+        codex_bin,
+        &args,
+        &workspace.worktree_root,
+        session_search_root,
+    )?;
     let (resolved_session_id, initial_stdout) = read_until_thread_started(stdout.take_reader())?;
 
     let running_result = build_running_result(&resolved_session_id, &workspace, &before);
@@ -476,6 +526,7 @@ pub fn resume_codex_session_with_bin(
         prompt: prompt.to_string(),
         workspace,
         before,
+        session_search_root: session_search_root.map(Path::to_path_buf),
         child,
         stdout,
         stderr,
@@ -514,7 +565,12 @@ fn complete_codex_session_in_background(mut context: BackgroundRunContext) {
             ));
         }
 
-        let mut result = build_result_from_stdout(&stdout, &context.workspace, &context.before)?;
+        let mut result = build_result_from_stdout(
+            &stdout,
+            &context.workspace,
+            &context.before,
+            context.session_search_root.as_deref(),
+        )?;
         let commit_note = commit_session_worktree_if_needed(
             &context.workspace.worktree_root,
             &context.workspace.session_branch,
@@ -819,6 +875,7 @@ fn spawn_codex_process(
     codex_bin: &Path,
     args: &[OsString],
     cwd: &Path,
+    session_search_root: Option<&Path>,
 ) -> Result<(Child, ChildOutputReader, Option<ChildStderr>), CodexWorkflowError> {
     let mut command = Command::new(codex_bin);
     command
@@ -826,6 +883,9 @@ fn spawn_codex_process(
         .current_dir(cwd)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    if let Some(root) = session_search_root {
+        command.env("ELROY_CODEX_SESSION_SEARCH_ROOT", root);
+    }
     let mut child = command.spawn()?;
     let stdout = child
         .stdout
@@ -1015,6 +1075,7 @@ fn build_result_from_stdout(
     stdout: &str,
     workspace: &SessionWorkspace,
     before: &RepoSnapshot,
+    session_search_root: Option<&Path>,
 ) -> Result<CodexSessionResult, CodexWorkflowError> {
     let (session_id, final_message, commands) = parse_codex_exec_output(stdout)?;
     let after = snapshot_repo(&workspace.worktree_root)?;
@@ -1040,7 +1101,7 @@ fn build_result_from_stdout(
         dirty_paths_before: before.dirty_paths.clone(),
         dirty_paths_after: after.dirty_paths.clone(),
         commands,
-        session_file_path: None,
+        session_file_path: find_session_file_path(&session_id, session_search_root),
         resume_command: format!(
             "codex resume {session_id} -C {}",
             workspace.worktree_root.display()
@@ -1095,6 +1156,58 @@ fn build_summary(
     }
     lines.push(format!("Final message: {}", final_message.trim()));
     lines.join("\n")
+}
+
+fn find_session_file_path(thread_id: &str, search_root: Option<&Path>) -> Option<String> {
+    let root = search_root
+        .map(Path::to_path_buf)
+        .or_else(default_session_search_root)?;
+    find_session_file_path_in_dir(&root, thread_id).map(|path| path.display().to_string())
+}
+
+fn default_session_search_root() -> Option<PathBuf> {
+    std::env::var_os("ELROY_CODEX_SESSION_SEARCH_ROOT")
+        .map(PathBuf::from)
+        .or_else(home_dir)
+        .map(|path| {
+            if path.ends_with(".codex/sessions") {
+                path
+            } else {
+                path.join(".codex").join("sessions")
+            }
+        })
+}
+
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from))
+}
+
+fn find_session_file_path_in_dir(root: &Path, thread_id: &str) -> Option<PathBuf> {
+    if !root.exists() {
+        return None;
+    }
+
+    let suffix = format!("{thread_id}.jsonl");
+    let entries = std::fs::read_dir(root).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if let Some(found) = find_session_file_path_in_dir(&path, thread_id) {
+                return Some(found);
+            }
+            continue;
+        }
+        if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with(&suffix))
+        {
+            return Some(path);
+        }
+    }
+    None
 }
 
 fn commit_session_worktree_if_needed(
@@ -1294,8 +1407,9 @@ mod tests {
 
     use super::{
         CodexCommandRecord, CodexSessionUpdate, dispatch_codex_session_with_bin,
-        get_codex_session_by_thread_id, list_recent_codex_sessions, resume_codex_session_with_bin,
-        upsert_codex_session,
+        dispatch_codex_session_with_bin_and_search_root, get_codex_session_by_thread_id,
+        list_recent_codex_sessions, resume_codex_session_with_bin,
+        resume_codex_session_with_bin_and_search_root, upsert_codex_session,
     };
 
     fn run_test_migrations(connection: &mut Connection) {
@@ -1438,8 +1552,10 @@ mod tests {
         let development_root = root.join("development");
         let repo_root = development_root.join("sample");
         let bin_dir = root.join("bin");
+        let session_root = root.join(".codex").join("sessions");
         let database_path = root.join("elroy.db");
         fs::create_dir_all(&bin_dir).expect("bin dir should exist");
+        fs::create_dir_all(&session_root).expect("session root should exist");
         init_repo(&repo_root);
         write_fake_codex_script(&bin_dir.join("codex"));
 
@@ -1447,13 +1563,14 @@ mod tests {
         run_test_migrations(&mut connection);
         drop(connection);
 
-        let result = dispatch_codex_session_with_bin(
+        let result = dispatch_codex_session_with_bin_and_search_root(
             &database_path,
             "local-user",
             "update notes",
             Some(&repo_root),
             None,
             &bin_dir.join("codex"),
+            Some(&session_root),
         )
         .expect("dispatch should succeed");
 
@@ -1465,11 +1582,16 @@ mod tests {
         assert_eq!(result.target_branch.as_deref(), Some("agent"));
 
         let completed = wait_for_status(&database_path, "local-user", "thread-123", "completed");
+        let expected_session_file = session_root.join("nested").join("thread-123.jsonl");
         assert_eq!(
             completed.latest_agent_message.as_deref(),
             Some("updated notes")
         );
         assert_eq!(completed.status, "completed");
+        assert_eq!(
+            completed.session_file_path.as_deref(),
+            Some(expected_session_file.to_string_lossy().as_ref())
+        );
 
         let agent_head = std::process::Command::new("git")
             .args([
@@ -1493,8 +1615,10 @@ mod tests {
         let development_root = root.join("development");
         let repo_root = development_root.join("sample");
         let bin_dir = root.join("bin");
+        let session_root = root.join(".codex").join("sessions");
         let database_path = root.join("elroy.db");
         fs::create_dir_all(&bin_dir).expect("bin dir should exist");
+        fs::create_dir_all(&session_root).expect("session root should exist");
         init_repo(&repo_root);
         write_fake_codex_script(&bin_dir.join("codex"));
 
@@ -1502,27 +1626,30 @@ mod tests {
         run_test_migrations(&mut connection);
         drop(connection);
 
-        let initial = dispatch_codex_session_with_bin(
+        let initial = dispatch_codex_session_with_bin_and_search_root(
             &database_path,
             "local-user",
             "update notes",
             Some(&repo_root),
             None,
             &bin_dir.join("codex"),
+            Some(&session_root),
         )
         .expect("initial dispatch should succeed");
         let _ = wait_for_status(&database_path, "local-user", "thread-123", "completed");
 
-        let resumed = resume_codex_session_with_bin(
+        let resumed = resume_codex_session_with_bin_and_search_root(
             &database_path,
             "local-user",
             "thread-123",
             "follow up",
             None,
             &bin_dir.join("codex"),
+            Some(&session_root),
         )
         .expect("resume should succeed");
         let completed = wait_for_status(&database_path, "local-user", "thread-123", "completed");
+        let expected_session_file = session_root.join("nested").join("thread-123.jsonl");
         let listed = list_recent_codex_sessions(
             &Connection::open(&database_path).expect("db should open"),
             "local-user",
@@ -1536,6 +1663,10 @@ mod tests {
         assert_eq!(
             completed.latest_agent_message.as_deref(),
             Some("resume complete")
+        );
+        assert_eq!(
+            completed.session_file_path.as_deref(),
+            Some(expected_session_file.to_string_lossy().as_ref())
         );
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].thread_id, "thread-123");
@@ -1682,6 +1813,7 @@ mod tests {
         let script = r#"#!/bin/sh
 mode="dispatch"
 prompt=""
+session_root="${ELROY_CODEX_SESSION_SEARCH_ROOT:-}"
 for arg in "$@"; do
   if [ "$arg" = "resume" ]; then
     mode="resume"
@@ -1689,8 +1821,16 @@ for arg in "$@"; do
   prompt="$arg"
 done
 
+write_session_file() {
+  if [ -n "$session_root" ]; then
+    mkdir -p "$session_root/nested"
+    printf '{"thread_id":"thread-123"}\n' > "$session_root/nested/thread-123.jsonl"
+  fi
+}
+
 if [ "$mode" = "resume" ]; then
   printf "after resume\n" > notes.txt
+  write_session_file
   echo '{"type":"thread.started","thread_id":"thread-123"}'
   echo '{"type":"item.completed","item":{"id":"item_2","type":"agent_message","text":"resume complete"}}'
   exit 0
@@ -1719,6 +1859,7 @@ fi
 
 printf "after\n" > notes.txt
 pwd_out="$(pwd)"
+write_session_file
 echo '{"type":"thread.started","thread_id":"thread-123"}'
 printf '{"type":"item.completed","item":{"id":"item_1","type":"command_execution","command":"/bin/zsh -lc pwd","aggregated_output":"%s\\n","exit_code":0,"status":"completed"}}\n' "$pwd_out"
 echo '{"type":"item.completed","item":{"id":"item_2","type":"agent_message","text":"updated notes"}}'
