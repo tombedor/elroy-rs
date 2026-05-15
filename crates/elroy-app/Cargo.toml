@@ -11,6 +11,7 @@ workspace = true
 
 [dependencies]
 elroy-agenda = { path = "../elroy-agenda" }
+elroy-codex = { path = "../elroy-codex" }
 elroy-config = { path = "../elroy-config" }
 elroy-core = { path = "../elroy-core" }
 elroy-db = { path = "../elroy-db" }

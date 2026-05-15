@@ -105,5 +105,6 @@ Current implemented coverage:
 - `elroy-app`: shared runtime behavior for provider config translation, snapshot loading, prompt execution, DB-backed sidebar-detail loading, and file-backed memory/agenda mutation tools
 - `elroy-tools`: canonical tool schema, provider adapter projections, and executable local registry behavior including DB-backed read/write tools in the shared runtime
 - `elroy-tui`: layout shell, focus-mode state machine, terminal key mapping, event-loop action transitions, runtime-backed prompt submission, runtime-backed sidebar opening, runtime-backed sidebar mutation actions, and snapshot rendering
+- `elroy-codex` + `elroy-app`: persisted Codex-session upsert/get/list behavior plus live read-only session inspection tools
 
 This is only bootstrap-level coverage. It does not yet prove product parity.

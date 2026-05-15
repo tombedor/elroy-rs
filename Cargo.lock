@@ -317,6 +317,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "elroy-agenda",
+ "elroy-codex",
  "elroy-config",
  "elroy-core",
  "elroy-db",
@@ -341,6 +342,14 @@ dependencies = [
  "elroy-db",
  "elroy-llm",
  "elroy-tui",
+]
+
+[[package]]
+name = "elroy-codex"
+version = "0.1.0"
+dependencies = [
+ "rusqlite",
+ "serde_json",
 ]
 
 [[package]]

@@ -5,6 +5,7 @@ members = [
     "crates/elroy-cli",
     "crates/elroy-config",
     "crates/elroy-core",
+    "crates/elroy-codex",
     "crates/elroy-db",
     "crates/elroy-llm",
     "crates/elroy-memory",

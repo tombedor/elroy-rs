@@ -7,6 +7,7 @@ use elroy_agenda::{
     mark_agenda_item_completed, mark_agenda_item_deleted, rename_agenda_file, update_agenda_body,
     update_checklist_item,
 };
+use elroy_codex::{get_codex_session_by_thread_id, list_recent_codex_sessions};
 use elroy_config::{AppConfig, LlmProvider};
 use elroy_core::{
     ConversationOrchestrator, LiveProviderModel, LocalToolExecutor, validated_transcript,
@@ -1195,6 +1196,106 @@ pub fn build_live_tool_registry(config: &AppConfig) -> ExecutableToolRegistry {
     );
 
     let database_path = config.database_path.clone();
+    let list_codex_sessions = ExecutableTool::new(
+        ToolSpec::new(
+            "list_codex_sessions",
+            "List recently recorded Codex sessions for this local user.",
+            JsonSchema::object(
+                [
+                    ("repo_path", json!({"type": "string"})),
+                    ("limit", json!({"type": "integer"})),
+                ],
+                [] as [&str; 0],
+            ),
+        ),
+        move |arguments| {
+            let limit = argument_limit(&arguments, 5);
+            let repo_path = arguments.get("repo_path").and_then(Value::as_str);
+            with_tool_connection(&database_path, |connection| {
+                let sessions = list_recent_codex_sessions(
+                    connection,
+                    LOCAL_USER_TOKEN,
+                    repo_path.map(Path::new),
+                    limit,
+                )?;
+                let payload = sessions
+                    .into_iter()
+                    .map(|session| {
+                        json!({
+                            "session_id": session.thread_id,
+                            "repo_path": session.repo_path,
+                            "worktree_path": session.worktree_path,
+                            "session_branch": session.session_branch,
+                            "target_branch": session.target_branch,
+                            "status": session.status,
+                            "updated_at_unix": session.updated_at_unix,
+                            "summary": session.latest_summary,
+                            "final_message": session.latest_agent_message,
+                            "touched_paths": session.touched_paths,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                Ok(ToolExecutionResult::success(
+                    serde_json::to_string_pretty(&payload)
+                        .expect("codex session payload should serialize"),
+                ))
+            })
+        },
+    );
+
+    let database_path = config.database_path.clone();
+    let show_codex_session = ExecutableTool::new(
+        ToolSpec::new(
+            "show_codex_session",
+            "Show one recorded Codex session by exact session id.",
+            JsonSchema::object([("session_id", json!({"type": "string"}))], ["session_id"]),
+        ),
+        move |arguments| {
+            let Some(session_id) = arguments.get("session_id").and_then(Value::as_str) else {
+                return ToolExecutionResult::error(
+                    "show_codex_session requires a string session_id",
+                );
+            };
+            with_tool_connection(&database_path, |connection| {
+                let Some(session) =
+                    get_codex_session_by_thread_id(connection, LOCAL_USER_TOKEN, session_id)?
+                else {
+                    return Ok(ToolExecutionResult::error(format!(
+                        "codex session not found: {session_id}"
+                    )));
+                };
+                Ok(ToolExecutionResult::success(
+                    json!({
+                        "session_id": session.thread_id,
+                        "repo_path": session.repo_path,
+                        "worktree_path": session.worktree_path,
+                        "session_branch": session.session_branch,
+                        "target_branch": session.target_branch,
+                        "latest_prompt": session.latest_prompt,
+                        "summary": session.latest_summary,
+                        "final_message": session.latest_agent_message,
+                        "status": session.status,
+                        "command_count": session.command_count,
+                        "commands": session.commands.into_iter().map(|command| {
+                            json!({
+                                "command": command.command,
+                                "exit_code": command.exit_code,
+                                "output_excerpt": command.output_excerpt,
+                            })
+                        }).collect::<Vec<_>>(),
+                        "touched_paths": session.touched_paths,
+                        "dirty_paths_before": session.dirty_paths_before,
+                        "dirty_paths_after": session.dirty_paths_after,
+                        "session_file_path": session.session_file_path,
+                        "updated_at_unix": session.updated_at_unix,
+                    })
+                    .to_string(),
+                ))
+            })
+        },
+    );
+
+    let database_path = config.database_path.clone();
     let list_tasks = ExecutableTool::new(
         ToolSpec::new(
             "list_tasks",
@@ -1511,6 +1612,8 @@ pub fn build_live_tool_registry(config: &AppConfig) -> ExecutableToolRegistry {
         get_user_preferred_name,
         set_user_full_name,
         get_user_full_name,
+        list_codex_sessions,
+        show_codex_session,
         update_task_text,
         update_due_item_text,
         rename_task,
@@ -2115,11 +2218,15 @@ pub fn provider_config_from_app_config(config: &AppConfig) -> Result<ProviderCon
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashSet, fs};
+    use std::{collections::HashSet, fs, path::PathBuf};
 
     use elroy_agenda::create_agenda_file;
+    use elroy_codex::{CodexCommandRecord, CodexSessionUpdate, upsert_codex_session};
     use elroy_config::{AppConfig, LlmProvider};
-    use elroy_db::{AgendaItemRecord, MemoryRecord, load_user_preferences, open_sqlite_connection};
+    use elroy_db::{
+        AgendaItemRecord, MemoryRecord, load_user_preferences, open_sqlite_connection,
+        run_migrations,
+    };
     use elroy_llm::{ConversationMessage, MessageRole, Provider};
     use elroy_memory::{create_memory_file, sanitize_filename};
 
@@ -2672,6 +2779,76 @@ mod tests {
         let deleted_text =
             fs::read_to_string(agenda_dir.join("inbox_zero.md")).expect("task file should read");
         assert!(deleted_text.contains("status: deleted"));
+
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
+    fn live_tool_registry_can_list_and_show_codex_sessions() {
+        let unique = format!(
+            "elroy-rs-app-codex-sessions-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+
+        let mut config = AppConfig::defaults();
+        config.memory_dir = memory_dir;
+        config.agenda_dir = agenda_dir;
+        config.database_path = database_path.clone();
+
+        let mut connection = open_sqlite_connection(&database_path).expect("database should open");
+        run_migrations(&mut connection).expect("migrations should run");
+        upsert_codex_session(
+            &mut connection,
+            LOCAL_USER_TOKEN,
+            "thread-123",
+            &CodexSessionUpdate {
+                repo_path: PathBuf::from("/tmp/sample"),
+                worktree_path: Some(PathBuf::from("/tmp/.elroy-codex-worktrees/sample")),
+                session_branch: Some("elroy-codex-abcd1234".to_string()),
+                target_branch: Some("agent".to_string()),
+                prompt: "Fix the parser".to_string(),
+                summary: "Codex updated the parser.".to_string(),
+                agent_message: "Parser update complete.".to_string(),
+                status: "completed".to_string(),
+                commands: vec![CodexCommandRecord {
+                    command: "/bin/zsh -lc cargo test".to_string(),
+                    exit_code: Some(0),
+                    output_excerpt: "ok\n".to_string(),
+                }],
+                touched_paths: vec!["src/parser.rs".to_string()],
+                dirty_paths_before: vec!["README.md".to_string()],
+                dirty_paths_after: vec!["src/parser.rs".to_string()],
+                session_file_path: Some("/tmp/.codex/sessions/thread-123.jsonl".to_string()),
+            },
+        )
+        .expect("codex session should persist");
+
+        let registry = build_live_tool_registry(&config);
+        let listed = registry.invoke("list_codex_sessions", "{\"limit\":5}");
+        assert!(!listed.is_error);
+        assert!(listed.content.contains("thread-123"));
+        assert!(listed.content.contains("/tmp/sample"));
+
+        let filtered = registry.invoke(
+            "list_codex_sessions",
+            "{\"repo_path\":\"/tmp/sample\",\"limit\":5}",
+        );
+        assert!(!filtered.is_error);
+        assert!(filtered.content.contains("thread-123"));
+
+        let shown = registry.invoke("show_codex_session", "{\"session_id\":\"thread-123\"}");
+        assert!(!shown.is_error);
+        assert!(shown.content.contains("Fix the parser"));
+        assert!(shown.content.contains("cargo test"));
 
         fs::remove_dir_all(home).expect("home should be removed");
     }

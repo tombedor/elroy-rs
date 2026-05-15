@@ -1588,4 +1588,21 @@ mod tests {
         assert_eq!(loaded.preferred_name.as_deref(), Some("Jimmy"));
         assert_eq!(loaded.full_name.as_deref(), Some("James Smith"));
     }
+
+    #[test]
+    fn migrations_create_codex_sessions_table() {
+        let mut connection = Connection::open_in_memory().expect("sqlite should open");
+
+        run_migrations(&mut connection).expect("migrations should run");
+
+        let table_name: String = connection
+            .query_row(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'codex_sessions'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("codex_sessions table should exist");
+
+        assert_eq!(table_name, "codex_sessions");
+    }
 }
