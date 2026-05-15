@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -16,7 +16,7 @@ use elroy_codex::{
 use elroy_config::{AppConfig, LlmProvider};
 use elroy_core::{
     ConversationOrchestrator, LiveProviderModel, LocalToolExecutor, ModelClient,
-    validated_transcript,
+    StreamingModelClient, TurnEventStream, validated_transcript,
 };
 use elroy_db::{
     AgendaItemRecord, BootstrapPlan, UserPreferenceRecord, find_active_agenda_item_by_name,
@@ -99,19 +99,23 @@ pub struct PromptRunResult {
     pub snapshot: TuiSnapshot,
 }
 
-#[derive(Debug, Clone)]
 pub struct PromptEventStream {
-    events: std::vec::IntoIter<StreamEvent>,
-    snapshot: TuiSnapshot,
+    state: Option<PromptEventStreamState>,
+    finalized_snapshot: Option<Result<TuiSnapshot, AppError>>,
 }
 
 impl PromptEventStream {
-    pub fn snapshot(&self) -> &TuiSnapshot {
-        &self.snapshot
+    pub fn snapshot(&self) -> Option<&TuiSnapshot> {
+        self.finalized_snapshot
+            .as_ref()
+            .and_then(|result| result.as_ref().ok())
     }
 
-    pub fn into_snapshot(self) -> TuiSnapshot {
-        self.snapshot
+    pub fn into_snapshot(mut self) -> Result<TuiSnapshot, AppError> {
+        while self.next().is_some() {}
+        self.finalized_snapshot
+            .take()
+            .unwrap_or_else(|| Err(AppError::Runtime("stream did not finalize".to_string())))
     }
 }
 
@@ -119,8 +123,34 @@ impl Iterator for PromptEventStream {
     type Item = StreamEvent;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.events.next()
+        let state = self.state.as_mut()?;
+        if let Some(event) = state.prelude_events.pop_front() {
+            return Some(event);
+        }
+
+        match state.turn_stream.next() {
+            Some(Ok(event)) => Some(event),
+            Some(Err(error)) => {
+                self.finalized_snapshot = Some(Err(AppError::from(error)));
+                self.state = None;
+                None
+            }
+            None => {
+                let state = self.state.take().expect("stream state should exist");
+                self.finalized_snapshot = Some(finalize_prompt_event_stream(state));
+                None
+            }
+        }
     }
+}
+
+struct PromptEventStreamState {
+    connection: rusqlite::Connection,
+    turn_stream: TurnEventStream,
+    existing_transcript_len: usize,
+    transient_context_count: usize,
+    persist_input_message: bool,
+    prelude_events: VecDeque<StreamEvent>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -158,40 +188,7 @@ impl AppRuntime {
 
     pub fn load_snapshot(&self) -> Result<TuiSnapshot, AppError> {
         let mut connection = self.open_connection()?;
-        let conversation_lines = load_context_messages(&mut connection, LOCAL_USER_TOKEN)?
-            .into_iter()
-            .map(|message| {
-                let role = match message.role {
-                    elroy_llm::MessageRole::System => "system",
-                    elroy_llm::MessageRole::User => "user",
-                    elroy_llm::MessageRole::Assistant => "assistant",
-                    elroy_llm::MessageRole::Tool => "tool",
-                };
-                let content = message.content.unwrap_or_default();
-                format!("{role}: {content}")
-            })
-            .collect::<Vec<_>>();
-        let memory_titles = list_active_memories(&connection, 15)?
-            .into_iter()
-            .map(|memory| memory.name)
-            .collect::<Vec<_>>();
-        let agenda_titles = list_active_plain_agenda_items(&connection, 15)?
-            .into_iter()
-            .map(|item| item.name)
-            .collect::<Vec<_>>();
-        let codex_session_titles =
-            list_recent_codex_sessions(&connection, LOCAL_USER_TOKEN, None, 15)?
-                .into_iter()
-                .map(|session| format_codex_session_title(&session))
-                .collect::<Vec<_>>();
-
-        Ok(TuiSnapshot {
-            conversation_lines,
-            memory_titles,
-            agenda_titles,
-            codex_session_titles,
-            status: Some("loaded persisted transcript and sidebar data".to_string()),
-        })
+        load_snapshot_from_connection(&mut connection)
     }
 
     pub fn submit_prompt(&self, prompt: &str) -> Result<PromptRunResult, AppError> {
@@ -203,11 +200,28 @@ impl AppRuntime {
         prompt: &str,
         options: MessageProcessOptions,
     ) -> Result<PromptEventStream, AppError> {
-        let result = self.process_message(prompt, options)?;
-        Ok(PromptEventStream {
-            events: result.events.into_iter(),
-            snapshot: result.snapshot,
-        })
+        let connection = self.open_connection()?;
+        let preferences = load_user_preferences(&connection, LOCAL_USER_TOKEN)?;
+        let model = live_provider_model(&self.config, preferences.as_ref())?;
+        let executable_tools = if options.enable_tools {
+            build_live_tool_registry(&self.config)
+        } else {
+            ExecutableToolRegistry::new(vec![])
+        };
+        let force_tool = if options.enable_tools {
+            options.force_tool.as_deref()
+        } else {
+            None
+        };
+        run_prompt_with_model_and_registry_stream(
+            connection,
+            prompt,
+            options.role,
+            Box::new(model),
+            executable_tools,
+            options.persist_input_message,
+            force_tool,
+        )
     }
 
     pub fn process_message(
@@ -240,7 +254,7 @@ impl AppRuntime {
 
         Ok(PromptRunResult {
             events,
-            snapshot: self.load_snapshot()?,
+            snapshot: load_snapshot_from_connection(&mut connection)?,
         })
     }
 
@@ -387,6 +401,65 @@ impl AppRuntime {
     }
 }
 
+fn load_snapshot_from_connection(
+    connection: &mut rusqlite::Connection,
+) -> Result<TuiSnapshot, AppError> {
+    let conversation_lines = load_context_messages(connection, LOCAL_USER_TOKEN)?
+        .into_iter()
+        .map(|message| {
+            let role = match message.role {
+                elroy_llm::MessageRole::System => "system",
+                elroy_llm::MessageRole::User => "user",
+                elroy_llm::MessageRole::Assistant => "assistant",
+                elroy_llm::MessageRole::Tool => "tool",
+            };
+            let content = message.content.unwrap_or_default();
+            format!("{role}: {content}")
+        })
+        .collect::<Vec<_>>();
+    let memory_titles = list_active_memories(connection, 15)?
+        .into_iter()
+        .map(|memory| memory.name)
+        .collect::<Vec<_>>();
+    let agenda_titles = list_active_plain_agenda_items(connection, 15)?
+        .into_iter()
+        .map(|item| item.name)
+        .collect::<Vec<_>>();
+    let codex_session_titles = list_recent_codex_sessions(connection, LOCAL_USER_TOKEN, None, 15)?
+        .into_iter()
+        .map(|session| format_codex_session_title(&session))
+        .collect::<Vec<_>>();
+
+    Ok(TuiSnapshot {
+        conversation_lines,
+        memory_titles,
+        agenda_titles,
+        codex_session_titles,
+        status: Some("loaded persisted transcript and sidebar data".to_string()),
+    })
+}
+
+fn finalize_prompt_event_stream(
+    mut state: PromptEventStreamState,
+) -> Result<TuiSnapshot, AppError> {
+    let turn_run = state.turn_stream.finish()?;
+    let persisted_transcript = strip_input_message_for_persistence(
+        strip_transient_context_messages(
+            turn_run.transcript,
+            state.existing_transcript_len,
+            state.transient_context_count,
+        ),
+        state.existing_transcript_len,
+        state.persist_input_message,
+    );
+    replace_context_messages(
+        &mut state.connection,
+        LOCAL_USER_TOKEN,
+        &persisted_transcript,
+    )?;
+    load_snapshot_from_connection(&mut state.connection)
+}
+
 fn live_provider_model(
     config: &AppConfig,
     preferences: Option<&UserPreferenceRecord>,
@@ -464,6 +537,71 @@ fn run_prompt_with_model_and_registry(
     }
     events.extend(turn_run.events);
     Ok(events)
+}
+
+fn run_prompt_with_model_and_registry_stream(
+    mut connection: rusqlite::Connection,
+    prompt: &str,
+    role: MessageRole,
+    model: Box<dyn StreamingModelClient>,
+    executable_tools: ExecutableToolRegistry,
+    persist_input_message: bool,
+    force_tool: Option<&str>,
+) -> Result<PromptEventStream, AppError> {
+    let tools = ToolRegistry::new(executable_tools.specs());
+    if let Some(force_tool) = force_tool
+        && !tools.specs().iter().any(|tool| tool.name == force_tool)
+    {
+        return Err(AppError::Runtime(format!(
+            "Requested tool {force_tool} not available."
+        )));
+    }
+    let orchestrator = ConversationOrchestrator::new(2);
+    let tool_executor = Box::new(LocalToolExecutor::new(executable_tools));
+    let existing_transcript =
+        validated_transcript(&load_context_messages(&mut connection, LOCAL_USER_TOKEN)?);
+    let recall_context = recall_memory_context_messages(
+        prompt,
+        &existing_transcript,
+        &list_active_memories(&connection, 50)?,
+    );
+    let due_item_context = due_item_context_messages(&list_active_due_items(&connection, 20)?);
+    let mut model_transcript = existing_transcript.clone();
+    model_transcript.extend(recall_context.iter().cloned());
+    model_transcript.extend(due_item_context.iter().cloned());
+
+    let turn_stream = orchestrator.stream_turn_with_transcript_and_options(
+        model,
+        tools.specs().to_vec(),
+        tool_executor,
+        &model_transcript,
+        elroy_core::ConversationOptions { role, force_tool },
+        prompt,
+    )?;
+
+    let mut prelude_events = VecDeque::new();
+    if !recall_context.is_empty() {
+        prelude_events.push_back(StreamEvent::StatusUpdate {
+            content: "fetching memories...".to_string(),
+        });
+    }
+    if !due_item_context.is_empty() {
+        prelude_events.push_back(StreamEvent::StatusUpdate {
+            content: "surfacing due items...".to_string(),
+        });
+    }
+
+    Ok(PromptEventStream {
+        state: Some(PromptEventStreamState {
+            connection,
+            turn_stream,
+            existing_transcript_len: existing_transcript.len(),
+            transient_context_count: recall_context.len() + due_item_context.len(),
+            persist_input_message,
+            prelude_events,
+        }),
+        finalized_snapshot: None,
+    })
 }
 
 fn run_background_codex_completion_followup(
@@ -2643,12 +2781,21 @@ mod tests {
         time::{Duration, Instant},
     };
 
+    use super::{
+        AppRuntime, LOCAL_USER_TOKEN, argument_limit, build_live_tool_registry,
+        build_live_tool_registry_with_codex_bin_and_hook, build_recall_query,
+        due_item_context_messages, parse_recalled_memory_names, provider_config_from_app_config,
+        recall_memory_context_messages, recalled_memory_names, recent_recall_context,
+        run_prompt_with_model_and_registry, run_prompt_with_model_and_registry_stream,
+        select_recalled_memories, should_skip_memory_recall, significant_tokens,
+        strip_input_message_for_persistence, strip_transient_context_messages,
+    };
     use elroy_agenda::create_agenda_file;
     use elroy_codex::{
         CodexCommandRecord, CodexSessionResult, CodexSessionUpdate, upsert_codex_session,
     };
     use elroy_config::{AppConfig, LlmProvider};
-    use elroy_core::{ConversationRequest, ModelClient};
+    use elroy_core::{ConversationRequest, ModelClient, StreamingModelClient};
     use elroy_db::{
         AgendaItemRecord, MemoryRecord, load_user_preferences, open_sqlite_connection,
         run_migrations,
@@ -2656,16 +2803,6 @@ mod tests {
     use elroy_llm::{ConversationMessage, MessageRole, Provider, StreamEvent};
     use elroy_memory::{create_memory_file, sanitize_filename};
     use elroy_tools::ExecutableToolRegistry;
-    use elroy_tui::TuiSnapshot;
-
-    use super::{
-        AppRuntime, LOCAL_USER_TOKEN, argument_limit, build_live_tool_registry,
-        build_live_tool_registry_with_codex_bin_and_hook, build_recall_query,
-        due_item_context_messages, parse_recalled_memory_names, provider_config_from_app_config,
-        recall_memory_context_messages, recalled_memory_names, recent_recall_context,
-        run_prompt_with_model_and_registry, select_recalled_memories, should_skip_memory_recall,
-        significant_tokens, strip_input_message_for_persistence, strip_transient_context_messages,
-    };
 
     struct FakeModel {
         responses: RefCell<Vec<Vec<StreamEvent>>>,
@@ -2685,6 +2822,19 @@ mod tests {
             _request: ConversationRequest<'_>,
         ) -> Result<Vec<StreamEvent>, elroy_core::ModelClientError> {
             Ok(self.responses.borrow_mut().remove(0))
+        }
+    }
+
+    impl StreamingModelClient for FakeModel {
+        fn stream_events(
+            &self,
+            _request: ConversationRequest<'_>,
+        ) -> Result<
+            Box<dyn Iterator<Item = Result<StreamEvent, elroy_core::ModelClientError>>>,
+            elroy_core::ModelClientError,
+        > {
+            let events = self.responses.borrow_mut().remove(0);
+            Ok(Box::new(events.into_iter().map(Ok)))
         }
     }
 
@@ -3760,25 +3910,55 @@ mod tests {
     }
 
     #[test]
-    fn prompt_event_stream_yields_events_and_keeps_snapshot() {
-        let stream = super::PromptEventStream {
-            events: vec![StreamEvent::StatusUpdate {
-                content: "thinking".to_string(),
-            }]
-            .into_iter(),
-            snapshot: TuiSnapshot {
-                status: Some("done".to_string()),
-                ..TuiSnapshot::default()
-            },
-        };
+    fn prompt_event_stream_finalizes_snapshot_after_drain() {
+        let unique = format!(
+            "elroy-rs-app-stream-finalize-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(home.join("memories")).expect("memory dir should be created");
+        fs::create_dir_all(home.join("agenda")).expect("agenda dir should be created");
 
-        let mut collected = stream.clone();
+        let mut connection = open_sqlite_connection(&database_path).expect("database should open");
+        run_migrations(&mut connection).expect("migrations should run");
+
+        let model = FakeModel::new(vec![vec![StreamEvent::AssistantResponse {
+            content: "streamed hello".to_string(),
+        }]]);
+        let mut stream = run_prompt_with_model_and_registry_stream(
+            connection,
+            "hello",
+            MessageRole::User,
+            Box::new(model),
+            ExecutableToolRegistry::new(vec![]),
+            true,
+            None,
+        )
+        .expect("stream should start");
+
         assert!(matches!(
-            collected.next(),
-            Some(StreamEvent::StatusUpdate { content }) if content == "thinking"
+            stream.next(),
+            Some(StreamEvent::AssistantResponse { content }) if content == "streamed hello"
         ));
-        assert_eq!(collected.snapshot().status.as_deref(), Some("done"));
-        assert_eq!(stream.into_snapshot().status.as_deref(), Some("done"));
+        assert!(stream.snapshot().is_none());
+        assert!(stream.next().is_none());
+        assert_eq!(
+            stream
+                .snapshot()
+                .and_then(|snapshot| snapshot.status.as_deref()),
+            Some("loaded persisted transcript and sidebar data")
+        );
+
+        let snapshot = stream.into_snapshot().expect("snapshot should finalize");
+        assert_eq!(
+            snapshot.status.as_deref(),
+            Some("loaded persisted transcript and sidebar data")
+        );
+        fs::remove_dir_all(home).expect("home should be removed");
     }
 
     #[test]

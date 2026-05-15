@@ -1,3 +1,5 @@
+use std::collections::VecDeque;
+
 use elroy_config::AppConfig;
 use elroy_llm::{
     CompletionRequest, ConversationMessage, LiveModelClient, LlmError, MessageRole, StreamEvent,
@@ -70,6 +72,13 @@ pub trait ModelClient {
     ) -> Result<Vec<StreamEvent>, ModelClientError>;
 }
 
+pub trait StreamingModelClient {
+    fn stream_events(
+        &self,
+        request: ConversationRequest<'_>,
+    ) -> Result<Box<dyn Iterator<Item = Result<StreamEvent, ModelClientError>>>, ModelClientError>;
+}
+
 pub trait ToolExecutor {
     fn execute(&self, call: &ToolCall) -> StreamEvent;
 }
@@ -83,6 +92,22 @@ pub struct ConversationOrchestrator {
 pub struct TurnRun {
     pub events: Vec<StreamEvent>,
     pub transcript: Vec<ConversationMessage>,
+}
+
+pub struct TurnEventStream {
+    model: Box<dyn StreamingModelClient>,
+    tools: Vec<ToolSpec>,
+    tool_executor: Box<dyn ToolExecutor>,
+    transcript: Vec<ConversationMessage>,
+    message: String,
+    force_tool: Option<String>,
+    max_tool_rounds: usize,
+    current_round: usize,
+    current_stream: Option<Box<dyn Iterator<Item = Result<StreamEvent, ModelClientError>>>>,
+    current_round_saw_tool_call: bool,
+    pending: VecDeque<Result<StreamEvent, ModelClientError>>,
+    events: Vec<StreamEvent>,
+    finished: bool,
 }
 
 #[derive(Debug)]
@@ -133,6 +158,28 @@ impl ModelClient for LiveProviderModel {
                 messages: request.transcript,
                 tools: &tools,
                 force_tool: request.force_tool,
+            })
+            .map_err(ModelClientError::from)
+    }
+}
+
+impl StreamingModelClient for LiveProviderModel {
+    fn stream_events(
+        &self,
+        request: ConversationRequest<'_>,
+    ) -> Result<Box<dyn Iterator<Item = Result<StreamEvent, ModelClientError>>>, ModelClientError>
+    {
+        let tools = ToolRegistry::new(request.tools.to_vec());
+        self.client
+            .query_stream(CompletionRequest {
+                system_prompt: &self.system_prompt,
+                messages: request.transcript,
+                tools: &tools,
+                force_tool: request.force_tool,
+            })
+            .map(|stream| {
+                Box::new(stream.map(|event| event.map_err(ModelClientError::from)))
+                    as Box<dyn Iterator<Item = Result<StreamEvent, ModelClientError>>>
             })
             .map_err(ModelClientError::from)
     }
@@ -285,6 +332,164 @@ impl ConversationOrchestrator {
 
         Ok(TurnRun { events, transcript })
     }
+
+    pub fn stream_turn_with_transcript_and_options(
+        &self,
+        model: Box<dyn StreamingModelClient>,
+        tools: Vec<ToolSpec>,
+        tool_executor: Box<dyn ToolExecutor>,
+        existing_transcript: &[ConversationMessage],
+        options: ConversationOptions<'_>,
+        message: &str,
+    ) -> Result<TurnEventStream, ModelClientError> {
+        let mut transcript = existing_transcript.to_vec();
+        transcript.push(ConversationMessage::new(options.role, message));
+
+        let mut stream = TurnEventStream {
+            model,
+            tools,
+            tool_executor,
+            transcript,
+            message: message.to_string(),
+            force_tool: options.force_tool.map(str::to_string),
+            max_tool_rounds: self.max_tool_rounds,
+            current_round: 0,
+            current_stream: None,
+            current_round_saw_tool_call: false,
+            pending: VecDeque::new(),
+            events: Vec::new(),
+            finished: false,
+        };
+        stream.start_next_round()?;
+        Ok(stream)
+    }
+}
+
+impl TurnEventStream {
+    fn start_next_round(&mut self) -> Result<(), ModelClientError> {
+        if self.current_round > self.max_tool_rounds {
+            self.finished = true;
+            self.current_stream = None;
+            return Ok(());
+        }
+        self.current_round_saw_tool_call = false;
+        self.current_stream = Some(self.model.stream_events(ConversationRequest {
+            user_message: &self.message,
+            tools: &self.tools,
+            transcript: &self.transcript,
+            force_tool: self.force_tool.as_deref(),
+        })?);
+        Ok(())
+    }
+
+    fn handle_event(&mut self, event: StreamEvent) {
+        match event {
+            StreamEvent::ToolCallRequested(call) => {
+                self.current_round_saw_tool_call = true;
+                self.transcript
+                    .push(ConversationMessage::assistant_with_tool_calls(
+                        "",
+                        vec![call.clone()],
+                    ));
+                self.events
+                    .push(StreamEvent::ToolCallRequested(call.clone()));
+                self.pending
+                    .push_back(Ok(StreamEvent::ToolCallRequested(call.clone())));
+
+                let tool_event = self.tool_executor.execute(&call);
+                self.transcript
+                    .push(tool_event_to_message(&call, &tool_event));
+                self.events.push(tool_event.clone());
+                self.pending.push_back(Ok(tool_event));
+            }
+            StreamEvent::AssistantResponse { content } => {
+                self.transcript
+                    .push(ConversationMessage::new(MessageRole::Assistant, &content));
+                self.events.push(StreamEvent::AssistantResponse {
+                    content: content.clone(),
+                });
+                self.pending
+                    .push_back(Ok(StreamEvent::AssistantResponse { content }));
+            }
+            StreamEvent::AssistantInternalThought { content } => {
+                self.events.push(StreamEvent::AssistantInternalThought {
+                    content: content.clone(),
+                });
+                self.pending
+                    .push_back(Ok(StreamEvent::AssistantInternalThought { content }));
+            }
+            StreamEvent::AssistantToolResult { content, is_error } => {
+                self.transcript.push(ConversationMessage::tool_result(
+                    "model-generated-tool-result",
+                    &content,
+                ));
+                self.events.push(StreamEvent::AssistantToolResult {
+                    content: content.clone(),
+                    is_error,
+                });
+                self.pending
+                    .push_back(Ok(StreamEvent::AssistantToolResult { content, is_error }));
+            }
+            StreamEvent::StatusUpdate { content } => {
+                self.events.push(StreamEvent::StatusUpdate {
+                    content: content.clone(),
+                });
+                self.pending
+                    .push_back(Ok(StreamEvent::StatusUpdate { content }));
+            }
+        }
+    }
+
+    pub fn finish(mut self) -> Result<TurnRun, ModelClientError> {
+        while self.next().is_some() {}
+        Ok(TurnRun {
+            events: self.events,
+            transcript: self.transcript,
+        })
+    }
+}
+
+impl Iterator for TurnEventStream {
+    type Item = Result<StreamEvent, ModelClientError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(event) = self.pending.pop_front() {
+                return Some(event);
+            }
+            if self.finished {
+                return None;
+            }
+
+            let next_from_model = match self.current_stream.as_mut() {
+                Some(stream) => stream.next(),
+                None => None,
+            };
+
+            match next_from_model {
+                Some(Ok(event)) => {
+                    self.handle_event(event);
+                }
+                Some(Err(error)) => {
+                    self.finished = true;
+                    return Some(Err(error));
+                }
+                None => {
+                    if self.current_round_saw_tool_call && self.current_round < self.max_tool_rounds
+                    {
+                        self.current_round += 1;
+                        if let Err(error) = self.start_next_round() {
+                            self.finished = true;
+                            return Some(Err(error));
+                        }
+                        continue;
+                    }
+                    self.finished = true;
+                    return None;
+                }
+            }
+        }
+    }
 }
 
 pub fn validated_transcript(messages: &[ConversationMessage]) -> Vec<ConversationMessage> {
@@ -402,8 +607,8 @@ mod tests {
     };
 
     use super::{
-        ConversationOrchestrator, ConversationRequest, ModelClient, ToolExecutor,
-        validated_transcript,
+        ConversationOrchestrator, ConversationRequest, ModelClient, StreamingModelClient,
+        ToolExecutor, validated_transcript,
     };
 
     struct FakeModel {
@@ -424,6 +629,19 @@ mod tests {
             _request: ConversationRequest<'_>,
         ) -> Result<Vec<StreamEvent>, super::ModelClientError> {
             Ok(self.responses.borrow_mut().remove(0))
+        }
+    }
+
+    impl StreamingModelClient for FakeModel {
+        fn stream_events(
+            &self,
+            _request: ConversationRequest<'_>,
+        ) -> Result<
+            Box<dyn Iterator<Item = Result<StreamEvent, super::ModelClientError>>>,
+            super::ModelClientError,
+        > {
+            let events = self.responses.borrow_mut().remove(0);
+            Ok(Box::new(events.into_iter().map(Ok)))
         }
     }
 
@@ -513,6 +731,65 @@ mod tests {
             .run_turn(&model, &[weather_tool()], &FakeToolExecutor, "weather?")
             .expect("turn should succeed");
 
+        assert_eq!(
+            turn_run.events,
+            vec![
+                StreamEvent::StatusUpdate {
+                    content: "thinking".to_string(),
+                },
+                StreamEvent::ToolCallRequested(ToolCall {
+                    id: "call-1".to_string(),
+                    name: "get_weather".to_string(),
+                    arguments_json: "{\"location\":\"Paris\"}".to_string(),
+                }),
+                StreamEvent::AssistantToolResult {
+                    content: "tool:get_weather:{\"location\":\"Paris\"}".to_string(),
+                    is_error: false,
+                },
+                StreamEvent::AssistantResponse {
+                    content: "The weather in Paris is sunny.".to_string(),
+                },
+            ]
+        );
+        assert_eq!(turn_run.transcript[0].role, MessageRole::User);
+        assert_eq!(
+            turn_run.transcript[1].tool_calls.as_ref().map(Vec::len),
+            Some(1)
+        );
+        assert_eq!(turn_run.transcript[2].role, MessageRole::Tool);
+        assert_eq!(turn_run.transcript[3].role, MessageRole::Assistant);
+    }
+
+    #[test]
+    fn orchestrator_streams_model_then_tools_then_followup_model_turn() {
+        let model = FakeModel::new(vec![
+            vec![
+                StreamEvent::StatusUpdate {
+                    content: "thinking".to_string(),
+                },
+                StreamEvent::ToolCallRequested(ToolCall {
+                    id: "call-1".to_string(),
+                    name: "get_weather".to_string(),
+                    arguments_json: "{\"location\":\"Paris\"}".to_string(),
+                }),
+            ],
+            vec![StreamEvent::AssistantResponse {
+                content: "The weather in Paris is sunny.".to_string(),
+            }],
+        ]);
+        let orchestrator = ConversationOrchestrator::new(2);
+        let stream = orchestrator
+            .stream_turn_with_transcript_and_options(
+                Box::new(model),
+                vec![weather_tool()],
+                Box::new(FakeToolExecutor),
+                &[],
+                super::ConversationOptions::default(),
+                "weather?",
+            )
+            .expect("stream should start");
+
+        let turn_run = stream.finish().expect("stream should finish");
         assert_eq!(
             turn_run.events,
             vec![

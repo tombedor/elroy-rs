@@ -1,4 +1,6 @@
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::{Display, Formatter};
+use std::io::{BufRead, BufReader};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use reqwest::StatusCode;
@@ -346,6 +348,71 @@ impl LiveModelClient {
             Provider::Anthropic => parse_anthropic_response(&payload),
         }
     }
+
+    pub fn query_stream(
+        &self,
+        request: CompletionRequest<'_>,
+    ) -> Result<Box<dyn Iterator<Item = Result<StreamEvent, LlmError>>>, LlmError> {
+        let response = match self.config.provider {
+            Provider::OpenAi => {
+                let mut payload = build_openai_responses_request(
+                    &self.config.model,
+                    request.system_prompt,
+                    request.messages,
+                    request.tools,
+                    self.config.max_output_tokens,
+                    request.force_tool,
+                );
+                payload["stream"] = json!(true);
+                self.http
+                    .post(&self.config.base_url)
+                    .bearer_auth(&self.config.api_key)
+                    .json(&payload)
+                    .send()
+                    .map_err(LlmError::HttpRequest)?
+            }
+            Provider::Anthropic => {
+                let mut payload = build_anthropic_messages_request(
+                    &self.config.model,
+                    request.system_prompt,
+                    request.messages,
+                    request.tools,
+                    self.config.max_output_tokens,
+                    request.force_tool,
+                );
+                payload["stream"] = json!(true);
+                self.http
+                    .post(&self.config.base_url)
+                    .header("x-api-key", &self.config.api_key)
+                    .header(
+                        "anthropic-version",
+                        self.config
+                            .anthropic_api_version
+                            .as_deref()
+                            .unwrap_or("2023-06-01"),
+                    )
+                    .json(&payload)
+                    .send()
+                    .map_err(LlmError::HttpRequest)?
+            }
+        };
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().map_err(LlmError::ReadResponse)?;
+            return Err(LlmError::Api {
+                provider: self.config.provider,
+                status,
+                body,
+            });
+        }
+
+        let reader = BufReader::new(response);
+        match self.config.provider {
+            Provider::OpenAi => Ok(Box::new(OpenAiStream::new(reader))),
+            Provider::Anthropic => Ok(Box::new(AnthropicStream::new(reader))),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -353,6 +420,7 @@ pub enum LlmError {
     HttpClient(reqwest::Error),
     HttpRequest(reqwest::Error),
     ReadResponse(reqwest::Error),
+    ReadStream(std::io::Error),
     ParseResponse(serde_json::Error),
     Api {
         provider: Provider,
@@ -367,6 +435,7 @@ impl Display for LlmError {
             Self::HttpClient(error) => write!(f, "failed to construct HTTP client: {error}"),
             Self::HttpRequest(error) => write!(f, "HTTP request failed: {error}"),
             Self::ReadResponse(error) => write!(f, "failed to read HTTP response: {error}"),
+            Self::ReadStream(error) => write!(f, "failed to read streaming response: {error}"),
             Self::ParseResponse(error) => write!(f, "failed to parse model response: {error}"),
             Self::Api {
                 provider,
@@ -389,6 +458,360 @@ fn trim_error_body(body: &str) -> String {
         body.to_string()
     } else {
         format!("{}...", &body[..LIMIT])
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SseEvent {
+    event_type: Option<String>,
+    data: String,
+}
+
+struct SseEventReader<R> {
+    reader: R,
+    finished: bool,
+}
+
+impl<R> SseEventReader<R> {
+    fn new(reader: R) -> Self {
+        Self {
+            reader,
+            finished: false,
+        }
+    }
+}
+
+impl<R: BufRead> Iterator for SseEventReader<R> {
+    type Item = Result<SseEvent, LlmError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.finished {
+            return None;
+        }
+
+        let mut event_type = None;
+        let mut data_lines = Vec::new();
+
+        loop {
+            let mut line = String::new();
+            match self.reader.read_line(&mut line) {
+                Ok(0) => {
+                    self.finished = true;
+                    if data_lines.is_empty() && event_type.is_none() {
+                        return None;
+                    }
+                    break;
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    self.finished = true;
+                    return Some(Err(LlmError::ReadStream(error)));
+                }
+            }
+
+            let trimmed = line.trim_end_matches(['\r', '\n']);
+            if trimmed.is_empty() {
+                if data_lines.is_empty() && event_type.is_none() {
+                    continue;
+                }
+                break;
+            }
+            if let Some(value) = trimmed.strip_prefix("event:") {
+                event_type = Some(value.trim().to_string());
+                continue;
+            }
+            if let Some(value) = trimmed.strip_prefix("data:") {
+                data_lines.push(value.trim_start().to_string());
+            }
+        }
+
+        let data = data_lines.join("\n");
+        if data == "[DONE]" {
+            self.finished = true;
+            return None;
+        }
+
+        Some(Ok(SseEvent { event_type, data }))
+    }
+}
+
+struct OpenAiStream<R> {
+    events: SseEventReader<R>,
+    queued: VecDeque<Result<StreamEvent, LlmError>>,
+    emitted_message_fallbacks: HashSet<String>,
+    partial_tool_calls: HashMap<String, PartialToolCall>,
+    saw_text_delta: bool,
+}
+
+impl<R> OpenAiStream<R> {
+    fn new(reader: R) -> Self {
+        Self {
+            events: SseEventReader::new(reader),
+            queued: VecDeque::new(),
+            emitted_message_fallbacks: HashSet::new(),
+            partial_tool_calls: HashMap::new(),
+            saw_text_delta: false,
+        }
+    }
+}
+
+impl<R: BufRead> Iterator for OpenAiStream<R> {
+    type Item = Result<StreamEvent, LlmError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(event) = self.queued.pop_front() {
+                return Some(event);
+            }
+
+            let raw = self.events.next()?;
+            let raw = match raw {
+                Ok(raw) => raw,
+                Err(error) => return Some(Err(error)),
+            };
+
+            let payload = match serde_json::from_str::<Value>(&raw.data) {
+                Ok(payload) => payload,
+                Err(error) => return Some(Err(LlmError::ParseResponse(error))),
+            };
+
+            match raw.event_type.as_deref() {
+                Some("response.output_text.delta") => {
+                    if let Some(delta) = payload.get("delta").and_then(Value::as_str)
+                        && !delta.is_empty()
+                    {
+                        self.saw_text_delta = true;
+                        self.queued.push_back(Ok(StreamEvent::AssistantResponse {
+                            content: delta.to_string(),
+                        }));
+                    }
+                }
+                Some("response.reasoning_summary_text.delta")
+                | Some("response.reasoning.delta") => {
+                    if let Some(delta) = payload.get("delta").and_then(Value::as_str)
+                        && !delta.is_empty()
+                    {
+                        self.queued
+                            .push_back(Ok(StreamEvent::AssistantInternalThought {
+                                content: delta.to_string(),
+                            }));
+                    }
+                }
+                Some("response.output_item.added") => {
+                    if let Some(item) = payload.get("item")
+                        && item.get("type").and_then(Value::as_str) == Some("function_call")
+                    {
+                        let id = item
+                            .get("id")
+                            .or_else(|| item.get("call_id"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("openai-call")
+                            .to_string();
+                        let mut partial = PartialToolCall::new(id.clone());
+                        if let Some(name) = item.get("name").and_then(Value::as_str) {
+                            partial.push_name_fragment(name);
+                        }
+                        if let Some(arguments) = item.get("arguments").and_then(Value::as_str) {
+                            partial.push_arguments_fragment(arguments);
+                        }
+                        self.partial_tool_calls.insert(id, partial);
+                    }
+                }
+                Some("response.function_call_arguments.delta") => {
+                    let Some(id) = payload
+                        .get("item_id")
+                        .or_else(|| payload.get("call_id"))
+                        .or_else(|| payload.get("id"))
+                        .and_then(Value::as_str)
+                    else {
+                        continue;
+                    };
+                    if let Some(delta) = payload.get("delta").and_then(Value::as_str)
+                        && let Some(partial) = self.partial_tool_calls.get_mut(id)
+                    {
+                        partial.push_arguments_fragment(delta);
+                    }
+                }
+                Some("response.output_item.done") => {
+                    let Some(item) = payload.get("item") else {
+                        continue;
+                    };
+                    match item.get("type").and_then(Value::as_str) {
+                        Some("function_call") => {
+                            let call_id = item
+                                .get("call_id")
+                                .or_else(|| item.get("id"))
+                                .and_then(Value::as_str)
+                                .unwrap_or("openai-call");
+                            let name = item
+                                .get("name")
+                                .and_then(Value::as_str)
+                                .unwrap_or("tool_call");
+                            let arguments_json = item
+                                .get("arguments")
+                                .map(|value| {
+                                    value
+                                        .as_str()
+                                        .map(ToString::to_string)
+                                        .unwrap_or_else(|| value.to_string())
+                                })
+                                .unwrap_or_else(|| {
+                                    self.partial_tool_calls
+                                        .remove(call_id)
+                                        .map(|partial| partial.arguments_json)
+                                        .unwrap_or_else(|| "{}".to_string())
+                                });
+                            self.partial_tool_calls.remove(call_id);
+                            self.queued
+                                .push_back(Ok(StreamEvent::ToolCallRequested(ToolCall {
+                                    id: call_id.to_string(),
+                                    name: name.to_string(),
+                                    arguments_json,
+                                })));
+                        }
+                        Some("message") if !self.saw_text_delta => {
+                            let text = item
+                                .get("content")
+                                .and_then(Value::as_array)
+                                .into_iter()
+                                .flatten()
+                                .filter_map(|block| block.get("text").and_then(Value::as_str))
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            if !text.is_empty()
+                                && self.emitted_message_fallbacks.insert(text.clone())
+                            {
+                                self.queued.push_back(Ok(StreamEvent::AssistantResponse {
+                                    content: text,
+                                }));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+struct AnthropicStream<R> {
+    events: SseEventReader<R>,
+    queued: VecDeque<Result<StreamEvent, LlmError>>,
+    partial_tool_calls: HashMap<usize, PartialToolCall>,
+}
+
+impl<R> AnthropicStream<R> {
+    fn new(reader: R) -> Self {
+        Self {
+            events: SseEventReader::new(reader),
+            queued: VecDeque::new(),
+            partial_tool_calls: HashMap::new(),
+        }
+    }
+}
+
+impl<R: BufRead> Iterator for AnthropicStream<R> {
+    type Item = Result<StreamEvent, LlmError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(event) = self.queued.pop_front() {
+                return Some(event);
+            }
+
+            let raw = self.events.next()?;
+            let raw = match raw {
+                Ok(raw) => raw,
+                Err(error) => return Some(Err(error)),
+            };
+            let payload = match serde_json::from_str::<Value>(&raw.data) {
+                Ok(payload) => payload,
+                Err(error) => return Some(Err(LlmError::ParseResponse(error))),
+            };
+
+            match raw.event_type.as_deref() {
+                Some("content_block_start") => {
+                    let index = payload
+                        .get("index")
+                        .and_then(Value::as_u64)
+                        .unwrap_or_default() as usize;
+                    let Some(block) = payload.get("content_block") else {
+                        continue;
+                    };
+                    if block.get("type").and_then(Value::as_str) == Some("tool_use") {
+                        let id = block
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .unwrap_or("anthropic-call");
+                        let name = block
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or("tool_call");
+                        let mut partial = PartialToolCall::new(id);
+                        partial.push_name_fragment(name);
+                        if let Some(input) = block.get("input")
+                            && !input.is_null()
+                        {
+                            partial.push_arguments_fragment(&input.to_string());
+                        }
+                        self.partial_tool_calls.insert(index, partial);
+                    }
+                }
+                Some("content_block_delta") => {
+                    let index = payload
+                        .get("index")
+                        .and_then(Value::as_u64)
+                        .unwrap_or_default() as usize;
+                    let Some(delta) = payload.get("delta") else {
+                        continue;
+                    };
+                    match delta.get("type").and_then(Value::as_str) {
+                        Some("text_delta") => {
+                            if let Some(text) = delta.get("text").and_then(Value::as_str)
+                                && !text.is_empty()
+                            {
+                                self.queued.push_back(Ok(StreamEvent::AssistantResponse {
+                                    content: text.to_string(),
+                                }));
+                            }
+                        }
+                        Some("thinking_delta") => {
+                            if let Some(text) = delta.get("thinking").and_then(Value::as_str)
+                                && !text.is_empty()
+                            {
+                                self.queued
+                                    .push_back(Ok(StreamEvent::AssistantInternalThought {
+                                        content: text.to_string(),
+                                    }));
+                            }
+                        }
+                        Some("input_json_delta") => {
+                            if let Some(partial_json) =
+                                delta.get("partial_json").and_then(Value::as_str)
+                                && let Some(partial) = self.partial_tool_calls.get_mut(&index)
+                            {
+                                partial.push_arguments_fragment(partial_json);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                Some("content_block_stop") => {
+                    let index = payload
+                        .get("index")
+                        .and_then(Value::as_u64)
+                        .unwrap_or_default() as usize;
+                    if let Some(partial) = self.partial_tool_calls.remove(&index)
+                        && let Some(call) = partial.try_complete()
+                    {
+                        self.queued
+                            .push_back(Ok(StreamEvent::ToolCallRequested(call)));
+                    }
+                }
+                _ => {}
+            }
+        }
     }
 }
 
@@ -669,7 +1092,7 @@ pub fn parse_anthropic_response(payload: &Value) -> Result<Vec<StreamEvent>, Llm
 #[cfg(test)]
 mod tests {
     use elroy_tools::{JsonSchema, ToolRegistry, ToolSpec};
-    use mockito::Server;
+    use mockito::{Matcher, Server};
     use serde_json::json;
 
     use super::{
@@ -1069,5 +1492,129 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn live_openai_client_streams_text_and_tool_calls() {
+        let mut server = Server::new();
+        let mock = server
+            .mock("POST", "/responses")
+            .match_header("authorization", "Bearer openai-key")
+            .match_body(Matcher::PartialJson(json!({"stream": true})))
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_body(
+                concat!(
+                    "event: response.output_text.delta\n",
+                    "data: {\"delta\":\"Hello\"}\n\n",
+                    "event: response.output_text.delta\n",
+                    "data: {\"delta\":\" there\"}\n\n",
+                    "event: response.output_item.done\n",
+                    "data: {\"item\":{\"type\":\"function_call\",\"call_id\":\"call-1\",\"name\":\"get_weather\",\"arguments\":\"{\\\"location\\\":\\\"Paris\\\"}\"}}\n\n",
+                    "data: [DONE]\n\n"
+                ),
+            )
+            .create();
+
+        let client = LiveModelClient::new(ProviderConfig {
+            provider: Provider::OpenAi,
+            model: "gpt-5.4".to_string(),
+            api_key: "openai-key".to_string(),
+            base_url: format!("{}/responses", server.url()),
+            anthropic_api_version: None,
+            timeout_seconds: 5,
+            max_output_tokens: 512,
+        })
+        .expect("client should construct");
+
+        let events = client
+            .query_stream(CompletionRequest {
+                system_prompt: "You are Elroy.",
+                messages: &[ConversationMessage::new(MessageRole::User, "Hello")],
+                tools: &weather_registry(),
+                force_tool: None,
+            })
+            .expect("stream should start")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("stream should parse");
+
+        mock.assert();
+        assert_eq!(
+            events,
+            vec![
+                StreamEvent::AssistantResponse {
+                    content: "Hello".to_string()
+                },
+                StreamEvent::AssistantResponse {
+                    content: " there".to_string()
+                },
+                StreamEvent::ToolCallRequested(ToolCall {
+                    id: "call-1".to_string(),
+                    name: "get_weather".to_string(),
+                    arguments_json: "{\"location\":\"Paris\"}".to_string(),
+                }),
+            ]
+        );
+    }
+
+    #[test]
+    fn live_anthropic_client_streams_text_and_tool_calls() {
+        let mut server = Server::new();
+        let mock = server
+            .mock("POST", "/messages")
+            .match_header("x-api-key", "anthropic-key")
+            .match_body(Matcher::PartialJson(json!({"stream": true})))
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_body(
+                concat!(
+                    "event: content_block_delta\n",
+                    "data: {\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Let me check.\"}}\n\n",
+                    "event: content_block_start\n",
+                    "data: {\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"get_weather\"}}\n\n",
+                    "event: content_block_delta\n",
+                    "data: {\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"location\\\":\\\"Paris\\\"}\"}}\n\n",
+                    "event: content_block_stop\n",
+                    "data: {\"index\":1}\n\n"
+                ),
+            )
+            .create();
+
+        let client = LiveModelClient::new(ProviderConfig {
+            provider: Provider::Anthropic,
+            model: "claude-sonnet-4-20250514".to_string(),
+            api_key: "anthropic-key".to_string(),
+            base_url: format!("{}/messages", server.url()),
+            anthropic_api_version: Some("2023-06-01".to_string()),
+            timeout_seconds: 5,
+            max_output_tokens: 512,
+        })
+        .expect("client should construct");
+
+        let events = client
+            .query_stream(CompletionRequest {
+                system_prompt: "You are Elroy.",
+                messages: &[ConversationMessage::new(MessageRole::User, "Hello")],
+                tools: &weather_registry(),
+                force_tool: None,
+            })
+            .expect("stream should start")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("stream should parse");
+
+        mock.assert();
+        assert_eq!(
+            events,
+            vec![
+                StreamEvent::AssistantResponse {
+                    content: "Let me check.".to_string()
+                },
+                StreamEvent::ToolCallRequested(ToolCall {
+                    id: "toolu_1".to_string(),
+                    name: "get_weather".to_string(),
+                    arguments_json: "{\"location\":\"Paris\"}".to_string(),
+                }),
+            ]
+        );
     }
 }

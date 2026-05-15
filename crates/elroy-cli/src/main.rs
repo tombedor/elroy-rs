@@ -70,14 +70,14 @@ fn prompt_arg(args: &[String]) -> Option<String> {
 }
 
 fn run_live_prompt(runtime: &AppRuntime, prompt: &str) {
-    let prompt_stream = runtime
+    let mut prompt_stream = runtime
         .process_message_stream(prompt, MessageProcessOptions::default())
         .unwrap_or_else(|error| {
             eprintln!("{error}");
             std::process::exit(1);
         });
 
-    for event in prompt_stream {
+    for event in prompt_stream.by_ref() {
         match event {
             StreamEvent::AssistantResponse { content } => println!("{content}"),
             StreamEvent::AssistantInternalThought { content } => eprintln!("thinking: {content}"),
@@ -94,6 +94,11 @@ fn run_live_prompt(runtime: &AppRuntime, prompt: &str) {
                 println!("tool requested: {} {}", call.name, call.arguments_json);
             }
         }
+    }
+
+    if let Err(error) = prompt_stream.into_snapshot() {
+        eprintln!("{error}");
+        std::process::exit(1);
     }
 }
 
