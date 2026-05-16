@@ -1546,16 +1546,24 @@ fn run_prompt_with_model_and_registry(
         options.assistant_name,
         options.ensure_alternating_roles,
     )?;
+    let all_due_items = list_active_due_items(connection, 20)?;
     let recall_context = recall_memory_context_messages(
         options.memory_recall_classifier_enabled,
         options.memory_recall_classifier_window,
         options.reflect,
         prompt,
-        &existing_transcript,
-        &list_active_memories_in_scope(connection, &options.bootstrap_plan.memory_dir, 50)?,
+        RecallContext {
+            transcript: &existing_transcript,
+            memories: &list_active_memories_in_scope(
+                connection,
+                &options.bootstrap_plan.memory_dir,
+                50,
+            )?,
+            due_items: &all_due_items,
+            agenda_items: &list_active_plain_agenda_items(connection, 20)?,
+        },
     );
     let now_iso = Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string();
-    let all_due_items = list_active_due_items(connection, 20)?;
     let timed_due_item_context =
         due_item_context_messages(&list_due_tasks(connection, 20, &now_iso)?);
     let contextual_due_item_context =
@@ -1636,16 +1644,24 @@ fn run_prompt_with_model_and_registry_stream(
         options.assistant_name,
         options.ensure_alternating_roles,
     )?;
+    let all_due_items = list_active_due_items(&connection, 20)?;
     let recall_context = recall_memory_context_messages(
         options.memory_recall_classifier_enabled,
         options.memory_recall_classifier_window,
         options.reflect,
         prompt,
-        &existing_transcript,
-        &list_active_memories_in_scope(&connection, &options.bootstrap_plan.memory_dir, 50)?,
+        RecallContext {
+            transcript: &existing_transcript,
+            memories: &list_active_memories_in_scope(
+                &connection,
+                &options.bootstrap_plan.memory_dir,
+                50,
+            )?,
+            due_items: &all_due_items,
+            agenda_items: &list_active_plain_agenda_items(&connection, 20)?,
+        },
     );
     let now_iso = Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string();
-    let all_due_items = list_active_due_items(&connection, 20)?;
     let timed_due_item_context =
         due_item_context_messages(&list_due_tasks(&connection, 20, &now_iso)?);
     let contextual_due_item_context =
@@ -7044,39 +7060,72 @@ fn format_context_summary_timestamp(unix_seconds: i64) -> String {
         .to_string()
 }
 
+struct RecallContext<'a> {
+    transcript: &'a [ConversationMessage],
+    memories: &'a [elroy_db::MemoryRecord],
+    due_items: &'a [AgendaItemRecord],
+    agenda_items: &'a [AgendaItemRecord],
+}
+
 fn recall_memory_context_messages(
     memory_recall_classifier_enabled: bool,
     memory_recall_classifier_window: usize,
     reflect: bool,
     prompt: &str,
-    transcript: &[ConversationMessage],
-    memories: &[elroy_db::MemoryRecord],
+    context: RecallContext<'_>,
 ) -> Vec<ConversationMessage> {
     if memory_recall_classifier_enabled && should_skip_memory_recall(prompt) {
         return Vec::new();
     }
 
-    let recall_query = build_recall_query(prompt, transcript, memory_recall_classifier_window);
-    let already_recalled = recalled_memory_names(transcript);
-    let recalled = select_recalled_memories(&recall_query, memories, &already_recalled, 2);
-    if recalled.is_empty() {
+    let recall_query =
+        build_recall_query(prompt, context.transcript, memory_recall_classifier_window);
+    let already_recalled = recalled_memory_names(context.transcript);
+    let recalled = select_recalled_memories(&recall_query, context.memories, &already_recalled, 2);
+    let reflective_due_items = if reflect {
+        select_due_items_by_overlap(&recall_query, context.due_items, 2, None)
+    } else {
+        Vec::new()
+    };
+    let reflective_agenda_items = if reflect {
+        select_agenda_items_by_overlap(&recall_query, context.agenda_items, 2)
+    } else {
+        Vec::new()
+    };
+    if recalled.is_empty() && reflective_due_items.is_empty() && reflective_agenda_items.is_empty()
+    {
         return Vec::new();
     }
 
     if reflect {
-        let recent_context = recent_recall_context(transcript, 3);
+        let recent_context = recent_recall_context(context.transcript, 3);
         let content = serde_json::to_string_pretty(&json!({
-            "content": build_reflective_recall_content(&recalled, prompt, &recent_context),
-            "recall_metadata": recalled
-                .iter()
-                .map(|memory| {
-                    json!({
-                        "memory_type": "Memory",
-                        "memory_id": memory.id,
-                        "name": memory.name,
-                    })
+            "content": build_reflective_recall_content(
+                &recalled,
+                &reflective_due_items,
+                &reflective_agenda_items,
+                prompt,
+                &recent_context,
+            ),
+            "recall_metadata": recalled.iter().map(|memory| {
+                json!({
+                    "memory_type": "Memory",
+                    "memory_id": memory.id,
+                    "name": memory.name,
                 })
-                .collect::<Vec<_>>(),
+            }).chain(reflective_due_items.iter().map(|item| {
+                json!({
+                    "memory_type": "AgendaItem",
+                    "memory_id": item.id,
+                    "name": item.name,
+                })
+            })).chain(reflective_agenda_items.iter().map(|item| {
+                json!({
+                    "memory_type": "AgendaItem",
+                    "memory_id": item.id,
+                    "name": item.name,
+                })
+            })).collect::<Vec<_>>(),
         }))
         .expect("reflective memory recall payload should serialize");
 
@@ -7268,17 +7317,51 @@ fn recent_recall_context(transcript: &[ConversationMessage], window: usize) -> V
 
 fn build_reflective_recall_content(
     memories: &[&elroy_db::MemoryRecord],
+    due_items: &[&AgendaItemRecord],
+    agenda_items: &[&AgendaItemRecord],
     prompt: &str,
     recent_context: &[String],
 ) -> String {
-    let memory_lines = memories
-        .iter()
-        .map(|memory| format!("- {}: {}", memory.name, excerpt(&memory.body, 180)))
-        .collect::<Vec<_>>();
-    let mut sections = vec![format!(
-        "I remember these details may be relevant to the current conversation:\n{}",
-        memory_lines.join("\n")
-    )];
+    let mut sections = Vec::new();
+    if !memories.is_empty() {
+        let memory_lines = memories
+            .iter()
+            .map(|memory| format!("- {}: {}", memory.name, excerpt(&memory.body, 180)))
+            .collect::<Vec<_>>();
+        sections.push(format!(
+            "I remember these memory details may be relevant to the current conversation:\n{}",
+            memory_lines.join("\n")
+        ));
+    }
+    if !due_items.is_empty() {
+        let due_item_lines = due_items
+            .iter()
+            .map(|item| {
+                let mut line = format!("- {}: {}", item.name, excerpt(&item.body, 180));
+                if let Some(trigger_datetime) = item.trigger_datetime.as_deref() {
+                    line.push_str(&format!(" (scheduled for {trigger_datetime})"));
+                }
+                if let Some(trigger_context) = item.trigger_context.as_deref() {
+                    line.push_str(&format!(" (trigger context: {trigger_context})"));
+                }
+                line
+            })
+            .collect::<Vec<_>>();
+        sections.push(format!(
+            "I also recall these due items may matter:\n{}",
+            due_item_lines.join("\n")
+        ));
+    }
+    if !agenda_items.is_empty() {
+        let agenda_item_lines = agenda_items
+            .iter()
+            .map(|item| format!("- {}: {}", item.name, excerpt(&item.body, 180)))
+            .collect::<Vec<_>>();
+        sections.push(format!(
+            "I also recall these agenda items may matter:\n{}",
+            agenda_item_lines.join("\n")
+        ));
+    }
     if !recent_context.is_empty() {
         sections.push(format!(
             "Recent conversation context:\n{}",
@@ -7437,9 +7520,15 @@ fn parse_recalled_memory_names(content: &str) -> Vec<String> {
         .unwrap_or_default()
         .into_iter()
         .filter_map(|item| {
-            item.get("name")
+            let memory_type = item
+                .get("memory_type")
                 .and_then(serde_json::Value::as_str)
-                .map(|name| name.to_ascii_lowercase())
+                .unwrap_or("Memory");
+            (memory_type == "Memory").then(|| {
+                item.get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .map(|name| name.to_ascii_lowercase())
+            })?
         })
         .collect()
 }
@@ -7676,6 +7765,7 @@ pub fn provider_config_from_app_config(config: &AppConfig) -> Result<ProviderCon
 
 #[cfg(test)]
 mod tests {
+    use crate::RecallContext;
     use chrono::{Local, Utc};
     use std::{
         cell::RefCell,
@@ -15197,16 +15287,20 @@ mod tests {
             config.memory_recall_classifier_window,
             config.reflect,
             "I am heading to basketball practice",
-            &[],
-            &[MemoryRecord {
-                id: 1,
-                legacy_frontmatter_id: None,
-                name: "basketball form".to_string(),
-                file_path: "/tmp/basketball.md".to_string(),
-                body: "Remember to follow through on your shot".to_string(),
-                is_active: true,
-                updated_at_unix: 10,
-            }],
+            RecallContext {
+                transcript: &[],
+                memories: &[MemoryRecord {
+                    id: 1,
+                    legacy_frontmatter_id: None,
+                    name: "basketball form".to_string(),
+                    file_path: "/tmp/basketball.md".to_string(),
+                    body: "Remember to follow through on your shot".to_string(),
+                    is_active: true,
+                    updated_at_unix: 10,
+                }],
+                due_items: &[],
+                agenda_items: &[],
+            },
         );
 
         assert_eq!(messages.len(), 2);
@@ -15236,21 +15330,59 @@ mod tests {
             ConversationMessage::new(MessageRole::User, "I am getting ready for practice"),
             ConversationMessage::new(MessageRole::Assistant, "What part do you want to focus on?"),
         ];
+        let due_items = vec![AgendaItemRecord {
+            id: 2,
+            legacy_frontmatter_id: None,
+            name: "practice reminder".to_string(),
+            file_path: "/tmp/practice_reminder.md".to_string(),
+            agenda_date: Some("unscheduled".to_string()),
+            is_completed: false,
+            status: Some("created".to_string()),
+            closing_comment: None,
+            checklist_total: 0,
+            checklist_completed: 0,
+            body: "Bring the resistance bands".to_string(),
+            trigger_datetime: Some("2026-05-20T09:00:00".to_string()),
+            trigger_context: Some("before basketball practice".to_string()),
+            is_active: true,
+            updated_at_unix: 11,
+        }];
+        let agenda_items = vec![AgendaItemRecord {
+            id: 3,
+            legacy_frontmatter_id: None,
+            name: "drill plan".to_string(),
+            file_path: "/tmp/drill_plan.md".to_string(),
+            agenda_date: Some("2026-05-20".to_string()),
+            is_completed: false,
+            status: Some("created".to_string()),
+            closing_comment: None,
+            checklist_total: 0,
+            checklist_completed: 0,
+            body: "Focus on footwork and follow-through".to_string(),
+            trigger_datetime: None,
+            trigger_context: None,
+            is_active: true,
+            updated_at_unix: 12,
+        }];
         let messages = recall_memory_context_messages(
             config.memory_recall_classifier_enabled,
             config.memory_recall_classifier_window,
             config.reflect,
             "I am heading to basketball practice",
-            &transcript,
-            &[MemoryRecord {
-                id: 1,
-                legacy_frontmatter_id: None,
-                name: "basketball form".to_string(),
-                file_path: "/tmp/basketball.md".to_string(),
-                body: "Remember to follow through on your shot".to_string(),
-                is_active: true,
-                updated_at_unix: 10,
-            }],
+            RecallContext {
+                transcript: &transcript,
+                memories: &[MemoryRecord {
+                    id: 1,
+                    legacy_frontmatter_id: None,
+                    name: "basketball form".to_string(),
+                    file_path: "/tmp/basketball.md".to_string(),
+                    body: "Remember to follow through on your shot".to_string(),
+                    is_active: true,
+                    updated_at_unix: 10,
+                }],
+                due_items: &due_items,
+                agenda_items: &agenda_items,
+            },
         );
 
         assert_eq!(messages.len(), 2);
@@ -15265,9 +15397,13 @@ mod tests {
             .content
             .as_deref()
             .expect("reflective recall payload should exist");
-        assert!(payload.contains("I remember these details may be relevant"));
+        assert!(payload.contains("I remember these memory details may be relevant"));
         assert!(payload.contains("\"recall_metadata\""));
         assert!(payload.contains("basketball form"));
+        assert!(payload.contains("I also recall these due items may matter"));
+        assert!(payload.contains("practice reminder"));
+        assert!(payload.contains("I also recall these agenda items may matter"));
+        assert!(payload.contains("drill plan"));
         assert!(payload.contains("Recent conversation context"));
         assert!(payload.contains("user: I am getting ready for practice"));
         assert!(payload.contains("assistant: What part do you want to focus on?"));
@@ -15285,36 +15421,40 @@ mod tests {
             config.memory_recall_classifier_window,
             config.reflect,
             "basketball shooting drills",
-            &[],
-            &[
-                MemoryRecord {
-                    id: 1,
-                    legacy_frontmatter_id: None,
-                    name: "basketball form".to_string(),
-                    file_path: "/tmp/basketball.md".to_string(),
-                    body: "Focus on shooting form during basketball drills".to_string(),
-                    is_active: true,
-                    updated_at_unix: 30,
-                },
-                MemoryRecord {
-                    id: 2,
-                    legacy_frontmatter_id: None,
-                    name: "basketball warmup".to_string(),
-                    file_path: "/tmp/warmup.md".to_string(),
-                    body: "Warm up shoulders before basketball shooting".to_string(),
-                    is_active: true,
-                    updated_at_unix: 20,
-                },
-                MemoryRecord {
-                    id: 3,
-                    legacy_frontmatter_id: None,
-                    name: "basketball recovery".to_string(),
-                    file_path: "/tmp/recovery.md".to_string(),
-                    body: "Stretch after basketball practice and shooting".to_string(),
-                    is_active: true,
-                    updated_at_unix: 10,
-                },
-            ],
+            RecallContext {
+                transcript: &[],
+                memories: &[
+                    MemoryRecord {
+                        id: 1,
+                        legacy_frontmatter_id: None,
+                        name: "basketball form".to_string(),
+                        file_path: "/tmp/basketball.md".to_string(),
+                        body: "Focus on shooting form during basketball drills".to_string(),
+                        is_active: true,
+                        updated_at_unix: 30,
+                    },
+                    MemoryRecord {
+                        id: 2,
+                        legacy_frontmatter_id: None,
+                        name: "basketball warmup".to_string(),
+                        file_path: "/tmp/warmup.md".to_string(),
+                        body: "Warm up shoulders before basketball shooting".to_string(),
+                        is_active: true,
+                        updated_at_unix: 20,
+                    },
+                    MemoryRecord {
+                        id: 3,
+                        legacy_frontmatter_id: None,
+                        name: "basketball recovery".to_string(),
+                        file_path: "/tmp/recovery.md".to_string(),
+                        body: "Stretch after basketball practice and shooting".to_string(),
+                        is_active: true,
+                        updated_at_unix: 10,
+                    },
+                ],
+                due_items: &[],
+                agenda_items: &[],
+            },
         );
 
         assert_eq!(messages.len(), 2);
@@ -15341,16 +15481,20 @@ mod tests {
             config.memory_recall_classifier_window,
             config.reflect,
             "hi",
-            &transcript,
-            &[MemoryRecord {
-                id: 1,
-                legacy_frontmatter_id: None,
-                name: "practice plan".to_string(),
-                file_path: "/tmp/practice.md".to_string(),
-                body: "Warm up before basketball drills".to_string(),
-                is_active: true,
-                updated_at_unix: 10,
-            }],
+            RecallContext {
+                transcript: &transcript,
+                memories: &[MemoryRecord {
+                    id: 1,
+                    legacy_frontmatter_id: None,
+                    name: "practice plan".to_string(),
+                    file_path: "/tmp/practice.md".to_string(),
+                    body: "Warm up before basketball drills".to_string(),
+                    is_active: true,
+                    updated_at_unix: 10,
+                }],
+                due_items: &[],
+                agenda_items: &[],
+            },
         );
 
         assert_eq!(messages.len(), 2);
@@ -15382,8 +15526,12 @@ mod tests {
             narrow.memory_recall_classifier_window,
             narrow.reflect,
             "What should I focus on?",
-            &transcript,
-            &memories,
+            RecallContext {
+                transcript: &transcript,
+                memories: &memories,
+                due_items: &[],
+                agenda_items: &[],
+            },
         );
 
         let mut wide = AppConfig::defaults();
@@ -15393,8 +15541,12 @@ mod tests {
             wide.memory_recall_classifier_window,
             wide.reflect,
             "What should I focus on?",
-            &transcript,
-            &memories,
+            RecallContext {
+                transcript: &transcript,
+                memories: &memories,
+                due_items: &[],
+                agenda_items: &[],
+            },
         );
 
         assert!(narrow_messages.is_empty());
@@ -15515,17 +15667,18 @@ mod tests {
     fn parse_reflective_recall_metadata_names_from_transcript() {
         let transcript = vec![ConversationMessage::tool_result(
             "bootstrap-memory-recall",
-            r#"{"content":"I remember these details may be relevant.","recall_metadata":[{"memory_type":"Memory","memory_id":1,"name":"Basketball Form"},{"memory_type":"Memory","memory_id":2,"name":"Sleep Routine"}]}"#,
+            r#"{"content":"I remember these details may be relevant.","recall_metadata":[{"memory_type":"Memory","memory_id":1,"name":"Basketball Form"},{"memory_type":"AgendaItem","memory_id":9,"name":"Payroll Followup"},{"memory_type":"Memory","memory_id":2,"name":"Sleep Routine"}]}"#,
         )];
 
         let parsed = parse_recalled_memory_names(
-            r#"{"content":"I remember these details may be relevant.","recall_metadata":[{"memory_type":"Memory","memory_id":1,"name":"Basketball Form"},{"memory_type":"Memory","memory_id":2,"name":"Sleep Routine"}]}"#,
+            r#"{"content":"I remember these details may be relevant.","recall_metadata":[{"memory_type":"Memory","memory_id":1,"name":"Basketball Form"},{"memory_type":"AgendaItem","memory_id":9,"name":"Payroll Followup"},{"memory_type":"Memory","memory_id":2,"name":"Sleep Routine"}]}"#,
         );
         let names = recalled_memory_names(&transcript);
 
         assert_eq!(parsed.len(), 2);
         assert!(names.contains("basketball form"));
         assert!(names.contains("sleep routine"));
+        assert!(!names.contains("payroll followup"));
     }
 
     #[test]
