@@ -1560,6 +1560,49 @@ fn redact_secret(value: Option<&str>) -> String {
     }
 }
 
+fn render_plain_text_table(title: &str, headers: &[&str], rows: &[Vec<String>]) -> String {
+    let mut widths = headers
+        .iter()
+        .map(|header| header.len())
+        .collect::<Vec<_>>();
+    for row in rows {
+        for (index, cell) in row.iter().enumerate() {
+            if let Some(width) = widths.get_mut(index) {
+                *width = (*width).max(cell.len());
+            }
+        }
+    }
+
+    let render_row = |cells: &[String]| {
+        cells
+            .iter()
+            .enumerate()
+            .map(|(index, cell)| format!("{cell:<width$}", width = widths[index]))
+            .collect::<Vec<_>>()
+            .join(" | ")
+    };
+    let header_cells = headers
+        .iter()
+        .map(|header| (*header).to_string())
+        .collect::<Vec<_>>();
+    let separator = widths
+        .iter()
+        .map(|width| "-".repeat(*width))
+        .collect::<Vec<_>>()
+        .join("-+-");
+
+    let mut lines = vec![
+        title.to_string(),
+        String::new(),
+        render_row(&header_cells),
+        separator,
+    ];
+    for row in rows {
+        lines.push(render_row(row));
+    }
+    lines.join("\n")
+}
+
 fn filesystem_display_path(target: &Path) -> String {
     let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     target
@@ -1917,60 +1960,143 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
             JsonSchema::object(Vec::<(String, Value)>::new(), [] as [&str; 0]),
         ),
         move |_| {
-            let lines = [
-                "Elroy Configuration".to_string(),
-                String::new(),
-                "System Information".to_string(),
-                format!(
-                    "Config Path: {}",
-                    config_for_print_config.config_path.display()
-                ),
-                String::new(),
-                "Basic Configuration".to_string(),
-                format!(
-                    "Default Assistant Name: {}",
-                    config_for_print_config.assistant_name
-                ),
-                format!(
-                    "Database URL: sqlite:///{}",
-                    config_for_print_config.database_path.display()
-                ),
-                String::new(),
-                "Model Configuration".to_string(),
-                format!("Chat Model: {}", config_for_print_config.chat_model),
-                format!("Max Tokens: {}", config_for_print_config.max_tokens),
-                format!(
-                    "Context Refresh Target Tokens: {}",
-                    config_for_print_config.context_refresh_target_tokens()
-                ),
-                String::new(),
-                "API Configuration".to_string(),
-                format!("Chat API Base: {}", config_for_print_config.openai_base_url),
-                format!(
-                    "Chat API Key: {}",
-                    redact_secret(config_for_print_config.openai_api_key.as_deref())
-                ),
-                format!(
-                    "Anthropic API Base: {}",
-                    config_for_print_config.anthropic_base_url
-                ),
-                format!(
-                    "Anthropic API Key: {}",
-                    redact_secret(config_for_print_config.anthropic_api_key.as_deref())
-                ),
-                String::new(),
-                "Paths".to_string(),
-                format!("Home Dir: {}", config_for_print_config.home_dir.display()),
-                format!(
-                    "Memory Dir: {}",
-                    config_for_print_config.memory_dir.display()
-                ),
-                format!(
-                    "Agenda Dir: {}",
-                    config_for_print_config.agenda_dir.display()
-                ),
+            let rows = vec![
+                vec![
+                    "System Information".to_string(),
+                    "Config Path".to_string(),
+                    config_for_print_config.config_path.display().to_string(),
+                ],
+                vec![
+                    String::new(),
+                    "Home Dir".to_string(),
+                    config_for_print_config.home_dir.display().to_string(),
+                ],
+                vec![
+                    "Basic Configuration".to_string(),
+                    "Default Assistant Name".to_string(),
+                    config_for_print_config.assistant_name.clone(),
+                ],
+                vec![
+                    String::new(),
+                    "Database URL".to_string(),
+                    format!(
+                        "sqlite:///{}",
+                        config_for_print_config.database_path.display()
+                    ),
+                ],
+                vec![
+                    String::new(),
+                    "Include Base Tools".to_string(),
+                    config_for_print_config.include_base_tools.to_string(),
+                ],
+                vec![
+                    String::new(),
+                    "Async Runtime".to_string(),
+                    config_for_print_config.async_runtime_enabled.to_string(),
+                ],
+                vec![
+                    "Model Configuration".to_string(),
+                    "Chat Model".to_string(),
+                    config_for_print_config.chat_model.clone(),
+                ],
+                vec![
+                    String::new(),
+                    "Max Tokens".to_string(),
+                    config_for_print_config.max_tokens.to_string(),
+                ],
+                vec![
+                    String::new(),
+                    "Context Refresh Target Tokens".to_string(),
+                    config_for_print_config
+                        .context_refresh_target_tokens()
+                        .to_string(),
+                ],
+                vec![
+                    "API Configuration".to_string(),
+                    "Chat API Base".to_string(),
+                    config_for_print_config.openai_base_url.clone(),
+                ],
+                vec![
+                    String::new(),
+                    "Chat API Key".to_string(),
+                    redact_secret(config_for_print_config.openai_api_key.as_deref()),
+                ],
+                vec![
+                    String::new(),
+                    "Anthropic API Base".to_string(),
+                    config_for_print_config.anthropic_base_url.clone(),
+                ],
+                vec![
+                    String::new(),
+                    "Anthropic API Key".to_string(),
+                    redact_secret(config_for_print_config.anthropic_api_key.as_deref()),
+                ],
+                vec![
+                    String::new(),
+                    "Anthropic API Version".to_string(),
+                    config_for_print_config.anthropic_api_version.clone(),
+                ],
+                vec![
+                    "Context Management".to_string(),
+                    "Assistant Greeting Enabled".to_string(),
+                    config_for_print_config
+                        .enable_assistant_greeting
+                        .to_string(),
+                ],
+                vec![
+                    String::new(),
+                    "Min Convo Age For Greeting Minutes".to_string(),
+                    config_for_print_config
+                        .min_convo_age_for_greeting_minutes
+                        .to_string(),
+                ],
+                vec![
+                    String::new(),
+                    "Max Context Age Minutes".to_string(),
+                    config_for_print_config.max_context_age_minutes.to_string(),
+                ],
+                vec![
+                    "Memory And Recall".to_string(),
+                    "Messages Between Memory".to_string(),
+                    config_for_print_config.messages_between_memory.to_string(),
+                ],
+                vec![
+                    String::new(),
+                    "Messages Between Self Reflection".to_string(),
+                    config_for_print_config
+                        .messages_between_self_reflection
+                        .to_string(),
+                ],
+                vec![
+                    String::new(),
+                    "Memory Recall Classifier Enabled".to_string(),
+                    config_for_print_config
+                        .memory_recall_classifier_enabled
+                        .to_string(),
+                ],
+                vec![
+                    String::new(),
+                    "Memory Recall Classifier Window".to_string(),
+                    config_for_print_config
+                        .memory_recall_classifier_window
+                        .to_string(),
+                ],
+                vec![
+                    "Paths".to_string(),
+                    "Memory Dir".to_string(),
+                    config_for_print_config.memory_dir.display().to_string(),
+                ],
+                vec![
+                    String::new(),
+                    "Agenda Dir".to_string(),
+                    config_for_print_config.agenda_dir.display().to_string(),
+                ],
             ];
-            ToolExecutionResult::success(lines.join("\n"))
+            ToolExecutionResult::success(render_plain_text_table(
+                "Elroy Configuration",
+                &["Section", "Setting", "Value"],
+                &rows,
+            ))
         },
     );
 
@@ -2029,11 +2155,15 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                 .collect::<Vec<_>>();
             commands.sort_by(|left, right| left.0.cmp(&right.0));
 
-            let mut lines = vec!["Available Slash Commands".to_string()];
-            for (name, description) in commands {
-                lines.push(format!("{name}: {description}"));
-            }
-            ToolExecutionResult::success(lines.join("\n"))
+            let rows = commands
+                .into_iter()
+                .map(|(name, description)| vec![name, description])
+                .collect::<Vec<_>>();
+            ToolExecutionResult::success(render_plain_text_table(
+                "Available Slash Commands",
+                &["Command", "Description"],
+                &rows,
+            ))
         },
     );
 
@@ -6984,10 +7114,14 @@ mod tests {
 
         assert!(!printed.is_error);
         assert!(printed.content.contains("Elroy Configuration"));
-        assert!(printed.content.contains("Chat Model:"));
-        assert!(printed.content.contains("Config Path:"));
-        assert!(printed.content.contains("Chat API Key: ********"));
-        assert!(printed.content.contains("Anthropic API Key: ********"));
+        assert!(printed.content.contains("Section"));
+        assert!(printed.content.contains("Setting"));
+        assert!(printed.content.contains("Value"));
+        assert!(printed.content.contains("Chat Model"));
+        assert!(printed.content.contains("Config Path"));
+        assert!(printed.content.contains("Chat API Key"));
+        assert!(printed.content.contains("********"));
+        assert!(printed.content.contains("Anthropic API Key"));
         assert!(!tailed.is_error);
         assert_eq!(tailed.content, "line two\nline three\n");
 
@@ -7003,16 +7137,22 @@ mod tests {
 
         assert!(!help.is_error);
         assert!(help.content.contains("Available Slash Commands"));
+        assert!(help.content.contains("Command"));
+        assert!(help.content.contains("Description"));
+        assert!(help.content.contains("get_help"));
         assert!(
             help.content
-                .contains("get_help: Print the available system commands.")
+                .contains("Print the available system commands.")
         );
-        assert!(help.content.contains(
-            "print_config: Print the current Elroy configuration in a formatted report."
-        ));
+        assert!(help.content.contains("print_config"));
         assert!(
             help.content
-                .contains("tail_elroy_logs: Return the last lines of the Elroy log file.")
+                .contains("Print the current Elroy configuration in a formatted report.")
+        );
+        assert!(help.content.contains("tail_elroy_logs"));
+        assert!(
+            help.content
+                .contains("Return the last lines of the Elroy log file.")
         );
     }
 
