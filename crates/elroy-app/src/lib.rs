@@ -5080,6 +5080,49 @@ fn archive_memory_file_from_config(
     }
 }
 
+#[cfg(test)]
+fn create_consolidated_memory_from_config(
+    config: &AppConfig,
+    name: &str,
+    text: &str,
+    source_names: &[&str],
+) -> std::io::Result<PathBuf> {
+    let mut connection = open_sqlite_connection(&config.database_path)
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    run_migrations(&mut connection).map_err(|error| std::io::Error::other(error.to_string()))?;
+
+    let mut source_memories = Vec::new();
+    for source_name in source_names {
+        let memory = find_active_memory_by_name(&connection, source_name)
+            .map_err(|error| std::io::Error::other(error.to_string()))?
+            .ok_or_else(|| std::io::Error::other(format!("memory not found: {source_name}")))?;
+        source_memories.push(memory);
+    }
+
+    let archive_dir = config.memory_dir.join("archive");
+    let mut archived_sources = Vec::new();
+    for memory in source_memories {
+        let archived_path = archive_memory_file(Path::new(&memory.file_path), &archive_dir)?;
+        archived_sources.push((memory.name, archived_path));
+    }
+
+    let frontmatter = memory_source_frontmatter(
+        &archived_sources
+            .iter()
+            .map(|(source_name, path)| (source_name.as_str(), path.as_path()))
+            .collect::<Vec<_>>(),
+    );
+    let created = create_memory_file_with_frontmatter(
+        &config.memory_dir,
+        name,
+        text,
+        frontmatter.as_deref(),
+    )?;
+    elroy_db::bootstrap_database(&BootstrapPlan::from_config(config))
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    Ok(created)
+}
+
 fn mutate_agenda_file_from_config(
     config: &AppConfig,
     name: &str,
@@ -5852,9 +5895,9 @@ mod tests {
         AppRuntime, LOCAL_USER_TOKEN, PromptExecutionOptions, SYNTHETIC_FIRST_USER_MESSAGE,
         argument_limit, build_live_tool_registry, build_live_tool_registry_with_codex_bin_and_hook,
         build_recall_query, codex_background_status_key, compress_context_messages,
-        count_context_tokens, drop_old_context_messages, due_item_context_messages,
-        format_context_summary_message, is_context_refresh_needed, memory_recall_status_updates,
-        parse_recalled_memory_names, prompt_prelude_status_updates,
+        count_context_tokens, create_consolidated_memory_from_config, drop_old_context_messages,
+        due_item_context_messages, format_context_summary_message, is_context_refresh_needed,
+        memory_recall_status_updates, parse_recalled_memory_names, prompt_prelude_status_updates,
         provider_config_from_app_config, recall_due_item_context_messages,
         recall_memory_context_messages, recalled_memory_names, recent_recall_context,
         refresh_context_if_needed, run_prompt_with_model_and_registry,
@@ -6519,6 +6562,82 @@ mod tests {
                 .content
                 .contains("user: Hello, I ran a marathon today!")
         );
+
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
+    fn consolidated_memory_records_multiple_memory_sources() {
+        let unique = format!(
+            "elroy-rs-app-consolidated-memory-source-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+        fs::write(
+            memory_dir.join("running_progress.md"),
+            "I ran a marathon today\n",
+        )
+        .expect("first memory should be written");
+        fs::write(memory_dir.join("run_today.md"), "I ran 24 miles today\n")
+            .expect("second memory should be written");
+
+        let mut config = AppConfig::defaults();
+        config.memory_dir = memory_dir.clone();
+        config.agenda_dir = agenda_dir;
+        config.database_path = database_path.clone();
+        elroy_db::bootstrap_database(&BootstrapPlan::from_config(&config))
+            .expect("bootstrap should succeed");
+
+        create_consolidated_memory_from_config(
+            &config,
+            "Running summary",
+            "The user ran a marathon and later reported running 24 miles in total.",
+            &["running progress", "run today"],
+        )
+        .expect("consolidated memory should be created");
+
+        let connection = open_sqlite_connection(&database_path).expect("database should reopen");
+        let active_memories =
+            elroy_db::list_active_memories(&connection, 10).expect("active memories should list");
+        assert_eq!(active_memories.len(), 1);
+        assert_eq!(active_memories[0].name, "running summary");
+
+        let registry = build_live_tool_registry(&config);
+        let source_list = registry.invoke(
+            "get_source_list_for_memory",
+            "{\"memory_name\":\"running summary\"}",
+        );
+        assert!(!source_list.is_error);
+        assert!(source_list.content.contains("\"source_type\":\"Memory\""));
+        assert!(
+            source_list
+                .content
+                .contains("\"name\":\"running progress\"")
+        );
+        assert!(source_list.content.contains("\"name\":\"run today\""));
+
+        let source_content = registry.invoke(
+            "get_source_content_for_memory",
+            "{\"memory_name\":\"running summary\",\"index\":0}",
+        );
+        assert!(!source_content.is_error);
+        assert!(source_content.content.contains("I ran a marathon today"));
+
+        assert!(
+            memory_dir
+                .join("archive")
+                .join("running_progress.md")
+                .exists()
+        );
+        assert!(memory_dir.join("archive").join("run_today.md").exists());
 
         fs::remove_dir_all(home).expect("home should be removed");
     }
