@@ -5157,18 +5157,12 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                     Err(_) => Vec::new(),
                 };
                 Ok(ToolExecutionResult::success(
-                    json!({
-                        "memory_name": memory.name,
-                        "sources": sources
+                    json!(
+                        sources
                             .into_iter()
-                            .map(|(source_type, name)| {
-                                json!({
-                                    "source_type": source_type,
-                                    "name": name,
-                                })
-                            })
-                            .collect::<Vec<_>>(),
-                    })
+                            .map(|(source_type, name)| json!([source_type, name]))
+                            .collect::<Vec<_>>()
+                    )
                     .to_string(),
                 ))
             })
@@ -5197,7 +5191,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
             let index = arguments.get("index").and_then(Value::as_i64).unwrap_or(0);
             if index < 0 {
                 return ToolExecutionResult::error(format!(
-                    "index {index} out of range. Available indices: [0]"
+                    "Index {index} out of range. Available indices: [0]"
                 ));
             }
             with_tool_connection(&database_path, |connection| {
@@ -5215,7 +5209,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                 if let Some(memory_sources) = parse_memory_sources(frontmatter.as_deref()) {
                     if index as usize >= memory_sources.len() {
                         return Ok(ToolExecutionResult::error(format!(
-                            "index {index} out of range. Available indices: {:?}",
+                            "Index {index} out of range. Available indices: {:?}",
                             (0..memory_sources.len()).collect::<Vec<_>>()
                         )));
                     }
@@ -5237,7 +5231,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                 {
                     if index > 0 {
                         return Ok(ToolExecutionResult::error(format!(
-                            "index {index} out of range. Available indices: [0]"
+                            "Index {index} out of range. Available indices: [0]"
                         )));
                     }
                     let source_messages = load_messages_by_ids(connection, &message_ids)?;
@@ -7056,10 +7050,7 @@ mod tests {
         assert!(!source.is_error);
         assert_eq!(source.content, "No sources found for memory 'runner notes'");
         assert!(!source_list.is_error);
-        assert_eq!(
-            source_list.content,
-            "{\"memory_name\":\"runner notes\",\"sources\":[]}"
-        );
+        assert_eq!(source_list.content, "[]");
         assert!(missing_source_list.is_error);
         assert_eq!(
             missing_source_list.content,
@@ -7121,15 +7112,19 @@ mod tests {
             "get_source_list_for_memory",
             "{\"memory_name\":\"running progress\"}",
         );
+        let out_of_range = registry.invoke(
+            "get_source_content_for_memory",
+            "{\"memory_name\":\"running progress\",\"index\":1}",
+        );
 
         assert!(!created.is_error);
         assert!(!source_list.is_error);
-        assert!(
-            source_list
-                .content
-                .contains("\"source_type\":\"ContextMessageSet\"")
+        assert_eq!(source_list.content, "[[\"ContextMessageSet\",\"1\"]]");
+        assert!(out_of_range.is_error);
+        assert_eq!(
+            out_of_range.content,
+            "Index 1 out of range. Available indices: [0]"
         );
-        assert!(source_list.content.contains("\"name\":\"1\""));
 
         fs::remove_dir_all(home).expect("home should be removed");
     }
@@ -7237,13 +7232,10 @@ mod tests {
             "{\"memory_name\":\"running summary\"}",
         );
         assert!(!source_list.is_error);
-        assert!(source_list.content.contains("\"source_type\":\"Memory\""));
-        assert!(
-            source_list
-                .content
-                .contains("\"name\":\"running progress\"")
+        assert_eq!(
+            source_list.content,
+            "[[\"Memory\",\"running progress\"],[\"Memory\",\"run today\"]]"
         );
-        assert!(source_list.content.contains("\"name\":\"run today\""));
 
         let source_content = registry.invoke(
             "get_source_content_for_memory",
@@ -7313,12 +7305,10 @@ mod tests {
             &format!("{{\"memory_name\":\"{consolidated_name}\"}}"),
         );
         assert!(!source_list.is_error);
-        assert!(
-            source_list
-                .content
-                .contains("\"name\":\"running progress\"")
+        assert_eq!(
+            source_list.content,
+            "[[\"Memory\",\"running progress\"],[\"Memory\",\"run today\"]]"
         );
-        assert!(source_list.content.contains("\"name\":\"run today\""));
 
         fs::remove_dir_all(home).expect("home should be removed");
     }
@@ -7510,8 +7500,7 @@ mod tests {
             "{\"memory_name\":\"runner notes\"}",
         );
         assert!(!source_list.is_error);
-        assert!(source_list.content.contains("\"source_type\":\"Memory\""));
-        assert!(source_list.content.contains("\"name\":\"runner notes\""));
+        assert_eq!(source_list.content, "[[\"Memory\",\"runner notes\"]]");
 
         let source_content = registry.invoke(
             "get_source_content_for_memory",
