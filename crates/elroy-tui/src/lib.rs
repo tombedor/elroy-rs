@@ -1158,6 +1158,25 @@ impl TuiApp {
                 action: TuiCommandPaletteAction::FocusAgenda,
             },
         );
+        entries.insert(
+            2,
+            TuiCommandPaletteEntry {
+                title: "Refresh System Instructions".to_string(),
+                description: "Rebuild the system instructions for the current conversation"
+                    .to_string(),
+                action: TuiCommandPaletteAction::ToolCommand(
+                    "refresh_system_instructions".to_string(),
+                ),
+            },
+        );
+        entries.insert(
+            3,
+            TuiCommandPaletteEntry {
+                title: "Reset Messages".to_string(),
+                description: "Clear the current conversation".to_string(),
+                action: TuiCommandPaletteAction::ToolCommand("reset_messages".to_string()),
+            },
+        );
         let mut command_palette = CommandPaletteState {
             all_entries: entries,
             query: String::new(),
@@ -2774,8 +2793,57 @@ mod tests {
         );
 
         assert_eq!(exit, TuiExit::Continue);
-        assert!(app.command_palette.is_some());
+        let command_palette = app.command_palette.as_ref().expect("palette should open");
+        assert!(
+            command_palette
+                .all_entries
+                .iter()
+                .any(|entry| entry.title == "Refresh System Instructions")
+        );
+        assert!(
+            command_palette
+                .all_entries
+                .iter()
+                .any(|entry| entry.title == "Reset Messages")
+        );
         assert_eq!(app.status, "command palette opened");
+    }
+
+    #[test]
+    fn command_palette_can_execute_system_command_entry() {
+        let mut app = TuiApp::bootstrap();
+        app.open_command_palette(vec![]);
+        app.command_palette
+            .as_mut()
+            .expect("command palette should open")
+            .selected_index = 2;
+        let mut runtime = FakeRuntime {
+            launch_named_command_action: Some(TuiSlashCommandAction::Execute(TuiSnapshot {
+                conversation_lines: vec!["assistant: refreshed".to_string()],
+                status: Some("slash command executed: /refresh_system_instructions".to_string()),
+                ..TuiSnapshot::default()
+            })),
+            ..FakeRuntime::default()
+        };
+        let mut pending = None;
+
+        apply_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut runtime,
+            &mut pending,
+        );
+
+        assert!(app.command_palette.is_none());
+        assert_eq!(app.focus, FocusTarget::Input);
+        assert_eq!(
+            app.conversation_lines.last().map(String::as_str),
+            Some("assistant: refreshed")
+        );
+        assert_eq!(
+            app.status,
+            "slash command executed: /refresh_system_instructions"
+        );
     }
 
     #[test]
@@ -2869,12 +2937,24 @@ mod tests {
             &mut runtime,
             &mut pending,
         );
+        apply_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE),
+            &mut runtime,
+            &mut pending,
+        );
+        apply_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE),
+            &mut runtime,
+            &mut pending,
+        );
 
         let command_palette = app
             .command_palette
             .as_ref()
             .expect("command palette should remain open");
-        assert_eq!(command_palette.query, "sh");
+        assert_eq!(command_palette.query, "show");
         assert_eq!(command_palette.filtered_indices.len(), 1);
         assert_eq!(
             command_palette.selected_entry().map(|entry| entry.title),
