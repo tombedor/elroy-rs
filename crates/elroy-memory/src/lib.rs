@@ -33,9 +33,18 @@ pub fn sanitize_filename(name: &str) -> String {
 }
 
 pub fn create_memory_file(memory_dir: &Path, name: &str, text: &str) -> std::io::Result<PathBuf> {
+    create_memory_file_with_frontmatter(memory_dir, name, text, None)
+}
+
+pub fn create_memory_file_with_frontmatter(
+    memory_dir: &Path,
+    name: &str,
+    text: &str,
+    frontmatter: Option<&str>,
+) -> std::io::Result<PathBuf> {
     std::fs::create_dir_all(memory_dir)?;
     let path = unique_markdown_path(memory_dir, name);
-    std::fs::write(&path, format!("{text}\n"))?;
+    write_markdown_parts(&path, frontmatter, text)?;
     Ok(path)
 }
 
@@ -86,7 +95,7 @@ fn unique_markdown_path(root: &Path, name: &str) -> PathBuf {
     }
 }
 
-fn read_markdown_parts(path: &Path) -> std::io::Result<(Option<String>, String)> {
+pub fn read_memory_parts(path: &Path) -> std::io::Result<(Option<String>, String)> {
     let raw = std::fs::read_to_string(path)?;
     let Some(stripped) = raw.strip_prefix("---\n") else {
         return Ok((None, raw.trim().to_string()));
@@ -95,6 +104,10 @@ fn read_markdown_parts(path: &Path) -> std::io::Result<(Option<String>, String)>
         return Ok((None, raw.trim().to_string()));
     };
     Ok((Some(frontmatter_raw.to_string()), body.trim().to_string()))
+}
+
+fn read_markdown_parts(path: &Path) -> std::io::Result<(Option<String>, String)> {
+    read_memory_parts(path)
 }
 
 fn write_markdown_parts(path: &Path, frontmatter: Option<&str>, body: &str) -> std::io::Result<()> {
@@ -109,7 +122,10 @@ fn write_markdown_parts(path: &Path, frontmatter: Option<&str>, body: &str) -> s
 
 #[cfg(test)]
 mod tests {
-    use super::{archive_memory_file, create_memory_file, sanitize_filename, update_memory_body};
+    use super::{
+        archive_memory_file, create_memory_file, create_memory_file_with_frontmatter,
+        read_memory_parts, sanitize_filename, update_memory_body,
+    };
 
     #[test]
     fn sanitize_filename_compacts_words() {
@@ -138,6 +154,36 @@ mod tests {
         assert!(archived.exists());
         let content = std::fs::read_to_string(archived).expect("archived memory should read");
         assert!(content.contains("Updated text"));
+
+        std::fs::remove_dir_all(root).expect("root should be removed");
+    }
+
+    #[test]
+    fn file_create_with_frontmatter_round_trips_metadata() {
+        let unique = format!(
+            "elroy-rs-memory-frontmatter-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let root = std::env::temp_dir().join(unique);
+        std::fs::create_dir_all(&root).expect("root should be created");
+
+        let path = create_memory_file_with_frontmatter(
+            &root,
+            "Runner Notes",
+            "Remember this",
+            Some("source_type: ContextMessageSet\nmessage_ids_json: [1,2,3]"),
+        )
+        .expect("memory file should be created");
+        let (frontmatter, body) = read_memory_parts(&path).expect("memory parts should read");
+
+        assert_eq!(
+            frontmatter.as_deref(),
+            Some("source_type: ContextMessageSet\nmessage_ids_json: [1,2,3]")
+        );
+        assert_eq!(body, "Remember this");
 
         std::fs::remove_dir_all(root).expect("root should be removed");
     }

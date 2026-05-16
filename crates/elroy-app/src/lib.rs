@@ -23,8 +23,9 @@ use elroy_db::{
     AgendaItemRecord, BootstrapPlan, UserPreferenceRecord, find_active_agenda_item_by_name,
     find_active_memory_by_name, get_or_create_memory_operation_tracker, list_active_due_items,
     list_active_memories, list_active_plain_agenda_items, list_inactive_due_items,
-    load_context_messages, load_user_preferences, open_sqlite_connection, replace_context_messages,
-    run_migrations, save_memory_operation_tracker, save_user_preferences, search_active_memories,
+    load_context_messages, load_messages_by_ids, load_user_preferences, open_sqlite_connection,
+    replace_context_messages, run_migrations, save_memory_operation_tracker, save_user_preferences,
+    search_active_memories,
 };
 use elroy_feature_requests::{
     FeatureRequestRecord, find_best_feature_request_match, get_feature_request,
@@ -35,7 +36,9 @@ use elroy_llm::{
     ConversationMessage, LiveModelClient, MessageRole, Provider, ProviderConfig, StreamEvent,
     ToolCall,
 };
-use elroy_memory::{archive_memory_file, create_memory_file, update_memory_body};
+use elroy_memory::{
+    archive_memory_file, create_memory_file_with_frontmatter, read_memory_parts, update_memory_body,
+};
 use elroy_self_reflection::{SelfReflectionConfig, SelfReflectionOrchestrator};
 use elroy_tasks::{
     complete_task_file, create_task_file_with_schedule, delete_task_file, find_task_by_name,
@@ -54,6 +57,7 @@ const SYNTHETIC_FIRST_USER_MESSAGE: &str = "The user has begun the conversation"
 const DEFAULT_MAX_LIST_ENTRIES: usize = 50;
 const DEFAULT_MAX_LIST_DEPTH: usize = 2;
 const DEFAULT_READ_LINE_LIMIT: usize = 200;
+const CONTEXT_MESSAGE_SOURCE_TYPE: &str = "ContextMessageSet";
 const DEFAULT_RESTART_RESUME_PROMPT: &str =
     "Elroy just restarted. Send a brief message that you are back and ready to continue.";
 
@@ -1316,7 +1320,12 @@ fn refresh_context_if_needed(
             .any(|message| message.role == MessageRole::User)
         {
             let (name, text) = formulate_memory_from_transcript(&transcript);
-            create_memory_file(&bootstrap_plan.memory_dir, &name, &text)?;
+            create_memory_file_from_context_messages(
+                &bootstrap_plan.memory_dir,
+                &name,
+                &text,
+                &transcript,
+            )?;
             elroy_db::bootstrap_database(bootstrap_plan)
                 .map_err(|error| AppError::Runtime(error.to_string()))?;
             *connection = open_sqlite_connection(&bootstrap_plan.database_path)?;
@@ -1388,7 +1397,13 @@ fn run_auto_memory_if_needed(
     }
 
     let (name, text) = formulate_memory_from_transcript(transcript);
-    create_memory_file(&bootstrap_plan.memory_dir, &name, &text)?;
+    let persisted_context_messages = load_context_messages(connection, LOCAL_USER_TOKEN)?;
+    create_memory_file_from_context_messages(
+        &bootstrap_plan.memory_dir,
+        &name,
+        &text,
+        &persisted_context_messages,
+    )?;
     elroy_db::bootstrap_database(bootstrap_plan)
         .map_err(|error| AppError::Runtime(error.to_string()))?;
     *connection = open_sqlite_connection(&bootstrap_plan.database_path)?;
@@ -1409,6 +1424,67 @@ fn reset_memory_tracker_after_creation(config: &AppConfig) -> Result<(), AppErro
     tracker.updated_at_unix = Utc::now().timestamp();
     save_memory_operation_tracker(&mut connection, &tracker)?;
     Ok(())
+}
+
+fn create_memory_file_from_context_messages(
+    memory_dir: &Path,
+    name: &str,
+    text: &str,
+    context_messages: &[ConversationMessage],
+) -> std::io::Result<PathBuf> {
+    let frontmatter = context_message_source_frontmatter(context_messages);
+    create_memory_file_with_frontmatter(memory_dir, name, text, frontmatter.as_deref())
+}
+
+fn context_message_source_frontmatter(context_messages: &[ConversationMessage]) -> Option<String> {
+    let message_ids = context_messages
+        .iter()
+        .filter_map(|message| message.id)
+        .collect::<Vec<_>>();
+    if message_ids.is_empty() {
+        return None;
+    }
+    let message_ids_json = serde_json::to_string(&message_ids).ok()?;
+    Some(format!(
+        "source_type: {CONTEXT_MESSAGE_SOURCE_TYPE}\nmessage_ids_json: {message_ids_json}"
+    ))
+}
+
+fn parse_context_message_source_ids(frontmatter: Option<&str>) -> Option<Vec<i64>> {
+    let frontmatter = frontmatter?;
+    let mut source_type = None;
+    let mut message_ids_json = None;
+    for line in frontmatter.lines() {
+        if let Some(value) = line.strip_prefix("source_type:") {
+            source_type = Some(value.trim().to_string());
+        }
+        if let Some(value) = line.strip_prefix("message_ids_json:") {
+            message_ids_json = Some(value.trim().to_string());
+        }
+    }
+    if source_type.as_deref() != Some(CONTEXT_MESSAGE_SOURCE_TYPE) {
+        return None;
+    }
+    serde_json::from_str(message_ids_json?.as_str()).ok()
+}
+
+fn format_context_message_source_content(messages: &[ConversationMessage]) -> String {
+    messages
+        .iter()
+        .filter_map(|message| {
+            let role = match message.role {
+                MessageRole::System => "system",
+                MessageRole::User => "user",
+                MessageRole::Assistant => "assistant",
+                MessageRole::Tool => "tool",
+            };
+            message
+                .content
+                .as_deref()
+                .map(|content| format!("{role}: {content}"))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn formulate_memory_from_transcript(transcript: &[ConversationMessage]) -> (String, String) {
@@ -2226,17 +2302,26 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
             let Some(text) = arguments.get("text").and_then(Value::as_str) else {
                 return ToolExecutionResult::error("create_memory requires string text");
             };
-            match create_memory_file(&config_for_memory_write.memory_dir, name, text).and_then(
-                |path| {
-                    elroy_db::bootstrap_database(&BootstrapPlan::from_config(
-                        &config_for_memory_write,
-                    ))
+            let created = (|| -> Result<PathBuf, std::io::Error> {
+                let mut connection = open_sqlite_connection(&config_for_memory_write.database_path)
                     .map_err(|error| std::io::Error::other(error.to_string()))?;
-                    reset_memory_tracker_after_creation(&config_for_memory_write)
-                        .map_err(|error| std::io::Error::other(error.to_string()))?;
-                    Ok(path)
-                },
-            ) {
+                run_migrations(&mut connection)
+                    .map_err(|error| std::io::Error::other(error.to_string()))?;
+                let context_messages = load_context_messages(&mut connection, LOCAL_USER_TOKEN)
+                    .map_err(|error| std::io::Error::other(error.to_string()))?;
+                let path = create_memory_file_from_context_messages(
+                    &config_for_memory_write.memory_dir,
+                    name,
+                    text,
+                    &context_messages,
+                )?;
+                elroy_db::bootstrap_database(&BootstrapPlan::from_config(&config_for_memory_write))
+                    .map_err(|error| std::io::Error::other(error.to_string()))?;
+                reset_memory_tracker_after_creation(&config_for_memory_write)
+                    .map_err(|error| std::io::Error::other(error.to_string()))?;
+                Ok(path)
+            })();
+            match created {
                 Ok(path) => ToolExecutionResult::success(
                     json!({
                         "created": true,
@@ -4478,21 +4563,34 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                         "memory not found: {memory_name}"
                     )));
                 };
+                let path = Path::new(&memory.file_path);
+                let Ok((frontmatter, body)) = read_memory_parts(path) else {
+                    return Ok(ToolExecutionResult::success(format!(
+                        "No sources found for memory '{memory_name}'"
+                    )));
+                };
+                if let Some(message_ids) = parse_context_message_source_ids(frontmatter.as_deref())
+                {
+                    if index > 0 {
+                        return Ok(ToolExecutionResult::error(format!(
+                            "index {index} out of range. Available indices: [0]"
+                        )));
+                    }
+                    let source_messages = load_messages_by_ids(connection, &message_ids)?;
+                    return Ok(ToolExecutionResult::success(format!(
+                        "# Source content for memory: {} (0 / 0)\n\n{}",
+                        memory.name,
+                        format_context_message_source_content(&source_messages)
+                    )));
+                }
                 if index > 0 {
                     return Ok(ToolExecutionResult::error(format!(
                         "index {index} out of range. Available indices: [0]"
                     )));
                 }
-                let path = Path::new(&memory.file_path);
-                let Ok(source_content) = std::fs::read_to_string(path) else {
-                    return Ok(ToolExecutionResult::success(format!(
-                        "No sources found for memory '{memory_name}'"
-                    )));
-                };
                 Ok(ToolExecutionResult::success(format!(
                     "# Source content for memory: {} (0 / 0)\n\n{}",
-                    memory.name,
-                    source_content.trim()
+                    memory.name, body
                 )))
             })
         },
@@ -6126,6 +6224,60 @@ mod tests {
         assert!(source.content.contains("with the harder second interval"));
         assert!(out_of_range.is_error);
         assert!(out_of_range.content.contains("Available indices: [0]"));
+
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
+    fn create_memory_tool_records_context_message_source_content() {
+        let unique = format!(
+            "elroy-rs-app-memory-context-source-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+
+        let mut config = AppConfig::defaults();
+        config.memory_dir = memory_dir.clone();
+        config.agenda_dir = agenda_dir;
+        config.database_path = database_path.clone();
+
+        let mut connection = open_sqlite_connection(&database_path).expect("database should open");
+        run_migrations(&mut connection).expect("migrations should run");
+        elroy_db::replace_context_messages(
+            &mut connection,
+            LOCAL_USER_TOKEN,
+            &[ConversationMessage::new(
+                MessageRole::User,
+                "Hello, I ran a marathon today!",
+            )],
+        )
+        .expect("context messages should persist");
+
+        let registry = build_live_tool_registry(&config);
+        let created = registry.invoke(
+            "create_memory",
+            "{\"name\":\"Running progress\",\"text\":\"I ran a marathon today\"}",
+        );
+        let source = registry.invoke(
+            "get_source_content_for_memory",
+            "{\"memory_name\":\"running progress\"}",
+        );
+
+        assert!(!created.is_error);
+        assert!(!source.is_error);
+        assert!(
+            source
+                .content
+                .contains("user: Hello, I ran a marathon today!")
+        );
 
         fs::remove_dir_all(home).expect("home should be removed");
     }

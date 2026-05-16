@@ -823,6 +823,58 @@ pub fn load_context_messages(
     rows.collect()
 }
 
+pub fn load_messages_by_ids(
+    connection: &Connection,
+    message_ids: &[i64],
+) -> rusqlite::Result<Vec<ConversationMessage>> {
+    if message_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let placeholders = (1..=message_ids.len())
+        .map(|index| format!("?{index}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let query = format!(
+        "SELECT
+            id,
+            role,
+            content,
+            chat_model,
+            created_at_unix,
+            tool_calls_json,
+            tool_call_id
+        FROM context_messages
+        WHERE id IN ({placeholders})"
+    );
+    let mut statement = connection.prepare(&query)?;
+    let rows = statement.query_map(rusqlite::params_from_iter(message_ids.iter()), |row| {
+        let role = parse_message_role(&row.get::<_, String>(1)?);
+        let tool_calls_json: Option<String> = row.get(5)?;
+        let tool_calls = parse_tool_calls_json(tool_calls_json.as_deref());
+        Ok(ConversationMessage {
+            role,
+            content: row.get(2)?,
+            chat_model: row.get(3)?,
+            id: row.get(0)?,
+            created_at_unix: row.get(4)?,
+            tool_calls,
+            tool_call_id: row.get(6)?,
+        })
+    })?;
+
+    let mut by_id = rows
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .into_iter()
+        .filter_map(|message| message.id.map(|id| (id, message)))
+        .collect::<std::collections::HashMap<_, _>>();
+
+    Ok(message_ids
+        .iter()
+        .filter_map(|message_id| by_id.remove(message_id))
+        .collect())
+}
+
 pub fn replace_context_messages(
     connection: &mut Connection,
     user_token: &str,
@@ -1278,7 +1330,7 @@ mod tests {
         find_active_memory_by_name, get_or_create_memory_operation_tracker,
         list_active_agenda_items, list_active_due_items, list_active_memories,
         list_active_plain_agenda_items, list_inactive_due_items, load_context_messages,
-        load_memory_operation_tracker, load_user_preferences, markdown_files,
+        load_memory_operation_tracker, load_messages_by_ids, load_user_preferences, markdown_files,
         open_sqlite_connection, persist_bootstrap_documents, replace_context_messages,
         run_migrations, save_memory_operation_tracker, save_user_preferences,
         search_active_memories, sync_derived_domain_tables,
@@ -1655,6 +1707,34 @@ mod tests {
         assert_eq!(loaded[1].tool_calls.as_ref().map(Vec::len), Some(1));
         assert_eq!(loaded[2].role, MessageRole::Tool);
         assert_eq!(loaded[2].tool_call_id.as_deref(), Some("call-1"));
+    }
+
+    #[test]
+    fn load_messages_by_ids_preserves_requested_order() {
+        let mut connection = Connection::open_in_memory().expect("sqlite should open");
+        run_migrations(&mut connection).expect("migrations should run");
+
+        let messages = vec![
+            ConversationMessage::new(MessageRole::System, "system"),
+            ConversationMessage::new(MessageRole::User, "first user"),
+            ConversationMessage::new(MessageRole::Assistant, "first reply"),
+        ];
+
+        replace_context_messages(&mut connection, "local-user", &messages)
+            .expect("messages should persist");
+        let stored =
+            load_context_messages(&mut connection, "local-user").expect("messages should load");
+        let requested_ids = vec![
+            stored[2].id.expect("assistant id should exist"),
+            stored[1].id.expect("user id should exist"),
+        ];
+
+        let loaded =
+            load_messages_by_ids(&connection, &requested_ids).expect("messages should load by ids");
+
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].content.as_deref(), Some("first reply"));
+        assert_eq!(loaded[1].content.as_deref(), Some("first user"));
     }
 
     #[test]
