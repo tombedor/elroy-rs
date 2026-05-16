@@ -3154,7 +3154,6 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                 [
                     ("name", json!({"type": "string"})),
                     ("new_text", json!({"type": "string"})),
-                    ("text", json!({"type": "string"})),
                 ],
                 ["name"],
             ),
@@ -7493,6 +7492,26 @@ mod tests {
         assert!(properties.contains_key("trigger_context"));
         assert!(!properties.contains_key("trigger_datetime"));
         assert!(!properties.contains_key("date"));
+    }
+
+    #[test]
+    fn update_due_item_text_tool_schema_matches_python_surface() {
+        let config = AppConfig::defaults();
+        let registry = build_live_tool_registry(&config);
+        let spec = registry
+            .specs()
+            .into_iter()
+            .find(|spec| spec.name == "update_due_item_text")
+            .expect("update_due_item_text tool should exist");
+
+        let properties = match &spec.parameters {
+            elroy_tools::JsonSchema::Object { properties, .. } => properties,
+        };
+
+        assert_eq!(properties.len(), 2);
+        assert!(properties.contains_key("name"));
+        assert!(properties.contains_key("new_text"));
+        assert!(!properties.contains_key("text"));
     }
 
     #[test]
