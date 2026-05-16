@@ -6985,12 +6985,40 @@ fn format_context_summary_message(messages: &[ConversationMessage]) -> String {
             }
         })
         .collect::<Vec<_>>();
+    let conversation_range = messages
+        .iter()
+        .filter(|message| message.role == MessageRole::User)
+        .map(|message| message.created_at_unix)
+        .collect::<Vec<_>>();
+    let summary_lines = if let (Some(min), Some(max)) = (
+        conversation_range.iter().min().copied(),
+        conversation_range.iter().max().copied(),
+    ) {
+        let mut lines_with_range = lines;
+        lines_with_range.push(format!(
+            "Messages from {} to {}",
+            format_context_summary_timestamp(min),
+            format_context_summary_timestamp(max)
+        ));
+        lines_with_range
+    } else {
+        lines
+    };
 
-    if lines.is_empty() {
+    if summary_lines.is_empty() {
         "Recent conversation summary: (No earlier conversation summary available.)".to_string()
     } else {
-        format!("Recent conversation summary: {}", lines.join("\n"))
+        format!("Recent conversation summary: {}", summary_lines.join("\n"))
     }
+}
+
+fn format_context_summary_timestamp(unix_seconds: i64) -> String {
+    Local
+        .timestamp_opt(unix_seconds, 0)
+        .single()
+        .unwrap_or_else(Local::now)
+        .format("%A, %B %d, %Y %I:%M %p %Z")
+        .to_string()
 }
 
 fn recall_memory_context_messages(
@@ -14260,21 +14288,33 @@ mod tests {
 
     #[test]
     fn format_context_summary_message_creates_bounded_summary_text() {
+        let now = Utc::now().timestamp();
         let summary = format_context_summary_message(&[
             ConversationMessage::new(MessageRole::System, "ignore"),
-            ConversationMessage::new(
-                MessageRole::User,
-                "A very long user message that should appear",
-            ),
-            ConversationMessage::new(
-                MessageRole::Assistant,
-                "A very long assistant message that should also appear",
-            ),
+            ConversationMessage {
+                id: None,
+                role: MessageRole::User,
+                content: Some("A very long user message that should appear".to_string()),
+                created_at_unix: now - 60,
+                tool_calls: None,
+                tool_call_id: None,
+                chat_model: None,
+            },
+            ConversationMessage {
+                id: None,
+                role: MessageRole::Assistant,
+                content: Some("A very long assistant message that should also appear".to_string()),
+                created_at_unix: now - 30,
+                tool_calls: None,
+                tool_call_id: None,
+                chat_model: None,
+            },
         ]);
 
         assert!(summary.starts_with("Recent conversation summary:"));
         assert!(summary.contains("User: A very long user message"));
         assert!(summary.contains("Assistant: A very long assistant message"));
+        assert!(summary.contains("Messages from "));
         assert!(!summary.contains("ignore"));
     }
 
