@@ -3900,7 +3900,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                 let existing = effective_user_preferred_name(Some(record));
                 if existing != elroy_user::DEFAULT_USER_PREFERRED_NAME && !override_existing {
                     return Ok(format!(
-                        "Preferred name already set to {}. If this should be changed, use override_existing=true.",
+                        "Preferred name already set to {}. If this should be changed, use override_existing=True.",
                         existing
                     ));
                 }
@@ -3954,7 +3954,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                 let existing = effective_user_full_name(Some(record));
                 if existing != elroy_user::UNKNOWN_FULL_NAME && !override_existing {
                     return Ok(format!(
-                        "Full name already set to {}. If this should be changed, set override_existing=true.",
+                        "Full name already set to {}. If this should be changed, set override_existing=True.",
                         existing
                     ));
                 }
@@ -7377,7 +7377,20 @@ mod tests {
         let duplicate =
             registry.invoke("set_user_preferred_name", "{\"preferred_name\":\"James\"}");
         assert!(!duplicate.is_error);
-        assert!(duplicate.content.contains("already set"));
+        assert_eq!(
+            duplicate.content,
+            "Preferred name already set to Jimmy. If this should be changed, use override_existing=True."
+        );
+
+        let preferred_override = registry.invoke(
+            "set_user_preferred_name",
+            "{\"preferred_name\":\"James\",\"override_existing\":true}",
+        );
+        assert!(!preferred_override.is_error);
+        assert_eq!(
+            preferred_override.content,
+            "Set user preferred name to James. Was Jimmy."
+        );
 
         let assistant = registry.invoke("set_assistant_name", "{\"assistant_name\":\"Nova\"}");
         assert!(!assistant.is_error);
@@ -7385,10 +7398,32 @@ mod tests {
 
         let full_name = registry.invoke("set_user_full_name", "{\"full_name\":\"James Smith\"}");
         assert!(!full_name.is_error);
+        assert_eq!(
+            full_name.content,
+            "Full name set to James Smith. Previous value was Unknown name."
+        );
+
+        let full_name_duplicate =
+            registry.invoke("set_user_full_name", "{\"full_name\":\"James T. Smith\"}");
+        assert!(!full_name_duplicate.is_error);
+        assert_eq!(
+            full_name_duplicate.content,
+            "Full name already set to James Smith. If this should be changed, set override_existing=True."
+        );
+
+        let full_name_override = registry.invoke(
+            "set_user_full_name",
+            "{\"full_name\":\"James T. Smith\",\"override_existing\":true}",
+        );
+        assert!(!full_name_override.is_error);
+        assert_eq!(
+            full_name_override.content,
+            "Full name set to James T. Smith. Previous value was James Smith."
+        );
 
         let get_full_name = registry.invoke("get_user_full_name", "{}");
         assert!(!get_full_name.is_error);
-        assert_eq!(get_full_name.content, "James Smith");
+        assert_eq!(get_full_name.content, "James T. Smith");
 
         let persona = registry.invoke(
             "set_persona",
@@ -7404,7 +7439,7 @@ mod tests {
         assert_eq!(context[0].role, MessageRole::System);
         assert_eq!(
             context[0].content.as_deref(),
-            Some("You are Nova helping Jimmy.")
+            Some("You are Nova helping James.")
         );
 
         let persisted = load_user_preferences(&connection, LOCAL_USER_TOKEN)
