@@ -3294,7 +3294,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                 return ToolExecutionResult::error("delete_due_item requires a string name");
             };
             let closing_comment = arguments.get("closing_comment").and_then(Value::as_str);
-            mutate_due_item_file_from_config_with_result(
+            let result = mutate_due_item_file_from_config_with_result(
                 &config_for_due_item_delete,
                 name,
                 |due_item_names| {
@@ -3314,7 +3314,17 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                         None => format!("Due item '{name}' has been deleted."),
                     })
                 },
-            )
+            );
+            if result.is_error {
+                return result;
+            }
+            let tool_call_id = context_due_item_tool_call_id(name);
+            match remove_context_tool_messages_by_id(&config_for_due_item_delete, &tool_call_id) {
+                Ok(()) => result,
+                Err(error) => ToolExecutionResult::error(format!(
+                    "failed to remove due item from context: {error}"
+                )),
+            }
         },
     );
 
@@ -5697,6 +5707,25 @@ fn message_matches_tool_call_id(message: &ConversationMessage, tool_call_id: &st
             .is_some_and(|tool_calls| tool_calls.iter().any(|call| call.id == tool_call_id))
 }
 
+fn remove_context_tool_messages_by_id(
+    config: &AppConfig,
+    tool_call_id: &str,
+) -> Result<(), AppError> {
+    let mut connection = open_sqlite_connection(&config.database_path)?;
+    run_migrations(&mut connection)?;
+    let transcript = load_validated_runtime_transcript(
+        &mut connection,
+        &config.assistant_name,
+        config.llm_provider() == LlmProvider::Anthropic,
+    )?;
+    let updated_transcript = transcript
+        .into_iter()
+        .filter(|message| !message_matches_tool_call_id(message, tool_call_id))
+        .collect::<Vec<_>>();
+    replace_context_messages(&mut connection, LOCAL_USER_TOKEN, &updated_transcript)?;
+    Ok(())
+}
+
 fn format_context_summary_message(messages: &[ConversationMessage]) -> String {
     let lines = messages
         .iter()
@@ -7523,10 +7552,18 @@ mod tests {
         assert!(timed_context.content.contains("context-due-item:pay rent"));
         assert!(timed_context.content.contains("pay rent"));
 
+        let deleted = registry.invoke(
+            "delete_due_item",
+            "{\"name\":\"call mom\",\"closing_comment\":\"done\"}",
+        );
+        assert!(!deleted.is_error);
+        let stripped = registry.invoke("show_context_messages", "{\"limit\":40}");
+        assert!(!stripped.is_error);
+        assert!(!stripped.content.contains("context-due-item:call mom"));
+        assert!(stripped.content.contains("context-due-item:pay rent"));
+
         let listed = registry.invoke("list_due_items", "{\"limit\":10}");
         assert!(!listed.is_error);
-        assert!(listed.content.contains("call mom"));
-        assert!(listed.content.contains("after dinner"));
         assert!(listed.content.contains("pay rent"));
     }
 
