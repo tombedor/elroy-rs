@@ -2587,13 +2587,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                 Ok(path)
             })();
             match created {
-                Ok(path) => ToolExecutionResult::success(
-                    json!({
-                        "created": true,
-                        "file_path": path.display().to_string(),
-                    })
-                    .to_string(),
-                ),
+                Ok(_path) => ToolExecutionResult::success(format!("New memory created: {name}")),
                 Err(error) => {
                     ToolExecutionResult::error(format!("failed to create memory: {error}"))
                 }
@@ -7342,6 +7336,7 @@ mod tests {
         );
 
         assert!(!created.is_error);
+        assert_eq!(created.content, "New memory created: Running progress");
         assert!(!source_list.is_error);
         assert_eq!(source_list.content, "[[\"ContextMessageSet\",\"1\"]]");
         assert!(out_of_range.is_error);
@@ -7397,6 +7392,7 @@ mod tests {
         );
 
         assert!(!created.is_error);
+        assert_eq!(created.content, "New memory created: Running progress");
         assert!(!source.is_error);
         assert!(
             source
