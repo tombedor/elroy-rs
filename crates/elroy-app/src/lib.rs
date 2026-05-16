@@ -1527,6 +1527,18 @@ fn live_provider_model(
     ))
 }
 
+fn best_effort_provider_model(
+    provider_config: Option<&ProviderConfig>,
+    assistant_name: &str,
+) -> Option<LiveProviderModel> {
+    let provider_config = provider_config.cloned()?;
+    let client = LiveModelClient::new(provider_config).ok()?;
+    Some(LiveProviderModel::new(
+        client,
+        effective_persona(None, assistant_name),
+    ))
+}
+
 fn run_prompt_with_model_and_registry_internal(
     connection: &mut rusqlite::Connection,
     prompt: &str,
@@ -2210,7 +2222,7 @@ fn format_memory_listing(memories: &[MemoryRecord]) -> String {
 }
 
 fn format_memory_search_results(
-    memories: &[MemoryRecord],
+    memories: &[&MemoryRecord],
     due_items: &[&AgendaItemRecord],
     agenda_items: &[&AgendaItemRecord],
 ) -> String {
@@ -5603,6 +5615,8 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
 
     let database_path = config.database_path.clone();
     let memory_dir_for_search_memories = config.memory_dir.clone();
+    let provider_config_for_search_memories = provider_config_from_app_config(config).ok();
+    let assistant_name_for_search_memories = config.assistant_name.clone();
     let search_memories = ExecutableTool::new(
         ToolSpec::new(
             "search_memories",
@@ -5614,21 +5628,46 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                 return ToolExecutionResult::error("search_memories requires a string query");
             };
             let recall_limit = argument_limit(&arguments, 10).min(2);
+            let relevance_model = best_effort_provider_model(
+                provider_config_for_search_memories.as_ref(),
+                &assistant_name_for_search_memories,
+            );
             with_tool_connection(&database_path, |connection| {
                 let memories = search_active_memories_in_scope(
                     connection,
                     &memory_dir_for_search_memories,
                     query,
-                    recall_limit,
+                    recall_limit * 3,
                 )?;
                 let due_items = list_active_due_items(connection, recall_limit * 3)?;
-                let relevant_due_items =
-                    select_due_items_by_overlap(query, &due_items, recall_limit, None);
                 let agenda_items = list_active_plain_agenda_items(connection, recall_limit * 3)?;
-                let relevant_agenda_items =
-                    select_agenda_items_by_overlap(query, &agenda_items, recall_limit);
-                Ok(ToolExecutionResult::success(format_memory_search_results(
+                let relevant_memories = select_relevant_recall_memories(
+                    query,
                     &memories,
+                    &HashSet::new(),
+                    recall_limit,
+                    relevance_model
+                        .as_ref()
+                        .map(|model| model as &dyn ModelClient),
+                );
+                let relevant_due_items = select_relevant_recall_due_items(
+                    query,
+                    &due_items,
+                    recall_limit,
+                    relevance_model
+                        .as_ref()
+                        .map(|model| model as &dyn ModelClient),
+                );
+                let relevant_agenda_items = select_relevant_recall_agenda_items(
+                    query,
+                    &agenda_items,
+                    recall_limit,
+                    relevance_model
+                        .as_ref()
+                        .map(|model| model as &dyn ModelClient),
+                );
+                Ok(ToolExecutionResult::success(format_memory_search_results(
+                    &relevant_memories,
                     &relevant_due_items,
                     &relevant_agenda_items,
                 )))
@@ -5638,6 +5677,8 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
 
     let database_path = config.database_path.clone();
     let memory_dir_for_examine_memories = config.memory_dir.clone();
+    let provider_config_for_examine_memories = provider_config_from_app_config(config).ok();
+    let assistant_name_for_examine_memories = config.assistant_name.clone();
     let examine_memories = ExecutableTool::new(
         ToolSpec::new(
             "examine_memories",
@@ -5649,20 +5690,43 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                 return ToolExecutionResult::error("examine_memories requires a string question");
             };
             let recall_limit = argument_limit(&arguments, 10).min(2);
+            let relevance_model = best_effort_provider_model(
+                provider_config_for_examine_memories.as_ref(),
+                &assistant_name_for_examine_memories,
+            );
             with_tool_connection(&database_path, |connection| {
                 let memories = list_active_memories_in_scope(
                     connection,
                     &memory_dir_for_examine_memories,
                     recall_limit * 3,
                 )?;
-                let relevant_memories =
-                    select_recalled_memories(question, &memories, &HashSet::new(), recall_limit);
                 let due_items = list_active_due_items(connection, recall_limit * 3)?;
-                let relevant_due_items =
-                    select_due_items_by_overlap(question, &due_items, recall_limit, None);
                 let agenda_items = list_active_plain_agenda_items(connection, recall_limit * 3)?;
-                let relevant_agenda_items =
-                    select_agenda_items_by_overlap(question, &agenda_items, recall_limit);
+                let relevant_memories = select_relevant_recall_memories(
+                    question,
+                    &memories,
+                    &HashSet::new(),
+                    recall_limit,
+                    relevance_model
+                        .as_ref()
+                        .map(|model| model as &dyn ModelClient),
+                );
+                let relevant_due_items = select_relevant_recall_due_items(
+                    question,
+                    &due_items,
+                    recall_limit,
+                    relevance_model
+                        .as_ref()
+                        .map(|model| model as &dyn ModelClient),
+                );
+                let relevant_agenda_items = select_relevant_recall_agenda_items(
+                    question,
+                    &agenda_items,
+                    recall_limit,
+                    relevance_model
+                        .as_ref()
+                        .map(|model| model as &dyn ModelClient),
+                );
 
                 let mut sections = relevant_memories
                     .into_iter()
@@ -7273,16 +7337,12 @@ fn recall_memory_context_messages_with_decision(
         build_recall_query(prompt, context.transcript, memory_recall_classifier_window);
     let relevance_model = if reflect { None } else { reflective_model };
     let already_recalled_memories = recalled_item_names_by_type(context.transcript, "Memory");
-    let recalled = filter_candidates_for_relevance(
-        relevance_model,
+    let recalled = select_relevant_recall_memories(
         &recall_query,
-        select_recalled_memories(
-            &recall_query,
-            context.memories,
-            &already_recalled_memories,
-            2,
-        ),
-        |memory| format!("# {}\n{}", memory.name, memory.body.trim()),
+        context.memories,
+        &already_recalled_memories,
+        2,
+        relevance_model,
     );
     let already_recalled_due_items = recalled_item_names_by_type(context.transcript, "AgendaItem");
     let reflective_due_items = if reflect {
@@ -7634,6 +7694,70 @@ Query: {query}\nResponses:\n{responses}"
         .zip(answers)
         .filter_map(|(candidate, is_relevant)| is_relevant.then_some(candidate))
         .collect()
+}
+
+fn select_relevant_recall_memories<'a>(
+    query: &str,
+    memories: &'a [MemoryRecord],
+    already_recalled: &HashSet<String>,
+    limit: usize,
+    relevance_model: Option<&dyn ModelClient>,
+) -> Vec<&'a MemoryRecord> {
+    let candidate_limit = limit.saturating_mul(3).max(limit);
+    filter_candidates_for_relevance(
+        relevance_model,
+        query,
+        select_recalled_memories(query, memories, already_recalled, candidate_limit),
+        |memory| format!("# {}\n{}", memory.name, memory.body.trim()),
+    )
+    .into_iter()
+    .take(limit)
+    .collect()
+}
+
+fn select_relevant_recall_due_items<'a>(
+    query: &str,
+    due_items: &'a [AgendaItemRecord],
+    limit: usize,
+    relevance_model: Option<&dyn ModelClient>,
+) -> Vec<&'a AgendaItemRecord> {
+    let candidate_limit = limit.saturating_mul(3).max(limit);
+    filter_candidates_for_relevance(
+        relevance_model,
+        query,
+        select_due_items_by_overlap(query, due_items, candidate_limit, None),
+        |item| {
+            let mut text = format!("# {}\n{}", item.name, item.body.trim());
+            if let Some(trigger_datetime) = item.trigger_datetime.as_deref() {
+                text.push_str(&format!("\ntrigger_datetime: {trigger_datetime}"));
+            }
+            if let Some(trigger_context) = item.trigger_context.as_deref() {
+                text.push_str(&format!("\ntrigger_context: {trigger_context}"));
+            }
+            text
+        },
+    )
+    .into_iter()
+    .take(limit)
+    .collect()
+}
+
+fn select_relevant_recall_agenda_items<'a>(
+    query: &str,
+    agenda_items: &'a [AgendaItemRecord],
+    limit: usize,
+    relevance_model: Option<&dyn ModelClient>,
+) -> Vec<&'a AgendaItemRecord> {
+    let candidate_limit = limit.saturating_mul(3).max(limit);
+    filter_candidates_for_relevance(
+        relevance_model,
+        query,
+        select_agenda_items_by_overlap(query, agenda_items, candidate_limit),
+        |item| format!("# {}\n{}", item.name, item.body.trim()),
+    )
+    .into_iter()
+    .take(limit)
+    .collect()
 }
 
 fn classify_memory_recall_with_model(
@@ -8342,7 +8466,8 @@ mod tests {
         recalled_memory_names, recent_recall_context, refresh_context_if_needed,
         run_prompt_with_model_and_registry, run_prompt_with_model_and_registry_internal,
         run_prompt_with_model_and_registry_stream, select_due_items_by_overlap,
-        select_recalled_due_items, select_recalled_memories, should_offer_greeting,
+        select_recalled_due_items, select_recalled_memories, select_relevant_recall_agenda_items,
+        select_relevant_recall_due_items, select_relevant_recall_memories, should_offer_greeting,
         should_skip_memory_recall, significant_tokens, strip_input_message_for_persistence,
         strip_transient_context_messages, summarize_context_messages_with_model,
     };
@@ -16799,6 +16924,88 @@ mod tests {
 
         assert_eq!(recalled.len(), 1);
         assert_eq!(recalled[0].name, "practice plan");
+    }
+
+    #[test]
+    fn select_relevant_recall_helpers_can_filter_tool_surface_candidates() {
+        let model = FakeModel::new(vec![
+            vec![StreamEvent::AssistantResponse {
+                content: r#"{"answers":[false],"reasoning":"Not actually relevant."}"#.to_string(),
+            }],
+            vec![StreamEvent::AssistantResponse {
+                content: r#"{"answers":[false],"reasoning":"Not actually relevant."}"#.to_string(),
+            }],
+            vec![StreamEvent::AssistantResponse {
+                content: r#"{"answers":[false],"reasoning":"Not actually relevant."}"#.to_string(),
+            }],
+        ]);
+        let memories = vec![MemoryRecord {
+            id: 1,
+            legacy_frontmatter_id: None,
+            name: "gym note".to_string(),
+            file_path: "/tmp/gym_note.md".to_string(),
+            body: "Bring dumbbells to the gym workout.".to_string(),
+            is_active: true,
+            updated_at_unix: 10,
+        }];
+        let due_items = vec![AgendaItemRecord {
+            id: 2,
+            legacy_frontmatter_id: None,
+            name: "gym follow up".to_string(),
+            file_path: "/tmp/gym_follow_up.md".to_string(),
+            agenda_date: Some("unscheduled".to_string()),
+            is_completed: false,
+            status: Some("created".to_string()),
+            closing_comment: None,
+            checklist_total: 0,
+            checklist_completed: 0,
+            body: "Ask about weight progression.".to_string(),
+            trigger_datetime: None,
+            trigger_context: Some("after the gym workout".to_string()),
+            is_active: true,
+            updated_at_unix: 11,
+        }];
+        let agenda_items = vec![AgendaItemRecord {
+            id: 3,
+            legacy_frontmatter_id: None,
+            name: "gym planning".to_string(),
+            file_path: "/tmp/gym_planning.md".to_string(),
+            agenda_date: Some("2026-05-21".to_string()),
+            is_completed: false,
+            status: Some("created".to_string()),
+            closing_comment: None,
+            checklist_total: 0,
+            checklist_completed: 0,
+            body: "Review the workout block and equipment list.".to_string(),
+            trigger_datetime: None,
+            trigger_context: None,
+            is_active: true,
+            updated_at_unix: 12,
+        }];
+
+        let relevant_memories = select_relevant_recall_memories(
+            "What workout gear should I bring?",
+            &memories,
+            &HashSet::new(),
+            2,
+            Some(&model),
+        );
+        let relevant_due_items = select_relevant_recall_due_items(
+            "What workout gear should I bring?",
+            &due_items,
+            2,
+            Some(&model),
+        );
+        let relevant_agenda_items = select_relevant_recall_agenda_items(
+            "What workout gear should I bring?",
+            &agenda_items,
+            2,
+            Some(&model),
+        );
+
+        assert!(relevant_memories.is_empty());
+        assert!(relevant_due_items.is_empty());
+        assert!(relevant_agenda_items.is_empty());
     }
 
     fn init_test_repo(repo_root: &Path) {
