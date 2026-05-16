@@ -2739,21 +2739,33 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
             let trigger_datetime = arguments.get("trigger_datetime").and_then(Value::as_str);
             let trigger_context = arguments.get("trigger_context").and_then(Value::as_str);
 
-            match create_agenda_file(
-                &config_for_agenda_write.agenda_dir,
-                name,
-                text,
-                Some(&effective_date),
-                trigger_datetime,
-                trigger_context,
-            )
-            .and_then(|path| {
+            match (|| -> Result<PathBuf, std::io::Error> {
+                let mut connection = open_sqlite_connection(&config_for_agenda_write.database_path)
+                    .map_err(|error| std::io::Error::other(error.to_string()))?;
+                run_migrations(&mut connection)
+                    .map_err(|error| std::io::Error::other(error.to_string()))?;
+                if find_active_agenda_item_by_name(&connection, name)
+                    .map_err(|error| std::io::Error::other(error.to_string()))?
+                    .is_some()
+                {
+                    return Err(std::io::Error::other(format!(
+                        "Task '{name}' already exists"
+                    )));
+                }
+                let path = create_agenda_file(
+                    &config_for_agenda_write.agenda_dir,
+                    name,
+                    text,
+                    Some(&effective_date),
+                    trigger_datetime,
+                    trigger_context,
+                )?;
                 elroy_db::bootstrap_database(&BootstrapPlan::from_config(&config_for_agenda_write))
                     .map_err(|error| std::io::Error::other(error.to_string()))?;
                 sync_task_context_after_mutation(&config_for_agenda_write, name, Some(name))
                     .map_err(|error| std::io::Error::other(error.to_string()))?;
                 Ok(path)
-            }) {
+            })() {
                 Ok(path) => ToolExecutionResult::success(format!(
                     "Agenda item added for {}: {}",
                     effective_date,
@@ -2761,6 +2773,9 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                         .and_then(|value| value.to_str())
                         .unwrap_or(name)
                 )),
+                Err(error) if error.to_string().starts_with("Task '") => {
+                    ToolExecutionResult::error(error.to_string())
+                }
                 Err(error) => {
                     ToolExecutionResult::error(format!("failed to create agenda item: {error}"))
                 }
@@ -9282,6 +9297,15 @@ mod tests {
             "Agenda item added for 2026-05-18: project_kickoff"
         );
         assert!(agenda_dir.join("project_kickoff.md").exists());
+        let duplicate_added = registry.invoke(
+            "add_agenda_item",
+            "{\"name\":\"Project Kickoff\",\"text\":\"Prepare other slides\",\"date\":\"2026-05-18\"}",
+        );
+        assert!(duplicate_added.is_error);
+        assert_eq!(
+            duplicate_added.content,
+            "Task 'Project Kickoff' already exists"
+        );
         let added_context = registry.invoke("show_context_messages", "{\"limit\":20}");
         assert!(!added_context.is_error);
         assert!(
