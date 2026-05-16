@@ -4474,7 +4474,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
 
                 let mut sections = relevant_memories
                     .into_iter()
-                    .map(|memory| format_memory_examination(memory))
+                    .map(format_memory_examination)
                     .collect::<Vec<_>>();
                 sections.extend(relevant_due_items.into_iter().map(|item| {
                     let mut text = format!("# Due Item: {}\n\n{}", item.name, item.body.trim());
@@ -4784,13 +4784,26 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
             };
             with_tool_connection(&database_path, |connection| {
                 let Some(item) = find_active_agenda_item_by_name(connection, name)? else {
+                    let valid_due_items = list_active_due_items(connection, 1_000)?
+                        .into_iter()
+                        .map(|item| item.name)
+                        .collect::<Vec<_>>();
                     return Ok(ToolExecutionResult::error(format!(
-                        "due item not found: {name}"
+                        "Due item '{name}' not found. Valid items: {}",
+                        valid_due_items.join(",")
                     )));
                 };
                 if item.trigger_datetime.is_none() && item.trigger_context.is_none() {
+                    let valid_due_items = list_active_due_items(connection, 1_000)?
+                        .into_iter()
+                        .filter(|item| {
+                            item.trigger_datetime.is_some() || item.trigger_context.is_some()
+                        })
+                        .map(|item| item.name)
+                        .collect::<Vec<_>>();
                     return Ok(ToolExecutionResult::error(format!(
-                        "due item not found: {name}"
+                        "Due item '{name}' not found. Valid items: {}",
+                        valid_due_items.join(",")
                     )));
                 }
                 Ok(ToolExecutionResult::success(format_due_item_detail(&item)))
@@ -7373,6 +7386,13 @@ mod tests {
                 .contains("Trigger Time: 2026-05-15T09:00:00")
         );
         assert!(printed.content.contains("Text: Pay bill"));
+
+        let missing_printed = registry.invoke("print_due_item", "{\"name\":\"missing\"}");
+        assert!(missing_printed.is_error);
+        assert_eq!(
+            missing_printed.content,
+            "Due item 'missing' not found. Valid items: pay bill"
+        );
 
         let inactive = registry.invoke("list_inactive_due_items", "{\"limit\":10}");
         assert!(!inactive.is_error);
