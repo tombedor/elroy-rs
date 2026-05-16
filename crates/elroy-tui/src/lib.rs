@@ -627,7 +627,7 @@ fn start_command_execution(
     runtime: &mut impl TuiRuntime,
     command: TuiCommandExecution,
 ) -> Result<(), String> {
-    if app.command_active {
+    if app.command_active || app.prompt_active {
         return Err(
             "Wait for the current task to finish before sending another message.".to_string(),
         );
@@ -3194,6 +3194,42 @@ mod tests {
     }
 
     #[test]
+    fn command_form_submit_keeps_form_open_when_prompt_stream_is_active() {
+        let mut app = TuiApp::bootstrap();
+        app.prompt_active = true;
+        app.open_command_form(TuiCommandForm {
+            command_name: "create_memory".to_string(),
+            description: "Create a memory".to_string(),
+            parameters: vec![TuiCommandParameter {
+                name: "name".to_string(),
+                optional: false,
+                default_text: String::new(),
+                suggestions: vec![],
+            }],
+            initial_values: vec![("name".to_string(), "trip".to_string())],
+        });
+        let mut runtime = FakeRuntime::default();
+        let mut pending = None;
+
+        apply_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut runtime,
+            &mut pending,
+        );
+
+        let command_form = app
+            .command_form
+            .as_ref()
+            .expect("command form should remain open");
+        assert_eq!(
+            command_form.error.as_deref(),
+            Some("Wait for the current task to finish before sending another message.")
+        );
+        assert!(runtime.started_command_executions.is_empty());
+    }
+
+    #[test]
     fn command_form_submit_keeps_form_open_when_command_launch_fails() {
         let mut app = TuiApp::bootstrap();
         app.open_command_form(TuiCommandForm {
@@ -3502,6 +3538,45 @@ mod tests {
             .expect("command palette should open")
             .selected_index = 2;
         app.command_active = true;
+        let mut runtime = FakeRuntime {
+            launch_named_command_action: Some(TuiSlashCommandAction::Execute(
+                TuiCommandExecution {
+                    command_name: "refresh_system_instructions".to_string(),
+                    display_name: "refresh_system_instructions".to_string(),
+                    values: vec![],
+                },
+            )),
+            ..FakeRuntime::default()
+        };
+        let mut pending = None;
+
+        apply_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut runtime,
+            &mut pending,
+        );
+
+        assert!(app.command_palette.is_some());
+        assert_eq!(
+            app.status,
+            "command launch failed: Wait for the current task to finish before sending another message."
+        );
+    }
+
+    #[test]
+    fn command_palette_keeps_modal_open_when_prompt_stream_is_active() {
+        let mut app = TuiApp::bootstrap();
+        app.open_command_palette(vec![TuiCommandPaletteEntry {
+            title: "/refresh_system_instructions".to_string(),
+            description: "Refresh system instructions".to_string(),
+            action: TuiCommandPaletteAction::ToolCommand("refresh_system_instructions".to_string()),
+        }]);
+        app.command_palette
+            .as_mut()
+            .expect("command palette should open")
+            .selected_index = 2;
+        app.prompt_active = true;
         let mut runtime = FakeRuntime {
             launch_named_command_action: Some(TuiSlashCommandAction::Execute(
                 TuiCommandExecution {
