@@ -14,6 +14,7 @@ pub struct AppConfig {
     pub agenda_dir: PathBuf,
     pub database_path: PathBuf,
     pub chat_model: String,
+    pub max_tokens: usize,
     pub assistant_name: String,
     pub enable_assistant_greeting: bool,
     pub min_convo_age_for_greeting_minutes: f64,
@@ -75,6 +76,7 @@ impl AppConfig {
             agenda_dir,
             database_path,
             chat_model: "gpt-5".to_string(),
+            max_tokens: 100_000,
             assistant_name: "Elroy".to_string(),
             enable_assistant_greeting: false,
             min_convo_age_for_greeting_minutes: 5.0,
@@ -105,6 +107,9 @@ impl AppConfig {
         }
         if let Some(chat_model) = file_config.chat_model {
             self.chat_model = chat_model;
+        }
+        if let Some(max_tokens) = file_config.max_tokens {
+            self.max_tokens = max_tokens;
         }
         if let Some(assistant_name) = file_config.default_assistant_name {
             self.assistant_name = assistant_name;
@@ -167,6 +172,9 @@ impl AppConfig {
         if let Some(chat_model) = env.get("ELROY_CHAT_MODEL") {
             self.chat_model = chat_model.clone();
         }
+        if let Some(max_tokens) = env.get("ELROY_MAX_TOKENS") {
+            self.max_tokens = parse_usize(max_tokens);
+        }
         if let Some(assistant_name) = env.get("ELROY_DEFAULT_ASSISTANT_NAME") {
             self.assistant_name = assistant_name.clone();
         }
@@ -225,11 +233,16 @@ impl AppConfig {
     pub fn llm_provider(&self) -> LlmProvider {
         LlmProvider::for_model(&self.chat_model)
     }
+
+    pub fn context_refresh_target_tokens(&self) -> usize {
+        self.max_tokens / 3
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
 struct FileConfig {
     chat_model: Option<String>,
+    max_tokens: Option<usize>,
     default_assistant_name: Option<String>,
     enable_assistant_greeting: Option<bool>,
     min_convo_age_for_greeting_minutes: Option<f64>,
@@ -369,6 +382,8 @@ mod tests {
 
         assert!(config.async_runtime_enabled);
         assert!(config.include_base_tools);
+        assert_eq!(config.max_tokens, 100_000);
+        assert_eq!(config.context_refresh_target_tokens(), 33_333);
         assert!(!config.enable_assistant_greeting);
         assert_eq!(config.min_convo_age_for_greeting_minutes, 5.0);
         assert_eq!(config.max_context_age_minutes, 720.0);
@@ -404,7 +419,7 @@ mod tests {
         let config_path = home_dir.join("elroy.conf.yaml");
         fs::write(
             &config_path,
-            "chat_model: gpt-5-nano\nenable_assistant_greeting: true\nmin_convo_age_for_greeting_minutes: 15.5\nmax_context_age_minutes: 180.0\nmessages_between_memory: 12\nmessages_between_self_reflection: 4\nmemory_recall_classifier_enabled: false\nmemory_recall_classifier_window: 7\nmemory_dir: /tmp/elroy-memories\nagenda_dir: /tmp/elroy-agenda\ndatabase_url: sqlite:////tmp/elroy.db\nirrelevant_key: ignored\n",
+            "chat_model: gpt-5-nano\nmax_tokens: 9000\nenable_assistant_greeting: true\nmin_convo_age_for_greeting_minutes: 15.5\nmax_context_age_minutes: 180.0\nmessages_between_memory: 12\nmessages_between_self_reflection: 4\nmemory_recall_classifier_enabled: false\nmemory_recall_classifier_window: 7\nmemory_dir: /tmp/elroy-memories\nagenda_dir: /tmp/elroy-agenda\ndatabase_url: sqlite:////tmp/elroy.db\nirrelevant_key: ignored\n",
         )
         .expect("config fixture should be written");
 
@@ -412,6 +427,8 @@ mod tests {
         let config = AppConfig::from_env(&env).expect("config should load");
 
         assert_eq!(config.chat_model, "gpt-5-nano");
+        assert_eq!(config.max_tokens, 9000);
+        assert_eq!(config.context_refresh_target_tokens(), 3000);
         assert_eq!(config.memory_dir, PathBuf::from("/tmp/elroy-memories"));
         assert_eq!(config.agenda_dir, PathBuf::from("/tmp/elroy-agenda"));
         assert_eq!(config.database_path, PathBuf::from("/tmp/elroy.db"));
@@ -446,6 +463,7 @@ mod tests {
                 "ELROY_CHAT_MODEL".to_string(),
                 "claude-sonnet-4-5-20250929".to_string(),
             ),
+            ("ELROY_MAX_TOKENS".to_string(), "12000".to_string()),
             (
                 "ELROY_DEFAULT_ASSISTANT_NAME".to_string(),
                 "EnvElroy".to_string(),
@@ -510,6 +528,8 @@ mod tests {
         let config = AppConfig::from_env(&env).expect("config should load");
 
         assert_eq!(config.chat_model, "claude-sonnet-4-5-20250929");
+        assert_eq!(config.max_tokens, 12_000);
+        assert_eq!(config.context_refresh_target_tokens(), 4_000);
         assert_eq!(config.assistant_name, "EnvElroy");
         assert!(config.enable_assistant_greeting);
         assert_eq!(config.min_convo_age_for_greeting_minutes, 2.5);

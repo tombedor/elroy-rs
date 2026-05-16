@@ -3759,6 +3759,116 @@ fn significant_tokens(text: &str) -> HashSet<String> {
         .collect()
 }
 
+#[allow(dead_code)]
+fn approximate_message_token_count(message: &ConversationMessage) -> usize {
+    let content_tokens = message
+        .content
+        .as_deref()
+        .map(|content| content.split_whitespace().count())
+        .unwrap_or(0);
+    let tool_call_tokens = message
+        .tool_calls
+        .as_ref()
+        .map(|calls| {
+            calls
+                .iter()
+                .map(|call| {
+                    call.name.split_whitespace().count()
+                        + call.arguments_json.split_whitespace().count()
+                })
+                .sum::<usize>()
+        })
+        .unwrap_or(0);
+    let tool_result_tokens = message
+        .tool_call_id
+        .as_deref()
+        .map(|tool_call_id| tool_call_id.split_whitespace().count())
+        .unwrap_or(0);
+
+    content_tokens + tool_call_tokens + tool_result_tokens
+}
+
+#[allow(dead_code)]
+fn count_context_tokens(context_messages: &[ConversationMessage]) -> usize {
+    context_messages
+        .iter()
+        .map(approximate_message_token_count)
+        .sum()
+}
+
+#[allow(dead_code)]
+fn is_context_refresh_needed(context_messages: &[ConversationMessage], max_tokens: usize) -> bool {
+    if !context_messages
+        .iter()
+        .any(|message| message.role == MessageRole::User)
+    {
+        return false;
+    }
+
+    count_context_tokens(context_messages) > max_tokens
+}
+
+#[allow(dead_code)]
+fn compress_context_messages(
+    context_messages: &[ConversationMessage],
+    context_refresh_target_tokens: usize,
+    max_context_age_minutes: f64,
+) -> Vec<ConversationMessage> {
+    if context_messages.is_empty() {
+        return Vec::new();
+    }
+
+    let system_message = context_messages[0].clone();
+    let previous_messages = &context_messages[1..];
+    if previous_messages.is_empty() {
+        return vec![system_message];
+    }
+
+    let system_tokens = approximate_message_token_count(&system_message);
+    let remaining_budget = context_refresh_target_tokens.saturating_sub(system_tokens);
+    let cutoff_unix = Utc::now().timestamp() - (max_context_age_minutes * 60.0) as i64;
+
+    let mut cutoff_index = 0usize;
+    let mut current_token_count = 0usize;
+    let mut idx = previous_messages.len();
+
+    while idx > 0 {
+        idx -= 1;
+        let message = &previous_messages[idx];
+
+        if message.role == MessageRole::Tool
+            && idx > 0
+            && previous_messages[idx - 1].role == MessageRole::Assistant
+        {
+            let pair_tokens = approximate_message_token_count(&previous_messages[idx - 1])
+                + approximate_message_token_count(message);
+            if current_token_count + pair_tokens > remaining_budget
+                || previous_messages[idx - 1].created_at_unix < cutoff_unix
+            {
+                cutoff_index = idx + 1;
+                break;
+            }
+            current_token_count += pair_tokens;
+            idx -= 1;
+            continue;
+        }
+
+        let message_tokens = approximate_message_token_count(message);
+        if current_token_count + message_tokens > remaining_budget
+            || message.created_at_unix < cutoff_unix
+        {
+            cutoff_index = idx + 1;
+            break;
+        }
+
+        current_token_count += message_tokens;
+    }
+
+    let mut compressed = vec![system_message];
+    compressed.extend(previous_messages[cutoff_index..].iter().cloned());
+    compressed
+}
+
 fn strip_transient_context_messages(
     mut transcript: Vec<ConversationMessage>,
     persistent_prefix_len: usize,
@@ -3840,7 +3950,8 @@ mod tests {
     use super::{
         AppRuntime, LOCAL_USER_TOKEN, PromptExecutionOptions, SYNTHETIC_FIRST_USER_MESSAGE,
         argument_limit, build_live_tool_registry, build_live_tool_registry_with_codex_bin_and_hook,
-        build_recall_query, drop_old_context_messages, due_item_context_messages,
+        build_recall_query, compress_context_messages, count_context_tokens,
+        drop_old_context_messages, due_item_context_messages, is_context_refresh_needed,
         memory_recall_status_updates, parse_recalled_memory_names, prompt_prelude_status_updates,
         provider_config_from_app_config, recall_memory_context_messages, recalled_memory_names,
         recent_recall_context, run_prompt_with_model_and_registry,
@@ -3859,6 +3970,7 @@ mod tests {
         load_user_preferences, open_sqlite_connection, run_migrations,
     };
     use elroy_feature_requests::{list_feature_requests, write_new_feature_request};
+    use elroy_llm::ToolCall;
     use elroy_llm::{ConversationMessage, MessageRole, Provider, StreamEvent};
     use elroy_memory::{create_memory_file, sanitize_filename};
     use elroy_tools::ExecutableToolRegistry;
@@ -6202,6 +6314,86 @@ mod tests {
         assert!(should_skip_memory_recall("hi"));
         assert!(should_skip_memory_recall("thanks"));
         assert!(!should_skip_memory_recall("I am going running tomorrow"));
+    }
+
+    #[test]
+    fn context_refresh_is_not_needed_without_user_messages() {
+        let context_messages = vec![
+            ConversationMessage::new(MessageRole::System, "system"),
+            ConversationMessage::new(MessageRole::Assistant, "assistant only"),
+        ];
+
+        assert!(!is_context_refresh_needed(&context_messages, 1));
+    }
+
+    #[test]
+    fn context_refresh_is_needed_when_token_budget_is_exceeded() {
+        let context_messages = vec![
+            ConversationMessage::new(MessageRole::System, "system"),
+            ConversationMessage::new(MessageRole::User, "one two three four five six"),
+            ConversationMessage::new(MessageRole::Assistant, "seven eight nine ten eleven"),
+        ];
+
+        assert!(count_context_tokens(&context_messages) > 5);
+        assert!(is_context_refresh_needed(&context_messages, 5));
+    }
+
+    #[test]
+    fn compress_context_messages_preserves_system_and_relative_order() {
+        let mut context_messages = vec![ConversationMessage::new(MessageRole::System, "system")];
+        for index in 0..12 {
+            context_messages.push(ConversationMessage::new(
+                MessageRole::User,
+                format!("{index} user words repeated repeated repeated"),
+            ));
+            context_messages.push(ConversationMessage::new(
+                MessageRole::Assistant,
+                format!("{index} assistant words repeated repeated repeated"),
+            ));
+        }
+
+        let compressed = compress_context_messages(&context_messages, 30, 10_000.0);
+
+        assert_eq!(compressed[0].role, MessageRole::System);
+        assert_eq!(compressed[0].content.as_deref(), Some("system"));
+        assert!(compressed.len() < context_messages.len());
+        for pair in compressed[1..].windows(2) {
+            let left = pair[0]
+                .content
+                .as_deref()
+                .and_then(|content| content.split_whitespace().next())
+                .and_then(|token| token.parse::<usize>().ok());
+            let right = pair[1]
+                .content
+                .as_deref()
+                .and_then(|content| content.split_whitespace().next())
+                .and_then(|token| token.parse::<usize>().ok());
+            if let (Some(left), Some(right)) = (left, right) {
+                assert!(left <= right);
+            }
+        }
+    }
+
+    #[test]
+    fn compress_context_messages_keeps_assistant_tool_result_pair_together() {
+        let tool_call = ToolCall {
+            id: "call-1".to_string(),
+            name: "get_weather".to_string(),
+            arguments_json: "{\"location\":\"Paris\"}".to_string(),
+        };
+        let context_messages = vec![
+            ConversationMessage::new(MessageRole::System, "system"),
+            ConversationMessage::new(MessageRole::User, "older context words words words"),
+            ConversationMessage::assistant_with_tool_calls("", vec![tool_call.clone()]),
+            ConversationMessage::tool_result(&tool_call.id, "{\"temp\":25}"),
+        ];
+
+        let compressed = compress_context_messages(&context_messages, 7, 10_000.0);
+
+        assert_eq!(compressed.len(), 3);
+        assert_eq!(compressed[0].role, MessageRole::System);
+        assert_eq!(compressed[1].role, MessageRole::Assistant);
+        assert_eq!(compressed[2].role, MessageRole::Tool);
     }
 
     #[test]
