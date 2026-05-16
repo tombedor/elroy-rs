@@ -5045,10 +5045,20 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
         ToolSpec::new(
             "show_memory",
             "Show one active memory by exact name.",
-            JsonSchema::object([("name", json!({"type": "string"}))], ["name"]),
+            JsonSchema::object(
+                [
+                    ("memory_name", json!({"type": "string"})),
+                    ("name", json!({"type": "string"})),
+                ],
+                [] as [&str; 0],
+            ),
         ),
         move |arguments| {
-            let Some(name) = arguments.get("name").and_then(Value::as_str) else {
+            let Some(name) = arguments
+                .get("memory_name")
+                .and_then(Value::as_str)
+                .or_else(|| arguments.get("name").and_then(Value::as_str))
+            else {
                 return ToolExecutionResult::error("show_memory requires a string name");
             };
             with_tool_connection(&database_path, |connection| {
@@ -5075,10 +5085,20 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
         ToolSpec::new(
             "print_memory",
             "Show one active memory by exact name.",
-            JsonSchema::object([("name", json!({"type": "string"}))], ["name"]),
+            JsonSchema::object(
+                [
+                    ("memory_name", json!({"type": "string"})),
+                    ("name", json!({"type": "string"})),
+                ],
+                [] as [&str; 0],
+            ),
         ),
         move |arguments| {
-            let Some(name) = arguments.get("name").and_then(Value::as_str) else {
+            let Some(name) = arguments
+                .get("memory_name")
+                .and_then(Value::as_str)
+                .or_else(|| arguments.get("name").and_then(Value::as_str))
+            else {
                 return ToolExecutionResult::error("print_memory requires a string name");
             };
             with_tool_connection(&database_path, |connection| {
@@ -6850,9 +6870,10 @@ mod tests {
             .expect("bootstrap should succeed");
 
         let registry = build_live_tool_registry(&config);
-        let memory = registry.invoke("show_memory", "{\"name\":\"runner notes\"}");
-        let printed_memory = registry.invoke("print_memory", "{\"name\":\"runner notes\"}");
-        let missing_printed_memory = registry.invoke("print_memory", "{\"name\":\"missing\"}");
+        let memory = registry.invoke("show_memory", "{\"memory_name\":\"runner notes\"}");
+        let printed_memory = registry.invoke("print_memory", "{\"memory_name\":\"runner notes\"}");
+        let missing_printed_memory =
+            registry.invoke("print_memory", "{\"memory_name\":\"missing\"}");
         let agenda = registry.invoke("show_agenda_item", "{\"name\":\"doctor visit\"}");
         let printed_memories = registry.invoke("print_memories", "{\"n\":10}");
 
