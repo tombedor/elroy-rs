@@ -2196,6 +2196,24 @@ fn format_memory_detail(memory: &MemoryRecord) -> String {
     format!("#{}\n{}", memory.name, memory.body)
 }
 
+fn format_agenda_item_recall_detail(item: &AgendaItemRecord) -> String {
+    if let Some(trigger_datetime) = item.trigger_datetime.as_deref() {
+        let formatted = parse_sidebar_trigger_datetime(trigger_datetime)
+            .map(|datetime| datetime.format("%Y-%m-%d %H:%M:%S").to_string())
+            .unwrap_or_else(|| trigger_datetime.to_string());
+        return format!("#{} (Timed: {formatted})\n{}", item.name, item.body.trim());
+    }
+    if let Some(trigger_context) = item.trigger_context.as_deref() {
+        return format!(
+            "#{} (Context: {})\n{}",
+            item.name,
+            trigger_context,
+            item.body.trim()
+        );
+    }
+    format!("#Agenda: {}\n{}", item.name, item.body.trim())
+}
+
 fn format_memory_examination(memory: &MemoryRecord) -> String {
     format!(
         "# Memory: {}\n\n*to view the source content this memory is based on, call tool `get_source_content_for_memory({}, idx)`\n\n{}",
@@ -7344,11 +7362,28 @@ fn recall_memory_context_messages_with_decision(
         2,
         relevance_model,
     );
-    let already_recalled_due_items = recalled_item_names_by_type(context.transcript, "AgendaItem");
+    let already_recalled_agenda_items =
+        recalled_item_names_by_type(context.transcript, "AgendaItem");
+    let fast_due_items = if reflect {
+        Vec::new()
+    } else {
+        select_relevant_recall_due_items(&recall_query, context.due_items, 2, relevance_model)
+            .into_iter()
+            .filter(|item| !already_recalled_agenda_items.contains(&item.name))
+            .collect()
+    };
+    let fast_agenda_items = if reflect {
+        Vec::new()
+    } else {
+        select_relevant_recall_agenda_items(&recall_query, context.agenda_items, 2, relevance_model)
+            .into_iter()
+            .filter(|item| !already_recalled_agenda_items.contains(&item.name))
+            .collect()
+    };
     let reflective_due_items = if reflect {
         select_due_items_by_overlap(&recall_query, context.due_items, 2, None)
             .into_iter()
-            .filter(|item| !already_recalled_due_items.contains(&item.name))
+            .filter(|item| !already_recalled_agenda_items.contains(&item.name))
             .collect()
     } else {
         Vec::new()
@@ -7356,12 +7391,16 @@ fn recall_memory_context_messages_with_decision(
     let reflective_agenda_items = if reflect {
         select_agenda_items_by_overlap(&recall_query, context.agenda_items, 2)
             .into_iter()
-            .filter(|item| !already_recalled_due_items.contains(&item.name))
+            .filter(|item| !already_recalled_agenda_items.contains(&item.name))
             .collect()
     } else {
         Vec::new()
     };
-    if recalled.is_empty() && reflective_due_items.is_empty() && reflective_agenda_items.is_empty()
+    if recalled.is_empty()
+        && fast_due_items.is_empty()
+        && fast_agenda_items.is_empty()
+        && reflective_due_items.is_empty()
+        && reflective_agenda_items.is_empty()
     {
         return Vec::new();
     }
@@ -7422,6 +7461,8 @@ fn recall_memory_context_messages_with_decision(
         "content": recalled
             .iter()
             .map(|memory| format_memory_detail(memory))
+            .chain(fast_due_items.iter().map(|item| format_agenda_item_recall_detail(item)))
+            .chain(fast_agenda_items.iter().map(|item| format_agenda_item_recall_detail(item)))
             .collect::<Vec<_>>()
             .join("\n\n"),
         "recall_metadata": recalled
@@ -7433,6 +7474,20 @@ fn recall_memory_context_messages_with_decision(
                     "name": memory.name,
                 })
             })
+            .chain(fast_due_items.iter().map(|item| {
+                json!({
+                    "memory_type": "AgendaItem",
+                    "memory_id": item.id,
+                    "name": item.name,
+                })
+            }))
+            .chain(fast_agenda_items.iter().map(|item| {
+                json!({
+                    "memory_type": "AgendaItem",
+                    "memory_id": item.id,
+                    "name": item.name,
+                })
+            }))
             .collect::<Vec<_>>(),
     }))
     .expect("memory recall payload should serialize");
@@ -16175,6 +16230,113 @@ mod tests {
     }
 
     #[test]
+    fn run_prompt_with_model_and_registry_fast_recall_can_include_due_and_agenda_items() {
+        struct MixedFastRecallPromptModel;
+
+        impl ModelClient for MixedFastRecallPromptModel {
+            fn next_events(
+                &self,
+                request: ConversationRequest<'_>,
+            ) -> Result<Vec<StreamEvent>, elroy_core::ModelClientError> {
+                assert_eq!(
+                    request.user_message,
+                    "What should I remember for basketball practice?"
+                );
+                let recall_payload = request
+                    .transcript
+                    .iter()
+                    .find(|message| {
+                        message.role == MessageRole::Tool
+                            && message.tool_call_id.as_deref() == Some("bootstrap-memory-recall")
+                    })
+                    .and_then(|message| message.content.as_deref())
+                    .expect("fast recall payload should be injected");
+                assert!(recall_payload.contains("basketball form"));
+                assert!(recall_payload.contains("practice reminder"));
+                assert!(recall_payload.contains("drill plan"));
+                assert!(recall_payload.contains("\"memory_type\": \"Memory\""));
+                assert!(recall_payload.contains("\"memory_type\": \"AgendaItem\""));
+                Ok(vec![StreamEvent::AssistantResponse {
+                    content: "Injected mixed fast recall.".to_string(),
+                }])
+            }
+        }
+
+        let unique = format!(
+            "elroy-rs-app-fast-recall-mixed-items-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+        fs::write(
+            memory_dir.join("basketball_form.md"),
+            "# Basketball Form\n\nRemember to follow through on your shot.\n",
+        )
+        .expect("memory file should be written");
+        fs::write(
+            agenda_dir.join("practice_reminder.md"),
+            "---\ndate: unscheduled\ncompleted: false\nstatus: created\ntrigger_context: before basketball practice\n---\n\nBring the resistance bands\n",
+        )
+        .expect("due item file should be written");
+        fs::write(
+            agenda_dir.join("drill_plan.md"),
+            "---\ndate: 2026-05-20\ncompleted: false\nstatus: created\n---\n\nFocus on basketball practice footwork and follow-through\n",
+        )
+        .expect("agenda item file should be written");
+
+        let mut config = AppConfig::defaults();
+        config.home_dir = home.clone();
+        config.memory_dir = memory_dir;
+        config.agenda_dir = agenda_dir;
+        config.database_path = database_path.clone();
+        config.memory_recall_classifier_enabled = false;
+        elroy_db::bootstrap_database(&BootstrapPlan::from_config(&config))
+            .expect("bootstrap should succeed");
+
+        let mut connection = open_sqlite_connection(&database_path).expect("database should open");
+        run_migrations(&mut connection).expect("migrations should run");
+
+        let events = run_prompt_with_model_and_registry(
+            &mut connection,
+            "What should I remember for basketball practice?",
+            &MixedFastRecallPromptModel,
+            build_live_tool_registry(&config),
+            PromptExecutionOptions {
+                role: MessageRole::User,
+                persist_input_message: true,
+                force_tool: None,
+                assistant_name: &config.assistant_name,
+                ensure_alternating_roles: config.llm_provider() == LlmProvider::Anthropic,
+                home_dir: &home,
+                bootstrap_plan: BootstrapPlan::from_config(&config),
+                messages_between_memory: config.messages_between_memory,
+                memories_between_consolidation: config.memories_between_consolidation,
+                messages_between_self_reflection: config.messages_between_self_reflection,
+                defer_auto_memory: false,
+                defer_self_reflection: false,
+                memory_recall_classifier_enabled: config.memory_recall_classifier_enabled,
+                memory_recall_classifier_window: config.memory_recall_classifier_window,
+                reflect: config.reflect,
+            },
+        )
+        .expect("prompt should succeed");
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::AssistantResponse { content } if content == "Injected mixed fast recall."
+        )));
+
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
     fn context_refresh_is_not_needed_without_user_messages() {
         let context_messages = vec![
             ConversationMessage::new(MessageRole::System, "system"),
@@ -16301,6 +16463,40 @@ mod tests {
     #[test]
     fn recall_memory_context_messages_create_synthetic_tool_context() {
         let config = AppConfig::defaults();
+        let due_items = vec![AgendaItemRecord {
+            id: 2,
+            legacy_frontmatter_id: None,
+            name: "practice reminder".to_string(),
+            file_path: "/tmp/practice_reminder.md".to_string(),
+            agenda_date: Some("unscheduled".to_string()),
+            is_completed: false,
+            status: Some("created".to_string()),
+            closing_comment: None,
+            checklist_total: 0,
+            checklist_completed: 0,
+            body: "Bring the resistance bands".to_string(),
+            trigger_datetime: Some("2026-05-20T09:00:00".to_string()),
+            trigger_context: Some("before basketball practice".to_string()),
+            is_active: true,
+            updated_at_unix: 11,
+        }];
+        let agenda_items = vec![AgendaItemRecord {
+            id: 3,
+            legacy_frontmatter_id: None,
+            name: "drill plan".to_string(),
+            file_path: "/tmp/drill_plan.md".to_string(),
+            agenda_date: Some("2026-05-20".to_string()),
+            is_completed: false,
+            status: Some("created".to_string()),
+            closing_comment: None,
+            checklist_total: 0,
+            checklist_completed: 0,
+            body: "Focus on basketball practice footwork and follow-through".to_string(),
+            trigger_datetime: None,
+            trigger_context: None,
+            is_active: true,
+            updated_at_unix: 12,
+        }];
         let messages = recall_memory_context_messages(
             config.memory_recall_classifier_enabled,
             config.memory_recall_classifier_window,
@@ -16317,8 +16513,8 @@ mod tests {
                     is_active: true,
                     updated_at_unix: 10,
                 }],
-                due_items: &[],
-                agenda_items: &[],
+                due_items: &due_items,
+                agenda_items: &agenda_items,
             },
         );
 
@@ -16337,8 +16533,11 @@ mod tests {
             .as_deref()
             .expect("tool payload should exist");
         assert!(payload.contains("basketball form"));
+        assert!(payload.contains("practice reminder"));
+        assert!(payload.contains("drill plan"));
         assert!(payload.contains("\"recall_metadata\""));
         assert!(payload.contains("\"memory_type\": \"Memory\""));
+        assert!(payload.contains("\"memory_type\": \"AgendaItem\""));
     }
 
     #[test]
@@ -16378,7 +16577,7 @@ mod tests {
             closing_comment: None,
             checklist_total: 0,
             checklist_completed: 0,
-            body: "Focus on footwork and follow-through".to_string(),
+            body: "Focus on basketball practice footwork and follow-through".to_string(),
             trigger_datetime: None,
             trigger_context: None,
             is_active: true,
@@ -16563,7 +16762,7 @@ mod tests {
             closing_comment: None,
             checklist_total: 0,
             checklist_completed: 0,
-            body: "Focus on footwork and follow-through".to_string(),
+            body: "Focus on basketball practice footwork and follow-through".to_string(),
             trigger_datetime: None,
             trigger_context: None,
             is_active: true,
