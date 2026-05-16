@@ -780,7 +780,8 @@ fn maybe_refresh_snapshot_after_background_completion(
         return;
     }
 
-    if let Ok(snapshot) = runtime.load_snapshot() {
+    if let Ok(mut snapshot) = runtime.load_snapshot() {
+        snapshot.status = None;
         app.apply_snapshot(snapshot);
     }
 }
@@ -3613,6 +3614,34 @@ mod tests {
         );
 
         assert_eq!(app.memory_titles, vec!["Fresh Memory".to_string()]);
+    }
+
+    #[test]
+    fn completed_background_status_refresh_preserves_local_status() {
+        let mut app = TuiApp::from_snapshot(TuiSnapshot {
+            memory_titles: vec!["Stale Memory".to_string()],
+            ..TuiSnapshot::default()
+        });
+        app.status = "editing command: /create_memory".to_string();
+        let mut runtime = FakeRuntime {
+            snapshot: TuiSnapshot {
+                memory_titles: vec!["Fresh Memory".to_string()],
+                status: Some("loaded persisted transcript and sidebar data".to_string()),
+                ..TuiSnapshot::default()
+            },
+            ..FakeRuntime::default()
+        };
+
+        maybe_refresh_snapshot_after_background_completion(
+            &mut app,
+            &mut runtime,
+            false,
+            Some("refreshing context..."),
+            None,
+        );
+
+        assert_eq!(app.memory_titles, vec!["Fresh Memory".to_string()]);
+        assert_eq!(app.status, "editing command: /create_memory");
     }
 
     #[test]
