@@ -356,10 +356,12 @@ pub fn sync_derived_domain_tables(
                     "created".to_string()
                 }
             });
-            let is_active = if document.completed || status == "deleted" {
-                0_i64
+            let is_active = if document.completed {
+                Some(0_i64)
+            } else if status == "deleted" {
+                None
             } else {
-                1_i64
+                Some(1_i64)
             };
 
             transaction.execute(
@@ -413,6 +415,10 @@ pub fn derived_counts(connection: &Connection) -> rusqlite::Result<DerivedCounts
         memories,
         agenda_items,
     })
+}
+
+fn sqlite_flag_is_true(value: Option<i64>) -> bool {
+    value.unwrap_or(0) != 0
 }
 
 pub fn list_active_memories(
@@ -567,7 +573,7 @@ pub fn list_active_agenda_items(
             checklist_total: row.get(10)?,
             checklist_completed: row.get(11)?,
             body: row.get(12)?,
-            is_active: row.get::<_, i64>(13)? != 0,
+            is_active: sqlite_flag_is_true(row.get(13)?),
             updated_at_unix: row.get(14)?,
         })
     })?;
@@ -619,7 +625,7 @@ pub fn list_active_plain_agenda_items(
             checklist_total: row.get(10)?,
             checklist_completed: row.get(11)?,
             body: row.get(12)?,
-            is_active: row.get::<_, i64>(13)? != 0,
+            is_active: sqlite_flag_is_true(row.get(13)?),
             updated_at_unix: row.get(14)?,
         })
     })?;
@@ -675,7 +681,7 @@ pub fn list_active_due_items(
             checklist_total: row.get(10)?,
             checklist_completed: row.get(11)?,
             body: row.get(12)?,
-            is_active: row.get::<_, i64>(13)? != 0,
+            is_active: sqlite_flag_is_true(row.get(13)?),
             updated_at_unix: row.get(14)?,
         })
     })?;
@@ -704,7 +710,7 @@ pub fn list_inactive_due_items(
             is_active,
             updated_at_unix
         FROM agenda_items
-        WHERE is_active = 0
+        WHERE COALESCE(is_active, 0) = 0
           AND (
             trigger_datetime IS NOT NULL
             OR trigger_context IS NOT NULL
@@ -729,7 +735,7 @@ pub fn list_inactive_due_items(
             checklist_total: row.get(10)?,
             checklist_completed: row.get(11)?,
             body: row.get(12)?,
-            is_active: row.get::<_, i64>(13)? != 0,
+            is_active: sqlite_flag_is_true(row.get(13)?),
             updated_at_unix: row.get(14)?,
         })
     })?;
@@ -782,7 +788,7 @@ pub fn find_active_agenda_item_by_name(
             checklist_total: row.get(10)?,
             checklist_completed: row.get(11)?,
             body: row.get(12)?,
-            is_active: row.get::<_, i64>(13)? != 0,
+            is_active: sqlite_flag_is_true(row.get(13)?),
             updated_at_unix: row.get(14)?,
         })
     });
@@ -1916,6 +1922,20 @@ mod tests {
 
         let inactive_due_items =
             list_inactive_due_items(&connection, 10).expect("inactive due items should query");
+        let completed_flags = connection
+            .query_row(
+                "SELECT is_active FROM agenda_items WHERE name = 'completed reminder'",
+                [],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .expect("completed reminder row should query");
+        let deleted_flags = connection
+            .query_row(
+                "SELECT is_active FROM agenda_items WHERE name = 'deleted reminder'",
+                [],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .expect("deleted reminder row should query");
 
         assert_eq!(inactive_due_items.len(), 2);
         assert!(
@@ -1928,6 +1948,8 @@ mod tests {
                 .iter()
                 .any(|item| item.name == "deleted reminder")
         );
+        assert_eq!(completed_flags, Some(0));
+        assert_eq!(deleted_flags, None);
 
         fs::remove_dir_all(home).expect("temp directories should be removed");
     }

@@ -10883,7 +10883,7 @@ mod tests {
             open_sqlite_connection(&config.database_path).expect("database should reopen");
         let deleted_rows: i64 = recreated_connection
             .query_row(
-                "SELECT COUNT(*) FROM agenda_items WHERE name = ?1 AND status = 'deleted' AND is_active = 0",
+                "SELECT COUNT(*) FROM agenda_items WHERE name = ?1 AND status = 'deleted' AND is_active IS NULL",
                 rusqlite::params!["desk reset"],
                 |row| row.get(0),
             )
