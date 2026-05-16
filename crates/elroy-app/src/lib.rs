@@ -1515,7 +1515,7 @@ fn parse_memory_sources(frontmatter: Option<&str>) -> Option<Vec<(String, String
     Some(names.into_iter().zip(paths).collect())
 }
 
-fn list_memory_sources(frontmatter: Option<&str>, memory_name: &str) -> Vec<(String, String)> {
+fn list_memory_sources(frontmatter: Option<&str>) -> Vec<(String, String)> {
     if let Some(memory_sources) = parse_memory_sources(frontmatter) {
         return memory_sources
             .into_iter()
@@ -1530,7 +1530,7 @@ fn list_memory_sources(frontmatter: Option<&str>, memory_name: &str) -> Vec<(Str
             .join(",");
         return vec![(CONTEXT_MESSAGE_SOURCE_TYPE.to_string(), source_name)];
     }
-    vec![("MemoryFile".to_string(), memory_name.to_string())]
+    Vec::new()
 }
 
 fn format_context_message_source_content(messages: &[ConversationMessage]) -> String {
@@ -4670,9 +4670,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                 };
                 let path = Path::new(&memory.file_path);
                 let sources = match read_memory_parts(path) {
-                    Ok((frontmatter, _)) => {
-                        list_memory_sources(frontmatter.as_deref(), &memory.name)
-                    }
+                    Ok((frontmatter, _)) => list_memory_sources(frontmatter.as_deref()),
                     Err(_) => Vec::new(),
                 };
                 Ok(ToolExecutionResult::success(
@@ -4766,14 +4764,10 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                         format_context_message_source_content(&source_messages)
                     )));
                 }
-                if index > 0 {
-                    return Ok(ToolExecutionResult::error(format!(
-                        "index {index} out of range. Available indices: [0]"
-                    )));
-                }
+                let _ = body;
                 Ok(ToolExecutionResult::success(format!(
-                    "# Source content for memory: {} (0 / 0)\n\n{}",
-                    memory.name, body
+                    "No sources found for memory '{}'",
+                    memory.name
                 )))
             })
         },
@@ -6439,20 +6433,27 @@ mod tests {
             "get_source_content_for_memory",
             "{\"memory_name\":\"runner notes\"}",
         );
+        let source_list = registry.invoke(
+            "get_source_list_for_memory",
+            "{\"memory_name\":\"runner notes\"}",
+        );
         let out_of_range = registry.invoke(
             "get_source_content_for_memory",
             "{\"memory_name\":\"runner notes\",\"index\":1}",
         );
 
         assert!(!source.is_error);
-        assert!(
-            source
-                .content
-                .contains("# Source content for memory: runner notes (0 / 0)")
+        assert_eq!(source.content, "No sources found for memory 'runner notes'");
+        assert!(!source_list.is_error);
+        assert_eq!(
+            source_list.content,
+            "{\"memory_name\":\"runner notes\",\"sources\":[]}"
         );
-        assert!(source.content.contains("with the harder second interval"));
-        assert!(out_of_range.is_error);
-        assert!(out_of_range.content.contains("Available indices: [0]"));
+        assert!(!out_of_range.is_error);
+        assert_eq!(
+            out_of_range.content,
+            "No sources found for memory 'runner notes'"
+        );
 
         fs::remove_dir_all(home).expect("home should be removed");
     }
