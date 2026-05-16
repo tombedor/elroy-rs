@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use chrono::{Local, NaiveDateTime, Utc};
 use elroy_agenda::{
     add_checklist_item, append_agenda_update, create_agenda_file, mark_agenda_item_completed,
-    mark_agenda_item_deleted, rename_agenda_file, update_agenda_body, update_checklist_item,
+    rename_agenda_file, update_agenda_body, update_checklist_item,
 };
 use elroy_codex::{
     CodexSessionResult, dispatch_codex_session_with_bin, dispatch_codex_session_with_hook,
@@ -3304,7 +3304,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                     )
                 },
                 |path, _| {
-                    mark_agenda_item_deleted(path, closing_comment)?;
+                    std::fs::remove_file(path)?;
                     Ok(match closing_comment {
                         Some(closing_comment) => {
                             format!(
@@ -3561,7 +3561,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                 return ToolExecutionResult::error("delete_agenda_item requires a string name");
             };
             mutate_agenda_file_from_config_with_result(&config_for_agenda_delete, name, |path| {
-                mark_agenda_item_deleted(path, None)?;
+                std::fs::remove_file(path)?;
                 Ok(format!("Agenda item '{name}' deleted."))
             })
         },
@@ -7387,9 +7387,7 @@ mod tests {
         let delete = registry.invoke("delete_agenda_item", "{\"name\":\"call mom\"}");
         assert!(!delete.is_error);
         assert_eq!(delete.content, "Agenda item 'call mom' deleted.");
-        let deleted_text =
-            fs::read_to_string(agenda_dir.join("call_mom.md")).expect("agenda should read");
-        assert!(deleted_text.contains("status: deleted"));
+        assert!(!agenda_dir.join("call_mom.md").exists());
 
         fs::remove_dir_all(home).expect("home should be removed");
     }
@@ -8733,10 +8731,7 @@ mod tests {
             deleted.content,
             "Due item 'pay bill' has been deleted. Comment: paid online"
         );
-        let deleted_text =
-            fs::read_to_string(agenda_dir.join("pay_bill.md")).expect("due item should read");
-        assert!(deleted_text.contains("status: deleted"));
-        assert!(deleted_text.contains("closing_comment: paid online"));
+        assert!(!agenda_dir.join("pay_bill.md").exists());
         let missing_deleted = registry.invoke("delete_due_item", "{\"name\":\"missing\"}");
         assert!(missing_deleted.is_error);
         assert_eq!(
