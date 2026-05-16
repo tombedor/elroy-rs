@@ -3532,14 +3532,19 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
             "Append a timestamped update note to one active agenda item.",
             JsonSchema::object(
                 [
+                    ("item_name", json!({"type": "string"})),
                     ("name", json!({"type": "string"})),
                     ("note", json!({"type": "string"})),
                 ],
-                ["name", "note"],
+                ["note"],
             ),
         ),
         move |arguments| {
-            let Some(name) = arguments.get("name").and_then(Value::as_str) else {
+            let Some(name) = arguments
+                .get("item_name")
+                .and_then(Value::as_str)
+                .or_else(|| arguments.get("name").and_then(Value::as_str))
+            else {
                 return ToolExecutionResult::error("add_agenda_item_update requires a string name");
             };
             let Some(note) = arguments.get("note").and_then(Value::as_str) else {
@@ -3559,14 +3564,19 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
             "Mark one active agenda item as completed.",
             JsonSchema::object(
                 [
+                    ("item_name", json!({"type": "string"})),
                     ("name", json!({"type": "string"})),
                     ("closing_comment", json!({"type": "string"})),
                 ],
-                ["name"],
+                [] as [&str; 0],
             ),
         ),
         move |arguments| {
-            let Some(name) = arguments.get("name").and_then(Value::as_str) else {
+            let Some(name) = arguments
+                .get("item_name")
+                .and_then(Value::as_str)
+                .or_else(|| arguments.get("name").and_then(Value::as_str))
+            else {
                 return ToolExecutionResult::error("complete_agenda_item requires a string name");
             };
             let closing_comment = arguments.get("closing_comment").and_then(Value::as_str);
@@ -3582,10 +3592,20 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
         ToolSpec::new(
             "delete_agenda_item",
             "Mark one active agenda item as deleted.",
-            JsonSchema::object([("name", json!({"type": "string"}))], ["name"]),
+            JsonSchema::object(
+                [
+                    ("item_name", json!({"type": "string"})),
+                    ("name", json!({"type": "string"})),
+                ],
+                [] as [&str; 0],
+            ),
         ),
         move |arguments| {
-            let Some(name) = arguments.get("name").and_then(Value::as_str) else {
+            let Some(name) = arguments
+                .get("item_name")
+                .and_then(Value::as_str)
+                .or_else(|| arguments.get("name").and_then(Value::as_str))
+            else {
                 return ToolExecutionResult::error("delete_agenda_item requires a string name");
             };
             mutate_agenda_file_from_config_with_result(&config_for_agenda_delete, name, |path| {
@@ -3602,15 +3622,20 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
             "Add a checklist item to one active agenda item.",
             JsonSchema::object(
                 [
+                    ("item_name", json!({"type": "string"})),
                     ("name", json!({"type": "string"})),
                     ("text", json!({"type": "string"})),
                     ("due_date", json!({"type": "string"})),
                 ],
-                ["name", "text"],
+                ["text"],
             ),
         ),
         move |arguments| {
-            let Some(name) = arguments.get("name").and_then(Value::as_str) else {
+            let Some(name) = arguments
+                .get("item_name")
+                .and_then(Value::as_str)
+                .or_else(|| arguments.get("name").and_then(Value::as_str))
+            else {
                 return ToolExecutionResult::error(
                     "add_agenda_checklist_item requires a string name",
                 );
@@ -3639,25 +3664,40 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
             "Edit the text of a checklist item on one active agenda item.",
             JsonSchema::object(
                 [
+                    ("item_name", json!({"type": "string"})),
                     ("name", json!({"type": "string"})),
+                    ("checklist_item_id", json!({"type": "integer"})),
                     ("item_id", json!({"type": "integer"})),
+                    ("new_text", json!({"type": "string"})),
                     ("text", json!({"type": "string"})),
                 ],
-                ["name", "item_id", "text"],
+                [] as [&str; 0],
             ),
         ),
         move |arguments| {
-            let Some(name) = arguments.get("name").and_then(Value::as_str) else {
+            let Some(name) = arguments
+                .get("item_name")
+                .and_then(Value::as_str)
+                .or_else(|| arguments.get("name").and_then(Value::as_str))
+            else {
                 return ToolExecutionResult::error(
                     "edit_agenda_checklist_item requires a string name",
                 );
             };
-            let Some(item_id) = arguments.get("item_id").and_then(Value::as_i64) else {
+            let Some(item_id) = arguments
+                .get("checklist_item_id")
+                .and_then(Value::as_i64)
+                .or_else(|| arguments.get("item_id").and_then(Value::as_i64))
+            else {
                 return ToolExecutionResult::error(
                     "edit_agenda_checklist_item requires integer item_id",
                 );
             };
-            let Some(text) = arguments.get("text").and_then(Value::as_str) else {
+            let Some(text) = arguments
+                .get("new_text")
+                .and_then(Value::as_str)
+                .or_else(|| arguments.get("text").and_then(Value::as_str))
+            else {
                 return ToolExecutionResult::error(
                     "edit_agenda_checklist_item requires string text",
                 );
@@ -3683,19 +3723,29 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
             "Mark a checklist item completed on one active agenda item.",
             JsonSchema::object(
                 [
+                    ("item_name", json!({"type": "string"})),
                     ("name", json!({"type": "string"})),
+                    ("checklist_item_id", json!({"type": "integer"})),
                     ("item_id", json!({"type": "integer"})),
                 ],
-                ["name", "item_id"],
+                [] as [&str; 0],
             ),
         ),
         move |arguments| {
-            let Some(name) = arguments.get("name").and_then(Value::as_str) else {
+            let Some(name) = arguments
+                .get("item_name")
+                .and_then(Value::as_str)
+                .or_else(|| arguments.get("name").and_then(Value::as_str))
+            else {
                 return ToolExecutionResult::error(
                     "complete_agenda_checklist_item requires a string name",
                 );
             };
-            let Some(item_id) = arguments.get("item_id").and_then(Value::as_i64) else {
+            let Some(item_id) = arguments
+                .get("checklist_item_id")
+                .and_then(Value::as_i64)
+                .or_else(|| arguments.get("item_id").and_then(Value::as_i64))
+            else {
                 return ToolExecutionResult::error(
                     "complete_agenda_checklist_item requires integer item_id",
                 );
@@ -7445,7 +7495,7 @@ mod tests {
 
         let update = registry.invoke(
             "add_agenda_item_update",
-            "{\"name\":\"doctor visit\",\"note\":\"called ahead\"}",
+            "{\"item_name\":\"doctor visit\",\"note\":\"called ahead\"}",
         );
         assert!(!update.is_error);
         assert_eq!(
@@ -7459,7 +7509,7 @@ mod tests {
 
         let complete = registry.invoke(
             "complete_agenda_item",
-            "{\"name\":\"doctor visit\",\"closing_comment\":\"done\"}",
+            "{\"item_name\":\"doctor visit\",\"closing_comment\":\"done\"}",
         );
         assert!(!complete.is_error);
         assert_eq!(
@@ -7478,7 +7528,7 @@ mod tests {
         .expect("second agenda file should be written");
         elroy_db::bootstrap_database(&elroy_db::BootstrapPlan::from_config(&config))
             .expect("bootstrap should succeed");
-        let delete = registry.invoke("delete_agenda_item", "{\"name\":\"call mom\"}");
+        let delete = registry.invoke("delete_agenda_item", "{\"item_name\":\"call mom\"}");
         assert!(!delete.is_error);
         assert_eq!(delete.content, "Agenda item 'call mom' deleted.");
         assert!(!agenda_dir.join("call_mom.md").exists());
@@ -7646,21 +7696,21 @@ mod tests {
         let registry = build_live_tool_registry(&config);
         let added = registry.invoke(
             "add_agenda_checklist_item",
-            "{\"name\":\"trip\",\"text\":\"passport\",\"due_date\":\"2026-05-14\"}",
+            "{\"item_name\":\"trip\",\"text\":\"passport\",\"due_date\":\"2026-05-14\"}",
         );
         assert!(!added.is_error);
         assert_eq!(added.content, "Checklist item 1 added to 'trip'.");
 
         let edited = registry.invoke(
             "edit_agenda_checklist_item",
-            "{\"name\":\"trip\",\"item_id\":1,\"text\":\"passport + visa\"}",
+            "{\"item_name\":\"trip\",\"checklist_item_id\":1,\"new_text\":\"passport + visa\"}",
         );
         assert!(!edited.is_error);
         assert_eq!(edited.content, "Checklist item 1 on 'trip' updated.");
 
         let completed = registry.invoke(
             "complete_agenda_checklist_item",
-            "{\"name\":\"trip\",\"item_id\":1}",
+            "{\"item_name\":\"trip\",\"checklist_item_id\":1}",
         );
         assert!(!completed.is_error);
         assert_eq!(
