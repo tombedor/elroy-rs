@@ -266,6 +266,15 @@ impl AppRuntime {
             &self.config.home_dir,
             &self.config.memory_dir,
         )?;
+        let mut slash_command_names = build_live_tool_registry(&self.config)
+            .specs()
+            .into_iter()
+            .map(|spec| format!("/{}", spec.name))
+            .collect::<Vec<_>>();
+        slash_command_names.push("/help".to_string());
+        slash_command_names.sort();
+        slash_command_names.dedup();
+        snapshot.input_completions.extend(slash_command_names);
         snapshot.model_name = Some(self.config.chat_model.clone());
         Ok(snapshot)
     }
@@ -10667,7 +10676,18 @@ mod tests {
         let runtime = AppRuntime::new(config);
         let snapshot = runtime.load_snapshot().expect("snapshot should load");
 
-        assert_eq!(snapshot.input_completions, vec!["desk reset".to_string()]);
+        assert!(
+            snapshot
+                .input_completions
+                .contains(&"desk reset".to_string())
+        );
+        assert!(snapshot.input_completions.contains(&"/help".to_string()));
+        assert!(
+            snapshot
+                .input_completions
+                .contains(&"/reset_messages".to_string())
+        );
+        assert!(!snapshot.input_completions.contains(&"call mom".to_string()));
 
         fs::remove_dir_all(home).expect("home should be removed");
     }

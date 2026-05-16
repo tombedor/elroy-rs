@@ -976,7 +976,7 @@ impl TuiApp {
 
     fn accept_input_completion(&mut self) {
         let prefix = self.input.trim();
-        if prefix.is_empty() || prefix.starts_with('/') {
+        if prefix.is_empty() {
             self.status = "input completion requested".to_string();
             return;
         }
@@ -1944,14 +1944,14 @@ mod tests {
     }
 
     #[test]
-    fn chat_input_tab_ignores_slash_prefixed_input() {
+    fn chat_input_tab_completes_slash_command_name() {
         let mut app = TuiApp::bootstrap();
-        app.input = "/desk".to_string();
-        app.input_completions = vec!["desk reset".to_string()];
+        app.input = "/re".to_string();
+        app.input_completions = vec!["/reset_messages".to_string()];
 
         app.apply_intent(UiIntent::CompleteInput);
 
-        assert_eq!(app.input, "/desk");
+        assert_eq!(app.input, "/reset_messages");
         assert_eq!(app.status, "input completion requested");
     }
 
