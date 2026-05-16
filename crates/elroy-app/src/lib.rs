@@ -2863,7 +2863,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
             let trigger_context = arguments.get("trigger_context").and_then(Value::as_str);
             if trigger_time.is_none() && trigger_context.is_none() {
                 return ToolExecutionResult::error(
-                    "create_due_item requires trigger_time or trigger_context",
+                    "Either trigger_time or trigger_context must be provided for due items",
                 );
             }
             if let Some(trigger_time) = trigger_time {
@@ -8081,6 +8081,15 @@ mod tests {
         assert_eq!(
             duplicate_contextual.content,
             "Contextual due item 'call mom' already exists"
+        );
+        let missing_trigger = registry.invoke(
+            "create_due_item",
+            "{\"name\":\"call dad\",\"text\":\"This should fail\"}",
+        );
+        assert!(missing_trigger.is_error);
+        assert_eq!(
+            missing_trigger.content,
+            "Either trigger_time or trigger_context must be provided for due items"
         );
         let blank_name = registry.invoke(
             "create_due_item",
