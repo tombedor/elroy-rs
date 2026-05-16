@@ -1081,6 +1081,66 @@ mod tests {
     }
 
     #[test]
+    fn validated_transcript_keeps_multiple_matching_tool_results() {
+        let validated = validated_transcript(&[
+            ConversationMessage::new(MessageRole::User, "hello"),
+            ConversationMessage::assistant_with_tool_calls(
+                "",
+                vec![
+                    ToolCall {
+                        id: "call-1".to_string(),
+                        name: "first_tool".to_string(),
+                        arguments_json: "{}".to_string(),
+                    },
+                    ToolCall {
+                        id: "call-2".to_string(),
+                        name: "second_tool".to_string(),
+                        arguments_json: "{}".to_string(),
+                    },
+                ],
+            ),
+            ConversationMessage::tool_result("call-1", "{\"first\":true}"),
+            ConversationMessage::tool_result("call-2", "{\"second\":true}"),
+        ]);
+
+        assert_eq!(validated.len(), 4);
+        assert_eq!(validated[2].tool_call_id.as_deref(), Some("call-1"));
+        assert_eq!(validated[3].tool_call_id.as_deref(), Some("call-2"));
+    }
+
+    #[test]
+    fn validated_transcript_drops_tool_result_with_wrong_tool_call_id() {
+        let validated = validated_transcript(&[
+            ConversationMessage::new(MessageRole::User, "hello"),
+            ConversationMessage::assistant_with_tool_calls(
+                "",
+                vec![
+                    ToolCall {
+                        id: "call-1".to_string(),
+                        name: "first_tool".to_string(),
+                        arguments_json: "{}".to_string(),
+                    },
+                    ToolCall {
+                        id: "call-2".to_string(),
+                        name: "second_tool".to_string(),
+                        arguments_json: "{}".to_string(),
+                    },
+                ],
+            ),
+            ConversationMessage::tool_result("call-1", "{\"first\":true}"),
+            ConversationMessage::tool_result("wrong-id", "{\"wrong\":true}"),
+        ]);
+
+        assert_eq!(validated.len(), 3);
+        assert_eq!(validated[2].tool_call_id.as_deref(), Some("call-1"));
+        assert!(
+            !validated
+                .iter()
+                .any(|message| message.tool_call_id.as_deref() == Some("wrong-id"))
+        );
+    }
+
+    #[test]
     fn background_status_registry_tracks_first_active_message() {
         clear_background_status("memory-sync");
         clear_background_status("other");
