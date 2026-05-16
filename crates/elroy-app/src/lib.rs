@@ -2241,11 +2241,15 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
             let Some(path) = arguments.get("path").and_then(Value::as_str) else {
                 return ToolExecutionResult::error("read_file requires a string path");
             };
-            let start_line = arguments
-                .get("start_line")
-                .and_then(Value::as_i64)
-                .unwrap_or(1);
-            let end_line = arguments.get("end_line").and_then(Value::as_i64);
+            let start_line = match parse_optional_line_number_argument(&arguments, "start_line") {
+                Ok(Some(value)) => value,
+                Ok(None) => 1,
+                Err(error) => return ToolExecutionResult::error(error),
+            };
+            let end_line = match parse_optional_line_number_argument(&arguments, "end_line") {
+                Ok(value) => value,
+                Err(error) => return ToolExecutionResult::error(error),
+            };
             if start_line < 1 {
                 return ToolExecutionResult::error("start_line must be at least 1");
             }
@@ -6117,6 +6121,25 @@ fn parse_trigger_datetime_for_validation(raw: &str) -> Result<DateTime<Utc>, Str
         "Invalid datetime format: '{}'. Expected formats: 'YYYY-MM-DD HH:MM:SS', 'YYYY-MM-DD HH:MM', 'YYYY-MM-DD', or ISO 8601 format",
         raw
     ))
+}
+
+fn parse_optional_line_number_argument(
+    arguments: &Value,
+    key: &str,
+) -> Result<Option<i64>, String> {
+    match arguments.get(key) {
+        None => Ok(None),
+        Some(Value::Number(number)) => number
+            .as_i64()
+            .map(Some)
+            .ok_or_else(|| format!("{key} must be an integer")),
+        Some(Value::String(raw)) => raw
+            .trim()
+            .parse::<i64>()
+            .map(Some)
+            .map_err(|_| format!("{key} must be an integer")),
+        Some(_) => Err(format!("{key} must be an integer")),
+    }
 }
 
 fn excerpt(body: &str, max_chars: usize) -> String {
@@ -10520,6 +10543,10 @@ mod tests {
             "read_file",
             "{\"path\":\"notes/todo.txt\",\"start_line\":2,\"end_line\":3}",
         );
+        let file_with_string_lines = registry.invoke(
+            "read_file",
+            "{\"path\":\"notes/todo.txt\",\"start_line\":\"2\",\"end_line\":\"3\"}",
+        );
         let bad_range = registry.invoke(
             "read_file",
             "{\"path\":\"notes/todo.txt\",\"start_line\":3,\"end_line\":2}",
@@ -10542,6 +10569,13 @@ mod tests {
         assert!(!file.is_error);
         assert!(file.content.contains("\"start_line\":2"));
         assert!(file.content.contains("2: beta\\n3: gamma"));
+        assert!(!file_with_string_lines.is_error);
+        assert!(file_with_string_lines.content.contains("\"start_line\":2"));
+        assert!(
+            file_with_string_lines
+                .content
+                .contains("2: beta\\n3: gamma")
+        );
         assert!(bad_range.is_error);
         assert!(
             bad_range
