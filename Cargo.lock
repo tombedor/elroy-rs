@@ -345,6 +345,7 @@ dependencies = [
  "elroy-db",
  "elroy-llm",
  "elroy-tui",
+ "mockito",
 ]
 
 [[package]]
