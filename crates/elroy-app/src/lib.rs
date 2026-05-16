@@ -10746,6 +10746,23 @@ mod tests {
             missing_completed.content,
             "Active task 'missing' not found."
         );
+        let completed_recreated = registry.invoke(
+            "create_task",
+            "{\"name\":\"Career Search\",\"text\":\"Follow up with recruiters\"}",
+        );
+        assert!(!completed_recreated.is_error);
+        assert_eq!(
+            completed_recreated.content,
+            "Task 'career search' has been created."
+        );
+        let completed_recreated_shown =
+            registry.invoke("show_task", "{\"name\":\"career search\"}");
+        assert!(!completed_recreated_shown.is_error);
+        assert!(
+            completed_recreated_shown
+                .content
+                .contains("Follow up with recruiters")
+        );
 
         let plain_created = registry.invoke(
             "create_task",
