@@ -6817,6 +6817,49 @@ mod tests {
         }
     }
 
+    struct MultipleDueItemsModel;
+
+    impl ModelClient for MultipleDueItemsModel {
+        fn next_events(
+            &self,
+            request: ConversationRequest<'_>,
+        ) -> Result<Vec<StreamEvent>, elroy_core::ModelClientError> {
+            assert_eq!(request.user_message, "What's on my schedule today?");
+            let tool_messages = request
+                .transcript
+                .iter()
+                .filter_map(|message| {
+                    (message.role == MessageRole::Tool)
+                        .then_some(message.content.as_deref())
+                        .flatten()
+                })
+                .collect::<Vec<_>>();
+            assert!(tool_messages.iter().any(|content| {
+                content.contains("First due reminder") && content.contains("⏰ DUE ITEM")
+            }));
+            assert!(tool_messages.iter().any(|content| {
+                content.contains("Second due reminder") && content.contains("⏰ DUE ITEM")
+            }));
+            Ok(vec![StreamEvent::AssistantResponse {
+                content: "You have two reminders due: First due reminder and Second due reminder."
+                    .to_string(),
+            }])
+        }
+    }
+
+    impl StreamingModelClient for MultipleDueItemsModel {
+        fn stream_events(
+            &self,
+            request: ConversationRequest<'_>,
+        ) -> Result<
+            Box<dyn Iterator<Item = Result<StreamEvent, elroy_core::ModelClientError>>>,
+            elroy_core::ModelClientError,
+        > {
+            let events = self.next_events(request)?;
+            Ok(Box::new(events.into_iter().map(Ok)))
+        }
+    }
+
     #[test]
     fn provider_config_uses_openai_when_model_is_not_claude() {
         let mut config = AppConfig::defaults();
@@ -10518,6 +10561,75 @@ mod tests {
                 .iter()
                 .any(|item| item.name == "future reminder")
         );
+
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
+    fn run_prompt_with_model_and_registry_surfaces_multiple_due_items() {
+        let unique = format!(
+            "elroy-rs-app-multiple-due-items-prompt-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+        fs::write(
+            agenda_dir.join("reminder1.md"),
+            "---\ndate: unscheduled\ncompleted: false\nstatus: created\ntrigger_datetime: 2000-01-01T09:00:00\n---\n\nFirst due reminder\n",
+        )
+        .expect("first due item file should be written");
+        fs::write(
+            agenda_dir.join("reminder2.md"),
+            "---\ndate: unscheduled\ncompleted: false\nstatus: created\ntrigger_datetime: 2000-01-01T10:00:00\n---\n\nSecond due reminder\n",
+        )
+        .expect("second due item file should be written");
+
+        let mut config = AppConfig::defaults();
+        config.home_dir = home.clone();
+        config.memory_dir = memory_dir;
+        config.agenda_dir = agenda_dir;
+        config.database_path = database_path.clone();
+        elroy_db::bootstrap_database(&BootstrapPlan::from_config(&config))
+            .expect("bootstrap should succeed");
+
+        let mut connection = open_sqlite_connection(&database_path).expect("database should open");
+        run_migrations(&mut connection).expect("migrations should run");
+
+        let events = run_prompt_with_model_and_registry(
+            &mut connection,
+            "What's on my schedule today?",
+            &MultipleDueItemsModel,
+            build_live_tool_registry(&config),
+            PromptExecutionOptions {
+                role: MessageRole::User,
+                persist_input_message: true,
+                force_tool: None,
+                assistant_name: &config.assistant_name,
+                ensure_alternating_roles: config.llm_provider() == LlmProvider::Anthropic,
+                home_dir: &home,
+                bootstrap_plan: BootstrapPlan::from_config(&config),
+                messages_between_memory: config.messages_between_memory,
+                memories_between_consolidation: config.memories_between_consolidation,
+                messages_between_self_reflection: config.messages_between_self_reflection,
+                memory_recall_classifier_enabled: config.memory_recall_classifier_enabled,
+                memory_recall_classifier_window: config.memory_recall_classifier_window,
+            },
+        )
+        .expect("prompt should succeed");
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::AssistantResponse { content }
+                if content.contains("First due reminder")
+                    && content.contains("Second due reminder")
+        )));
 
         fs::remove_dir_all(home).expect("home should be removed");
     }
