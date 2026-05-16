@@ -58,6 +58,7 @@ const DEFAULT_MAX_LIST_ENTRIES: usize = 50;
 const DEFAULT_MAX_LIST_DEPTH: usize = 2;
 const DEFAULT_READ_LINE_LIMIT: usize = 200;
 const CONTEXT_MESSAGE_SOURCE_TYPE: &str = "ContextMessageSet";
+const MEMORY_SOURCE_TYPE: &str = "Memory";
 const DEFAULT_RESTART_RESUME_PROMPT: &str =
     "Elroy just restarted. Send a brief message that you are back and ready to continue.";
 
@@ -1468,7 +1469,59 @@ fn parse_context_message_source_ids(frontmatter: Option<&str>) -> Option<Vec<i64
     serde_json::from_str(message_ids_json?.as_str()).ok()
 }
 
+fn memory_source_frontmatter(memory_sources: &[(&str, &Path)]) -> Option<String> {
+    if memory_sources.is_empty() {
+        return None;
+    }
+    let names = memory_sources
+        .iter()
+        .map(|(name, _)| (*name).to_string())
+        .collect::<Vec<_>>();
+    let paths = memory_sources
+        .iter()
+        .map(|(_, path)| path.display().to_string())
+        .collect::<Vec<_>>();
+    let source_memory_names_json = serde_json::to_string(&names).ok()?;
+    let source_memory_paths_json = serde_json::to_string(&paths).ok()?;
+    Some(format!(
+        "source_type: {MEMORY_SOURCE_TYPE}\nsource_memory_names_json: {source_memory_names_json}\nsource_memory_paths_json: {source_memory_paths_json}"
+    ))
+}
+
+fn parse_memory_sources(frontmatter: Option<&str>) -> Option<Vec<(String, String)>> {
+    let frontmatter = frontmatter?;
+    let mut source_type = None;
+    let mut names_json = None;
+    let mut paths_json = None;
+    for line in frontmatter.lines() {
+        if let Some(value) = line.strip_prefix("source_type:") {
+            source_type = Some(value.trim().to_string());
+        }
+        if let Some(value) = line.strip_prefix("source_memory_names_json:") {
+            names_json = Some(value.trim().to_string());
+        }
+        if let Some(value) = line.strip_prefix("source_memory_paths_json:") {
+            paths_json = Some(value.trim().to_string());
+        }
+    }
+    if source_type.as_deref() != Some(MEMORY_SOURCE_TYPE) {
+        return None;
+    }
+    let names = serde_json::from_str::<Vec<String>>(names_json?.as_str()).ok()?;
+    let paths = serde_json::from_str::<Vec<String>>(paths_json?.as_str()).ok()?;
+    if names.len() != paths.len() {
+        return None;
+    }
+    Some(names.into_iter().zip(paths).collect())
+}
+
 fn list_memory_sources(frontmatter: Option<&str>, memory_name: &str) -> Vec<(String, String)> {
+    if let Some(memory_sources) = parse_memory_sources(frontmatter) {
+        return memory_sources
+            .into_iter()
+            .map(|(name, _)| (MEMORY_SOURCE_TYPE.to_string(), name))
+            .collect();
+    }
     if let Some(message_ids) = parse_context_message_source_ids(frontmatter) {
         let source_name = message_ids
             .iter()
@@ -2934,7 +2987,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
     let update_outdated_or_incorrect_memory = ExecutableTool::new(
         ToolSpec::new(
             "update_outdated_or_incorrect_memory",
-            "Append corrective information to one active memory by exact name.",
+            "Replace one active memory with an updated version while preserving the old content as a source.",
             JsonSchema::object(
                 [
                     ("memory_name", json!({"type": "string"})),
@@ -2954,23 +3007,66 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                     "update_outdated_or_incorrect_memory requires string update_text",
                 );
             };
-            mutate_memory_file_from_config(
-                &config_for_outdated_memory_update,
-                memory_name,
-                |path| {
-                    let existing = std::fs::read_to_string(path)?;
-                    let mut updated = existing.trim_end_matches('\n').to_string();
-                    if !updated.is_empty() {
-                        updated.push_str("\n\n");
+            let connection =
+                match open_sqlite_connection(&config_for_outdated_memory_update.database_path) {
+                    Ok(connection) => connection,
+                    Err(error) => {
+                        return ToolExecutionResult::error(format!(
+                            "failed to open database: {error}"
+                        ));
                     }
-                    updated.push_str(&format!(
-                        "Update ({}):\n{}",
-                        Utc::now().format("%Y-%m-%d %H:%M:%S UTC"),
-                        update_text.trim()
-                    ));
-                    update_memory_body(path, &updated)
-                },
-            );
+                };
+            let memory = match find_active_memory_by_name(&connection, memory_name) {
+                Ok(Some(memory)) => memory,
+                Ok(None) => {
+                    return ToolExecutionResult::error(format!("memory not found: {memory_name}"));
+                }
+                Err(error) => {
+                    return ToolExecutionResult::error(format!("database query failed: {error}"));
+                }
+            };
+            let path = Path::new(&memory.file_path);
+            let existing = match read_memory_parts(path) {
+                Ok((_, body)) => body,
+                Err(error) => {
+                    return ToolExecutionResult::error(format!("memory mutation failed: {error}"));
+                }
+            };
+            let mut updated = existing;
+            if !updated.is_empty() {
+                updated.push_str("\n\n");
+            }
+            updated.push_str(&format!(
+                "Update ({}):\n{}",
+                Utc::now().format("%Y-%m-%d %H:%M:%S UTC"),
+                update_text.trim()
+            ));
+            let archive_dir = config_for_outdated_memory_update.memory_dir.join("archive");
+            let archived_path = match archive_memory_file(path, &archive_dir) {
+                Ok(path) => path,
+                Err(error) => {
+                    return ToolExecutionResult::error(format!("memory mutation failed: {error}"));
+                }
+            };
+            let frontmatter = memory_source_frontmatter(&[(&memory.name, archived_path.as_path())]);
+            if let Err(error) = create_memory_file_with_frontmatter(
+                &config_for_outdated_memory_update.memory_dir,
+                &memory.name,
+                &updated,
+                frontmatter.as_deref(),
+            ) {
+                return ToolExecutionResult::error(format!("memory mutation failed: {error}"));
+            }
+            if let Err(error) = elroy_db::bootstrap_database(&BootstrapPlan::from_config(
+                &config_for_outdated_memory_update,
+            )) {
+                return ToolExecutionResult::error(format!("memory mutation failed: {error}"));
+            }
+            if let Err(error) =
+                reset_memory_tracker_after_creation(&config_for_outdated_memory_update)
+            {
+                return ToolExecutionResult::error(format!("memory mutation failed: {error}"));
+            }
             ToolExecutionResult::success(format!("Memory '{memory_name}' has been updated"))
         },
     );
@@ -4629,6 +4725,27 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                         "No sources found for memory '{memory_name}'"
                     )));
                 };
+                if let Some(memory_sources) = parse_memory_sources(frontmatter.as_deref()) {
+                    if index as usize >= memory_sources.len() {
+                        return Ok(ToolExecutionResult::error(format!(
+                            "index {index} out of range. Available indices: {:?}",
+                            (0..memory_sources.len()).collect::<Vec<_>>()
+                        )));
+                    }
+                    let (source_name, source_path) = &memory_sources[index as usize];
+                    let Ok((_, source_body)) = read_memory_parts(Path::new(source_path)) else {
+                        return Ok(ToolExecutionResult::success(format!(
+                            "Source not found with type: {MEMORY_SOURCE_TYPE}, name: {source_name}"
+                        )));
+                    };
+                    return Ok(ToolExecutionResult::success(format!(
+                        "# Source content for memory: {} ({} / {})\n\n{}",
+                        memory.name,
+                        index,
+                        memory_sources.len() - 1,
+                        source_body
+                    )));
+                }
                 if let Some(message_ids) = parse_context_message_source_ids(frontmatter.as_deref())
                 {
                     if index > 0 {
@@ -6572,6 +6689,30 @@ mod tests {
         assert!(file_text.contains("old text"));
         assert!(file_text.contains("Update ("));
         assert!(file_text.contains("new correction"));
+        assert!(memory_dir.join("archive").join("runner_notes.md").exists());
+
+        let source_list = registry.invoke(
+            "get_source_list_for_memory",
+            "{\"memory_name\":\"runner notes\"}",
+        );
+        assert!(!source_list.is_error);
+        assert!(source_list.content.contains("\"source_type\":\"Memory\""));
+        assert!(source_list.content.contains("\"name\":\"runner notes\""));
+
+        let source_content = registry.invoke(
+            "get_source_content_for_memory",
+            "{\"memory_name\":\"runner notes\",\"index\":0}",
+        );
+        assert!(!source_content.is_error);
+        assert!(source_content.content.contains("old text"));
+        assert!(!source_content.content.contains("new correction"));
+
+        let connection =
+            open_sqlite_connection(&config.database_path).expect("database should reopen");
+        let active_memories =
+            elroy_db::list_active_memories(&connection, 10).expect("active memories should list");
+        assert_eq!(active_memories.len(), 1);
+        assert!(active_memories[0].body.contains("new correction"));
 
         fs::remove_dir_all(home).expect("home should be removed");
     }
