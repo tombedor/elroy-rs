@@ -154,6 +154,7 @@ pub trait TuiRuntime {
     fn take_restart_request(&mut self) -> Result<Option<String>, String>;
     fn load_context_messages(&mut self) -> Result<Vec<TuiContextMessage>, String>;
     fn refresh_context_if_needed(&mut self) -> Result<(), String>;
+    fn run_self_reflection_if_needed(&mut self) -> Result<(), String>;
     fn background_status(&mut self) -> Result<Option<String>, String>;
     fn open_sidebar_item(
         &mut self,
@@ -297,6 +298,7 @@ fn start_startup_prompt_stream(
             app.status = "thinking...".to_string();
             Some(PendingPrompt {
                 submitted_prompt: None,
+                schedule_self_reflection: false,
                 before_ids: app.rendered_context_message_ids.clone(),
                 stream,
             })
@@ -382,6 +384,7 @@ fn apply_intent_with_runtime(
                     app.status = "thinking...".to_string();
                     *pending_prompt = Some(PendingPrompt {
                         submitted_prompt: Some(submitted),
+                        schedule_self_reflection: true,
                         before_ids: app.rendered_context_message_ids.clone(),
                         stream,
                     });
@@ -454,6 +457,7 @@ fn apply_intent_with_runtime(
 
 struct PendingPrompt {
     submitted_prompt: Option<String>,
+    schedule_self_reflection: bool,
     before_ids: HashSet<i64>,
     stream: Box<dyn TuiPromptStream>,
 }
@@ -486,6 +490,12 @@ fn advance_prompt_stream(
                             &pending.before_ids,
                             &context_messages,
                         );
+                    }
+                    if pending.schedule_self_reflection
+                        && let Err(error) = runtime.run_self_reflection_if_needed()
+                    {
+                        app.status = format!("self reflection failed: {error}");
+                        return PromptAdvance::CompletedTurn;
                     }
                     match runtime.take_restart_request() {
                         Ok(Some(resume_message)) => {
@@ -1296,6 +1306,10 @@ impl TuiRuntime for NoopRuntime {
         Ok(())
     }
 
+    fn run_self_reflection_if_needed(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+
     fn background_status(&mut self) -> Result<Option<String>, String> {
         Ok(None)
     }
@@ -1334,10 +1348,10 @@ mod tests {
     use ratatui::layout::Rect;
 
     use super::{
-        CommandPane, FocusTarget, PromptAdvance, PromptUpdate, SidebarAction, SidebarSection,
-        TuiApp, TuiContextMessage, TuiExit, TuiPromptStream, TuiRuntime, TuiSidebarDetail,
-        TuiSnapshot, UiIntent, advance_prompt_stream, apply_intent_with_runtime, apply_key_event,
-        key_event_token, maybe_refresh_snapshot_after_background_completion,
+        CommandPane, FocusTarget, PendingPrompt, PromptAdvance, PromptUpdate, SidebarAction,
+        SidebarSection, TuiApp, TuiContextMessage, TuiExit, TuiPromptStream, TuiRuntime,
+        TuiSidebarDetail, TuiSnapshot, UiIntent, advance_prompt_stream, apply_intent_with_runtime,
+        apply_key_event, key_event_token, maybe_refresh_snapshot_after_background_completion,
         maybe_run_deferred_context_refresh, poll_context_updates, start_startup_prompt_stream,
     };
 
@@ -1345,6 +1359,7 @@ mod tests {
     struct FakeRuntime {
         snapshot: TuiSnapshot,
         submitted_prompts: Vec<String>,
+        self_reflection_runs: usize,
         last_opened: Option<(SidebarSection, String)>,
         last_mutation: Option<(SidebarSection, String, SidebarAction)>,
         startup_stream: Option<FakePromptStream>,
@@ -1462,6 +1477,11 @@ mod tests {
 
         fn refresh_context_if_needed(&mut self) -> Result<(), String> {
             self.refresh_context_calls += 1;
+            Ok(())
+        }
+
+        fn run_self_reflection_if_needed(&mut self) -> Result<(), String> {
+            self.self_reflection_runs += 1;
             Ok(())
         }
 
@@ -2022,6 +2042,34 @@ mod tests {
         );
 
         assert_eq!(app.memory_titles, vec!["Stale Memory".to_string()]);
+    }
+
+    #[test]
+    fn completed_user_prompt_triggers_deferred_self_reflection() {
+        let mut app = TuiApp::bootstrap();
+        let mut runtime = FakeRuntime {
+            context_messages: vec![TuiContextMessage {
+                id: 1,
+                role: "assistant".to_string(),
+                content: "done".to_string(),
+            }],
+            ..FakeRuntime::default()
+        };
+        let mut pending_prompt = Some(PendingPrompt {
+            submitted_prompt: Some("remember this".to_string()),
+            schedule_self_reflection: true,
+            before_ids: HashSet::new(),
+            stream: Box::new(FakePromptStream {
+                updates: vec![],
+                finalized_snapshot: TuiSnapshot::default(),
+                cancelled_snapshot: TuiSnapshot::default(),
+            }),
+        });
+
+        let advance = advance_prompt_stream(&mut app, &mut runtime, &mut pending_prompt);
+
+        assert_eq!(advance, PromptAdvance::CompletedTurn);
+        assert_eq!(runtime.self_reflection_runs, 1);
     }
 
     #[test]

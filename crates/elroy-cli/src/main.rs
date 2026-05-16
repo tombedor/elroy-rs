@@ -153,6 +153,8 @@ struct CliTuiRuntime {
     runtime: AppRuntime,
     deferred_context_refresh: Option<BackgroundRefreshTask>,
     deferred_context_refresh_error: Option<String>,
+    deferred_self_reflection: Option<BackgroundRefreshTask>,
+    deferred_self_reflection_error: Option<String>,
 }
 
 struct CliPromptStream {
@@ -198,6 +200,8 @@ impl CliTuiRuntime {
             runtime,
             deferred_context_refresh: None,
             deferred_context_refresh_error: None,
+            deferred_self_reflection: None,
+            deferred_self_reflection_error: None,
         }
     }
 
@@ -221,6 +225,27 @@ impl CliTuiRuntime {
     fn clear_deferred_context_refresh_error(&mut self) {
         self.deferred_context_refresh_error = None;
     }
+
+    fn poll_deferred_self_reflection(&mut self) {
+        let Some(task) = self.deferred_self_reflection.as_ref() else {
+            return;
+        };
+        if !task.is_finished() {
+            return;
+        }
+
+        let task = self
+            .deferred_self_reflection
+            .take()
+            .expect("finished deferred self reflection task should exist");
+        if let Some(error) = task.join() {
+            self.deferred_self_reflection_error = Some(error);
+        }
+    }
+
+    fn clear_deferred_self_reflection_error(&mut self) {
+        self.deferred_self_reflection_error = None;
+    }
 }
 
 impl Drop for CliTuiRuntime {
@@ -232,6 +257,7 @@ impl Drop for CliTuiRuntime {
 impl TuiRuntime for CliTuiRuntime {
     fn load_snapshot(&mut self) -> Result<elroy_tui::TuiSnapshot, String> {
         self.poll_deferred_context_refresh();
+        self.poll_deferred_self_reflection();
         self.runtime
             .load_snapshot()
             .map_err(|error| error.to_string())
@@ -239,7 +265,9 @@ impl TuiRuntime for CliTuiRuntime {
 
     fn submit_prompt(&mut self, prompt: &str) -> Result<elroy_tui::TuiSnapshot, String> {
         self.poll_deferred_context_refresh();
+        self.poll_deferred_self_reflection();
         self.clear_deferred_context_refresh_error();
+        self.clear_deferred_self_reflection_error();
         self.runtime
             .process_message(prompt, MessageProcessOptions::default())
             .map(|result| result.snapshot)
@@ -248,16 +276,26 @@ impl TuiRuntime for CliTuiRuntime {
 
     fn start_prompt_stream(&mut self, prompt: &str) -> Result<Box<dyn TuiPromptStream>, String> {
         self.poll_deferred_context_refresh();
+        self.poll_deferred_self_reflection();
         self.clear_deferred_context_refresh_error();
+        self.clear_deferred_self_reflection_error();
         self.runtime
-            .process_message_stream(prompt, MessageProcessOptions::default())
+            .process_message_stream(
+                prompt,
+                MessageProcessOptions {
+                    defer_self_reflection: true,
+                    ..MessageProcessOptions::default()
+                },
+            )
             .map(|inner| Box::new(CliPromptStream { inner }) as Box<dyn TuiPromptStream>)
             .map_err(|error| error.to_string())
     }
 
     fn start_startup_prompt_stream(&mut self) -> Result<Option<Box<dyn TuiPromptStream>>, String> {
         self.poll_deferred_context_refresh();
+        self.poll_deferred_self_reflection();
         self.clear_deferred_context_refresh_error();
+        self.clear_deferred_self_reflection_error();
         let restart_resume_message = std::env::var(RESTART_RESUME_MESSAGE_ENV).ok();
         self.runtime
             .startup_prompt_stream(restart_resume_message.as_deref())
@@ -272,7 +310,9 @@ impl TuiRuntime for CliTuiRuntime {
         resume_message: &str,
     ) -> Result<Box<dyn TuiPromptStream>, String> {
         self.poll_deferred_context_refresh();
+        self.poll_deferred_self_reflection();
         self.clear_deferred_context_refresh_error();
+        self.clear_deferred_self_reflection_error();
         self.runtime
             .restart_prompt_stream(resume_message)
             .map(|inner| Box::new(CliPromptStream { inner }) as Box<dyn TuiPromptStream>)
@@ -285,6 +325,7 @@ impl TuiRuntime for CliTuiRuntime {
 
     fn load_context_messages(&mut self) -> Result<Vec<TuiContextMessage>, String> {
         self.poll_deferred_context_refresh();
+        self.poll_deferred_self_reflection();
         self.runtime
             .load_context_messages()
             .map(|messages| {
@@ -309,6 +350,7 @@ impl TuiRuntime for CliTuiRuntime {
 
     fn refresh_context_if_needed(&mut self) -> Result<(), String> {
         self.poll_deferred_context_refresh();
+        self.poll_deferred_self_reflection();
         if self.deferred_context_refresh.is_some() {
             return Ok(());
         }
@@ -324,10 +366,31 @@ impl TuiRuntime for CliTuiRuntime {
         Ok(())
     }
 
+    fn run_self_reflection_if_needed(&mut self) -> Result<(), String> {
+        self.poll_deferred_context_refresh();
+        self.poll_deferred_self_reflection();
+        if self.deferred_self_reflection.is_some() {
+            return Ok(());
+        }
+
+        self.clear_deferred_self_reflection_error();
+        let runtime = self.runtime.clone();
+        self.deferred_self_reflection = Some(BackgroundRefreshTask::spawn(move || {
+            runtime
+                .run_self_reflection_if_needed()
+                .map_err(|error| error.to_string())
+        }));
+        Ok(())
+    }
+
     fn background_status(&mut self) -> Result<Option<String>, String> {
         self.poll_deferred_context_refresh();
+        self.poll_deferred_self_reflection();
         if let Some(error) = &self.deferred_context_refresh_error {
             return Ok(Some(format!("context refresh failed: {error}")));
+        }
+        if let Some(error) = &self.deferred_self_reflection_error {
+            return Ok(Some(format!("self reflection failed: {error}")));
         }
         Ok(self.runtime.background_status())
     }
@@ -338,6 +401,7 @@ impl TuiRuntime for CliTuiRuntime {
         title: &str,
     ) -> Result<TuiSidebarDetail, String> {
         self.poll_deferred_context_refresh();
+        self.poll_deferred_self_reflection();
         self.runtime
             .open_sidebar_item(section, title)
             .map_err(|error| error.to_string())
@@ -350,6 +414,7 @@ impl TuiRuntime for CliTuiRuntime {
         action: SidebarAction,
     ) -> Result<elroy_tui::TuiSnapshot, String> {
         self.poll_deferred_context_refresh();
+        self.poll_deferred_self_reflection();
         self.runtime
             .mutate_sidebar_item(section, title, action)
             .map_err(|error| error.to_string())
@@ -440,6 +505,8 @@ mod tests {
                 Err("refresh exploded".to_string())
             })),
             deferred_context_refresh_error: None,
+            deferred_self_reflection: None,
+            deferred_self_reflection_error: None,
         };
 
         let background_status = loop {
@@ -457,6 +524,36 @@ mod tests {
             Some("context refresh failed: refresh exploded")
         );
         assert!(runtime.deferred_context_refresh.is_none());
+    }
+
+    #[test]
+    fn cli_tui_runtime_surfaces_deferred_self_reflection_failures_in_background_status() {
+        let config = AppConfig::from_env(&HashMap::new()).expect("config should load");
+        let mut runtime = CliTuiRuntime {
+            runtime: AppRuntime::new(config),
+            deferred_context_refresh: None,
+            deferred_context_refresh_error: None,
+            deferred_self_reflection: Some(BackgroundRefreshTask::spawn(|| {
+                Err("reflection exploded".to_string())
+            })),
+            deferred_self_reflection_error: None,
+        };
+
+        let background_status = loop {
+            let status = runtime
+                .background_status()
+                .expect("background status should load");
+            if status.is_some() {
+                break status;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        };
+
+        assert_eq!(
+            background_status.as_deref(),
+            Some("self reflection failed: reflection exploded")
+        );
+        assert!(runtime.deferred_self_reflection.is_none());
     }
 
     #[test]
