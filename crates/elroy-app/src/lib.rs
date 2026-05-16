@@ -3085,16 +3085,21 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
             JsonSchema::object(
                 [
                     ("name", json!({"type": "string"})),
+                    ("new_text", json!({"type": "string"})),
                     ("text", json!({"type": "string"})),
                 ],
-                ["name", "text"],
+                ["name"],
             ),
         ),
         move |arguments| {
             let Some(name) = arguments.get("name").and_then(Value::as_str) else {
                 return ToolExecutionResult::error("update_due_item_text requires a string name");
             };
-            let Some(text) = arguments.get("text").and_then(Value::as_str) else {
+            let Some(text) = arguments
+                .get("new_text")
+                .and_then(Value::as_str)
+                .or_else(|| arguments.get("text").and_then(Value::as_str))
+            else {
                 return ToolExecutionResult::error("update_due_item_text requires string text");
             };
             mutate_due_item_file_from_config_with_result(
@@ -9093,7 +9098,7 @@ mod tests {
         let registry = build_live_tool_registry(&config);
         let updated = registry.invoke(
             "update_due_item_text",
-            "{\"name\":\"call mom\",\"text\":\"Call mom after dinner\"}",
+            "{\"name\":\"call mom\",\"new_text\":\"Call mom after dinner\"}",
         );
         assert!(!updated.is_error);
         assert_eq!(
@@ -9102,7 +9107,7 @@ mod tests {
         );
         let missing_updated = registry.invoke(
             "update_due_item_text",
-            "{\"name\":\"missing\",\"text\":\"No-op\"}",
+            "{\"name\":\"missing\",\"new_text\":\"No-op\"}",
         );
         assert!(missing_updated.is_error);
         assert_eq!(
