@@ -10576,6 +10576,118 @@ mod tests {
     }
 
     #[test]
+    fn create_memory_tool_resets_auto_memory_tracker() {
+        let unique = format!(
+            "elroy-rs-app-create-memory-reset-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+
+        let mut connection = open_sqlite_connection(&database_path).expect("database should open");
+        run_migrations(&mut connection).expect("migrations should run");
+        let model = FakeModel::new(vec![
+            vec![StreamEvent::AssistantResponse {
+                content: "First response".to_string(),
+            }],
+            vec![StreamEvent::AssistantResponse {
+                content: "Second response".to_string(),
+            }],
+        ]);
+        let mut config = AppConfig::defaults();
+        config.home_dir = home.clone();
+        config.memory_dir = memory_dir;
+        config.agenda_dir = agenda_dir;
+        config.database_path = database_path.clone();
+        config.messages_between_memory = 3;
+
+        run_prompt_with_model_and_registry(
+            &mut connection,
+            "First message",
+            &model,
+            ExecutableToolRegistry::new(vec![]),
+            PromptExecutionOptions {
+                role: MessageRole::User,
+                persist_input_message: true,
+                force_tool: None,
+                assistant_name: &config.assistant_name,
+                ensure_alternating_roles: config.llm_provider() == LlmProvider::Anthropic,
+                home_dir: &home,
+                bootstrap_plan: BootstrapPlan::from_config(&config),
+                messages_between_memory: config.messages_between_memory,
+                memories_between_consolidation: config.memories_between_consolidation,
+                messages_between_self_reflection: config.messages_between_self_reflection,
+                memory_recall_classifier_enabled: config.memory_recall_classifier_enabled,
+                memory_recall_classifier_window: config.memory_recall_classifier_window,
+            },
+        )
+        .expect("first prompt should succeed");
+
+        let tracker = load_memory_operation_tracker(&connection, LOCAL_USER_TOKEN)
+            .expect("tracker should load")
+            .expect("tracker should exist");
+        assert_eq!(tracker.messages_since_memory, 2);
+
+        let registry = build_live_tool_registry(&config);
+        let created = registry.invoke(
+            "create_memory",
+            "{\"name\":\"Manual memory\",\"text\":\"A manual memory\"}",
+        );
+        assert!(!created.is_error);
+        assert_eq!(created.content, "New memory created: Manual memory");
+
+        let mut connection =
+            open_sqlite_connection(&config.database_path).expect("database should reopen");
+        let tracker = load_memory_operation_tracker(&connection, LOCAL_USER_TOKEN)
+            .expect("tracker should load")
+            .expect("tracker should exist");
+        assert_eq!(tracker.messages_since_memory, 0);
+        assert_eq!(tracker.memories_since_consolidation, 1);
+
+        run_prompt_with_model_and_registry(
+            &mut connection,
+            "Second message",
+            &model,
+            ExecutableToolRegistry::new(vec![]),
+            PromptExecutionOptions {
+                role: MessageRole::User,
+                persist_input_message: true,
+                force_tool: None,
+                assistant_name: &config.assistant_name,
+                ensure_alternating_roles: config.llm_provider() == LlmProvider::Anthropic,
+                home_dir: &home,
+                bootstrap_plan: BootstrapPlan::from_config(&config),
+                messages_between_memory: config.messages_between_memory,
+                memories_between_consolidation: config.memories_between_consolidation,
+                messages_between_self_reflection: config.messages_between_self_reflection,
+                memory_recall_classifier_enabled: config.memory_recall_classifier_enabled,
+                memory_recall_classifier_window: config.memory_recall_classifier_window,
+            },
+        )
+        .expect("second prompt should succeed");
+
+        let memories =
+            elroy_db::list_active_memories(&connection, 10).expect("memories should list");
+        assert_eq!(memories.len(), 1);
+        assert!(memories[0].body.contains("A manual memory"));
+
+        let tracker = load_memory_operation_tracker(&connection, LOCAL_USER_TOKEN)
+            .expect("tracker should load")
+            .expect("tracker should exist");
+        assert_eq!(tracker.messages_since_memory, 2);
+        assert_eq!(tracker.memories_since_consolidation, 1);
+
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
     fn refresh_context_if_needed_compresses_transcript_and_creates_memory() {
         let unique = format!(
             "elroy-rs-app-context-refresh-{}",
