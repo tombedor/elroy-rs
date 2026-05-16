@@ -3034,8 +3034,9 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
             let Some(text) = arguments.get("text").and_then(Value::as_str) else {
                 return ToolExecutionResult::error("update_due_item_text requires string text");
             };
-            mutate_agenda_file_from_config(&config_for_due_item_text, name, |path| {
-                update_agenda_body(path, text)
+            mutate_agenda_file_from_config_with_result(&config_for_due_item_text, name, |path| {
+                update_agenda_body(path, text)?;
+                Ok(format!("Due item '{name}' text has been updated."))
             })
         },
     );
@@ -3087,12 +3088,10 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                 return ToolExecutionResult::error("rename_due_item requires string new_name");
             };
             mutate_agenda_file_from_config_with_result(&config_for_due_item_rename, name, |path| {
-                let renamed = rename_agenda_file(path, new_name)?;
-                Ok(json!({
-                    "updated": true,
-                    "new_file_path": renamed.display().to_string(),
-                })
-                .to_string())
+                let _renamed = rename_agenda_file(path, new_name)?;
+                Ok(format!(
+                    "Due item '{name}' has been renamed to '{new_name}'."
+                ))
             })
         },
     );
@@ -3145,9 +3144,19 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                 return ToolExecutionResult::error("complete_due_item requires a string name");
             };
             let closing_comment = arguments.get("closing_comment").and_then(Value::as_str);
-            mutate_agenda_file_from_config(&config_for_due_item_complete, name, |path| {
-                mark_agenda_item_completed(path, closing_comment)
-            })
+            mutate_agenda_file_from_config_with_result(
+                &config_for_due_item_complete,
+                name,
+                |path| {
+                    mark_agenda_item_completed(path, closing_comment)?;
+                    Ok(match closing_comment {
+                        Some(closing_comment) => format!(
+                            "Due item '{name}' has been marked as completed. Comment: {closing_comment}"
+                        ),
+                        None => format!("Due item '{name}' has been marked as completed."),
+                    })
+                },
+            )
         },
     );
 
@@ -3193,8 +3202,14 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                 return ToolExecutionResult::error("delete_due_item requires a string name");
             };
             let closing_comment = arguments.get("closing_comment").and_then(Value::as_str);
-            mutate_agenda_file_from_config(&config_for_due_item_delete, name, |path| {
-                mark_agenda_item_deleted(path, closing_comment)
+            mutate_agenda_file_from_config_with_result(&config_for_due_item_delete, name, |path| {
+                mark_agenda_item_deleted(path, closing_comment)?;
+                Ok(match closing_comment {
+                    Some(closing_comment) => {
+                        format!("Due item '{name}' has been deleted. Comment: {closing_comment}")
+                    }
+                    None => format!("Due item '{name}' has been deleted."),
+                })
             })
         },
     );
@@ -8336,12 +8351,20 @@ mod tests {
             "{\"name\":\"call mom\",\"text\":\"Call mom after dinner\"}",
         );
         assert!(!updated.is_error);
+        assert_eq!(
+            updated.content,
+            "Due item 'call mom' text has been updated."
+        );
 
         let renamed = registry.invoke(
             "rename_due_item",
             "{\"name\":\"call mom\",\"new_name\":\"Call Parents\"}",
         );
         assert!(!renamed.is_error);
+        assert_eq!(
+            renamed.content,
+            "Due item 'call mom' has been renamed to 'Call Parents'."
+        );
         assert!(agenda_dir.join("call_parents.md").exists());
 
         let completed = registry.invoke(
@@ -8349,6 +8372,10 @@ mod tests {
             "{\"name\":\"call parents\",\"closing_comment\":\"done\"}",
         );
         assert!(!completed.is_error);
+        assert_eq!(
+            completed.content,
+            "Due item 'call parents' has been marked as completed. Comment: done"
+        );
         let completed_text =
             fs::read_to_string(agenda_dir.join("call_parents.md")).expect("due item should read");
         assert!(completed_text.contains("completed: true"));
@@ -8365,6 +8392,10 @@ mod tests {
             "{\"name\":\"pay bill\",\"closing_comment\":\"paid online\"}",
         );
         assert!(!deleted.is_error);
+        assert_eq!(
+            deleted.content,
+            "Due item 'pay bill' has been deleted. Comment: paid online"
+        );
         let deleted_text =
             fs::read_to_string(agenda_dir.join("pay_bill.md")).expect("due item should read");
         assert!(deleted_text.contains("status: deleted"));
