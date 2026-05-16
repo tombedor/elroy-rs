@@ -712,6 +712,22 @@ fn flatten_pasted_text(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+fn wrapped_line_count(text: &str, width: usize) -> usize {
+    let width = width.max(1);
+    let mut total = 0usize;
+
+    for line in text.split('\n') {
+        let char_count = line.chars().count();
+        total += if char_count == 0 {
+            1
+        } else {
+            char_count.div_ceil(width)
+        };
+    }
+
+    total.max(1)
+}
+
 struct PendingPrompt {
     submitted_prompt: Option<String>,
     schedule_self_reflection: bool,
@@ -1046,11 +1062,12 @@ impl TuiApp {
     }
 
     pub fn render(&self, area: Rect, buf: &mut Buffer) {
+        let input_height = self.input_box_height(area.width, area.height);
         let vertical = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Min(1),
-                Constraint::Length(3),
+                Constraint::Length(input_height),
                 Constraint::Length(1),
             ])
             .split(area);
@@ -1126,6 +1143,15 @@ impl TuiApp {
                 "Codex [active]".to_string(),
             ],
         }
+    }
+
+    fn input_box_height(&self, total_width: u16, total_height: u16) -> u16 {
+        let available_width = total_width.saturating_sub(2).max(1) as usize;
+        let wrapped_lines = wrapped_line_count(self.input.as_str(), available_width);
+        let content_height = wrapped_lines.max(1) as u16;
+        let desired = content_height.saturating_add(2).max(3);
+        let max_height = total_height.saturating_sub(2).max(3);
+        desired.min(max_height)
     }
 
     fn sidebar_text(&self) -> String {
@@ -2471,6 +2497,24 @@ mod tests {
         assert!(text.contains("Input"));
         assert!(text.contains("● gpt-5"));
         assert!(text.contains("Esc command mode"));
+    }
+
+    #[test]
+    fn input_box_height_grows_for_wrapped_text() {
+        let mut app = TuiApp::bootstrap();
+        let initial = app.input_box_height(50, 20);
+
+        app.input = "This is a long message that should wrap in the composer instead of scrolling horizontally off screen.".to_string();
+
+        assert!(app.input_box_height(50, 20) > initial);
+    }
+
+    #[test]
+    fn input_box_height_keeps_body_visible_on_short_terminal() {
+        let mut app = TuiApp::bootstrap();
+        app.input = "x".repeat(400);
+
+        assert!(app.input_box_height(40, 8) <= 6);
     }
 
     #[test]
