@@ -71,6 +71,7 @@ pub fn run_migrations(connection: &mut Connection) -> Result<(), refinery::Error
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BootstrapInventory {
     pub memory_files: Vec<PathBuf>,
+    pub archived_memory_files: Vec<PathBuf>,
     pub agenda_files: Vec<PathBuf>,
 }
 
@@ -78,6 +79,7 @@ impl BootstrapInventory {
     pub fn discover(plan: &BootstrapPlan) -> Self {
         Self {
             memory_files: markdown_files(&plan.memory_dir),
+            archived_memory_files: archived_markdown_files(&plan.memory_dir.join("archive")),
             agenda_files: markdown_files(&plan.agenda_dir),
         }
     }
@@ -101,6 +103,7 @@ pub struct BootstrapDocument {
     pub kind: String,
     pub path: PathBuf,
     pub stem: String,
+    pub is_active: bool,
     pub frontmatter_id: Option<i64>,
     pub agenda_date: Option<String>,
     pub completed: bool,
@@ -245,10 +248,13 @@ pub fn bootstrap_documents(
     let mut documents = Vec::new();
 
     for path in &inventory.memory_files {
-        documents.push(build_document(MEMORY_KIND, path)?);
+        documents.push(build_document(MEMORY_KIND, path, true)?);
+    }
+    for path in &inventory.archived_memory_files {
+        documents.push(build_document(MEMORY_KIND, path, false)?);
     }
     for path in &inventory.agenda_files {
-        documents.push(build_document(AGENDA_KIND, path)?);
+        documents.push(build_document(AGENDA_KIND, path, true)?);
     }
 
     documents.sort_by(|left, right| left.path.cmp(&right.path));
@@ -335,7 +341,7 @@ pub fn sync_derived_domain_tables(
                     document.stem.replace('_', " "),
                     path,
                     document.body,
-                    1_i64,
+                    if document.is_active { 1_i64 } else { 0_i64 },
                     document.updated_at_unix,
                 ],
             )?;
@@ -1151,7 +1157,22 @@ pub fn markdown_files(root: &Path) -> Vec<PathBuf> {
     files
 }
 
+pub fn archived_markdown_files(root: &Path) -> Vec<PathBuf> {
+    if !root.exists() {
+        return Vec::new();
+    }
+
+    let mut files = Vec::new();
+    visit_markdown_files(root, &mut files, false);
+    files.sort();
+    files
+}
+
 fn visit_memory_files(root: &Path, files: &mut Vec<PathBuf>) {
+    visit_markdown_files(root, files, true);
+}
+
+fn visit_markdown_files(root: &Path, files: &mut Vec<PathBuf>, skip_archive_dirs: bool) {
     let Ok(entries) = std::fs::read_dir(root) else {
         return;
     };
@@ -1159,10 +1180,12 @@ fn visit_memory_files(root: &Path, files: &mut Vec<PathBuf>) {
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            if path.file_name().and_then(|name| name.to_str()) == Some("archive") {
+            if skip_archive_dirs
+                && path.file_name().and_then(|name| name.to_str()) == Some("archive")
+            {
                 continue;
             }
-            visit_memory_files(&path, files);
+            visit_markdown_files(&path, files, skip_archive_dirs);
             continue;
         }
 
@@ -1175,7 +1198,7 @@ fn visit_memory_files(root: &Path, files: &mut Vec<PathBuf>) {
     }
 }
 
-fn build_document(kind: &str, path: &Path) -> std::io::Result<BootstrapDocument> {
+fn build_document(kind: &str, path: &Path, is_active: bool) -> std::io::Result<BootstrapDocument> {
     let raw = std::fs::read_to_string(path)?;
     let (frontmatter, body) = parse_frontmatter_and_body(&raw);
     let metadata = std::fs::metadata(path)?;
@@ -1194,6 +1217,7 @@ fn build_document(kind: &str, path: &Path) -> std::io::Result<BootstrapDocument>
             .and_then(|stem| stem.to_str())
             .unwrap_or_default()
             .to_string(),
+        is_active,
         frontmatter_id: frontmatter.id,
         agenda_date: frontmatter.agenda_date,
         completed: frontmatter.completed,
@@ -1330,14 +1354,15 @@ mod tests {
 
     use super::{
         BootstrapInventory, BootstrapPlan, MemoryOperationTrackerRecord, UserPreferenceRecord,
-        bootstrap_database, bootstrap_documents, derived_counts, find_active_agenda_item_by_name,
-        find_active_memory_by_name, get_or_create_context_message_set,
-        get_or_create_memory_operation_tracker, list_active_agenda_items, list_active_due_items,
-        list_active_memories, list_active_plain_agenda_items, list_inactive_due_items,
-        load_context_messages, load_memory_operation_tracker, load_messages_by_ids,
-        load_user_preferences, markdown_files, open_sqlite_connection, persist_bootstrap_documents,
-        replace_context_messages, run_migrations, save_memory_operation_tracker,
-        save_user_preferences, search_active_memories, sync_derived_domain_tables,
+        archived_markdown_files, bootstrap_database, bootstrap_documents, derived_counts,
+        find_active_agenda_item_by_name, find_active_memory_by_name,
+        get_or_create_context_message_set, get_or_create_memory_operation_tracker,
+        list_active_agenda_items, list_active_due_items, list_active_memories,
+        list_active_plain_agenda_items, list_inactive_due_items, load_context_messages,
+        load_memory_operation_tracker, load_messages_by_ids, load_user_preferences, markdown_files,
+        open_sqlite_connection, persist_bootstrap_documents, replace_context_messages,
+        run_migrations, save_memory_operation_tracker, save_user_preferences,
+        search_active_memories, sync_derived_domain_tables,
     };
     use elroy_config::AppConfig;
     use elroy_llm::{ConversationMessage, MessageRole, ToolCall};
@@ -1412,6 +1437,33 @@ mod tests {
     }
 
     #[test]
+    fn archived_markdown_files_reads_archive_subtrees() {
+        let unique = format!(
+            "elroy-rs-memory-files-archive-read-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let root = std::env::temp_dir().join(unique);
+        let archive = root.join("archive");
+        let nested = archive.join("nested");
+
+        fs::create_dir_all(&nested).expect("nested archive dir should be created");
+        fs::write(archive.join("a.md"), "# archived").expect("archive markdown should write");
+        fs::write(nested.join("b.md"), "# nested archived")
+            .expect("nested archive markdown should write");
+
+        let files = archived_markdown_files(&archive);
+
+        assert_eq!(files.len(), 2);
+        assert!(files.iter().any(|path| path.ends_with("a.md")));
+        assert!(files.iter().any(|path| path.ends_with("b.md")));
+
+        fs::remove_dir_all(root).expect("temp directories should be removed");
+    }
+
+    #[test]
     fn bootstrap_inventory_discovers_memory_and_agenda_files() {
         let unique = format!(
             "elroy-rs-bootstrap-inventory-{}",
@@ -1439,6 +1491,7 @@ mod tests {
         let inventory = BootstrapInventory::discover(&plan);
 
         assert_eq!(inventory.memory_files, vec![memory_dir.join("memory.md")]);
+        assert!(inventory.archived_memory_files.is_empty());
         assert_eq!(inventory.agenda_files, vec![agenda_dir.join("agenda.md")]);
 
         fs::remove_dir_all(home).expect("temp directories should be removed");
@@ -1524,6 +1577,7 @@ mod tests {
 
         let inventory = BootstrapInventory {
             memory_files: vec![memory_dir.join("memory.md")],
+            archived_memory_files: Vec::new(),
             agenda_files: vec![agenda_dir.join("agenda.md")],
         };
         let documents = bootstrap_documents(&inventory).expect("documents should parse");
@@ -1539,6 +1593,7 @@ mod tests {
         assert_eq!(documents[0].trigger_context.as_deref(), Some("on standup"));
         assert_eq!(documents[0].closing_comment.as_deref(), Some("done"));
         assert_eq!(documents[1].kind, "memory");
+        assert!(documents[1].is_active);
         assert_eq!(documents[1].frontmatter_id, Some(7));
         assert_eq!(documents[1].body, "remember this");
 
@@ -1568,6 +1623,7 @@ mod tests {
 
         let inventory = BootstrapInventory {
             memory_files: vec![memory_dir.join("memory.md")],
+            archived_memory_files: Vec::new(),
             agenda_files: Vec::new(),
         };
         let documents = bootstrap_documents(&inventory).expect("documents should parse");
@@ -1614,6 +1670,7 @@ mod tests {
 
         let inventory = BootstrapInventory {
             memory_files: vec![memory_dir.join("runner_notes.md")],
+            archived_memory_files: Vec::new(),
             agenda_files: vec![agenda_dir.join("doctor_visit.md")],
         };
         let documents = bootstrap_documents(&inventory).expect("documents should parse");
@@ -1771,6 +1828,7 @@ mod tests {
 
         let inventory = BootstrapInventory {
             memory_files: vec![memory_dir.join("runner_notes.md")],
+            archived_memory_files: Vec::new(),
             agenda_files: vec![agenda_dir.join("doctor_visit.md")],
         };
         let documents = bootstrap_documents(&inventory).expect("documents should parse");
@@ -1844,6 +1902,7 @@ mod tests {
 
         let inventory = BootstrapInventory {
             memory_files: vec![],
+            archived_memory_files: Vec::new(),
             agenda_files: vec![
                 agenda_dir.join("completed_reminder.md"),
                 agenda_dir.join("deleted_reminder.md"),
@@ -1868,6 +1927,72 @@ mod tests {
             inactive_due_items
                 .iter()
                 .any(|item| item.name == "deleted reminder")
+        );
+
+        fs::remove_dir_all(home).expect("temp directories should be removed");
+    }
+
+    #[test]
+    fn archived_memory_files_sync_as_inactive_derived_rows() {
+        let mut connection = Connection::open_in_memory().expect("sqlite should open");
+        run_migrations(&mut connection).expect("migrations should run");
+
+        let unique = format!(
+            "elroy-rs-archived-memory-sync-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        let archive_dir = memory_dir.join("archive");
+        fs::create_dir_all(&archive_dir).expect("archive dir should be created");
+        fs::write(memory_dir.join("runner_notes.md"), "active version\n")
+            .expect("active memory should be written");
+        fs::write(archive_dir.join("runner_notes.md"), "archived version\n")
+            .expect("archived memory should be written");
+
+        let inventory = BootstrapInventory {
+            memory_files: vec![memory_dir.join("runner_notes.md")],
+            archived_memory_files: vec![archive_dir.join("runner_notes.md")],
+            agenda_files: Vec::new(),
+        };
+        let documents = bootstrap_documents(&inventory).expect("documents should parse");
+        persist_bootstrap_documents(&mut connection, &documents)
+            .expect("bootstrap documents should persist");
+        sync_derived_domain_tables(&mut connection, &documents)
+            .expect("derived tables should sync");
+
+        let rows: Vec<(String, bool)> = {
+            let mut statement = connection
+                .prepare(
+                    "SELECT file_path, is_active
+                     FROM memories
+                     ORDER BY is_active DESC, file_path ASC",
+                )
+                .expect("memory query should prepare");
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? != 0))
+                })
+                .expect("memory rows should map");
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .expect("memory rows should collect")
+        };
+
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    memory_dir.join("runner_notes.md").display().to_string(),
+                    true
+                ),
+                (
+                    archive_dir.join("runner_notes.md").display().to_string(),
+                    false,
+                ),
+            ]
         );
 
         fs::remove_dir_all(home).expect("temp directories should be removed");

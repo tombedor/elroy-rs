@@ -8142,9 +8142,16 @@ mod tests {
             "{\"memory_name\":\"running summary\"}",
         );
         assert!(!source_list.is_error);
+        let mut source_entries: Vec<(String, String)> =
+            serde_json::from_str::<Vec<(String, String)>>(&source_list.content)
+                .expect("source list should parse");
+        source_entries.sort();
         assert_eq!(
-            source_list.content,
-            "[[\"Memory\",\"running progress\"],[\"Memory\",\"run today\"]]"
+            source_entries,
+            vec![
+                ("Memory".to_string(), "run today".to_string()),
+                ("Memory".to_string(), "running progress".to_string()),
+            ]
         );
 
         let source_content = registry.invoke(
@@ -8215,9 +8222,16 @@ mod tests {
             &format!("{{\"memory_name\":\"{consolidated_name}\"}}"),
         );
         assert!(!source_list.is_error);
+        let mut source_entries: Vec<(String, String)> =
+            serde_json::from_str::<Vec<(String, String)>>(&source_list.content)
+                .expect("source list should parse");
+        source_entries.sort();
         assert_eq!(
-            source_list.content,
-            "[[\"Memory\",\"running progress\"],[\"Memory\",\"run today\"]]"
+            source_entries,
+            vec![
+                ("Memory".to_string(), "run today".to_string()),
+                ("Memory".to_string(), "running progress".to_string()),
+            ]
         );
 
         fs::remove_dir_all(home).expect("home should be removed");
@@ -8976,6 +8990,46 @@ mod tests {
             elroy_db::list_active_memories(&connection, 10).expect("active memories should list");
         assert_eq!(active_memories.len(), 1);
         assert!(active_memories[0].body.contains("new correction"));
+        let historical_rows: Vec<(String, bool, String)> = {
+            let mut statement = connection
+                .prepare(
+                    "SELECT file_path, is_active, body
+                     FROM memories
+                     WHERE LOWER(name) = LOWER(?1)
+                     ORDER BY is_active DESC, updated_at_unix DESC, file_path ASC",
+                )
+                .expect("memory history query should prepare");
+            let rows = statement
+                .query_map(["runner notes"], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)? != 0,
+                        row.get::<_, String>(2)?,
+                    ))
+                })
+                .expect("memory history rows should map");
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .expect("memory history rows should collect")
+        };
+        assert_eq!(historical_rows.len(), 2);
+        assert_eq!(
+            historical_rows[0].0,
+            memory_dir.join("runner_notes.md").display().to_string()
+        );
+        assert!(historical_rows[0].1);
+        assert!(historical_rows[0].2.contains("old text"));
+        assert!(historical_rows[0].2.contains("new correction"));
+        assert_eq!(
+            historical_rows[1].0,
+            memory_dir
+                .join("archive")
+                .join("runner_notes.md")
+                .display()
+                .to_string()
+        );
+        assert!(!historical_rows[1].1);
+        assert!(historical_rows[1].2.contains("old text"));
+        assert!(!historical_rows[1].2.contains("new correction"));
 
         fs::remove_dir_all(home).expect("home should be removed");
     }

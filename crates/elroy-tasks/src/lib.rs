@@ -172,6 +172,7 @@ mod tests {
         run_migrations(&mut connection).expect("migrations should run");
         let inventory = BootstrapInventory {
             memory_files: vec![],
+            archived_memory_files: vec![],
             agenda_files: vec![
                 agenda_dir.join("doctor_visit.md"),
                 agenda_dir.join("job_search.md"),
