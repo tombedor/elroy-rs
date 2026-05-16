@@ -22,9 +22,9 @@ use elroy_core::{
 use elroy_db::{
     AgendaItemRecord, BootstrapPlan, UserPreferenceRecord, find_active_agenda_item_by_name,
     find_active_memory_by_name, get_or_create_memory_operation_tracker, list_active_due_items,
-    list_active_memories, list_active_plain_agenda_items, load_context_messages,
-    load_user_preferences, open_sqlite_connection, replace_context_messages, run_migrations,
-    save_memory_operation_tracker, save_user_preferences, search_active_memories,
+    list_active_memories, list_active_plain_agenda_items, list_inactive_due_items,
+    load_context_messages, load_user_preferences, open_sqlite_connection, replace_context_messages,
+    run_migrations, save_memory_operation_tracker, save_user_preferences, search_active_memories,
 };
 use elroy_feature_requests::{
     FeatureRequestRecord, find_best_feature_request_match, get_feature_request,
@@ -3392,6 +3392,39 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
     );
 
     let database_path = config.database_path.clone();
+    let list_inactive_due_items_tool = ExecutableTool::new(
+        ToolSpec::new(
+            "list_inactive_due_items",
+            "List inactive due items and reminders.",
+            JsonSchema::object([("limit", json!({"type": "integer"}))], [] as [&str; 0]),
+        ),
+        move |arguments| {
+            let limit = argument_limit(&arguments, 10);
+            with_tool_connection(&database_path, |connection| {
+                let items = list_inactive_due_items(connection, limit)?;
+                let payload = items
+                    .into_iter()
+                    .map(|item| {
+                        json!({
+                            "name": item.name,
+                            "agenda_date": item.agenda_date,
+                            "trigger_datetime": item.trigger_datetime,
+                            "trigger_context": item.trigger_context,
+                            "status": item.status,
+                            "closing_comment": item.closing_comment,
+                            "excerpt": excerpt(&item.body, 180),
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                Ok(ToolExecutionResult::success(
+                    serde_json::to_string_pretty(&payload)
+                        .expect("inactive due item payload should serialize"),
+                ))
+            })
+        },
+    );
+
+    let database_path = config.database_path.clone();
     let show_task = ExecutableTool::new(
         ToolSpec::new(
             "show_task",
@@ -3409,6 +3442,43 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                     )));
                 };
                 Ok(ToolExecutionResult::success(task_payload(item).to_string()))
+            })
+        },
+    );
+
+    let database_path = config.database_path.clone();
+    let show_due_item = ExecutableTool::new(
+        ToolSpec::new(
+            "show_due_item",
+            "Show one active due item by exact name.",
+            JsonSchema::object([("name", json!({"type": "string"}))], ["name"]),
+        ),
+        move |arguments| {
+            let Some(name) = arguments.get("name").and_then(Value::as_str) else {
+                return ToolExecutionResult::error("show_due_item requires a string name");
+            };
+            with_tool_connection(&database_path, |connection| {
+                let Some(item) = find_active_agenda_item_by_name(connection, name)? else {
+                    return Ok(ToolExecutionResult::error(format!(
+                        "due item not found: {name}"
+                    )));
+                };
+                if item.trigger_datetime.is_none() && item.trigger_context.is_none() {
+                    return Ok(ToolExecutionResult::error(format!(
+                        "due item not found: {name}"
+                    )));
+                }
+                Ok(ToolExecutionResult::success(
+                    json!({
+                        "name": item.name,
+                        "trigger_datetime": item.trigger_datetime,
+                        "trigger_context": item.trigger_context,
+                        "status": item.status,
+                        "closing_comment": item.closing_comment,
+                        "body": item.body,
+                    })
+                    .to_string(),
+                ))
             })
         },
     );
@@ -3530,7 +3600,9 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
         examine_memories,
         list_agenda,
         list_due_items,
+        list_inactive_due_items_tool,
         show_task,
+        show_due_item,
         show_memory,
         show_agenda_item,
     ])
@@ -5283,6 +5355,51 @@ mod tests {
         assert!(!listed.is_error);
         assert!(listed.content.contains("call mom"));
         assert!(listed.content.contains("after dinner"));
+    }
+
+    #[test]
+    fn live_tool_registry_can_show_and_list_inactive_due_items() {
+        let unique = format!(
+            "elroy-rs-app-inactive-due-items-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+        fs::write(
+            agenda_dir.join("call_mom.md"),
+            "---\ndate: unscheduled\ncompleted: true\nstatus: completed\ntrigger_context: after dinner\nclosing_comment: done\n---\n\nCall mom tonight\n",
+        )
+        .expect("inactive due item should be written");
+        fs::write(
+            agenda_dir.join("pay_bill.md"),
+            "---\ndate: unscheduled\ncompleted: false\nstatus: created\ntrigger_datetime: 2026-05-15T09:00:00\n---\n\nPay bill\n",
+        )
+        .expect("active due item should be written");
+
+        let mut config = AppConfig::defaults();
+        config.memory_dir = memory_dir;
+        config.agenda_dir = agenda_dir;
+        config.database_path = database_path;
+        elroy_db::bootstrap_database(&BootstrapPlan::from_config(&config))
+            .expect("bootstrap should succeed");
+
+        let registry = build_live_tool_registry(&config);
+        let shown = registry.invoke("show_due_item", "{\"name\":\"pay bill\"}");
+        assert!(!shown.is_error);
+        assert!(shown.content.contains("Pay bill"));
+        assert!(shown.content.contains("2026-05-15T09:00:00"));
+
+        let inactive = registry.invoke("list_inactive_due_items", "{\"limit\":10}");
+        assert!(!inactive.is_error);
+        assert!(inactive.content.contains("call mom"));
+        assert!(inactive.content.contains("done"));
     }
 
     #[test]

@@ -676,6 +676,60 @@ pub fn list_active_due_items(
     rows.collect()
 }
 
+pub fn list_inactive_due_items(
+    connection: &Connection,
+    limit: usize,
+) -> rusqlite::Result<Vec<AgendaItemRecord>> {
+    let mut statement = connection.prepare(
+        "SELECT
+            id,
+            legacy_frontmatter_id,
+            name,
+            file_path,
+            agenda_date,
+            is_completed,
+            status,
+            trigger_datetime,
+            trigger_context,
+            closing_comment,
+            checklist_total,
+            checklist_completed,
+            body,
+            is_active,
+            updated_at_unix
+        FROM agenda_items
+        WHERE is_active = 0
+          AND (
+            trigger_datetime IS NOT NULL
+            OR trigger_context IS NOT NULL
+          )
+        ORDER BY
+            updated_at_unix DESC,
+            name ASC
+        LIMIT ?1",
+    )?;
+    let rows = statement.query_map([limit as i64], |row| {
+        Ok(AgendaItemRecord {
+            id: row.get(0)?,
+            legacy_frontmatter_id: row.get(1)?,
+            name: row.get(2)?,
+            file_path: row.get(3)?,
+            agenda_date: row.get(4)?,
+            is_completed: row.get::<_, i64>(5)? != 0,
+            status: row.get(6)?,
+            trigger_datetime: row.get(7)?,
+            trigger_context: row.get(8)?,
+            closing_comment: row.get(9)?,
+            checklist_total: row.get(10)?,
+            checklist_completed: row.get(11)?,
+            body: row.get(12)?,
+            is_active: row.get::<_, i64>(13)? != 0,
+            updated_at_unix: row.get(14)?,
+        })
+    })?;
+    rows.collect()
+}
+
 pub fn find_active_agenda_item_by_name(
     connection: &Connection,
     name: &str,
@@ -1220,10 +1274,11 @@ mod tests {
         bootstrap_database, bootstrap_documents, derived_counts, find_active_agenda_item_by_name,
         find_active_memory_by_name, get_or_create_memory_operation_tracker,
         list_active_agenda_items, list_active_due_items, list_active_memories,
-        list_active_plain_agenda_items, load_context_messages, load_memory_operation_tracker,
-        load_user_preferences, markdown_files, open_sqlite_connection, persist_bootstrap_documents,
-        replace_context_messages, run_migrations, save_memory_operation_tracker,
-        save_user_preferences, search_active_memories, sync_derived_domain_tables,
+        list_active_plain_agenda_items, list_inactive_due_items, load_context_messages,
+        load_memory_operation_tracker, load_user_preferences, markdown_files,
+        open_sqlite_connection, persist_bootstrap_documents, replace_context_messages,
+        run_migrations, save_memory_operation_tracker, save_user_preferences,
+        search_active_memories, sync_derived_domain_tables,
     };
     use elroy_config::AppConfig;
     use elroy_llm::{ConversationMessage, MessageRole, ToolCall};
@@ -1615,6 +1670,8 @@ mod tests {
         let plain_agenda =
             list_active_plain_agenda_items(&connection, 10).expect("plain agenda should query");
         let due_items = list_active_due_items(&connection, 10).expect("due items should query");
+        let inactive_due_items =
+            list_inactive_due_items(&connection, 10).expect("inactive due items should query");
         let exact_memory =
             find_active_memory_by_name(&connection, "runner notes").expect("memory should query");
         let exact_agenda = find_active_agenda_item_by_name(&connection, "doctor visit")
@@ -1628,6 +1685,7 @@ mod tests {
         assert_eq!(agenda[0].name, "doctor visit");
         assert_eq!(due_items.len(), 1);
         assert_eq!(due_items[0].name, "doctor visit");
+        assert!(inactive_due_items.is_empty());
         assert_eq!(
             exact_memory.as_ref().map(|memory| memory.name.as_str()),
             Some("runner notes")
@@ -1635,6 +1693,65 @@ mod tests {
         assert_eq!(
             exact_agenda.as_ref().map(|item| item.name.as_str()),
             Some("doctor visit")
+        );
+
+        fs::remove_dir_all(home).expect("temp directories should be removed");
+    }
+
+    #[test]
+    fn inactive_due_item_query_returns_inactive_triggered_items() {
+        let mut connection = Connection::open_in_memory().expect("sqlite should open");
+        run_migrations(&mut connection).expect("migrations should run");
+
+        let unique = format!(
+            "elroy-rs-inactive-due-items-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+        fs::write(
+            agenda_dir.join("completed_reminder.md"),
+            "---\ndate: unscheduled\ncompleted: true\nstatus: completed\ntrigger_context: after dinner\n---\n\nCall mom\n",
+        )
+        .expect("completed due item should be written");
+        fs::write(
+            agenda_dir.join("deleted_reminder.md"),
+            "---\ndate: unscheduled\ncompleted: false\nstatus: deleted\ntrigger_datetime: 2026-05-14T09:00:00\n---\n\nPay bill\n",
+        )
+        .expect("deleted due item should be written");
+
+        let inventory = BootstrapInventory {
+            memory_files: vec![],
+            agenda_files: vec![
+                agenda_dir.join("completed_reminder.md"),
+                agenda_dir.join("deleted_reminder.md"),
+            ],
+        };
+        let documents = bootstrap_documents(&inventory).expect("documents should parse");
+        persist_bootstrap_documents(&mut connection, &documents)
+            .expect("bootstrap documents should persist");
+        sync_derived_domain_tables(&mut connection, &documents)
+            .expect("derived tables should sync");
+
+        let inactive_due_items =
+            list_inactive_due_items(&connection, 10).expect("inactive due items should query");
+
+        assert_eq!(inactive_due_items.len(), 2);
+        assert!(
+            inactive_due_items
+                .iter()
+                .any(|item| item.name == "completed reminder")
+        );
+        assert!(
+            inactive_due_items
+                .iter()
+                .any(|item| item.name == "deleted reminder")
         );
 
         fs::remove_dir_all(home).expect("temp directories should be removed");
