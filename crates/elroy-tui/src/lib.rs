@@ -3749,6 +3749,54 @@ mod tests {
     }
 
     #[test]
+    fn streaming_draft_survives_browse_mode_switches() {
+        let mut app = TuiApp::bootstrap();
+        let mut runtime = FakeRuntime::default();
+        let mut pending = None;
+        app.input = "hello".to_string();
+
+        apply_intent_with_runtime(&mut app, UiIntent::SubmitPrompt, &mut runtime, &mut pending);
+        app.input = "draft".to_string();
+
+        assert_eq!(
+            apply_key_event(
+                &mut app,
+                KeyEvent::new(KeyCode::Char('m'), KeyModifiers::CONTROL),
+                &mut runtime,
+                &mut pending,
+            ),
+            TuiExit::Continue
+        );
+        assert_eq!(app.focus, FocusTarget::Command(CommandPane::Sidebar));
+        assert_eq!(app.sidebar_section, SidebarSection::Memories);
+        assert_eq!(app.input, "draft");
+
+        assert_eq!(
+            apply_key_event(
+                &mut app,
+                KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
+                &mut runtime,
+                &mut pending,
+            ),
+            TuiExit::Continue
+        );
+        assert_eq!(app.sidebar_section, SidebarSection::Agenda);
+        assert_eq!(app.input, "draft");
+
+        assert_eq!(
+            apply_key_event(
+                &mut app,
+                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                &mut runtime,
+                &mut pending,
+            ),
+            TuiExit::Continue
+        );
+        assert_eq!(app.focus, FocusTarget::Input);
+        assert_eq!(app.input, "draft");
+    }
+
+    #[test]
     fn runtime_submit_replaces_snapshot_data() {
         let mut app = TuiApp::bootstrap();
         app.input = "hello runtime".to_string();
