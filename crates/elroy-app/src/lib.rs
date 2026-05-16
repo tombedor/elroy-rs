@@ -4732,13 +4732,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
         ToolSpec::new(
             "search_memories",
             "Search active memories by keyword.",
-            JsonSchema::object(
-                [
-                    ("query", json!({"type": "string"})),
-                    ("limit", json!({"type": "integer"})),
-                ],
-                ["query"],
-            ),
+            JsonSchema::object([("query", json!({"type": "string"}))], ["query"]),
         ),
         move |arguments| {
             let Some(query) = arguments.get("query").and_then(Value::as_str) else {
@@ -4767,13 +4761,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
         ToolSpec::new(
             "examine_memories",
             "Search memories and due items for the answer to a question.",
-            JsonSchema::object(
-                [
-                    ("question", json!({"type": "string"})),
-                    ("limit", json!({"type": "integer"})),
-                ],
-                ["question"],
-            ),
+            JsonSchema::object([("question", json!({"type": "string"}))], ["question"]),
         ),
         move |arguments| {
             let Some(question) = arguments.get("question").and_then(Value::as_str) else {
@@ -7591,6 +7579,41 @@ mod tests {
                 "{tool_name} should expose only one field"
             );
             assert!(properties.contains_key("n"), "{tool_name} should expose n");
+            assert!(
+                !properties.contains_key("limit"),
+                "{tool_name} should not expose limit"
+            );
+        }
+    }
+
+    #[test]
+    fn memory_search_tool_schemas_match_python_surface() {
+        let config = AppConfig::defaults();
+        let registry = build_live_tool_registry(&config);
+
+        for (tool_name, expected_field) in [
+            ("search_memories", "query"),
+            ("examine_memories", "question"),
+        ] {
+            let spec = registry
+                .specs()
+                .into_iter()
+                .find(|spec| spec.name == tool_name)
+                .unwrap_or_else(|| panic!("{tool_name} tool should exist"));
+
+            let properties = match &spec.parameters {
+                elroy_tools::JsonSchema::Object { properties, .. } => properties,
+            };
+
+            assert_eq!(
+                properties.len(),
+                1,
+                "{tool_name} should expose only one field"
+            );
+            assert!(
+                properties.contains_key(expected_field),
+                "{tool_name} should expose {expected_field}"
+            );
             assert!(
                 !properties.contains_key("limit"),
                 "{tool_name} should not expose limit"
