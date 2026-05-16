@@ -256,6 +256,7 @@ struct PromptExecutionOptions<'a> {
     defer_self_reflection: bool,
     memory_recall_classifier_enabled: bool,
     memory_recall_classifier_window: usize,
+    reflect: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -562,6 +563,7 @@ impl AppRuntime {
                 defer_self_reflection: options.defer_self_reflection,
                 memory_recall_classifier_enabled: self.config.memory_recall_classifier_enabled,
                 memory_recall_classifier_window: self.config.memory_recall_classifier_window,
+                reflect: self.config.reflect,
             },
             Box::new(model),
             executable_tools,
@@ -606,6 +608,7 @@ impl AppRuntime {
                 defer_self_reflection: options.defer_self_reflection,
                 memory_recall_classifier_enabled: self.config.memory_recall_classifier_enabled,
                 memory_recall_classifier_window: self.config.memory_recall_classifier_window,
+                reflect: self.config.reflect,
             },
         )?;
 
@@ -1546,6 +1549,7 @@ fn run_prompt_with_model_and_registry(
     let recall_context = recall_memory_context_messages(
         options.memory_recall_classifier_enabled,
         options.memory_recall_classifier_window,
+        options.reflect,
         prompt,
         &existing_transcript,
         &list_active_memories_in_scope(connection, &options.bootstrap_plan.memory_dir, 50)?,
@@ -1635,6 +1639,7 @@ fn run_prompt_with_model_and_registry_stream(
     let recall_context = recall_memory_context_messages(
         options.memory_recall_classifier_enabled,
         options.memory_recall_classifier_window,
+        options.reflect,
         prompt,
         &existing_transcript,
         &list_active_memories_in_scope(&connection, &options.bootstrap_plan.memory_dir, 50)?,
@@ -2257,6 +2262,7 @@ fn run_background_codex_completion_followup(
             defer_self_reflection: false,
             memory_recall_classifier_enabled: config.memory_recall_classifier_enabled,
             memory_recall_classifier_window: config.memory_recall_classifier_window,
+            reflect: config.reflect,
         },
     )?;
     Ok(())
@@ -3113,6 +3119,15 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
         ToolSpec::new(
             "get_fast_recall",
             "No-op tool used to acknowledge synthetic recall context.",
+            JsonSchema::object(Vec::<(String, Value)>::new(), [] as [&str; 0]),
+        ),
+        move |_| ToolExecutionResult::success("OK".to_string()),
+    );
+
+    let get_reflective_recall = ExecutableTool::new(
+        ToolSpec::new(
+            "get_reflective_recall",
+            "No-op tool used to acknowledge synthetic reflective recall context.",
             JsonSchema::object(Vec::<(String, Value)>::new(), [] as [&str; 0]),
         ),
         move |_| ToolExecutionResult::success("OK".to_string()),
@@ -6063,6 +6078,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
         create_memory,
         create_consolidated_memory,
         get_fast_recall,
+        get_reflective_recall,
         add_agenda_item,
         create_task,
         create_due_item,
@@ -7031,6 +7047,7 @@ fn format_context_summary_timestamp(unix_seconds: i64) -> String {
 fn recall_memory_context_messages(
     memory_recall_classifier_enabled: bool,
     memory_recall_classifier_window: usize,
+    reflect: bool,
     prompt: &str,
     transcript: &[ConversationMessage],
     memories: &[elroy_db::MemoryRecord],
@@ -7044,6 +7061,30 @@ fn recall_memory_context_messages(
     let recalled = select_recalled_memories(&recall_query, memories, &already_recalled, 2);
     if recalled.is_empty() {
         return Vec::new();
+    }
+
+    if reflect {
+        let content = serde_json::to_string_pretty(&json!({
+            "content": build_reflective_recall_content(&recalled),
+            "recall_metadata": recalled
+                .iter()
+                .map(|memory| {
+                    json!({
+                        "memory_type": "Memory",
+                        "memory_id": memory.id,
+                        "name": memory.name,
+                    })
+                })
+                .collect::<Vec<_>>(),
+        }))
+        .expect("reflective memory recall payload should serialize");
+
+        return synthetic_tool_context_messages(
+            "bootstrap-memory-recall",
+            "get_reflective_recall",
+            "{}",
+            content,
+        );
     }
 
     let payload = recalled
@@ -7224,6 +7265,17 @@ fn recent_recall_context(transcript: &[ConversationMessage], window: usize) -> V
         .collect()
 }
 
+fn build_reflective_recall_content(memories: &[&elroy_db::MemoryRecord]) -> String {
+    let lines = memories
+        .iter()
+        .map(|memory| format!("- {}: {}", memory.name, excerpt(&memory.body, 180)))
+        .collect::<Vec<_>>();
+    format!(
+        "I remember these details may be relevant to the current conversation:\n{}",
+        lines.join("\n")
+    )
+}
+
 fn recalled_memory_names(transcript: &[ConversationMessage]) -> HashSet<String> {
     transcript
         .iter()
@@ -7344,9 +7396,25 @@ fn select_recalled_due_items<'a>(
 }
 
 fn parse_recalled_memory_names(content: &str) -> Vec<String> {
-    serde_json::from_str::<serde_json::Value>(content)
-        .ok()
-        .and_then(|value| value.as_array().cloned())
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(content) else {
+        return Vec::new();
+    };
+
+    if let Some(items) = value.as_array() {
+        return items
+            .iter()
+            .filter_map(|item| {
+                item.get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .map(|name| name.to_ascii_lowercase())
+            })
+            .collect();
+    }
+
+    value
+        .get("recall_metadata")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
         .unwrap_or_default()
         .into_iter()
         .filter_map(|item| {
@@ -9703,6 +9771,7 @@ mod tests {
                 defer_self_reflection: false,
                 memory_recall_classifier_enabled: false,
                 memory_recall_classifier_window: config.memory_recall_classifier_window,
+                reflect: config.reflect,
             },
         )
         .expect("prompt should succeed");
@@ -9719,6 +9788,15 @@ mod tests {
     fn live_tool_registry_includes_get_fast_recall_ack_tool() {
         let registry = build_live_tool_registry(&AppConfig::defaults());
         let result = registry.invoke("get_fast_recall", "{}");
+
+        assert!(!result.is_error);
+        assert_eq!(result.content, "OK");
+    }
+
+    #[test]
+    fn live_tool_registry_includes_get_reflective_recall_ack_tool() {
+        let registry = build_live_tool_registry(&AppConfig::defaults());
+        let result = registry.invoke("get_reflective_recall", "{}");
 
         assert!(!result.is_error);
         assert_eq!(result.content, "OK");
@@ -13122,6 +13200,7 @@ mod tests {
                 defer_self_reflection: false,
                 memory_recall_classifier_enabled: config.memory_recall_classifier_enabled,
                 memory_recall_classifier_window: config.memory_recall_classifier_window,
+                reflect: config.reflect,
             },
         )
         .expect("background follow-up should succeed");
@@ -13198,6 +13277,7 @@ mod tests {
                 defer_self_reflection: false,
                 memory_recall_classifier_enabled: config.memory_recall_classifier_enabled,
                 memory_recall_classifier_window: config.memory_recall_classifier_window,
+                reflect: config.reflect,
             },
         )
         .expect("prompt should succeed");
@@ -13284,6 +13364,7 @@ mod tests {
                 defer_self_reflection: false,
                 memory_recall_classifier_enabled: config.memory_recall_classifier_enabled,
                 memory_recall_classifier_window: config.memory_recall_classifier_window,
+                reflect: config.reflect,
             },
         )
         .expect("prompt should succeed");
@@ -13365,6 +13446,7 @@ mod tests {
                 defer_self_reflection: true,
                 memory_recall_classifier_enabled: config.memory_recall_classifier_enabled,
                 memory_recall_classifier_window: config.memory_recall_classifier_window,
+                reflect: config.reflect,
             },
             Box::new(model),
             ExecutableToolRegistry::new(vec![]),
@@ -13437,6 +13519,7 @@ mod tests {
                 defer_self_reflection: false,
                 memory_recall_classifier_enabled: config.memory_recall_classifier_enabled,
                 memory_recall_classifier_window: config.memory_recall_classifier_window,
+                reflect: config.reflect,
             },
             Box::new(model),
             ExecutableToolRegistry::new(vec![]),
@@ -13537,6 +13620,7 @@ mod tests {
                 defer_self_reflection: false,
                 memory_recall_classifier_enabled: config.memory_recall_classifier_enabled,
                 memory_recall_classifier_window: config.memory_recall_classifier_window,
+                reflect: config.reflect,
             },
         )
         .expect("prompt should succeed");
@@ -13603,6 +13687,7 @@ mod tests {
                 defer_self_reflection: false,
                 memory_recall_classifier_enabled: config.memory_recall_classifier_enabled,
                 memory_recall_classifier_window: config.memory_recall_classifier_window,
+                reflect: config.reflect,
             },
         )
         .expect("prompt should succeed");
@@ -13668,6 +13753,7 @@ mod tests {
                 defer_self_reflection: false,
                 memory_recall_classifier_enabled: config.memory_recall_classifier_enabled,
                 memory_recall_classifier_window: config.memory_recall_classifier_window,
+                reflect: config.reflect,
             },
         )
         .expect("prompt should succeed");
@@ -13708,6 +13794,7 @@ mod tests {
                 defer_self_reflection: false,
                 memory_recall_classifier_enabled: config.memory_recall_classifier_enabled,
                 memory_recall_classifier_window: config.memory_recall_classifier_window,
+                reflect: config.reflect,
             },
         )
         .expect("second prompt should succeed");
@@ -13773,6 +13860,7 @@ mod tests {
                 defer_self_reflection: false,
                 memory_recall_classifier_enabled: config.memory_recall_classifier_enabled,
                 memory_recall_classifier_window: config.memory_recall_classifier_window,
+                reflect: config.reflect,
             },
         )
         .expect("system-role prompt should succeed");
@@ -13839,6 +13927,7 @@ mod tests {
                 defer_self_reflection: false,
                 memory_recall_classifier_enabled: config.memory_recall_classifier_enabled,
                 memory_recall_classifier_window: config.memory_recall_classifier_window,
+                reflect: config.reflect,
             },
         )
         .expect("prompt should succeed");
@@ -13909,6 +13998,7 @@ mod tests {
                 defer_self_reflection: false,
                 memory_recall_classifier_enabled: config.memory_recall_classifier_enabled,
                 memory_recall_classifier_window: config.memory_recall_classifier_window,
+                reflect: config.reflect,
             },
         )
         .expect("prompt should succeed");
@@ -13989,6 +14079,7 @@ mod tests {
                 defer_self_reflection: false,
                 memory_recall_classifier_enabled: config.memory_recall_classifier_enabled,
                 memory_recall_classifier_window: config.memory_recall_classifier_window,
+                reflect: config.reflect,
             },
         )
         .expect("prompt should succeed");
@@ -14059,6 +14150,7 @@ mod tests {
                 defer_self_reflection: false,
                 memory_recall_classifier_enabled: config.memory_recall_classifier_enabled,
                 memory_recall_classifier_window: config.memory_recall_classifier_window,
+                reflect: config.reflect,
             },
         )
         .expect("prompt should succeed");
@@ -14087,6 +14179,7 @@ mod tests {
                 defer_self_reflection: false,
                 memory_recall_classifier_enabled: config.memory_recall_classifier_enabled,
                 memory_recall_classifier_window: config.memory_recall_classifier_window,
+                reflect: config.reflect,
             },
         )
         .expect("second prompt should succeed");
@@ -14159,6 +14252,7 @@ mod tests {
                 defer_self_reflection: false,
                 memory_recall_classifier_enabled: config.memory_recall_classifier_enabled,
                 memory_recall_classifier_window: config.memory_recall_classifier_window,
+                reflect: config.reflect,
             },
         )
         .expect("first prompt should succeed");
@@ -14204,6 +14298,7 @@ mod tests {
                 defer_self_reflection: false,
                 memory_recall_classifier_enabled: config.memory_recall_classifier_enabled,
                 memory_recall_classifier_window: config.memory_recall_classifier_window,
+                reflect: config.reflect,
             },
         )
         .expect("second prompt should succeed");
@@ -14455,6 +14550,7 @@ mod tests {
                 defer_self_reflection: false,
                 memory_recall_classifier_enabled: config.memory_recall_classifier_enabled,
                 memory_recall_classifier_window: config.memory_recall_classifier_window,
+                reflect: config.reflect,
             },
         )
         .expect_err("missing force tool should fail");
@@ -14507,6 +14603,7 @@ mod tests {
                 defer_self_reflection: false,
                 memory_recall_classifier_enabled: config.memory_recall_classifier_enabled,
                 memory_recall_classifier_window: config.memory_recall_classifier_window,
+                reflect: config.reflect,
             },
             Box::new(model),
             ExecutableToolRegistry::new(vec![]),
@@ -15079,6 +15176,7 @@ mod tests {
         let messages = recall_memory_context_messages(
             config.memory_recall_classifier_enabled,
             config.memory_recall_classifier_window,
+            config.reflect,
             "I am heading to basketball practice",
             &[],
             &[MemoryRecord {
@@ -15111,12 +15209,52 @@ mod tests {
     }
 
     #[test]
+    fn recall_memory_context_messages_use_reflective_recall_when_enabled() {
+        let mut config = AppConfig::defaults();
+        config.memory_recall_classifier_enabled = false;
+        config.reflect = true;
+        let messages = recall_memory_context_messages(
+            config.memory_recall_classifier_enabled,
+            config.memory_recall_classifier_window,
+            config.reflect,
+            "I am heading to basketball practice",
+            &[],
+            &[MemoryRecord {
+                id: 1,
+                legacy_frontmatter_id: None,
+                name: "basketball form".to_string(),
+                file_path: "/tmp/basketball.md".to_string(),
+                body: "Remember to follow through on your shot".to_string(),
+                is_active: true,
+                updated_at_unix: 10,
+            }],
+        );
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(
+            messages[0]
+                .tool_calls
+                .as_ref()
+                .map(|calls| calls[0].name.as_str()),
+            Some("get_reflective_recall")
+        );
+        let payload = messages[1]
+            .content
+            .as_deref()
+            .expect("reflective recall payload should exist");
+        assert!(payload.contains("I remember these details may be relevant"));
+        assert!(payload.contains("\"recall_metadata\""));
+        assert!(payload.contains("basketball form"));
+    }
+
+    #[test]
     fn recall_memory_context_messages_limits_to_two_memories() {
         let mut config = AppConfig::defaults();
         config.memory_recall_classifier_enabled = false;
         let messages = recall_memory_context_messages(
             config.memory_recall_classifier_enabled,
             config.memory_recall_classifier_window,
+            config.reflect,
             "basketball shooting drills",
             &[],
             &[
@@ -15172,6 +15310,7 @@ mod tests {
         let messages = recall_memory_context_messages(
             config.memory_recall_classifier_enabled,
             config.memory_recall_classifier_window,
+            config.reflect,
             "hi",
             &transcript,
             &[MemoryRecord {
@@ -15212,6 +15351,7 @@ mod tests {
         let narrow_messages = recall_memory_context_messages(
             narrow.memory_recall_classifier_enabled,
             narrow.memory_recall_classifier_window,
+            narrow.reflect,
             "What should I focus on?",
             &transcript,
             &memories,
@@ -15222,6 +15362,7 @@ mod tests {
         let wide_messages = recall_memory_context_messages(
             wide.memory_recall_classifier_enabled,
             wide.memory_recall_classifier_window,
+            wide.reflect,
             "What should I focus on?",
             &transcript,
             &memories,
@@ -15334,6 +15475,23 @@ mod tests {
 
         let parsed =
             parse_recalled_memory_names(r#"[{"name":"Basketball Form"},{"name":"Sleep Routine"}]"#);
+        let names = recalled_memory_names(&transcript);
+
+        assert_eq!(parsed.len(), 2);
+        assert!(names.contains("basketball form"));
+        assert!(names.contains("sleep routine"));
+    }
+
+    #[test]
+    fn parse_reflective_recall_metadata_names_from_transcript() {
+        let transcript = vec![ConversationMessage::tool_result(
+            "bootstrap-memory-recall",
+            r#"{"content":"I remember these details may be relevant.","recall_metadata":[{"memory_type":"Memory","memory_id":1,"name":"Basketball Form"},{"memory_type":"Memory","memory_id":2,"name":"Sleep Routine"}]}"#,
+        )];
+
+        let parsed = parse_recalled_memory_names(
+            r#"{"content":"I remember these details may be relevant.","recall_metadata":[{"memory_type":"Memory","memory_id":1,"name":"Basketball Form"},{"memory_type":"Memory","memory_id":2,"name":"Sleep Routine"}]}"#,
+        );
         let names = recalled_memory_names(&transcript);
 
         assert_eq!(parsed.len(), 2);
