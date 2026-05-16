@@ -5428,7 +5428,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                 )?
                 else {
                     return Ok(ToolExecutionResult::error(format!(
-                        "memory not found: {name}"
+                        "Memory '{name}' not found for the current user."
                     )));
                 };
                 Ok(ToolExecutionResult::success(
@@ -8959,7 +8959,10 @@ mod tests {
             "No sources found for memory 'shared memory name'"
         );
         assert!(missing_other.is_error);
-        assert_eq!(missing_other.content, "memory not found: Other Only Memory");
+        assert_eq!(
+            missing_other.content,
+            "Memory 'Other Only Memory' not found for the current user."
+        );
 
         fs::remove_dir_all(root).expect("root should be removed");
     }
