@@ -1079,7 +1079,7 @@ fn get_or_create_context_message_set(
         Err(rusqlite::Error::QueryReturnedNoRows) => {
             let now = unix_timestamp_now();
             connection.execute(
-                "INSERT INTO context_message_sets (
+                "INSERT OR IGNORE INTO context_message_sets (
                     user_token,
                     is_active,
                     created_at_unix,
@@ -1087,7 +1087,11 @@ fn get_or_create_context_message_set(
                 ) VALUES (?1, 1, ?2, ?2)",
                 params![user_token, now],
             )?;
-            Ok(connection.last_insert_rowid())
+            connection.query_row(
+                "SELECT id FROM context_message_sets WHERE user_token = ?1 AND is_active = 1",
+                [user_token],
+                |row| row.get(0),
+            )
         }
         Err(error) => Err(error),
     }
@@ -1327,13 +1331,13 @@ mod tests {
     use super::{
         BootstrapInventory, BootstrapPlan, MemoryOperationTrackerRecord, UserPreferenceRecord,
         bootstrap_database, bootstrap_documents, derived_counts, find_active_agenda_item_by_name,
-        find_active_memory_by_name, get_or_create_memory_operation_tracker,
-        list_active_agenda_items, list_active_due_items, list_active_memories,
-        list_active_plain_agenda_items, list_inactive_due_items, load_context_messages,
-        load_memory_operation_tracker, load_messages_by_ids, load_user_preferences, markdown_files,
-        open_sqlite_connection, persist_bootstrap_documents, replace_context_messages,
-        run_migrations, save_memory_operation_tracker, save_user_preferences,
-        search_active_memories, sync_derived_domain_tables,
+        find_active_memory_by_name, get_or_create_context_message_set,
+        get_or_create_memory_operation_tracker, list_active_agenda_items, list_active_due_items,
+        list_active_memories, list_active_plain_agenda_items, list_inactive_due_items,
+        load_context_messages, load_memory_operation_tracker, load_messages_by_ids,
+        load_user_preferences, markdown_files, open_sqlite_connection, persist_bootstrap_documents,
+        replace_context_messages, run_migrations, save_memory_operation_tracker,
+        save_user_preferences, search_active_memories, sync_derived_domain_tables,
     };
     use elroy_config::AppConfig;
     use elroy_llm::{ConversationMessage, MessageRole, ToolCall};
@@ -1896,6 +1900,28 @@ mod tests {
         assert_eq!(loaded.assistant_name.as_deref(), Some("Nova"));
         assert_eq!(loaded.preferred_name.as_deref(), Some("Jimmy"));
         assert_eq!(loaded.full_name.as_deref(), Some("James Smith"));
+    }
+
+    #[test]
+    fn get_or_create_context_message_set_returns_stable_active_id() {
+        let mut connection = Connection::open_in_memory().expect("sqlite should open");
+        run_migrations(&mut connection).expect("migrations should run");
+
+        let first = get_or_create_context_message_set(&mut connection, "local-user")
+            .expect("context message set should be created");
+        let second = get_or_create_context_message_set(&mut connection, "local-user")
+            .expect("context message set should reload");
+
+        assert_eq!(first, second);
+
+        let active_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM context_message_sets WHERE user_token = ?1 AND is_active = 1",
+                ["local-user"],
+                |row| row.get(0),
+            )
+            .expect("active context-message-set count should query");
+        assert_eq!(active_count, 1);
     }
 
     #[test]
