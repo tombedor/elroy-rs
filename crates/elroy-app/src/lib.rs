@@ -1699,7 +1699,7 @@ fn format_memory_listing(memories: &[MemoryRecord]) -> String {
     }
 
     let mut lines = vec!["Memories".to_string()];
-    for memory in memories {
+    for memory in memories.iter().rev() {
         lines.push(format!(
             "- {} | Text: {}",
             memory.name,
@@ -7128,6 +7128,51 @@ mod tests {
         assert!(!printed_memories.is_error);
         assert!(printed_memories.content.contains("Memories"));
         assert!(printed_memories.content.contains("runner notes"));
+
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
+    fn print_memories_lists_oldest_visible_first() {
+        let unique = format!(
+            "elroy-rs-app-memory-order-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+        fs::write(memory_dir.join("older.md"), "remember the earlier note\n")
+            .expect("older memory should be written");
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        fs::write(memory_dir.join("newer.md"), "remember the later note\n")
+            .expect("newer memory should be written");
+
+        let mut config = AppConfig::defaults();
+        config.memory_dir = memory_dir;
+        config.agenda_dir = agenda_dir;
+        config.database_path = database_path;
+        elroy_db::bootstrap_database(&elroy_db::BootstrapPlan::from_config(&config))
+            .expect("bootstrap should succeed");
+
+        let registry = build_live_tool_registry(&config);
+        let printed = registry.invoke("print_memories", "{\"n\":10}");
+
+        assert!(!printed.is_error);
+        let older_index = printed
+            .content
+            .find("- older | Text: remember the earlier note")
+            .expect("older memory should appear");
+        let newer_index = printed
+            .content
+            .find("- newer | Text: remember the later note")
+            .expect("newer memory should appear");
+        assert!(older_index < newer_index);
 
         fs::remove_dir_all(home).expect("home should be removed");
     }
