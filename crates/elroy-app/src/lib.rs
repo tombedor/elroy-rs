@@ -3468,7 +3468,9 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
             let memory = match find_active_memory_by_name(&connection, memory_name) {
                 Ok(Some(memory)) => memory,
                 Ok(None) => {
-                    return ToolExecutionResult::error(format!("memory not found: {memory_name}"));
+                    return ToolExecutionResult::success(format!(
+                        "Memory '{memory_name}' not found"
+                    ));
                 }
                 Err(error) => {
                     return ToolExecutionResult::error(format!("database query failed: {error}"));
@@ -7489,6 +7491,12 @@ mod tests {
         );
         assert!(!update.is_error);
         assert_eq!(update.content, "Memory 'runner notes' has been updated");
+        let missing_update = registry.invoke(
+            "update_outdated_or_incorrect_memory",
+            "{\"memory_name\":\"missing\",\"update_text\":\"unused\"}",
+        );
+        assert!(!missing_update.is_error);
+        assert_eq!(missing_update.content, "Memory 'missing' not found");
 
         let file_text =
             fs::read_to_string(memory_dir.join("runner_notes.md")).expect("memory should read");
