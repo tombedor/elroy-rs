@@ -1552,6 +1552,50 @@ fn format_context_message_source_content(messages: &[ConversationMessage]) -> St
         .join("\n")
 }
 
+fn format_due_item_detail(item: &AgendaItemRecord) -> String {
+    let mut lines = vec![format!("Due item '{}':", item.name)];
+    if let Some(trigger_datetime) = &item.trigger_datetime {
+        lines.push(format!("Trigger Time: {trigger_datetime}"));
+    }
+    if let Some(trigger_context) = &item.trigger_context {
+        lines.push(format!("Context: {trigger_context}"));
+    }
+    lines.push(format!("Text: {}", item.body));
+    lines.join("\n")
+}
+
+fn format_due_item_listing(items: &[AgendaItemRecord], active: bool) -> String {
+    if items.is_empty() {
+        let status = if active { "active" } else { "inactive" };
+        return format!("No {status} due items found.");
+    }
+
+    let title = if active {
+        "Active Due Items"
+    } else {
+        "Inactive Due Items"
+    };
+    let mut lines = vec![title.to_string()];
+    for item in items {
+        let item_type = if item.trigger_datetime.is_some() {
+            "Timed"
+        } else {
+            "Contextual"
+        };
+        let trigger_time = item
+            .trigger_datetime
+            .as_deref()
+            .unwrap_or("N/A")
+            .to_string();
+        let context = item.trigger_context.as_deref().unwrap_or("N/A").to_string();
+        lines.push(format!(
+            "- {} | Type: {} | Trigger Time: {} | Context: {} | Text: {}",
+            item.name, item_type, trigger_time, context, item.body
+        ));
+    }
+    lines.join("\n")
+}
+
 fn formulate_memory_from_transcript(transcript: &[ConversationMessage]) -> (String, String) {
     let messages = transcript
         .iter()
@@ -4395,25 +4439,9 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
             let limit = argument_limit(&arguments, 10);
             with_tool_connection(&database_path, |connection| {
                 let items = list_active_due_items(connection, limit)?;
-                let payload = items
-                    .into_iter()
-                    .map(|item| {
-                        json!({
-                            "name": item.name,
-                            "agenda_date": item.agenda_date,
-                            "trigger_datetime": item.trigger_datetime,
-                            "trigger_context": item.trigger_context,
-                            "status": item.status,
-                            "checklist_total": item.checklist_total,
-                            "checklist_completed": item.checklist_completed,
-                            "excerpt": excerpt(&item.body, 180),
-                        })
-                    })
-                    .collect::<Vec<_>>();
-                Ok(ToolExecutionResult::success(
-                    serde_json::to_string_pretty(&payload)
-                        .expect("due item payload should serialize"),
-                ))
+                Ok(ToolExecutionResult::success(format_due_item_listing(
+                    &items, true,
+                )))
             })
         },
     );
@@ -4462,24 +4490,9 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
             let limit = argument_limit(&arguments, 10);
             with_tool_connection(&database_path, |connection| {
                 let items = list_inactive_due_items(connection, limit)?;
-                let payload = items
-                    .into_iter()
-                    .map(|item| {
-                        json!({
-                            "name": item.name,
-                            "agenda_date": item.agenda_date,
-                            "trigger_datetime": item.trigger_datetime,
-                            "trigger_context": item.trigger_context,
-                            "status": item.status,
-                            "closing_comment": item.closing_comment,
-                            "excerpt": excerpt(&item.body, 180),
-                        })
-                    })
-                    .collect::<Vec<_>>();
-                Ok(ToolExecutionResult::success(
-                    serde_json::to_string_pretty(&payload)
-                        .expect("inactive due item payload should serialize"),
-                ))
+                Ok(ToolExecutionResult::success(format_due_item_listing(
+                    &items, false,
+                )))
             })
         },
     );
@@ -4565,17 +4578,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                         "due item not found: {name}"
                     )));
                 }
-                Ok(ToolExecutionResult::success(
-                    json!({
-                        "name": item.name,
-                        "trigger_datetime": item.trigger_datetime,
-                        "trigger_context": item.trigger_context,
-                        "status": item.status,
-                        "closing_comment": item.closing_comment,
-                        "body": item.body,
-                    })
-                    .to_string(),
-                ))
+                Ok(ToolExecutionResult::success(format_due_item_detail(&item)))
             })
         },
     );
@@ -6961,8 +6964,13 @@ mod tests {
 
         let printed = registry.invoke("print_due_item", "{\"name\":\"pay bill\"}");
         assert!(!printed.is_error);
-        assert!(printed.content.contains("Pay bill"));
-        assert!(printed.content.contains("2026-05-15T09:00:00"));
+        assert!(printed.content.contains("Due item 'pay bill':"));
+        assert!(
+            printed
+                .content
+                .contains("Trigger Time: 2026-05-15T09:00:00")
+        );
+        assert!(printed.content.contains("Text: Pay bill"));
 
         let inactive = registry.invoke("list_inactive_due_items", "{\"limit\":10}");
         assert!(!inactive.is_error);
@@ -6971,11 +6979,15 @@ mod tests {
 
         let printed_active = registry.invoke("print_active_due_items", "{\"limit\":10}");
         assert!(!printed_active.is_error);
+        assert!(printed_active.content.contains("Active Due Items"));
         assert!(printed_active.content.contains("pay bill"));
+        assert!(printed_active.content.contains("Type: Timed"));
 
         let printed_inactive = registry.invoke("print_inactive_due_items", "{\"limit\":10}");
         assert!(!printed_inactive.is_error);
+        assert!(printed_inactive.content.contains("Inactive Due Items"));
         assert!(printed_inactive.content.contains("call mom"));
+        assert!(printed_inactive.content.contains("Type: Contextual"));
     }
 
     #[test]
