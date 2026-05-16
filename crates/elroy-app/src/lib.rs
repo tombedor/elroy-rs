@@ -5399,20 +5399,20 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
             let Some(query) = arguments.get("query").and_then(Value::as_str) else {
                 return ToolExecutionResult::error("search_memories requires a string query");
             };
-            let limit = argument_limit(&arguments, 10);
+            let recall_limit = argument_limit(&arguments, 10).min(2);
             with_tool_connection(&database_path, |connection| {
                 let memories = search_active_memories_in_scope(
                     connection,
                     &memory_dir_for_search_memories,
                     query,
-                    limit,
+                    recall_limit,
                 )?;
-                let due_items = list_active_due_items(connection, limit * 3)?;
+                let due_items = list_active_due_items(connection, recall_limit * 3)?;
                 let relevant_due_items =
-                    select_due_items_by_overlap(query, &due_items, limit, None);
-                let agenda_items = list_active_plain_agenda_items(connection, limit * 3)?;
+                    select_due_items_by_overlap(query, &due_items, recall_limit, None);
+                let agenda_items = list_active_plain_agenda_items(connection, recall_limit * 3)?;
                 let relevant_agenda_items =
-                    select_agenda_items_by_overlap(query, &agenda_items, limit);
+                    select_agenda_items_by_overlap(query, &agenda_items, recall_limit);
                 Ok(ToolExecutionResult::success(format_memory_search_results(
                     &memories,
                     &relevant_due_items,
@@ -5434,21 +5434,21 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
             let Some(question) = arguments.get("question").and_then(Value::as_str) else {
                 return ToolExecutionResult::error("examine_memories requires a string question");
             };
-            let limit = argument_limit(&arguments, 10);
+            let recall_limit = argument_limit(&arguments, 10).min(2);
             with_tool_connection(&database_path, |connection| {
                 let memories = list_active_memories_in_scope(
                     connection,
                     &memory_dir_for_examine_memories,
-                    limit * 3,
+                    recall_limit * 3,
                 )?;
                 let relevant_memories =
-                    select_recalled_memories(question, &memories, &HashSet::new(), limit);
-                let due_items = list_active_due_items(connection, limit * 3)?;
+                    select_recalled_memories(question, &memories, &HashSet::new(), recall_limit);
+                let due_items = list_active_due_items(connection, recall_limit * 3)?;
                 let relevant_due_items =
-                    select_due_items_by_overlap(question, &due_items, limit, None);
-                let agenda_items = list_active_plain_agenda_items(connection, limit * 3)?;
+                    select_due_items_by_overlap(question, &due_items, recall_limit, None);
+                let agenda_items = list_active_plain_agenda_items(connection, recall_limit * 3)?;
                 let relevant_agenda_items =
-                    select_agenda_items_by_overlap(question, &agenda_items, limit);
+                    select_agenda_items_by_overlap(question, &agenda_items, recall_limit);
 
                 let mut sections = relevant_memories
                     .into_iter()
@@ -12709,6 +12709,86 @@ mod tests {
     }
 
     #[test]
+    fn live_tool_registry_search_memories_caps_results_to_two_per_type() {
+        let unique = format!(
+            "elroy-rs-app-search-memories-limit-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+
+        for idx in 1..=3 {
+            fs::write(
+                memory_dir.join(format!("project_phoenix_note_{idx}.md")),
+                format!("Project Phoenix launch update note {idx} with launch planning details.\n"),
+            )
+            .expect("memory should be written");
+            fs::write(
+                agenda_dir.join(format!("project_phoenix_due_{idx}.md")),
+                format!(
+                    "---\ndate: unscheduled\ncompleted: false\nstatus: created\ntrigger_context: after the Project Phoenix launch update\n---\n\nProject Phoenix due item {idx}\n"
+                ),
+            )
+            .expect("due item should be written");
+            fs::write(
+                agenda_dir.join(format!("project_phoenix_agenda_{idx}.md")),
+                format!(
+                    "---\ndate: 2026-05-2{idx}\ncompleted: false\nstatus: created\n---\n\nProject Phoenix agenda item {idx}\n"
+                ),
+            )
+            .expect("agenda item should be written");
+        }
+
+        let mut config = AppConfig::defaults();
+        config.memory_dir = memory_dir;
+        config.agenda_dir = agenda_dir;
+        config.database_path = database_path;
+        elroy_db::bootstrap_database(&BootstrapPlan::from_config(&config))
+            .expect("bootstrap should succeed");
+
+        let registry = build_live_tool_registry(&config);
+        let search = registry.invoke(
+            "search_memories",
+            "{\"query\":\"Project Phoenix launch update\",\"limit\":5}",
+        );
+
+        assert!(!search.is_error);
+        assert_eq!(
+            search
+                .content
+                .lines()
+                .filter(|line| line.starts_with("- Memory | "))
+                .count(),
+            2
+        );
+        assert_eq!(
+            search
+                .content
+                .lines()
+                .filter(|line| line.starts_with("- DueItem | "))
+                .count(),
+            2
+        );
+        assert_eq!(
+            search
+                .content
+                .lines()
+                .filter(|line| line.starts_with("- AgendaItem | "))
+                .count(),
+            2
+        );
+
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
     fn live_tool_registry_examine_memories_can_return_memory_and_due_item_sections() {
         let unique = format!(
             "elroy-rs-app-examine-memories-{}",
@@ -12803,6 +12883,65 @@ mod tests {
                 .contains("team offsite agenda and venue shortlist")
         );
         assert!(result.content.contains("Agenda date: 2026-05-21"));
+
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
+    fn live_tool_registry_examine_memories_caps_results_to_two_per_type() {
+        let unique = format!(
+            "elroy-rs-app-examine-memories-limit-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+
+        for idx in 1..=3 {
+            fs::write(
+                memory_dir.join(format!("project_phoenix_memory_{idx}.md")),
+                format!("Project Phoenix planning memory {idx} with launch checklist notes.\n"),
+            )
+            .expect("memory should be written");
+            fs::write(
+                agenda_dir.join(format!("project_phoenix_follow_up_{idx}.md")),
+                format!(
+                    "---\ndate: unscheduled\ncompleted: false\nstatus: created\ntrigger_context: after the Project Phoenix launch planning check-in\n---\n\nProject Phoenix due follow-up {idx}\n"
+                ),
+            )
+            .expect("due item should be written");
+            fs::write(
+                agenda_dir.join(format!("project_phoenix_plan_{idx}.md")),
+                format!(
+                    "---\ndate: 2026-06-0{idx}\ncompleted: false\nstatus: created\n---\n\nProject Phoenix agenda planning item {idx}\n"
+                ),
+            )
+            .expect("agenda item should be written");
+        }
+
+        let mut config = AppConfig::defaults();
+        config.memory_dir = memory_dir;
+        config.agenda_dir = agenda_dir;
+        config.database_path = database_path;
+        elroy_db::bootstrap_database(&BootstrapPlan::from_config(&config))
+            .expect("bootstrap should succeed");
+
+        let registry = build_live_tool_registry(&config);
+        let result = registry.invoke(
+            "examine_memories",
+            "{\"question\":\"What do I know about the Project Phoenix launch planning check-in?\",\"limit\":5}",
+        );
+
+        assert!(!result.is_error);
+        assert_eq!(result.content.matches("# Memory: ").count(), 2);
+        assert_eq!(result.content.matches("# Due Item: ").count(), 2);
+        assert_eq!(result.content.matches("# Agenda Item: ").count(), 2);
 
         fs::remove_dir_all(home).expect("home should be removed");
     }
