@@ -2491,6 +2491,76 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
         },
     );
 
+    let config_for_consolidated_memory_write = config.clone();
+    let create_consolidated_memory = ExecutableTool::new(
+        ToolSpec::new(
+            "create_consolidated_memory",
+            "Create a consolidated memory from one or more existing active memories.",
+            JsonSchema::object(
+                [
+                    ("name", json!({"type": "string"})),
+                    ("text", json!({"type": "string"})),
+                    (
+                        "source_names",
+                        json!({
+                            "type": "array",
+                            "items": {"type": "string"}
+                        }),
+                    ),
+                ],
+                ["name", "text", "source_names"],
+            ),
+        ),
+        move |arguments| {
+            let Some(name) = arguments.get("name").and_then(Value::as_str) else {
+                return ToolExecutionResult::error(
+                    "create_consolidated_memory requires a string name",
+                );
+            };
+            let Some(text) = arguments.get("text").and_then(Value::as_str) else {
+                return ToolExecutionResult::error(
+                    "create_consolidated_memory requires string text",
+                );
+            };
+            let Some(source_names) = arguments.get("source_names").and_then(Value::as_array) else {
+                return ToolExecutionResult::error(
+                    "create_consolidated_memory requires array source_names",
+                );
+            };
+            let source_names = source_names
+                .iter()
+                .map(Value::as_str)
+                .collect::<Option<Vec<_>>>();
+            let Some(source_names) = source_names else {
+                return ToolExecutionResult::error(
+                    "create_consolidated_memory requires string source_names entries",
+                );
+            };
+            if source_names.is_empty() {
+                return ToolExecutionResult::error(
+                    "create_consolidated_memory requires at least one source memory",
+                );
+            }
+            match create_consolidated_memory_from_config(
+                &config_for_consolidated_memory_write,
+                name,
+                text,
+                &source_names,
+            ) {
+                Ok(path) => ToolExecutionResult::success(
+                    json!({
+                        "created": true,
+                        "file_path": path.display().to_string(),
+                    })
+                    .to_string(),
+                ),
+                Err(error) => ToolExecutionResult::error(format!(
+                    "failed to create consolidated memory: {error}"
+                )),
+            }
+        },
+    );
+
     let get_fast_recall = ExecutableTool::new(
         ToolSpec::new(
             "get_fast_recall",
@@ -4818,6 +4888,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
         print_config,
         tail_elroy_logs,
         create_memory,
+        create_consolidated_memory,
         get_fast_recall,
         add_agenda_item,
         create_task,
@@ -5074,7 +5145,6 @@ fn archive_memory_file_from_config(
     }
 }
 
-#[cfg(test)]
 fn create_consolidated_memory_from_config(
     config: &AppConfig,
     name: &str,
@@ -5889,9 +5959,9 @@ mod tests {
         AppRuntime, LOCAL_USER_TOKEN, PromptExecutionOptions, SYNTHETIC_FIRST_USER_MESSAGE,
         argument_limit, build_live_tool_registry, build_live_tool_registry_with_codex_bin_and_hook,
         build_recall_query, codex_background_status_key, compress_context_messages,
-        count_context_tokens, create_consolidated_memory_from_config, drop_old_context_messages,
-        due_item_context_messages, format_context_summary_message, is_context_refresh_needed,
-        memory_recall_status_updates, parse_recalled_memory_names, prompt_prelude_status_updates,
+        count_context_tokens, drop_old_context_messages, due_item_context_messages,
+        format_context_summary_message, is_context_refresh_needed, memory_recall_status_updates,
+        parse_recalled_memory_names, prompt_prelude_status_updates,
         provider_config_from_app_config, recall_due_item_context_messages,
         recall_memory_context_messages, recalled_memory_names, recent_recall_context,
         refresh_context_if_needed, run_prompt_with_model_and_registry,
@@ -6597,13 +6667,13 @@ mod tests {
         elroy_db::bootstrap_database(&BootstrapPlan::from_config(&config))
             .expect("bootstrap should succeed");
 
-        create_consolidated_memory_from_config(
-            &config,
-            "Running summary",
-            "The user ran a marathon and later reported running 24 miles in total.",
-            &["running progress", "run today"],
+        let registry = build_live_tool_registry(&config);
+        let created = registry.invoke(
+            "create_consolidated_memory",
+            "{\"name\":\"Running summary\",\"text\":\"The user ran a marathon and later reported running 24 miles in total.\",\"source_names\":[\"running progress\",\"run today\"]}",
         )
-        .expect("consolidated memory should be created");
+        ;
+        assert!(!created.is_error);
 
         let connection = open_sqlite_connection(&database_path).expect("database should reopen");
         let active_memories =
@@ -6611,7 +6681,6 @@ mod tests {
         assert_eq!(active_memories.len(), 1);
         assert_eq!(active_memories[0].name, "running summary");
 
-        let registry = build_live_tool_registry(&config);
         let source_list = registry.invoke(
             "get_source_list_for_memory",
             "{\"memory_name\":\"running summary\"}",
