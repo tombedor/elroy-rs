@@ -4,9 +4,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use chrono::{Local, NaiveDateTime, Utc};
 use elroy_agenda::{
-    add_checklist_item, append_agenda_update, create_agenda_file, get_checklist,
-    mark_agenda_item_completed, mark_agenda_item_deleted, rename_agenda_file, update_agenda_body,
-    update_checklist_item,
+    add_checklist_item, append_agenda_update, create_agenda_file, mark_agenda_item_completed,
+    mark_agenda_item_deleted, rename_agenda_file, update_agenda_body, update_checklist_item,
 };
 use elroy_codex::{
     CodexSessionResult, dispatch_codex_session_with_bin, dispatch_codex_session_with_hook,
@@ -2693,13 +2692,13 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                     .map_err(|error| std::io::Error::other(error.to_string()))?;
                 Ok(path)
             }) {
-                Ok(path) => ToolExecutionResult::success(
-                    json!({
-                        "created": true,
-                        "file_path": path.display().to_string(),
-                    })
-                    .to_string(),
-                ),
+                Ok(path) => ToolExecutionResult::success(format!(
+                    "Agenda item added for {}: {}",
+                    date.unwrap_or("unscheduled"),
+                    path.file_stem()
+                        .and_then(|value| value.to_str())
+                        .unwrap_or(name)
+                )),
                 Err(error) => {
                     ToolExecutionResult::error(format!("failed to create agenda item: {error}"))
                 }
@@ -3386,8 +3385,9 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
             let Some(note) = arguments.get("note").and_then(Value::as_str) else {
                 return ToolExecutionResult::error("add_agenda_item_update requires string note");
             };
-            mutate_agenda_file_from_config(&config_for_agenda_update, name, |path| {
-                append_agenda_update(path, note)
+            mutate_agenda_file_from_config_with_result(&config_for_agenda_update, name, |path| {
+                append_agenda_update(path, note)?;
+                Ok(format!("Update added to '{name}' at <timestamp>."))
             })
         },
     );
@@ -3410,8 +3410,9 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                 return ToolExecutionResult::error("complete_agenda_item requires a string name");
             };
             let closing_comment = arguments.get("closing_comment").and_then(Value::as_str);
-            mutate_agenda_file_from_config(&config_for_agenda_complete, name, |path| {
-                mark_agenda_item_completed(path, closing_comment)
+            mutate_agenda_file_from_config_with_result(&config_for_agenda_complete, name, |path| {
+                mark_agenda_item_completed(path, closing_comment)?;
+                Ok(format!("Agenda item '{name}' marked as completed."))
             })
         },
     );
@@ -3427,8 +3428,9 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
             let Some(name) = arguments.get("name").and_then(Value::as_str) else {
                 return ToolExecutionResult::error("delete_agenda_item requires a string name");
             };
-            mutate_agenda_file_from_config(&config_for_agenda_delete, name, |path| {
-                mark_agenda_item_deleted(path, None)
+            mutate_agenda_file_from_config_with_result(&config_for_agenda_delete, name, |path| {
+                mark_agenda_item_deleted(path, None)?;
+                Ok(format!("Agenda item '{name}' deleted."))
             })
         },
     );
@@ -3464,13 +3466,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                 name,
                 |path| {
                     let item_id = add_checklist_item(path, text, due_date)?;
-                    let checklist = get_checklist(path)?;
-                    Ok(json!({
-                        "updated": true,
-                        "checklist_item_id": item_id,
-                        "checklist_count": checklist.len(),
-                    })
-                    .to_string())
+                    Ok(format!("Checklist item {item_id} added to '{name}'."))
                 },
             )
         },
@@ -3511,13 +3507,10 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                 name,
                 |path| {
                     let updated = update_checklist_item(path, item_id, Some(text), None)?;
-                    Ok(json!({
-                        "updated": true,
-                        "item_id": updated.id,
-                        "text": updated.text,
-                        "completed": updated.completed,
-                    })
-                    .to_string())
+                    Ok(format!(
+                        "Checklist item {} on '{}' updated.",
+                        updated.id, name
+                    ))
                 },
             )
         },
@@ -3552,13 +3545,10 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                 name,
                 |path| {
                     let updated = update_checklist_item(path, item_id, None, Some(true))?;
-                    Ok(json!({
-                        "updated": true,
-                        "item_id": updated.id,
-                        "text": updated.text,
-                        "completed": updated.completed,
-                    })
-                    .to_string())
+                    Ok(format!(
+                        "Checklist item {} on '{}' marked as completed.",
+                        updated.id, name
+                    ))
                 },
             )
         },
@@ -5314,37 +5304,6 @@ fn create_consolidated_memory_from_plan(
     elroy_db::bootstrap_database(bootstrap_plan)
         .map_err(|error| std::io::Error::other(error.to_string()))?;
     Ok(created)
-}
-
-fn mutate_agenda_file_from_config(
-    config: &AppConfig,
-    name: &str,
-    operation: impl FnOnce(&Path) -> std::io::Result<()>,
-) -> ToolExecutionResult {
-    let mut connection = match open_sqlite_connection(&config.database_path) {
-        Ok(connection) => connection,
-        Err(error) => {
-            return ToolExecutionResult::error(format!("failed to open database: {error}"));
-        }
-    };
-    if let Err(error) = run_migrations(&mut connection) {
-        return ToolExecutionResult::error(format!("failed to run migrations: {error}"));
-    }
-    let item = match find_active_agenda_item_by_name(&connection, name) {
-        Ok(Some(item)) => item,
-        Ok(None) => return ToolExecutionResult::error(format!("agenda item not found: {name}")),
-        Err(error) => return ToolExecutionResult::error(format!("database query failed: {error}")),
-    };
-    match operation(Path::new(&item.file_path)).and_then(|()| {
-        elroy_db::bootstrap_database(&BootstrapPlan::from_config(config))
-            .map_err(|error| std::io::Error::other(error.to_string()))?;
-        Ok(())
-    }) {
-        Ok(()) => ToolExecutionResult::success(
-            json!({"updated": true, "name": item.name, "file_path": item.file_path}).to_string(),
-        ),
-        Err(error) => ToolExecutionResult::error(format!("agenda mutation failed: {error}")),
-    }
 }
 
 fn mutate_agenda_file_from_config_with_result(
@@ -7132,11 +7091,26 @@ mod tests {
             .expect("bootstrap should succeed");
 
         let registry = build_live_tool_registry(&config);
+        let added = registry.invoke(
+            "add_agenda_item",
+            "{\"name\":\"Project Kickoff\",\"text\":\"Prepare slides\",\"date\":\"2026-05-18\"}",
+        );
+        assert!(!added.is_error);
+        assert_eq!(
+            added.content,
+            "Agenda item added for 2026-05-18: project_kickoff"
+        );
+        assert!(agenda_dir.join("project_kickoff.md").exists());
+
         let update = registry.invoke(
             "add_agenda_item_update",
             "{\"name\":\"doctor visit\",\"note\":\"called ahead\"}",
         );
         assert!(!update.is_error);
+        assert_eq!(
+            update.content,
+            "Update added to 'doctor visit' at <timestamp>."
+        );
         let updated_text =
             fs::read_to_string(agenda_dir.join("doctor_visit.md")).expect("agenda should read");
         assert!(updated_text.contains("## Updates"));
@@ -7147,6 +7121,10 @@ mod tests {
             "{\"name\":\"doctor visit\",\"closing_comment\":\"done\"}",
         );
         assert!(!complete.is_error);
+        assert_eq!(
+            complete.content,
+            "Agenda item 'doctor visit' marked as completed."
+        );
         let completed_text =
             fs::read_to_string(agenda_dir.join("doctor_visit.md")).expect("agenda should read");
         assert!(completed_text.contains("completed: true"));
@@ -7161,6 +7139,7 @@ mod tests {
             .expect("bootstrap should succeed");
         let delete = registry.invoke("delete_agenda_item", "{\"name\":\"call mom\"}");
         assert!(!delete.is_error);
+        assert_eq!(delete.content, "Agenda item 'call mom' deleted.");
         let deleted_text =
             fs::read_to_string(agenda_dir.join("call_mom.md")).expect("agenda should read");
         assert!(deleted_text.contains("status: deleted"));
@@ -7248,21 +7227,24 @@ mod tests {
             "{\"name\":\"trip\",\"text\":\"passport\",\"due_date\":\"2026-05-14\"}",
         );
         assert!(!added.is_error);
-        assert!(added.content.contains("\"checklist_item_id\":1"));
+        assert_eq!(added.content, "Checklist item 1 added to 'trip'.");
 
         let edited = registry.invoke(
             "edit_agenda_checklist_item",
             "{\"name\":\"trip\",\"item_id\":1,\"text\":\"passport + visa\"}",
         );
         assert!(!edited.is_error);
-        assert!(edited.content.contains("passport + visa"));
+        assert_eq!(edited.content, "Checklist item 1 on 'trip' updated.");
 
         let completed = registry.invoke(
             "complete_agenda_checklist_item",
             "{\"name\":\"trip\",\"item_id\":1}",
         );
         assert!(!completed.is_error);
-        assert!(completed.content.contains("\"completed\":true"));
+        assert_eq!(
+            completed.content,
+            "Checklist item 1 on 'trip' marked as completed."
+        );
 
         let file_text = fs::read_to_string(agenda_dir.join("trip.md")).expect("agenda should read");
         assert!(file_text.contains("passport + visa"));
