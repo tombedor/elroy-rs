@@ -62,6 +62,9 @@ pub struct TuiApp {
     pub prompt_active: bool,
     pub background_status: Option<String>,
     pub input: String,
+    pub input_history: Vec<String>,
+    pub history_index: Option<usize>,
+    pub history_draft: Option<String>,
     pub detail_modal: Option<DetailModalState>,
     pub sidebar_section: SidebarSection,
     pub focus: FocusTarget,
@@ -338,11 +341,13 @@ fn apply_key_event(
     if app.focus == FocusTarget::Input {
         match key.code {
             KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                app.reset_prompt_history_navigation();
                 app.input.push(ch);
                 app.status = "editing prompt".to_string();
                 return TuiExit::Continue;
             }
             KeyCode::Backspace => {
+                app.reset_prompt_history_navigation();
                 app.input.pop();
                 app.status = "editing prompt".to_string();
                 return TuiExit::Continue;
@@ -380,6 +385,7 @@ fn apply_intent_with_runtime(
             match runtime.start_prompt_stream(&submitted) {
                 Ok(stream) => {
                     app.conversation_lines.push(format!("user: {submitted}"));
+                    app.record_submitted_prompt(&submitted);
                     app.input.clear();
                     app.status = "thinking...".to_string();
                     *pending_prompt = Some(PendingPrompt {
@@ -656,6 +662,9 @@ impl TuiApp {
             prompt_active: false,
             background_status: None,
             input: String::new(),
+            input_history: Vec::new(),
+            history_index: None,
+            history_draft: None,
             detail_modal: None,
             sidebar_section: SidebarSection::Memories,
             focus: FocusTarget::Input,
@@ -914,6 +923,53 @@ impl TuiApp {
         });
     }
 
+    fn record_submitted_prompt(&mut self, submitted: &str) {
+        self.reset_prompt_history_navigation();
+        self.input_history.retain(|entry| entry != submitted);
+        self.input_history.insert(0, submitted.to_string());
+    }
+
+    fn reset_prompt_history_navigation(&mut self) {
+        self.history_index = None;
+        self.history_draft = None;
+    }
+
+    fn recall_previous_prompt(&mut self) {
+        if self.input_history.is_empty() {
+            self.status = "prompt history previous".to_string();
+            return;
+        }
+
+        let next_index = match self.history_index {
+            Some(index) if index + 1 < self.input_history.len() => index + 1,
+            Some(index) => index,
+            None => {
+                self.history_draft = Some(self.input.clone());
+                0
+            }
+        };
+        self.history_index = Some(next_index);
+        self.input = self.input_history[next_index].clone();
+        self.status = "prompt history previous".to_string();
+    }
+
+    fn recall_next_prompt(&mut self) {
+        let Some(index) = self.history_index else {
+            self.status = "prompt history next".to_string();
+            return;
+        };
+
+        if index == 0 {
+            self.history_index = None;
+            self.input = self.history_draft.take().unwrap_or_default();
+        } else {
+            let next_index = index - 1;
+            self.history_index = Some(next_index);
+            self.input = self.input_history[next_index].clone();
+        }
+        self.status = "prompt history next".to_string();
+    }
+
     pub fn handle_modal_key(&mut self, key: &str) -> UiIntent {
         let Some(detail_modal) = self.detail_modal.as_mut() else {
             return UiIntent::Noop;
@@ -1009,10 +1065,10 @@ impl TuiApp {
                 self.status = "cancel requested".to_string();
             }
             UiIntent::HistoryPrevious => {
-                self.status = "prompt history previous".to_string();
+                self.recall_previous_prompt();
             }
             UiIntent::HistoryNext => {
-                self.status = "prompt history next".to_string();
+                self.recall_next_prompt();
             }
             UiIntent::CompleteInput => {
                 self.status = "input completion requested".to_string();
@@ -1805,6 +1861,55 @@ mod tests {
             key_event_token(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
             Some("escape")
         );
+    }
+
+    #[test]
+    fn chat_input_up_down_cycles_prompt_history() {
+        let mut app = TuiApp::bootstrap();
+        app.input_history = vec!["latest prompt".to_string(), "older prompt".to_string()];
+
+        let intent = app.handle_key("up");
+        app.apply_intent(intent);
+        assert_eq!(app.input, "latest prompt");
+
+        let intent = app.handle_key("up");
+        app.apply_intent(intent);
+        assert_eq!(app.input, "older prompt");
+
+        let intent = app.handle_key("down");
+        app.apply_intent(intent);
+        assert_eq!(app.input, "latest prompt");
+
+        let intent = app.handle_key("down");
+        app.apply_intent(intent);
+        assert_eq!(app.input, "");
+    }
+
+    #[test]
+    fn chat_input_history_restores_in_progress_draft() {
+        let mut app = TuiApp::bootstrap();
+        app.input_history = vec!["latest prompt".to_string(), "older prompt".to_string()];
+        app.input = "draft".to_string();
+
+        app.apply_intent(UiIntent::HistoryPrevious);
+        assert_eq!(app.input, "latest prompt");
+
+        app.apply_intent(UiIntent::HistoryNext);
+        assert_eq!(app.input, "draft");
+    }
+
+    #[test]
+    fn submitting_prompt_records_history_for_later_recall() {
+        let mut app = TuiApp::bootstrap();
+        app.input = "hello runtime".to_string();
+        let mut runtime = FakeRuntime::default();
+        let mut pending = None;
+
+        apply_intent_with_runtime(&mut app, UiIntent::SubmitPrompt, &mut runtime, &mut pending);
+
+        assert_eq!(app.input_history, vec!["hello runtime".to_string()]);
+        app.apply_intent(UiIntent::HistoryPrevious);
+        assert_eq!(app.input, "hello runtime");
     }
 
     #[test]
