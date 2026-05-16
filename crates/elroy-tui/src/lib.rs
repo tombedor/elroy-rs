@@ -62,6 +62,7 @@ pub struct TuiApp {
     pub prompt_active: bool,
     pub background_status: Option<String>,
     pub input: String,
+    pub input_completions: Vec<String>,
     pub input_history: Vec<String>,
     pub history_index: Option<usize>,
     pub history_draft: Option<String>,
@@ -181,6 +182,7 @@ pub struct TuiSnapshot {
     pub conversation_lines: Vec<String>,
     pub memory_titles: Vec<String>,
     pub agenda_titles: Vec<String>,
+    pub input_completions: Vec<String>,
     pub improvement_titles: Vec<String>,
     pub feature_request_titles: Vec<String>,
     pub codex_session_titles: Vec<String>,
@@ -662,6 +664,7 @@ impl TuiApp {
             prompt_active: false,
             background_status: None,
             input: String::new(),
+            input_completions: Vec::new(),
             input_history: Vec::new(),
             history_index: None,
             history_draft: None,
@@ -692,6 +695,7 @@ impl TuiApp {
         }
         self.memory_titles = snapshot.memory_titles;
         self.agenda_titles = snapshot.agenda_titles;
+        self.input_completions = snapshot.input_completions;
         self.improvement_titles = snapshot.improvement_titles;
         self.feature_request_titles = snapshot.feature_request_titles;
         self.codex_session_titles = snapshot.codex_session_titles;
@@ -970,6 +974,31 @@ impl TuiApp {
         self.status = "prompt history next".to_string();
     }
 
+    fn accept_input_completion(&mut self) {
+        let prefix = self.input.trim();
+        if prefix.is_empty() || prefix.starts_with('/') {
+            self.status = "input completion requested".to_string();
+            return;
+        }
+
+        let matched_completion = self
+            .input_completions
+            .iter()
+            .find(|suggestion| {
+                suggestion.len() != prefix.len()
+                    && suggestion
+                        .to_lowercase()
+                        .starts_with(&prefix.to_lowercase())
+            })
+            .cloned();
+
+        if let Some(completion) = matched_completion {
+            self.reset_prompt_history_navigation();
+            self.input = completion;
+        }
+        self.status = "input completion requested".to_string();
+    }
+
     pub fn handle_modal_key(&mut self, key: &str) -> UiIntent {
         let Some(detail_modal) = self.detail_modal.as_mut() else {
             return UiIntent::Noop;
@@ -1071,7 +1100,7 @@ impl TuiApp {
                 self.recall_next_prompt();
             }
             UiIntent::CompleteInput => {
-                self.status = "input completion requested".to_string();
+                self.accept_input_completion();
             }
             UiIntent::MoveUp => {
                 if self.selected_sidebar_index > 0 {
@@ -1470,6 +1499,7 @@ mod tests {
                 codex_session_titles: vec!["Fresh Session".to_string()],
                 model_name: None,
                 status: Some("runtime updated".to_string()),
+                ..TuiSnapshot::default()
             })
         }
 
@@ -1496,6 +1526,7 @@ mod tests {
                     codex_session_titles: vec!["Fresh Session".to_string()],
                     model_name: None,
                     status: Some("runtime updated".to_string()),
+                    ..TuiSnapshot::default()
                 },
                 cancelled_snapshot: TuiSnapshot {
                     conversation_lines: vec!["assistant: cancelled".to_string()],
@@ -1593,6 +1624,7 @@ mod tests {
                 codex_session_titles: vec!["Session After Mutation".to_string()],
                 model_name: None,
                 status: Some("mutation updated".to_string()),
+                ..TuiSnapshot::default()
             })
         }
     }
@@ -1693,6 +1725,7 @@ mod tests {
             codex_session_titles: vec!["sample (completed) thread-123".to_string()],
             model_name: Some("gpt-test".to_string()),
             status: Some("loaded snapshot".to_string()),
+            ..TuiSnapshot::default()
         });
         let text = rendered_text(&app);
 
@@ -1896,6 +1929,30 @@ mod tests {
 
         app.apply_intent(UiIntent::HistoryNext);
         assert_eq!(app.input, "draft");
+    }
+
+    #[test]
+    fn chat_input_tab_accepts_matching_completion() {
+        let mut app = TuiApp::bootstrap();
+        app.input = "desk".to_string();
+        app.input_completions = vec!["desk reset".to_string(), "doctor follow-up".to_string()];
+
+        app.apply_intent(UiIntent::CompleteInput);
+
+        assert_eq!(app.input, "desk reset");
+        assert_eq!(app.status, "input completion requested");
+    }
+
+    #[test]
+    fn chat_input_tab_ignores_slash_prefixed_input() {
+        let mut app = TuiApp::bootstrap();
+        app.input = "/desk".to_string();
+        app.input_completions = vec!["desk reset".to_string()];
+
+        app.apply_intent(UiIntent::CompleteInput);
+
+        assert_eq!(app.input, "/desk");
+        assert_eq!(app.status, "input completion requested");
     }
 
     #[test]

@@ -720,6 +720,10 @@ fn load_snapshot_from_connection(
         .into_iter()
         .map(|item| format_agenda_sidebar_title(&item, now))
         .collect::<Vec<_>>();
+    let input_completions = list_active_plain_agenda_items(connection, 50)?
+        .into_iter()
+        .map(|item| item.name)
+        .collect::<Vec<_>>();
     let improvement_titles = list_self_reflection_feature_requests(home_dir, true)
         .map_err(AppError::Io)?
         .into_iter()
@@ -741,6 +745,7 @@ fn load_snapshot_from_connection(
         conversation_lines,
         memory_titles,
         agenda_titles,
+        input_completions,
         improvement_titles,
         feature_request_titles,
         codex_session_titles,
@@ -10607,6 +10612,50 @@ mod tests {
                 .iter()
                 .any(|line| line == "assistant: hello")
         );
+
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
+    fn load_snapshot_exposes_plain_agenda_input_completions_only() {
+        let unique = format!(
+            "elroy-rs-app-snapshot-input-completions-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+
+        fs::write(
+            agenda_dir.join("desk reset.md"),
+            "---\ndate: 2025-05-16\ncompleted: false\nstatus: created\n---\n\nDesk reset\n",
+        )
+        .expect("plain agenda item should persist");
+        fs::write(
+            agenda_dir.join("call-mom.md"),
+            "---\ndate: unscheduled\ncompleted: false\nstatus: created\ntrigger_context: after dinner\n---\n\nCall Mom\n",
+        )
+        .expect("triggered task should persist");
+
+        let mut config = AppConfig::defaults();
+        config.home_dir = home.clone();
+        config.memory_dir = memory_dir;
+        config.agenda_dir = agenda_dir;
+        config.database_path = database_path.clone();
+
+        elroy_db::bootstrap_database(&BootstrapPlan::from_config(&config))
+            .expect("bootstrap should succeed");
+
+        let runtime = AppRuntime::new(config);
+        let snapshot = runtime.load_snapshot().expect("snapshot should load");
+
+        assert_eq!(snapshot.input_completions, vec!["desk reset".to_string()]);
 
         fs::remove_dir_all(home).expect("home should be removed");
     }
