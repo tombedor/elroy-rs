@@ -1632,7 +1632,10 @@ fn format_context_message_source_content(messages: &[ConversationMessage]) -> St
 fn format_due_item_detail(item: &AgendaItemRecord) -> String {
     let mut lines = vec![format!("Due item '{}':", item.name)];
     if let Some(trigger_datetime) = &item.trigger_datetime {
-        lines.push(format!("Trigger Time: {trigger_datetime}"));
+        let formatted = parse_sidebar_trigger_datetime(trigger_datetime)
+            .map(|datetime| datetime.format("%Y-%m-%d %H:%M:%S").to_string())
+            .unwrap_or_else(|| trigger_datetime.clone());
+        lines.push(format!("Trigger Time: {formatted}"));
     }
     if let Some(trigger_context) = &item.trigger_context {
         lines.push(format!("Context: {trigger_context}"));
@@ -8203,7 +8206,7 @@ mod tests {
         assert!(
             printed
                 .content
-                .contains("Trigger Time: 2026-05-15T09:00:00")
+                .contains("Trigger Time: 2026-05-15 09:00:00")
         );
         assert!(printed.content.contains("Text: Pay bill"));
 
