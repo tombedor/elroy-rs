@@ -427,7 +427,12 @@ impl AppRuntime {
         );
         let result = registry.invoke(command_name, &arguments.to_string());
         let mut snapshot = self.load_snapshot()?;
-        if !result.content.trim().is_empty() {
+        let trimmed_content = result.content.trim();
+        let use_toast_result = !result.is_error
+            && command_result_target(command_name) == CommandResultTarget::Toast
+            && is_short_single_line_result(trimmed_content);
+
+        if !trimmed_content.is_empty() && !use_toast_result {
             let label = if result.is_error {
                 "tool error"
             } else {
@@ -435,10 +440,12 @@ impl AppRuntime {
             };
             snapshot
                 .conversation_lines
-                .push(format!("{label}: {}", result.content.trim()));
+                .push(format!("{label}: {trimmed_content}"));
         }
         snapshot.status = Some(if result.is_error {
             format!("slash command failed: /{slash_name}")
+        } else if use_toast_result {
+            trimmed_content.to_string()
         } else {
             format!("slash command executed: /{slash_name}")
         });
@@ -864,6 +871,36 @@ impl AppRuntime {
             .map(|item| item.name)
             .collect())
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommandResultTarget {
+    History,
+    Toast,
+}
+
+fn command_result_target(command_name: &str) -> CommandResultTarget {
+    match command_name {
+        "refresh_system_instructions"
+        | "reset_messages"
+        | "set_assistant_name"
+        | "set_user_full_name"
+        | "set_user_preferred_name"
+        | "create_due_item"
+        | "complete_due_item"
+        | "delete_due_item"
+        | "rename_due_item"
+        | "update_due_item_text"
+        | "create_memory"
+        | "update_outdated_or_incorrect_memory"
+        | "add_memory_to_current_context"
+        | "drop_memory_from_current_context" => CommandResultTarget::Toast,
+        _ => CommandResultTarget::History,
+    }
+}
+
+fn is_short_single_line_result(content: &str) -> bool {
+    !content.is_empty() && !content.contains('\n') && content.chars().count() <= 180
 }
 
 fn ordered_command_parameters(
@@ -11092,13 +11129,13 @@ mod tests {
             .expect("command form submit should execute");
         assert_eq!(
             submitted_snapshot.status.as_deref(),
-            Some("slash command executed: /create_memory")
+            Some("New memory created: trip")
         );
         assert!(
             submitted_snapshot
                 .conversation_lines
-                .last()
-                .is_some_and(|line| line.contains("New memory created: trip"))
+                .iter()
+                .all(|line| !line.contains("New memory created: trip"))
         );
 
         fs::remove_dir_all(home).expect("home should be removed");
@@ -11204,6 +11241,33 @@ mod tests {
         assert_eq!(
             snapshot.status.as_deref(),
             Some("slash command executed: /help")
+        );
+        assert!(
+            snapshot
+                .conversation_lines
+                .last()
+                .is_some_and(|line| line.starts_with("tool result: "))
+        );
+
+        let toast_snapshot = runtime
+            .execute_command(
+                "create_memory",
+                "create_memory",
+                &[
+                    ("name".to_string(), "trip".to_string()),
+                    ("text".to_string(), "Aisle seats.".to_string()),
+                ],
+            )
+            .expect("create_memory should execute from the palette path");
+        assert_eq!(
+            toast_snapshot.status.as_deref(),
+            Some("New memory created: trip")
+        );
+        assert!(
+            toast_snapshot
+                .conversation_lines
+                .iter()
+                .all(|line| !line.contains("New memory created: trip"))
         );
 
         fs::remove_dir_all(home).expect("home should be removed");
