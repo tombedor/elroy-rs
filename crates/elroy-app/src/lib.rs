@@ -1925,6 +1925,10 @@ fn codex_background_status_message(session_id: &str) -> String {
     format!("codex session {session_id} running...")
 }
 
+fn codex_completion_followup_status_message(session_id: &str) -> String {
+    format!("processing codex session {session_id} completion...")
+}
+
 fn restart_state() -> &'static Mutex<RestartState> {
     RESTART_STATE.get_or_init(|| Mutex::new(RestartState::default()))
 }
@@ -4662,6 +4666,10 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
             let completion_hook = {
                 let upstream_hook = codex_completion_hook_for_dispatch.clone();
                 Arc::new(move |result: CodexSessionResult| {
+                    set_background_status(
+                        codex_background_status_key(&result.session_id),
+                        codex_completion_followup_status_message(&result.session_id),
+                    );
                     upstream_hook(result.clone());
                     clear_background_status(&codex_background_status_key(&result.session_id));
                 })
@@ -4740,6 +4748,10 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
             let completion_hook = {
                 let upstream_hook = codex_completion_hook_for_resume.clone();
                 Arc::new(move |result: CodexSessionResult| {
+                    set_background_status(
+                        codex_background_status_key(&result.session_id),
+                        codex_completion_followup_status_message(&result.session_id),
+                    );
                     upstream_hook(result.clone());
                     clear_background_status(&codex_background_status_key(&result.session_id));
                 })
@@ -11404,6 +11416,7 @@ mod tests {
             Some("codex session thread-123 running...")
         );
         wait_for_codex_status(&database_path, "thread-123", "completed");
+        wait_for_background_status_message("processing codex session thread-123 completion...");
         thread::sleep(Duration::from_millis(250));
         assert!(get_background_status().is_none());
 
@@ -11418,6 +11431,7 @@ mod tests {
             Some("codex session thread-123 running...")
         );
         wait_for_codex_status(&database_path, "thread-123", "completed");
+        wait_for_background_status_message("processing codex session thread-123 completion...");
         thread::sleep(Duration::from_millis(250));
         assert!(get_background_status().is_none());
 
@@ -14284,6 +14298,21 @@ echo '{"type":"item.completed","item":{"id":"item_2","type":"agent_message","tex
                 record.status
             );
             thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    fn wait_for_background_status_message(expected_status: &str) {
+        let started = Instant::now();
+        loop {
+            if get_background_status().as_deref() == Some(expected_status) {
+                break;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "timed out waiting for background status {expected_status}, last status {:?}",
+                get_background_status()
+            );
+            thread::sleep(Duration::from_millis(25));
         }
     }
 }
