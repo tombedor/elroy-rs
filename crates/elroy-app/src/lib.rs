@@ -3276,7 +3276,6 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
             JsonSchema::object(
                 [
                     ("old_name", json!({"type": "string"})),
-                    ("name", json!({"type": "string"})),
                     ("new_name", json!({"type": "string"})),
                 ],
                 ["new_name"],
@@ -7522,6 +7521,26 @@ mod tests {
             .into_iter()
             .find(|spec| spec.name == "rename_due_item")
             .expect("rename_due_item tool should exist");
+
+        let properties = match &spec.parameters {
+            elroy_tools::JsonSchema::Object { properties, .. } => properties,
+        };
+
+        assert_eq!(properties.len(), 2);
+        assert!(properties.contains_key("old_name"));
+        assert!(properties.contains_key("new_name"));
+        assert!(!properties.contains_key("name"));
+    }
+
+    #[test]
+    fn rename_task_tool_schema_matches_python_surface() {
+        let config = AppConfig::defaults();
+        let registry = build_live_tool_registry(&config);
+        let spec = registry
+            .specs()
+            .into_iter()
+            .find(|spec| spec.name == "rename_task")
+            .expect("rename_task tool should exist");
 
         let properties = match &spec.parameters {
             elroy_tools::JsonSchema::Object { properties, .. } => properties,
