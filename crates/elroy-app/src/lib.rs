@@ -35,7 +35,8 @@ use elroy_llm::{
     ToolCall,
 };
 use elroy_memory::{
-    archive_memory_file, create_memory_file_with_frontmatter, read_memory_parts, update_memory_body,
+    archive_memory_file, create_memory_file_with_frontmatter, read_memory_parts, sanitize_filename,
+    update_memory_body,
 };
 use elroy_self_reflection::{SelfReflectionConfig, SelfReflectionOrchestrator};
 use elroy_tasks::{
@@ -2829,7 +2830,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                     Err(error) => return ToolExecutionResult::error(error),
                 }
             }
-            match (|| -> Result<PathBuf, std::io::Error> {
+            match (|| -> Result<String, std::io::Error> {
                 let mut connection = open_sqlite_connection(&config_for_task_write.database_path)
                     .map_err(|error| std::io::Error::other(error.to_string()))?;
                 run_migrations(&mut connection)
@@ -2850,9 +2851,19 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                     trigger_datetime,
                     trigger_context,
                 )?;
+                let logical_task_name = sanitize_filename(name).replace('_', " ");
                 elroy_db::bootstrap_database(&BootstrapPlan::from_config(&config_for_task_write))
                     .map_err(|error| std::io::Error::other(error.to_string()))?;
-                let task = find_active_agenda_item_by_name(&connection, name)
+                connection
+                    .execute(
+                        "UPDATE agenda_items
+                         SET name = ?1
+                         WHERE file_path = ?2
+                           AND is_active = 1",
+                        rusqlite::params![logical_task_name, path.to_string_lossy().as_ref()],
+                    )
+                    .map_err(|error| std::io::Error::other(error.to_string()))?;
+                let task = find_active_agenda_item_by_name(&connection, &logical_task_name)
                     .map_err(|error| std::io::Error::other(error.to_string()))?
                     .filter(|item| {
                         item.trigger_datetime.is_none() && item.trigger_context.is_none()
@@ -2870,14 +2881,10 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                             .map_err(|error| std::io::Error::other(error.to_string()))?;
                     }
                 }
-                Ok(path)
+                Ok(logical_task_name)
             })() {
-                Ok(path) => ToolExecutionResult::success(format!(
-                    "Task '{}' has been created.",
-                    path.file_stem()
-                        .and_then(|value| value.to_str())
-                        .unwrap_or(name)
-                        .replace('_', " ")
+                Ok(logical_task_name) => ToolExecutionResult::success(format!(
+                    "Task '{logical_task_name}' has been created."
                 )),
                 Err(error) if error.to_string().starts_with("Task '") => {
                     ToolExecutionResult::error(error.to_string())
@@ -10829,6 +10836,40 @@ mod tests {
         assert!(!stripped_context.is_error);
         assert!(!stripped_context.content.contains("context-task:desk reset"));
         assert!(stripped_context.content.contains("keep context"));
+        let recreated = registry.invoke(
+            "create_task",
+            "{\"name\":\"Desk Reset\",\"text\":\"Tidy the desk again\"}",
+        );
+        assert!(!recreated.is_error);
+        assert_eq!(recreated.content, "Task 'desk reset' has been created.");
+        let recreated_shown = registry.invoke("show_task", "{\"name\":\"desk reset\"}");
+        assert!(!recreated_shown.is_error);
+        assert!(recreated_shown.content.contains("Tidy the desk again"));
+        let recreated_context = registry.invoke("show_context_messages", "{\"limit\":20}");
+        assert!(!recreated_context.is_error);
+        assert!(
+            recreated_context
+                .content
+                .contains("context-task:desk reset")
+        );
+        let recreated_connection =
+            open_sqlite_connection(&config.database_path).expect("database should reopen");
+        let deleted_rows: i64 = recreated_connection
+            .query_row(
+                "SELECT COUNT(*) FROM agenda_items WHERE name = ?1 AND status = 'deleted' AND is_active = 0",
+                rusqlite::params!["desk reset"],
+                |row| row.get(0),
+            )
+            .expect("deleted task rows should query");
+        let active_rows: i64 = recreated_connection
+            .query_row(
+                "SELECT COUNT(*) FROM agenda_items WHERE name = ?1 AND status = 'created' AND is_active = 1",
+                rusqlite::params!["desk reset"],
+                |row| row.get(0),
+            )
+            .expect("active task rows should query");
+        assert_eq!(deleted_rows, 1);
+        assert_eq!(active_rows, 1);
         let missing_deleted = registry.invoke("delete_task", "{\"name\":\"missing\"}");
         assert!(missing_deleted.is_error);
         assert_eq!(missing_deleted.content, "Active task 'missing' not found.");
