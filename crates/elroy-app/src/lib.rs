@@ -1172,9 +1172,10 @@ fn run_prompt_with_model_and_registry(
     let contextual_due_item_context =
         recall_due_item_context_messages(prompt, &existing_transcript, &all_due_items, &now_iso);
     let mut model_transcript = existing_transcript.clone();
+    model_transcript.extend(contextual_due_item_context.iter().cloned());
+    let persisted_transcript_start_len = model_transcript.len();
     model_transcript.extend(recall_context.iter().cloned());
     model_transcript.extend(timed_due_item_context.iter().cloned());
-    model_transcript.extend(contextual_due_item_context.iter().cloned());
 
     let turn_run = orchestrator.run_turn_with_transcript_and_options(
         model,
@@ -1190,10 +1191,10 @@ fn run_prompt_with_model_and_registry(
     let persisted_transcript = strip_input_message_for_persistence(
         strip_transient_context_messages(
             turn_run.transcript.clone(),
-            existing_transcript.len(),
-            recall_context.len() + timed_due_item_context.len() + contextual_due_item_context.len(),
+            persisted_transcript_start_len,
+            recall_context.len() + timed_due_item_context.len(),
         ),
-        existing_transcript.len(),
+        persisted_transcript_start_len,
         options.persist_input_message,
     );
     replace_context_messages(connection, LOCAL_USER_TOKEN, &persisted_transcript)?;
@@ -1201,7 +1202,7 @@ fn run_prompt_with_model_and_registry(
         connection,
         &options.bootstrap_plan,
         options.memories_between_consolidation,
-        existing_transcript.len(),
+        persisted_transcript_start_len,
         persisted_transcript.as_slice(),
         options.messages_between_memory,
     )?;
@@ -1258,9 +1259,10 @@ fn run_prompt_with_model_and_registry_stream(
     let contextual_due_item_context =
         recall_due_item_context_messages(prompt, &existing_transcript, &all_due_items, &now_iso);
     let mut model_transcript = existing_transcript.clone();
+    model_transcript.extend(contextual_due_item_context.iter().cloned());
+    let persisted_transcript_start_len = model_transcript.len();
     model_transcript.extend(recall_context.iter().cloned());
     model_transcript.extend(timed_due_item_context.iter().cloned());
-    model_transcript.extend(contextual_due_item_context.iter().cloned());
 
     let turn_stream = orchestrator.stream_turn_with_transcript_and_options(
         model,
@@ -1287,10 +1289,8 @@ fn run_prompt_with_model_and_registry_stream(
             bootstrap_plan: options.bootstrap_plan,
             connection,
             turn_stream,
-            existing_transcript_len: existing_transcript.len(),
-            transient_context_count: recall_context.len()
-                + timed_due_item_context.len()
-                + contextual_due_item_context.len(),
+            existing_transcript_len: persisted_transcript_start_len,
+            transient_context_count: recall_context.len() + timed_due_item_context.len(),
             persist_input_message: options.persist_input_message,
             messages_between_memory: options.messages_between_memory,
             memories_between_consolidation: options.memories_between_consolidation,
@@ -6265,26 +6265,11 @@ fn recall_due_item_context_messages(
     if recalled.is_empty() {
         return Vec::new();
     }
-
-    let lines = recalled
-        .iter()
-        .map(|item| {
-            let trigger_context = item.trigger_context.as_deref().unwrap_or("relevant context");
-            format!(
-                "RELEVANT DUE ITEM: '{}' - {}\n\nThis item should surface when the conversation matches this context: {}.",
-                item.name,
-                item.body,
-                trigger_context,
-            )
-        })
-        .collect::<Vec<_>>();
-
-    synthetic_tool_context_messages(
-        "bootstrap-contextual-due-items",
-        "get_due_items",
-        "{}",
-        lines.join("\n\n"),
-    )
+    recalled
+        .into_iter()
+        .filter(|item| !transcript_contains_context_due_item(transcript, &item.name))
+        .flat_map(context_due_item_tool_messages)
+        .collect()
 }
 
 fn memory_recall_status_updates(
@@ -6775,12 +6760,14 @@ mod tests {
         AppRuntime, LOCAL_USER_TOKEN, PromptExecutionOptions, SYNTHETIC_FIRST_USER_MESSAGE,
         argument_limit, build_live_tool_registry, build_live_tool_registry_with_codex_bin_and_hook,
         build_recall_query, codex_background_status_key, compress_context_messages,
-        consolidate_exact_duplicate_memories, context_task_tool_call_id, count_context_tokens,
+        consolidate_exact_duplicate_memories, context_due_item_tool_call_id,
+        context_due_item_tool_messages, context_task_tool_call_id, count_context_tokens,
         drop_old_context_messages, due_item_context_messages, format_context_summary_message,
-        is_context_refresh_needed, memory_recall_status_updates, parse_recalled_memory_names,
-        prompt_prelude_status_updates, provider_config_from_app_config,
-        recall_due_item_context_messages, recall_memory_context_messages, recalled_memory_names,
-        recent_recall_context, refresh_context_if_needed, run_prompt_with_model_and_registry,
+        is_context_refresh_needed, memory_recall_status_updates, message_matches_tool_call_id,
+        parse_recalled_memory_names, prompt_prelude_status_updates,
+        provider_config_from_app_config, recall_due_item_context_messages,
+        recall_memory_context_messages, recalled_memory_names, recent_recall_context,
+        refresh_context_if_needed, run_prompt_with_model_and_registry,
         run_prompt_with_model_and_registry_stream, select_due_items_by_overlap,
         select_recalled_due_items, select_recalled_memories, should_offer_greeting,
         should_skip_memory_recall, significant_tokens, strip_input_message_for_persistence,
@@ -7100,13 +7087,16 @@ mod tests {
             &self,
             request: ConversationRequest<'_>,
         ) -> Result<Vec<StreamEvent>, elroy_core::ModelClientError> {
-            assert_eq!(request.user_message, "I just got the payroll email.");
+            assert!(
+                request.user_message == "I just got the payroll email."
+                    || request.user_message == "I'm following up after that payroll email now."
+            );
             assert!(request.transcript.iter().any(|message| {
                 message.role == MessageRole::Tool
                     && message.content.as_deref().is_some_and(|content| {
-                        content.contains("RELEVANT DUE ITEM")
+                        content.contains("DUE ITEM")
                             && content.contains("Reply to payroll")
-                            && content.contains("after payroll email")
+                            && content.contains("\"trigger_context\": \"after payroll email\"")
                     })
             }));
             Ok(vec![StreamEvent::AssistantResponse {
@@ -11006,13 +10996,58 @@ mod tests {
                 .tool_calls
                 .as_ref()
                 .map(|calls| calls[0].id.as_str()),
-            Some("bootstrap-contextual-due-items")
+            Some("context-due-item:payroll follow-up")
         );
         assert!(messages[1].content.as_deref().is_some_and(|content| {
-            content.contains("RELEVANT DUE ITEM")
-                && content.contains("after payroll email")
-                && content.contains("Reply to payroll")
+            content.contains("DUE ITEM") && content.contains("Reply to payroll")
         }));
+    }
+
+    #[test]
+    fn recall_due_item_context_messages_skip_already_pinned_due_items() {
+        let transcript = context_due_item_tool_messages(&AgendaItemRecord {
+            id: 1,
+            legacy_frontmatter_id: None,
+            name: "payroll follow up".to_string(),
+            file_path: "/tmp/payroll.md".to_string(),
+            agenda_date: Some("unscheduled".to_string()),
+            is_completed: false,
+            status: Some("created".to_string()),
+            trigger_datetime: None,
+            trigger_context: Some("after payroll email".to_string()),
+            closing_comment: None,
+            checklist_total: 0,
+            checklist_completed: 0,
+            body: "Reply to payroll".to_string(),
+            is_active: true,
+            updated_at_unix: 20,
+        });
+        let due_items = vec![AgendaItemRecord {
+            id: 1,
+            legacy_frontmatter_id: None,
+            name: "payroll follow up".to_string(),
+            file_path: "/tmp/payroll.md".to_string(),
+            agenda_date: Some("unscheduled".to_string()),
+            is_completed: false,
+            status: Some("created".to_string()),
+            trigger_datetime: None,
+            trigger_context: Some("after payroll email".to_string()),
+            closing_comment: None,
+            checklist_total: 0,
+            checklist_completed: 0,
+            body: "Reply to payroll".to_string(),
+            is_active: true,
+            updated_at_unix: 20,
+        }];
+
+        let messages = recall_due_item_context_messages(
+            "I just got the payroll email",
+            &transcript,
+            &due_items,
+            "2026-05-15T12:00:00",
+        );
+
+        assert!(messages.is_empty());
     }
 
     #[test]
@@ -11671,6 +11706,53 @@ mod tests {
             StreamEvent::AssistantResponse { content }
                 if content.contains("Reply to payroll")
         )));
+        let stored =
+            elroy_db::load_context_messages(&mut connection, LOCAL_USER_TOKEN).expect("load ok");
+        let due_item_tool_call_id = context_due_item_tool_call_id("payroll follow up");
+        assert_eq!(
+            stored
+                .iter()
+                .filter(|message| message_matches_tool_call_id(message, &due_item_tool_call_id))
+                .count(),
+            2
+        );
+
+        let second_events = run_prompt_with_model_and_registry(
+            &mut connection,
+            "I'm following up after that payroll email now.",
+            &ContextualDueItemModel,
+            build_live_tool_registry(&config),
+            PromptExecutionOptions {
+                role: MessageRole::User,
+                persist_input_message: true,
+                force_tool: None,
+                assistant_name: &config.assistant_name,
+                ensure_alternating_roles: config.llm_provider() == LlmProvider::Anthropic,
+                home_dir: &home,
+                bootstrap_plan: BootstrapPlan::from_config(&config),
+                messages_between_memory: config.messages_between_memory,
+                memories_between_consolidation: config.memories_between_consolidation,
+                messages_between_self_reflection: config.messages_between_self_reflection,
+                memory_recall_classifier_enabled: config.memory_recall_classifier_enabled,
+                memory_recall_classifier_window: config.memory_recall_classifier_window,
+            },
+        )
+        .expect("second prompt should succeed");
+
+        assert!(second_events.iter().any(|event| matches!(
+            event,
+            StreamEvent::AssistantResponse { content }
+                if content.contains("Reply to payroll")
+        )));
+        let stored =
+            elroy_db::load_context_messages(&mut connection, LOCAL_USER_TOKEN).expect("load ok");
+        assert_eq!(
+            stored
+                .iter()
+                .filter(|message| message_matches_tool_call_id(message, &due_item_tool_call_id))
+                .count(),
+            2
+        );
 
         fs::remove_dir_all(home).expect("home should be removed");
     }
