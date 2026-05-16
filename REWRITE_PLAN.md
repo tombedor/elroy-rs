@@ -1,216 +1,301 @@
-# Rewrite Plan
+# Rewrite Roadmap
 
-This document defines the migration strategy for porting `../elroy` to Rust.
+This document is the execution roadmap for the remaining rewrite work in `elroy-rs`.
 
-## Objective
+It supersedes the earlier bootstrap-oriented milestone list. The workspace now has substantial partial parity across most major subsystems, so the next planning problem is sequencing the remaining work into usable product checkpoints instead of continuing an undifferentiated stream of small parity fixes.
 
-Build a Rust implementation of Elroy that achieves functional parity with the current Python application in controlled, testable increments.
+Source of truth for status remains [PARITY_MATRIX.md](/Users/tombedor/development/elroy-rs/PARITY_MATRIX.md). This document answers a different question:
 
-Parity default:
+- what should we do next
+- in what order
+- what can wait
+- what counts as a usable checkpoint along the way
 
-- strict parity for core workflows unless a delta is explicitly documented and accepted
+## Planning Principles
 
-## Scope
+1. Ship usable vertical checkpoints, not endless micro-parity patches.
+2. Prefer closing broad `partial` rows that affect core workflows over polishing already-usable tool wording or schema details.
+3. Only do narrow contract or wording fixes when they:
+   - unblock a phase exit criterion
+   - close a high-frequency user-facing mismatch in an otherwise finished flow
+   - protect existing data or workflow correctness
+4. Keep Rust behavior aligned with Python unless an intentional delta is documented in the parity matrix.
+5. Every phase should leave the product in a better standalone state, not just a more complete matrix.
 
-In scope:
+## Current Read Of The Product
 
-- CLI and TUI behavior
-- conversation orchestration
-- model integration surface
-- tool registration and execution
-- memory, reminders, agenda, and related repositories
-- persistence and migration strategy
-- Codex session and agent workflow support present in the Python project
-- bootstrap/reconciliation from an existing Python-era file set
+The rewrite is no longer in a "missing major subsystems everywhere" state.
 
-Out of scope during parity phase:
+Implemented enough to be structurally usable:
 
-- major product redesign
-- new feature families not already present in Python
-- UI rethinks that change established interaction behavior
+- shared runtime and messenger loop
+- live provider streaming
+- file-backed memories, tasks, reminders, agenda items
+- current-context pinning flows
+- self-reflection and feature-request slices
+- Codex session persistence and background follow-up
+- a working ratatui shell with prompt streaming, sidebars, modals, and background polling
 
-## Migration Strategy
+What is still broadly incomplete is concentrated in a smaller set of high-value areas:
 
-Port in dependency order, not by file count.
+- memory recall quality
+- context refresh quality and orchestration
+- broader TUI/session workflow parity
+- richer Codex interactive UI workflows
+- broader config/tool coverage
+- broader repository-level persistence behavior
+- more representative end-to-end parity coverage
 
-The preferred approach is:
+That means sequencing should now optimize for "usable release candidate" behavior, not for raw parity-matrix row count.
 
-1. establish workspace and core boundaries
-2. port low-level runtime and config primitives
-3. port domain slices behind tests
-4. port UI and end-to-end interaction once lower layers are stable
+## What Not To Prioritize
 
-## Milestones
+Do not spend primary effort on these until the current phase says they matter:
 
-## Current Progress
+- one-off tool wording tweaks
+- additional schema narrowing for already-usable tools
+- isolated print/report formatting differences
+- extra direct parity tests for behavior that is already well-covered through larger flows
 
-- `M0` workspace bootstrap: completed
-- `M1` core runtime and session model: started
-- `M2` persistence and domain data model: started at the bootstrap-planning level
-- `M3` tool system and conversation loop: started with a messenger-style shared runtime surface for prompt processing and background follow-up turns, now includes a live incremental provider-stream path through the shared messenger runtime, and now covers Python-style feature-request list/create/edit tool flows on top of the new file-backed feature-request crate
-- `M4` terminal UI shell: now consumes the shared messenger stream incrementally with editable-draft, blocked-resubmit, and `Ctrl+C` clear/cancel behavior; it also covers startup restart/greeting stream handling, Python-style rendered-message bookkeeping after bootstrap/chat turns, deferred context-refresh scheduling plus polled rendering of newly arrived background context-message tails, the idle model/background-status footer, Python-style active-task agenda sidebar labels with due-time formatting, `Improvements` / `Feature Requests` sidebar sections with modal open/complete flows, and detail-modal confirmation semantics for sidebar actions, but still lacks fuller background-status producer parity and broader session workflow coverage
-- `M4` memory, recall, reminders, agenda: started with file-backed memory/agenda/task flows, persisted local-user naming/persona preferences, Python-style recall-classifier config gating/window controls on the shared prompt-time memory recall path, a first self-reflection slice that turns cadence-gated correction feedback into persisted improvement feature requests, a first message-count-driven auto-memory creation path with persisted tracker state, and a first deferred context-refresh path that compresses transcript state, snapshots conversation memory, and records a synthetic context-summary tool result when the token threshold is exceeded
-- `M6` agent workflow and operational polish: started with persisted Codex-session metadata, async dispatch/resume orchestration, session-file discovery, background follow-up messaging, background-status registration for running Codex sessions, and session-inspection tools
-- `M5` TUI and UX parity: started with a `ratatui` shell
+Those are acceptable as opportunistic cleanup inside a broader slice, but they should not drive roadmap order.
 
-### M0: Workspace Bootstrap
+## Roadmap Phases
 
-Goals:
+## Phase 1: Usable Core Product
 
-- create Cargo workspace structure
-- define standard commands for format, lint, test, and run
-- choose baseline libraries through recorded decisions
-- establish fixture and test harness layout
+Goal:
 
-Done when:
+- make the Rust app reliably usable for the main day-to-day local assistant workflow even if some deep parity remains missing
 
-- the repo builds
-- the repo tests run
-- agent workflow docs match the actual command surface
+Why this comes first:
 
-Status:
+- the product already has most of the core slices
+- remaining blockers are mostly around workflow cohesion rather than basic existence
+- this phase creates a credible "use Rust by default" checkpoint
 
-- completed on 2026-05-13
-- workspace commands validated with `just fmt`, `just lint`, `just test`, and `just run`
+Primary parity rows to advance:
 
-### M1: Core Runtime And Session Model
+- `elroy/ui/`
+- `elroy/messenger/`
+- `elroy/repository/context_messages/`
+- `Streaming status semantics`
+- `TUI keyboard behavior`
 
-Goals:
+Focus areas:
 
-- define config, session, and turn/request boundaries
-- define runtime composition objects
-- define error types, logging, and cancellation model
-- define model client abstraction and tool execution interfaces
+1. Finish the remaining session workflow gaps in the TUI.
+   - full restart/session transitions
+   - remaining background-message rendering edge cases
+   - stronger foreground/background prompt state coordination
+2. Finish broader background-status producer coverage.
+   - long-running refresh/reflection/Codex/background operations should all report through the shared footer model
+3. Tighten the runtime/UI handoff for live workflows.
+   - fewer snapshot-style seams
+   - better cancellation and resumed-state behavior
+4. Raise end-to-end confidence for the primary interactive loop.
+   - prompt -> tool loop -> transcript persistence -> sidebar/background update
 
-Source areas:
+Exit criteria:
 
-- `../elroy/elroy/core/`
-- `../elroy/elroy/config/`
+- the TUI can serve as the default local interface for ordinary chat, reminders, tasks, agenda, and memory usage
+- the main background workflow states are visible and understandable in the UI
+- restart/resume/session behavior is coherent enough that users are not forced back to Python for ordinary interactive work
 
-Done when:
+Usable checkpoint:
 
-- core boundaries are documented and implemented
-- representative unit tests exist for config/session/runtime behavior
+- "Rust as daily-driver local assistant" for single-user interactive use
 
-### M2: Persistence And Domain Data Model
+## Phase 2: Memory And Reminder Quality
 
-Goals:
+Goal:
 
-- define Rust data model for persisted entities
-- choose migration strategy and schema tooling
-- implement stores/repositories for core entities
-- define compatibility expectations with existing Elroy data
-- preserve file-backed source-of-truth behavior for user-inspectable recallable content where the Python app does so
-- support database/index backfill from an existing Elroy file set
+- improve the product differentiators that matter most to actual Elroy usefulness: recall, reminders, and context maintenance
 
-Source areas:
+Why this comes second:
 
-- `../elroy/elroy/db/`
-- `../elroy/elroy/repository/data_models.py`
-- repository store/query modules
+- the base mechanics already exist
+- current behavior is functional but still heuristic and visibly lower quality than Python in the most important smart features
+- this work increases product usefulness more than another round of tool-surface cleanup
 
-Done when:
+Primary parity rows to advance:
 
-- the primary entities can be persisted and loaded in Rust
-- migration/document compatibility rules are documented
-- a bootstrap path exists to derive required DB state from compatible files
+- `elroy/repository/memories/`
+- `elroy/repository/reminders/`
+- `elroy/repository/tasks/`
+- `elroy/repository/context_messages/`
+- `Memory recall quality`
+- `Reminder and due-item surfacing`
 
-### M3: Tool System And Conversation Loop
+Focus areas:
 
-Goals:
+1. Improve recall selection quality.
+   - move beyond simple token-overlap heuristics
+   - port more of the Python classifier/selection behavior
+   - add scenario-driven parity tests instead of only narrow helper coverage
+2. Improve context refresh quality.
+   - replace deterministic synthetic summary quality with Python-like LLM-generated summary behavior
+   - tighten scheduling/orchestration around refresh
+3. Improve reminder surfacing quality.
+   - richer contextual selection behavior
+   - better interplay between due items, tasks, and current context
+4. Improve memory lifecycle quality.
+   - richer consolidation behavior
+   - better source metadata and reflective recall behavior where Python has it
 
-- implement tool registry and schema generation
-- implement assistant loop with tool calls
-- port status and streaming event model
-- preserve execution ordering and persistence boundaries
+Exit criteria:
 
-Source areas:
+- memory recall feels predictably useful in realistic conversations
+- reminders surface at the right times with fewer false negatives and fewer brittle heuristics
+- long conversations degrade gracefully because context refresh quality is acceptable, not merely structurally present
 
-- `../elroy/elroy/tools/`
-- `../elroy/elroy/core/conversation_orchestrator.py`
-- `../elroy/elroy/llm/`
+Usable checkpoint:
 
-Done when:
+- "Rust preserves the core Elroy differentiators" instead of merely reproducing CRUD surfaces
 
-- conversation turns can execute with tools and persist resulting context
-- parity tests cover the main loop behavior
+## Phase 3: Repository And Persistence Completion
 
-### M4: Memory, Recall, Reminders, Agenda
+Goal:
 
-Goals:
+- close remaining persistence and repository-behavior gaps that affect data fidelity, rebuild behavior, and compatibility with Python-era data
 
-- port memory storage and retrieval behavior
-- port recall classification and context injection
-- port reminders, due items, agenda, and task workflows
-- preserve file-backed and database-backed responsibilities where intended
+Why this comes third:
 
-Source areas:
+- the app should already be usable before deeper storage completion
+- these gaps matter for trust and long-term correctness, but are less visible than Phases 1 and 2 in first-use flows
 
-- `../elroy/elroy/repository/memories/`
-- `../elroy/elroy/repository/reminders/`
-- `../elroy/elroy/repository/agenda/`
-- `../elroy/elroy/repository/tasks/`
-- `../elroy/elroy/repository/context_messages/`
+Primary parity rows to advance:
 
-Done when:
+- `elroy/db/`
+- `Persistence compatibility with existing user data`
+- `File-backed inspectable recallable content`
+- repository rows still marked partial for memory/reminders/tasks/context
 
-- recall and due-item behaviors are tested against Python expectations
-- the main product differentiators work end-to-end
+Focus areas:
 
-### M5: TUI And UX Parity
+1. Broader repository-level sync/rebuild behavior.
+2. Remaining data-compatibility edge cases for Python-era files and derived state.
+3. Narrower domain-schema and higher-level repository workflow completion.
+4. Better invariants around rebuilds, tombstones, inactive history, and backfill.
 
-Goals:
+Exit criteria:
 
-- implement terminal UI layout and command flow
-- preserve keybindings, focus behavior, and streaming output semantics
-- preserve sidebar and modal behaviors
+- rebuilding derived state from an existing Python data set is trustworthy
+- repository behaviors are no longer the main source of parity caveats in the matrix
 
-Source areas:
+Usable checkpoint:
 
-- `../elroy/elroy/ui/`
-- `../elroy/UI.md`
-- `../elroy/ROADMAP.md` UI section
+- "Rust is safe to adopt on existing user data without hidden repository caveats"
 
-Done when:
+## Phase 4: Codex And Operational Completion
 
-- core keyboard workflows match the current app
-- user-visible behavior is covered by UI or end-to-end tests where feasible
+Goal:
 
-### M6: Agent Workflow And Operational Polish
+- finish the remaining agent workflow and operational product gaps so the Rust app covers the active Python operational surface
 
-Goals:
+Why this comes fourth:
 
-- port Codex session support and related workflows
-- complete operational commands and packaging
-- document intentional post-parity improvements
+- core assistant usefulness matters before specialized operational workflows
+- Codex already exists structurally, so the remaining work is interactive completion rather than initial bring-up
 
-Source areas:
+Primary parity rows to advance:
 
-- `../elroy/elroy/repository/codex_sessions/`
-- roadmap and operational docs
+- `elroy/repository/codex_sessions/`
+- `Codex workflow support in v1`
+- `elroy/__main__.py`
+- `elroy/config/`
+- `elroy/tools`
 
-Done when:
+Focus areas:
 
-- the Rust app covers the current operational feature set required by active Elroy workflows
-- Codex workflow support is present in the first release candidate, not deferred to a later version
+1. Broader interactive Codex UI workflows.
+   - beyond read-only inspection
+   - better session lifecycle control and visibility
+2. Remaining operational command and config surface parity.
+3. Final packaging and entrypoint expectations for a release-candidate workflow.
 
-## Sequencing Rules
+Exit criteria:
 
-- Do not start broad UI work before core runtime and domain behavior are stable enough to drive it
-- Do not mark a subsystem complete without updating `PARITY_MATRIX.md`
-- Prefer one partially vertical subsystem over many disconnected stubs
-- If a major dependency choice affects several milestones, record it in architecture docs immediately
+- Codex workflows are first-class enough that they are not treated as "exists, but use Python if you really need it"
+- config and operational surface support the intended first release
 
-## Completion Criteria
+Usable checkpoint:
 
-The rewrite is ready to replace the Python app only when:
+- "Rust covers the operational workflows the active project actually relies on"
 
-- every in-scope subsystem is at `parity` or `intentional delta`
-- intentional deltas are documented and accepted
-- the default workflows are validated end-to-end
-- build, lint, and test workflows are stable for contributors and agents
+## Phase 5: Test And Parity Closure
 
-## Open Questions
+Goal:
 
-- What persistence stack best balances SQLite compatibility, migrations, and async ergonomics?
-- Which parts of the Python file-backed model should remain file-backed versus become database-owned in Rust?
+- convert the remaining broad `partial` rows into either `parity` or explicit intentional deltas with strong verification
+
+Why this is last:
+
+- broad end-to-end closure is more efficient after the main behavior gaps are actually closed
+- otherwise the team risks writing large amounts of test scaffolding around still-moving behavior
+
+Primary parity rows to advance:
+
+- `tests/`
+- all remaining `partial` system rows
+- all remaining `partial` cross-cutting rows
+
+Focus areas:
+
+1. Scenario-driven parity tests for high-value workflows.
+2. End-to-end validation across runtime, persistence, and TUI seams.
+3. Matrix cleanup:
+   - remove stale `partial` wording
+   - record intentional deltas explicitly
+   - mark truly-finished rows as `parity`
+
+Exit criteria:
+
+- every in-scope row in `PARITY_MATRIX.md` is either `parity` or `intentional delta`
+- remaining intentional deltas are explicit, justified, and accepted
+
+Usable checkpoint:
+
+- release candidate for replacing the Python app by default
+
+## Recommended Slice Order Inside The Next Phase
+
+The next sequence should be:
+
+1. finish the remaining high-friction TUI/session/background workflow gaps
+2. improve memory recall and context-refresh quality
+3. improve reminder selection quality
+4. close repository/persistence completion gaps
+5. finish Codex interactive workflow parity
+6. do broad end-to-end test and matrix closure
+
+This is intentionally different from the recent pattern of spending many consecutive commits on narrow contract cleanup.
+
+## Pull Request Heuristics
+
+For the next stretch of work, a good PR or commit series should usually satisfy one of these:
+
+- closes a broad `partial` note in a major parity row
+- turns a user-visible workflow from "exists" into "daily usable"
+- replaces heuristic behavior with higher-fidelity Python behavior
+- adds scenario-driven verification for a differentiating workflow
+
+A weak PR pattern for now is:
+
+- adjusts one tool string or schema detail without moving a phase exit criterion
+- adds isolated helper coverage without advancing a broader workflow
+
+## Definition Of Roadmap Success
+
+This roadmap is successful if it changes team behavior from:
+
+- "pick the next tiny parity mismatch"
+
+to:
+
+- "pick the next broad workflow gap that improves the product and shrinks the matrix in a meaningful way"
+
+The rewrite is complete only when:
+
+- every in-scope subsystem in [PARITY_MATRIX.md](/Users/tombedor/development/elroy-rs/PARITY_MATRIX.md) is `parity` or `intentional delta`
+- the Rust app is usable as the default local Elroy client throughout the main workflows
+- end-to-end validation supports that claim rather than only many isolated unit tests
