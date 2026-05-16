@@ -10665,6 +10665,13 @@ mod tests {
         assert!(!triggered.is_error);
         assert!(triggered.content.contains("job search"));
         assert!(triggered.content.contains("after breakfast"));
+        let triggered_context = registry.invoke("show_context_messages", "{\"limit\":20}");
+        assert!(!triggered_context.is_error);
+        assert!(
+            !triggered_context
+                .content
+                .contains("context-task:job search")
+        );
 
         let today = registry.invoke("list_today_tasks", "{\"limit\":10}");
         assert!(!today.is_error);
