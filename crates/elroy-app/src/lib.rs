@@ -1256,6 +1256,13 @@ fn refresh_context_if_needed(
             config.context_refresh_target_tokens(),
             config.max_context_age_minutes,
         );
+        let removed_prefix_len = transcript.len().saturating_sub(compressed.len());
+        let dropped_messages = transcript
+            .iter()
+            .skip(1)
+            .take(removed_prefix_len)
+            .cloned()
+            .collect::<Vec<_>>();
 
         if transcript
             .iter()
@@ -1274,7 +1281,23 @@ fn refresh_context_if_needed(
             save_memory_operation_tracker(connection, &tracker)?;
         }
 
-        replace_context_messages(connection, LOCAL_USER_TOKEN, &compressed)?;
+        let mut refreshed_transcript = compressed;
+        if !dropped_messages.is_empty() {
+            let tool_call_id = format!(
+                "context-summary-{}",
+                Utc::now()
+                    .timestamp_nanos_opt()
+                    .unwrap_or_else(|| Utc::now().timestamp_micros() * 1_000)
+            );
+            refreshed_transcript.extend(synthetic_tool_context_messages(
+                tool_call_id,
+                "context_summary",
+                "{}",
+                format_context_summary_message(&dropped_messages),
+            ));
+        }
+
+        replace_context_messages(connection, LOCAL_USER_TOKEN, &refreshed_transcript)?;
         Ok(true)
     })();
 
@@ -3561,17 +3584,57 @@ fn due_item_context_messages(items: &[AgendaItemRecord]) -> Vec<ConversationMess
     let content =
         serde_json::to_string_pretty(&payload).expect("due item payload should serialize");
 
+    synthetic_tool_context_messages(
+        "bootstrap-due-items",
+        "list_due_items",
+        arguments_json,
+        content,
+    )
+}
+
+fn synthetic_tool_context_messages(
+    tool_call_id: impl Into<String>,
+    tool_name: impl Into<String>,
+    arguments_json: impl Into<String>,
+    content: impl Into<String>,
+) -> Vec<ConversationMessage> {
+    let tool_call_id = tool_call_id.into();
     vec![
         ConversationMessage::assistant_with_tool_calls(
             "",
             vec![ToolCall {
-                id: "bootstrap-due-items".to_string(),
-                name: "list_due_items".to_string(),
-                arguments_json,
+                id: tool_call_id.clone(),
+                name: tool_name.into(),
+                arguments_json: arguments_json.into(),
             }],
         ),
-        ConversationMessage::tool_result("bootstrap-due-items", content),
+        ConversationMessage::tool_result(tool_call_id, content),
     ]
+}
+
+fn format_context_summary_message(messages: &[ConversationMessage]) -> String {
+    let lines = messages
+        .iter()
+        .filter_map(|message| {
+            let role = match message.role {
+                MessageRole::User => "User",
+                MessageRole::Assistant => "Assistant",
+                MessageRole::Tool => "Tool",
+                MessageRole::System => return None,
+            };
+            let content = message.content.as_deref()?.trim();
+            if content.is_empty() {
+                return None;
+            }
+            Some(format!("{role}: {}", excerpt(content, 160)))
+        })
+        .collect::<Vec<_>>();
+
+    if lines.is_empty() {
+        "Recent conversation summary: (No earlier conversation summary available.)".to_string()
+    } else {
+        format!("Recent conversation summary: {}", lines.join("\n"))
+    }
 }
 
 fn recall_memory_context_messages(
@@ -3606,21 +3669,16 @@ fn recall_memory_context_messages(
     let content =
         serde_json::to_string_pretty(&payload).expect("memory recall payload should serialize");
 
-    vec![
-        ConversationMessage::assistant_with_tool_calls(
-            "",
-            vec![ToolCall {
-                id: "bootstrap-memory-recall".to_string(),
-                name: "search_memories".to_string(),
-                arguments_json: json!({
-                    "query": recall_query,
-                    "limit": recalled.len(),
-                })
-                .to_string(),
-            }],
-        ),
-        ConversationMessage::tool_result("bootstrap-memory-recall", content),
-    ]
+    synthetic_tool_context_messages(
+        "bootstrap-memory-recall",
+        "search_memories",
+        json!({
+            "query": recall_query,
+            "limit": recalled.len(),
+        })
+        .to_string(),
+        content,
+    )
 }
 
 fn memory_recall_status_updates(
@@ -4005,10 +4063,11 @@ mod tests {
         AppRuntime, LOCAL_USER_TOKEN, PromptExecutionOptions, SYNTHETIC_FIRST_USER_MESSAGE,
         argument_limit, build_live_tool_registry, build_live_tool_registry_with_codex_bin_and_hook,
         build_recall_query, compress_context_messages, count_context_tokens,
-        drop_old_context_messages, due_item_context_messages, is_context_refresh_needed,
-        memory_recall_status_updates, parse_recalled_memory_names, prompt_prelude_status_updates,
-        provider_config_from_app_config, recall_memory_context_messages, recalled_memory_names,
-        recent_recall_context, refresh_context_if_needed, run_prompt_with_model_and_registry,
+        drop_old_context_messages, due_item_context_messages, format_context_summary_message,
+        is_context_refresh_needed, memory_recall_status_updates, parse_recalled_memory_names,
+        prompt_prelude_status_updates, provider_config_from_app_config,
+        recall_memory_context_messages, recalled_memory_names, recent_recall_context,
+        refresh_context_if_needed, run_prompt_with_model_and_registry,
         run_prompt_with_model_and_registry_stream, select_recalled_memories, should_offer_greeting,
         should_skip_memory_recall, significant_tokens, strip_input_message_for_persistence,
         strip_transient_context_messages,
@@ -5975,6 +6034,21 @@ mod tests {
             elroy_db::load_context_messages(&mut connection, LOCAL_USER_TOKEN).expect("load ok");
         assert_eq!(stored[0].role, MessageRole::System);
         assert!(stored.len() < original_len);
+        assert_eq!(
+            stored[stored.len() - 2]
+                .tool_calls
+                .as_ref()
+                .and_then(|calls| calls.first())
+                .map(|call| call.name.as_str()),
+            Some("context_summary")
+        );
+        assert_eq!(stored[stored.len() - 1].role, MessageRole::Tool);
+        assert!(
+            stored[stored.len() - 1]
+                .content
+                .as_deref()
+                .is_some_and(|content| content.starts_with("Recent conversation summary:"))
+        );
 
         let memories = elroy_db::list_active_memories(&connection, 10).expect("memories load");
         assert_eq!(memories.len(), 1);
@@ -5987,6 +6061,26 @@ mod tests {
         assert_eq!(tracker.memories_since_consolidation, 1);
 
         fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
+    fn format_context_summary_message_creates_bounded_summary_text() {
+        let summary = format_context_summary_message(&[
+            ConversationMessage::new(MessageRole::System, "ignore"),
+            ConversationMessage::new(
+                MessageRole::User,
+                "A very long user message that should appear",
+            ),
+            ConversationMessage::new(
+                MessageRole::Assistant,
+                "A very long assistant message that should also appear",
+            ),
+        ]);
+
+        assert!(summary.starts_with("Recent conversation summary:"));
+        assert!(summary.contains("User: A very long user message"));
+        assert!(summary.contains("Assistant: A very long assistant message"));
+        assert!(!summary.contains("ignore"));
     }
 
     #[test]
