@@ -148,6 +148,7 @@ pub trait TuiPromptStream {
 
 pub trait TuiRuntime {
     fn load_snapshot(&mut self) -> Result<TuiSnapshot, String>;
+    fn execute_slash_command(&mut self, prompt: &str) -> Result<Option<TuiSnapshot>, String>;
     fn submit_prompt(&mut self, prompt: &str) -> Result<TuiSnapshot, String>;
     fn start_prompt_stream(&mut self, prompt: &str) -> Result<Box<dyn TuiPromptStream>, String>;
     fn start_startup_prompt_stream(&mut self) -> Result<Option<Box<dyn TuiPromptStream>>, String>;
@@ -383,6 +384,20 @@ fn apply_intent_with_runtime(
                 app.status = "Wait for the current task to finish before sending another message."
                     .to_string();
                 return;
+            }
+            match runtime.execute_slash_command(&submitted) {
+                Ok(Some(snapshot)) => {
+                    app.record_submitted_prompt(&submitted);
+                    app.input.clear();
+                    app.apply_snapshot(snapshot);
+                    app.focus = FocusTarget::Input;
+                    return;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    app.status = format!("slash command failed: {error}");
+                    return;
+                }
             }
             match runtime.start_prompt_stream(&submitted) {
                 Ok(stream) => {
@@ -1363,6 +1378,10 @@ impl TuiRuntime for NoopRuntime {
         Ok(TuiSnapshot::default())
     }
 
+    fn execute_slash_command(&mut self, _prompt: &str) -> Result<Option<TuiSnapshot>, String> {
+        Ok(None)
+    }
+
     fn submit_prompt(&mut self, _prompt: &str) -> Result<TuiSnapshot, String> {
         Ok(TuiSnapshot::default())
     }
@@ -1446,6 +1465,7 @@ mod tests {
     #[derive(Default)]
     struct FakeRuntime {
         snapshot: TuiSnapshot,
+        slash_command_snapshot: Option<TuiSnapshot>,
         submitted_prompts: Vec<String>,
         self_reflection_runs: usize,
         last_opened: Option<(SidebarSection, String)>,
@@ -1485,6 +1505,14 @@ mod tests {
     impl TuiRuntime for FakeRuntime {
         fn load_snapshot(&mut self) -> Result<TuiSnapshot, String> {
             Ok(self.snapshot.clone())
+        }
+
+        fn execute_slash_command(&mut self, prompt: &str) -> Result<Option<TuiSnapshot>, String> {
+            if prompt.starts_with('/') {
+                Ok(self.slash_command_snapshot.clone())
+            } else {
+                Ok(None)
+            }
         }
 
         fn submit_prompt(&mut self, prompt: &str) -> Result<TuiSnapshot, String> {
@@ -1955,6 +1983,34 @@ mod tests {
 
         assert_eq!(app.input, "/reset_messages");
         assert_eq!(app.status, "input completion requested");
+    }
+
+    #[test]
+    fn slash_command_submit_executes_without_starting_prompt_stream() {
+        let mut app = TuiApp::bootstrap();
+        app.input = "/help".to_string();
+        let mut runtime = FakeRuntime {
+            slash_command_snapshot: Some(TuiSnapshot {
+                conversation_lines: vec!["tool result: Available commands...".to_string()],
+                status: Some("slash command executed: /help".to_string()),
+                ..TuiSnapshot::default()
+            }),
+            ..FakeRuntime::default()
+        };
+        let mut pending = None;
+
+        apply_intent_with_runtime(&mut app, UiIntent::SubmitPrompt, &mut runtime, &mut pending);
+
+        assert!(pending.is_none());
+        assert!(runtime.submitted_prompts.is_empty());
+        assert_eq!(app.input, "");
+        assert_eq!(app.focus, FocusTarget::Input);
+        assert_eq!(app.status, "slash command executed: /help");
+        assert_eq!(
+            app.conversation_lines.last().map(String::as_str),
+            Some("tool result: Available commands...")
+        );
+        assert_eq!(app.input_history, vec!["/help".to_string()]);
     }
 
     #[test]

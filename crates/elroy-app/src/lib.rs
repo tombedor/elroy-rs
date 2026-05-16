@@ -288,6 +288,61 @@ impl AppRuntime {
         )
     }
 
+    pub fn execute_zero_arg_slash_command(
+        &self,
+        prompt: &str,
+    ) -> Result<Option<TuiSnapshot>, AppError> {
+        let trimmed = prompt.trim();
+        let Some(command_text) = trimmed.strip_prefix('/') else {
+            return Ok(None);
+        };
+        let parts = command_text.split_whitespace().collect::<Vec<_>>();
+        if parts.len() != 1 {
+            return Ok(None);
+        }
+
+        let slash_name = parts[0];
+        let command_name = match slash_name {
+            "help" => "get_help",
+            _ => slash_name,
+        };
+        let registry = build_live_tool_registry(&self.config);
+        let Some(spec) = registry
+            .specs()
+            .into_iter()
+            .find(|spec| spec.name == command_name)
+        else {
+            return Ok(None);
+        };
+        let JsonSchema::Object {
+            properties,
+            required,
+            ..
+        } = &spec.parameters;
+        if !properties.is_empty() || !required.is_empty() {
+            return Ok(None);
+        }
+
+        let result = registry.invoke(command_name, "{}");
+        let mut snapshot = self.load_snapshot()?;
+        if !result.content.trim().is_empty() {
+            let label = if result.is_error {
+                "tool error"
+            } else {
+                "tool result"
+            };
+            snapshot
+                .conversation_lines
+                .push(format!("{label}: {}", result.content.trim()));
+        }
+        snapshot.status = Some(if result.is_error {
+            format!("slash command failed: /{slash_name}")
+        } else {
+            format!("slash command executed: /{slash_name}")
+        });
+        Ok(Some(snapshot))
+    }
+
     pub fn refresh_context_if_needed(&self) -> Result<bool, AppError> {
         let mut connection = self.open_connection()?;
         refresh_context_if_needed(
@@ -10688,6 +10743,60 @@ mod tests {
                 .contains(&"/reset_messages".to_string())
         );
         assert!(!snapshot.input_completions.contains(&"call mom".to_string()));
+
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
+    fn execute_zero_arg_slash_command_runs_help_but_not_parameterized_tools() {
+        let unique = format!(
+            "elroy-rs-app-slash-command-exec-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+
+        let mut config = AppConfig::defaults();
+        config.home_dir = home.clone();
+        config.memory_dir = memory_dir;
+        config.agenda_dir = agenda_dir;
+        config.database_path = database_path;
+
+        let runtime = AppRuntime::new(config);
+        let help_snapshot = runtime
+            .execute_zero_arg_slash_command("/help")
+            .expect("slash command should execute")
+            .expect("help should execute as zero-arg command");
+        assert_eq!(
+            help_snapshot.status.as_deref(),
+            Some("slash command executed: /help")
+        );
+        assert!(
+            help_snapshot
+                .conversation_lines
+                .last()
+                .is_some_and(|line| line.starts_with("tool result: "))
+        );
+        assert!(
+            help_snapshot
+                .conversation_lines
+                .last()
+                .is_some_and(|line| line.contains("get_help"))
+        );
+
+        assert!(
+            runtime
+                .execute_zero_arg_slash_command("/show_memory runner notes")
+                .expect("slash command lookup should succeed")
+                .is_none()
+        );
 
         fs::remove_dir_all(home).expect("home should be removed");
     }
