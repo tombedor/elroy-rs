@@ -2750,6 +2750,8 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
             .and_then(|path| {
                 elroy_db::bootstrap_database(&BootstrapPlan::from_config(&config_for_agenda_write))
                     .map_err(|error| std::io::Error::other(error.to_string()))?;
+                sync_task_context_after_mutation(&config_for_agenda_write, name, Some(name))
+                    .map_err(|error| std::io::Error::other(error.to_string()))?;
                 Ok(path)
             }) {
                 Ok(path) => ToolExecutionResult::success(format!(
@@ -3764,10 +3766,23 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
             let Some(note) = arguments.get("note").and_then(Value::as_str) else {
                 return ToolExecutionResult::error("add_agenda_item_update requires string note");
             };
-            mutate_agenda_file_from_config_with_result(&config_for_agenda_update, name, |path| {
-                let timestamp = append_agenda_update(path, note)?;
-                Ok(format!("Update added to '{name}' at {timestamp}."))
-            })
+            let result = mutate_agenda_file_from_config_with_result(
+                &config_for_agenda_update,
+                name,
+                |path| {
+                    let timestamp = append_agenda_update(path, note)?;
+                    Ok(format!("Update added to '{name}' at {timestamp}."))
+                },
+            );
+            if result.is_error {
+                return result;
+            }
+            match sync_task_context_after_mutation(&config_for_agenda_update, name, Some(name)) {
+                Ok(()) => result,
+                Err(error) => {
+                    ToolExecutionResult::error(format!("failed to refresh task context: {error}"))
+                }
+            }
         },
     );
 
@@ -3794,10 +3809,23 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                 return ToolExecutionResult::error("complete_agenda_item requires a string name");
             };
             let closing_comment = arguments.get("closing_comment").and_then(Value::as_str);
-            mutate_agenda_file_from_config_with_result(&config_for_agenda_complete, name, |path| {
-                mark_agenda_item_completed(path, closing_comment)?;
-                Ok(format!("Agenda item '{name}' marked as completed."))
-            })
+            let result = mutate_agenda_file_from_config_with_result(
+                &config_for_agenda_complete,
+                name,
+                |path| {
+                    mark_agenda_item_completed(path, closing_comment)?;
+                    Ok(format!("Agenda item '{name}' marked as completed."))
+                },
+            );
+            if result.is_error {
+                return result;
+            }
+            match sync_task_context_after_mutation(&config_for_agenda_complete, name, None) {
+                Ok(()) => result,
+                Err(error) => {
+                    ToolExecutionResult::error(format!("failed to refresh task context: {error}"))
+                }
+            }
         },
     );
 
@@ -3822,10 +3850,23 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
             else {
                 return ToolExecutionResult::error("delete_agenda_item requires a string name");
             };
-            mutate_agenda_file_from_config_with_result(&config_for_agenda_delete, name, |path| {
-                std::fs::remove_file(path)?;
-                Ok(format!("Agenda item '{name}' deleted."))
-            })
+            let result = mutate_agenda_file_from_config_with_result(
+                &config_for_agenda_delete,
+                name,
+                |path| {
+                    std::fs::remove_file(path)?;
+                    Ok(format!("Agenda item '{name}' deleted."))
+                },
+            );
+            if result.is_error {
+                return result;
+            }
+            match sync_task_context_after_mutation(&config_for_agenda_delete, name, None) {
+                Ok(()) => result,
+                Err(error) => {
+                    ToolExecutionResult::error(format!("failed to refresh task context: {error}"))
+                }
+            }
         },
     );
 
@@ -9241,40 +9282,63 @@ mod tests {
             "Agenda item added for 2026-05-18: project_kickoff"
         );
         assert!(agenda_dir.join("project_kickoff.md").exists());
+        let added_context = registry.invoke("show_context_messages", "{\"limit\":20}");
+        assert!(!added_context.is_error);
+        assert!(
+            added_context
+                .content
+                .contains("context-task:project kickoff")
+        );
+        assert!(added_context.content.contains("Prepare slides"));
 
         let update = registry.invoke(
             "add_agenda_item_update",
-            "{\"item_name\":\"doctor visit\",\"note\":\"called ahead\"}",
+            "{\"item_name\":\"project kickoff\",\"note\":\"called ahead\"}",
         );
         assert!(!update.is_error);
         assert!(
             update
                 .content
-                .starts_with("Update added to 'doctor visit' at unix-")
+                .starts_with("Update added to 'project kickoff' at unix-")
         );
         let updated_text =
-            fs::read_to_string(agenda_dir.join("doctor_visit.md")).expect("agenda should read");
+            fs::read_to_string(agenda_dir.join("project_kickoff.md")).expect("agenda should read");
         assert!(updated_text.contains("## Updates"));
         let update_timestamp = update
             .content
-            .trim_start_matches("Update added to 'doctor visit' at ")
+            .trim_start_matches("Update added to 'project kickoff' at ")
             .trim_end_matches('.');
         assert!(updated_text.contains(&format!("**{update_timestamp}**")));
         assert!(updated_text.contains("called ahead"));
+        let updated_context = registry.invoke("show_context_messages", "{\"limit\":20}");
+        assert!(!updated_context.is_error);
+        assert!(
+            updated_context
+                .content
+                .contains("context-task:project kickoff")
+        );
+        assert!(updated_context.content.contains("called ahead"));
 
         let complete = registry.invoke(
             "complete_agenda_item",
-            "{\"item_name\":\"doctor visit\",\"closing_comment\":\"done\"}",
+            "{\"item_name\":\"project kickoff\",\"closing_comment\":\"done\"}",
         );
         assert!(!complete.is_error);
         assert_eq!(
             complete.content,
-            "Agenda item 'doctor visit' marked as completed."
+            "Agenda item 'project kickoff' marked as completed."
         );
         let completed_text =
-            fs::read_to_string(agenda_dir.join("doctor_visit.md")).expect("agenda should read");
+            fs::read_to_string(agenda_dir.join("project_kickoff.md")).expect("agenda should read");
         assert!(completed_text.contains("completed: true"));
         assert!(completed_text.contains("status: completed"));
+        let completed_context = registry.invoke("show_context_messages", "{\"limit\":20}");
+        assert!(!completed_context.is_error);
+        assert!(
+            !completed_context
+                .content
+                .contains("context-task:project kickoff")
+        );
 
         fs::write(
             agenda_dir.join("call_mom.md"),
@@ -9288,16 +9352,24 @@ mod tests {
         .expect("third agenda file should be written");
         elroy_db::bootstrap_database(&elroy_db::BootstrapPlan::from_config(&config))
             .expect("bootstrap should succeed");
+        let delete_created = registry.invoke(
+            "add_agenda_item",
+            "{\"name\":\"Desk Notes\",\"text\":\"Tidy desk\",\"date\":\"2026-05-16\"}",
+        );
+        assert!(!delete_created.is_error);
         let ambiguous = registry.invoke("delete_agenda_item", "{\"item_name\":\"call\"}");
         assert!(ambiguous.is_error);
         assert_eq!(
             ambiguous.content,
             "Multiple agenda items match 'call': call_dad, call_mom. Be more specific."
         );
-        let delete = registry.invoke("delete_agenda_item", "{\"item_name\":\"call mom\"}");
+        let delete = registry.invoke("delete_agenda_item", "{\"item_name\":\"desk notes\"}");
         assert!(!delete.is_error);
-        assert_eq!(delete.content, "Agenda item 'call mom' deleted.");
-        assert!(!agenda_dir.join("call_mom.md").exists());
+        assert_eq!(delete.content, "Agenda item 'desk notes' deleted.");
+        assert!(!agenda_dir.join("desk_notes.md").exists());
+        let deleted_context = registry.invoke("show_context_messages", "{\"limit\":20}");
+        assert!(!deleted_context.is_error);
+        assert!(!deleted_context.content.contains("context-task:desk notes"));
 
         fs::remove_dir_all(home).expect("home should be removed");
     }
