@@ -499,9 +499,15 @@ fn apply_intent_with_runtime(
             }
             match runtime.handle_slash_command(&submitted) {
                 Ok(TuiSlashCommandAction::Execute(command)) => {
-                    app.record_submitted_prompt(&submitted);
-                    app.input.clear();
-                    start_command_execution(app, runtime, command);
+                    match start_command_execution(app, runtime, command) {
+                        Ok(()) => {
+                            app.record_submitted_prompt(&submitted);
+                            app.input.clear();
+                        }
+                        Err(error) => {
+                            app.status = format!("command launch failed: {error}");
+                        }
+                    }
                     return;
                 }
                 Ok(TuiSlashCommandAction::OpenForm(form)) => {
@@ -607,11 +613,11 @@ fn start_command_execution(
     app: &mut TuiApp,
     runtime: &mut impl TuiRuntime,
     command: TuiCommandExecution,
-) {
+) -> Result<(), String> {
     if app.command_active {
-        app.status =
-            "Wait for the current task to finish before sending another message.".to_string();
-        return;
+        return Err(
+            "Wait for the current task to finish before sending another message.".to_string(),
+        );
     }
 
     let display_name = command.display_name.clone();
@@ -620,10 +626,9 @@ fn start_command_execution(
             app.command_active = true;
             app.focus = FocusTarget::Input;
             app.status = format!("running command: /{display_name}");
+            Ok(())
         }
-        Err(error) => {
-            app.status = format!("command launch failed: {error}");
-        }
+        Err(error) => Err(error),
     }
 }
 
@@ -1826,7 +1831,9 @@ fn handle_command_palette_key(app: &mut TuiApp, key: KeyEvent, runtime: &mut imp
                 TuiCommandPaletteAction::ToolCommand(name) => {
                     match runtime.launch_named_command(&name) {
                         Ok(TuiSlashCommandAction::Execute(command)) => {
-                            start_command_execution(app, runtime, command);
+                            if let Err(error) = start_command_execution(app, runtime, command) {
+                                app.status = format!("command launch failed: {error}");
+                            }
                         }
                         Ok(TuiSlashCommandAction::OpenForm(form)) => {
                             app.open_command_form(form);
@@ -1918,13 +1925,16 @@ fn handle_command_form_key(app: &mut TuiApp, key: KeyEvent, runtime: &mut impl T
                 display_name: command_name,
                 values,
             };
-            app.command_form = None;
-            if app.command_active {
-                app.status = "Wait for the current task to finish before sending another message."
-                    .to_string();
-                return;
+            match start_command_execution(app, runtime, command) {
+                Ok(()) => {
+                    app.command_form = None;
+                }
+                Err(error) => {
+                    if let Some(form) = app.command_form.as_mut() {
+                        form.error = Some(error);
+                    }
+                }
             }
-            start_command_execution(app, runtime, command);
         }
         _ => {}
     }
@@ -2099,6 +2109,7 @@ mod tests {
         slash_command_action: Option<TuiSlashCommandAction>,
         slash_command_error: Option<String>,
         started_command_executions: Vec<TuiCommandExecution>,
+        start_command_execution_error: Option<String>,
         completed_command_execution_snapshot: Option<TuiSnapshot>,
         command_execution_error: Option<String>,
         submitted_prompts: Vec<String>,
@@ -2168,6 +2179,9 @@ mod tests {
         }
 
         fn start_command_execution(&mut self, command: TuiCommandExecution) -> Result<(), String> {
+            if let Some(error) = self.start_command_execution_error.clone() {
+                return Err(error);
+            }
             self.started_command_executions.push(command);
             Ok(())
         }
@@ -2933,6 +2947,80 @@ mod tests {
             Some("tool result: submitted /create_memory")
         );
         assert_eq!(app.status, "slash command executed: /create_memory");
+    }
+
+    #[test]
+    fn command_form_submit_keeps_form_open_when_command_is_already_running() {
+        let mut app = TuiApp::bootstrap();
+        app.command_active = true;
+        app.open_command_form(TuiCommandForm {
+            command_name: "create_memory".to_string(),
+            description: "Create a memory".to_string(),
+            parameters: vec![TuiCommandParameter {
+                name: "name".to_string(),
+                optional: false,
+                default_text: String::new(),
+                suggestions: vec![],
+            }],
+            initial_values: vec![("name".to_string(), "trip".to_string())],
+        });
+        let mut runtime = FakeRuntime::default();
+        let mut pending = None;
+
+        apply_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut runtime,
+            &mut pending,
+        );
+
+        let command_form = app
+            .command_form
+            .as_ref()
+            .expect("command form should remain open");
+        assert_eq!(
+            command_form.error.as_deref(),
+            Some("Wait for the current task to finish before sending another message.")
+        );
+        assert!(runtime.started_command_executions.is_empty());
+    }
+
+    #[test]
+    fn command_form_submit_keeps_form_open_when_command_launch_fails() {
+        let mut app = TuiApp::bootstrap();
+        app.open_command_form(TuiCommandForm {
+            command_name: "create_memory".to_string(),
+            description: "Create a memory".to_string(),
+            parameters: vec![TuiCommandParameter {
+                name: "name".to_string(),
+                optional: false,
+                default_text: String::new(),
+                suggestions: vec![],
+            }],
+            initial_values: vec![("name".to_string(), "trip".to_string())],
+        });
+        let mut runtime = FakeRuntime {
+            start_command_execution_error: Some("memory_name must be a string".to_string()),
+            ..FakeRuntime::default()
+        };
+        let mut pending = None;
+
+        apply_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut runtime,
+            &mut pending,
+        );
+
+        let command_form = app
+            .command_form
+            .as_ref()
+            .expect("command form should remain open");
+        assert_eq!(
+            command_form.error.as_deref(),
+            Some("memory_name must be a string")
+        );
+        assert!(runtime.started_command_executions.is_empty());
     }
 
     #[test]
