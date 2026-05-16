@@ -3872,6 +3872,27 @@ mod tests {
     }
 
     #[test]
+    fn streaming_draft_survives_sidebar_and_status_updates() {
+        let mut app = TuiApp::bootstrap();
+        app.prompt_active = true;
+        app.input = "draft".to_string();
+
+        app.apply_snapshot(TuiSnapshot {
+            memory_titles: vec!["Trip note".to_string()],
+            agenda_titles: vec!["Call mom".to_string()],
+            input_completions: vec!["Trip note".to_string()],
+            status: Some("loading context...".to_string()),
+            ..TuiSnapshot::default()
+        });
+
+        assert_eq!(app.input, "draft");
+        assert_eq!(app.memory_titles, vec!["Trip note".to_string()]);
+        assert_eq!(app.agenda_titles, vec!["Call mom".to_string()]);
+        assert_eq!(app.input_completions, vec!["Trip note".to_string()]);
+        assert_eq!(app.status, "loading context...");
+    }
+
+    #[test]
     fn runtime_submit_replaces_snapshot_data() {
         let mut app = TuiApp::bootstrap();
         app.input = "hello runtime".to_string();
