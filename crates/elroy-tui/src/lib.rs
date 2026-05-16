@@ -790,30 +790,34 @@ fn poll_context_updates(app: &mut TuiApp, runtime: &mut impl TuiRuntime) {
     let Ok(context_messages) = runtime.load_context_messages() else {
         return;
     };
-    let unseen_indices = context_messages
+    let first_unseen = context_messages
         .iter()
-        .enumerate()
-        .filter_map(|(index, message)| {
-            (!app.rendered_context_message_ids.contains(&message.id)).then_some(index)
-        })
+        .position(|message| !app.rendered_context_message_ids.contains(&message.id));
+    let Some(first_unseen) = first_unseen else {
+        return;
+    };
+
+    let trailing_start = context_messages
+        .iter()
+        .rposition(|message| app.rendered_context_message_ids.contains(&message.id))
+        .map_or(0, |index| index + 1);
+    let trailing_unseen = context_messages[trailing_start..]
+        .iter()
+        .filter(|message| !app.rendered_context_message_ids.contains(&message.id))
+        .cloned()
         .collect::<Vec<_>>();
-    if unseen_indices.is_empty() {
+
+    if trailing_start <= first_unseen {
+        if !trailing_unseen.is_empty() {
+            app.render_new_context_messages(&trailing_unseen);
+        }
         return;
     }
 
-    let first_unseen = unseen_indices[0];
-    if context_messages[first_unseen + 1..]
-        .iter()
-        .any(|message| app.rendered_context_message_ids.contains(&message.id))
-    {
-        app.mark_context_messages_rendered(&context_messages);
-        return;
+    if !trailing_unseen.is_empty() {
+        app.render_new_context_messages(&trailing_unseen);
     }
-
-    let unseen_messages = context_messages[first_unseen..].to_vec();
-    if !unseen_messages.is_empty() {
-        app.render_new_context_messages(&unseen_messages);
-    }
+    app.mark_context_messages_rendered(&context_messages[..trailing_start]);
 }
 
 fn apply_prompt_update(app: &mut TuiApp, update: PromptUpdate) {
@@ -4060,6 +4064,54 @@ mod tests {
         assert_eq!(
             app.rendered_context_message_ids,
             HashSet::from([10, 11, 12])
+        );
+    }
+
+    #[test]
+    fn poll_context_updates_renders_trailing_unseen_suffix_after_interleaved_gap() {
+        let mut app = TuiApp::from_snapshot(TuiSnapshot {
+            conversation_lines: vec!["assistant: existing".to_string()],
+            ..TuiSnapshot::default()
+        });
+        app.rendered_context_message_ids = HashSet::from([10, 12]);
+        let mut runtime = FakeRuntime {
+            context_messages: vec![
+                TuiContextMessage {
+                    id: 10,
+                    role: "assistant".to_string(),
+                    content: "existing".to_string(),
+                },
+                TuiContextMessage {
+                    id: 11,
+                    role: "assistant".to_string(),
+                    content: "unseen middle".to_string(),
+                },
+                TuiContextMessage {
+                    id: 12,
+                    role: "assistant".to_string(),
+                    content: "already rendered later".to_string(),
+                },
+                TuiContextMessage {
+                    id: 13,
+                    role: "assistant".to_string(),
+                    content: "new trailing".to_string(),
+                },
+            ],
+            ..FakeRuntime::default()
+        };
+
+        poll_context_updates(&mut app, &mut runtime);
+
+        assert_eq!(
+            app.conversation_lines,
+            vec![
+                "assistant: existing".to_string(),
+                "assistant: new trailing".to_string()
+            ]
+        );
+        assert_eq!(
+            app.rendered_context_message_ids,
+            HashSet::from([10, 11, 12, 13])
         );
     }
 
