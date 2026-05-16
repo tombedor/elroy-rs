@@ -3227,6 +3227,58 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
     );
 
     let database_path = config.database_path.clone();
+    let examine_memories = ExecutableTool::new(
+        ToolSpec::new(
+            "examine_memories",
+            "Search memories and due items for the answer to a question.",
+            JsonSchema::object(
+                [
+                    ("question", json!({"type": "string"})),
+                    ("limit", json!({"type": "integer"})),
+                ],
+                ["question"],
+            ),
+        ),
+        move |arguments| {
+            let Some(question) = arguments.get("question").and_then(Value::as_str) else {
+                return ToolExecutionResult::error("examine_memories requires a string question");
+            };
+            let limit = argument_limit(&arguments, 10);
+            with_tool_connection(&database_path, |connection| {
+                let memories = list_active_memories(connection, limit * 3)?;
+                let relevant_memories =
+                    select_recalled_memories(question, &memories, &HashSet::new(), limit);
+                let due_items = list_active_due_items(connection, limit * 3)?;
+                let relevant_due_items =
+                    select_due_items_by_overlap(question, &due_items, limit, None);
+
+                let mut sections = relevant_memories
+                    .into_iter()
+                    .map(|memory| format!("# Memory: {}\n\n{}", memory.name, memory.body.trim()))
+                    .collect::<Vec<_>>();
+                sections.extend(relevant_due_items.into_iter().map(|item| {
+                    let mut text = format!("# Due Item: {}\n\n{}", item.name, item.body.trim());
+                    if let Some(trigger_datetime) = item.trigger_datetime.as_deref() {
+                        text.push_str(&format!("\n\nScheduled for: {trigger_datetime}"));
+                    }
+                    if let Some(trigger_context) = item.trigger_context.as_deref() {
+                        text.push_str(&format!("\nTrigger context: {trigger_context}"));
+                    }
+                    text
+                }));
+
+                if sections.is_empty() {
+                    Ok(ToolExecutionResult::success(
+                        "No relevant memories found".to_string(),
+                    ))
+                } else {
+                    Ok(ToolExecutionResult::success(sections.join("\n\n")))
+                }
+            })
+        },
+    );
+
+    let database_path = config.database_path.clone();
     let list_agenda = ExecutableTool::new(
         ToolSpec::new(
             "list_agenda",
@@ -3429,6 +3481,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
         list_today_tasks_tool,
         list_memories,
         search_memories,
+        examine_memories,
         list_agenda,
         list_due_items,
         show_task,
@@ -6158,6 +6211,54 @@ mod tests {
         assert!(search.content.contains("\"type\": \"due_item\""));
         assert!(search.content.contains("payroll_follow_up.md"));
         assert!(search.content.contains("after payroll email"));
+
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
+    fn live_tool_registry_examine_memories_can_return_memory_and_due_item_sections() {
+        let unique = format!(
+            "elroy-rs-app-examine-memories-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+        fs::write(
+            memory_dir.join("running_notes.md"),
+            "User is training for a marathon in October.\n",
+        )
+        .expect("memory should be written");
+        fs::write(
+            agenda_dir.join("running_follow_up.md"),
+            "---\ndate: unscheduled\ncompleted: false\nstatus: created\ntrigger_context: after the marathon training check-in\n---\n\nAsk about long run recovery.\n",
+        )
+        .expect("due item should be written");
+
+        let mut config = AppConfig::defaults();
+        config.memory_dir = memory_dir;
+        config.agenda_dir = agenda_dir;
+        config.database_path = database_path;
+        elroy_db::bootstrap_database(&BootstrapPlan::from_config(&config))
+            .expect("bootstrap should succeed");
+
+        let registry = build_live_tool_registry(&config);
+        let result = registry.invoke(
+            "examine_memories",
+            "{\"question\":\"What do I know about the marathon training check-in?\",\"limit\":5}",
+        );
+
+        assert!(!result.is_error);
+        assert!(result.content.contains("# Memory: running notes"));
+        assert!(result.content.contains("marathon in October"));
+        assert!(result.content.contains("# Due Item: running follow up"));
+        assert!(result.content.contains("long run recovery"));
 
         fs::remove_dir_all(home).expect("home should be removed");
     }
