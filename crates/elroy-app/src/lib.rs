@@ -3689,6 +3689,43 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
     );
 
     let database_path = config.database_path.clone();
+    let list_agenda_items = ExecutableTool::new(
+        ToolSpec::new(
+            "list_agenda_items",
+            "List agenda items for a given date, defaulting to today.",
+            JsonSchema::object([("item_date", json!({"type": "string"}))], [] as [&str; 0]),
+        ),
+        move |arguments| {
+            let target_date = arguments
+                .get("item_date")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| Local::now().date_naive().format("%Y-%m-%d").to_string());
+            with_tool_connection(&database_path, |connection| {
+                let items = list_active_plain_agenda_items(connection, 1000)?
+                    .into_iter()
+                    .filter(|item| item.agenda_date.as_deref() == Some(target_date.as_str()))
+                    .map(|item| {
+                        json!({
+                            "name": item.name,
+                            "text": item.body,
+                            "checklist_completed": item.checklist_completed,
+                            "checklist_total": item.checklist_total,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                Ok(ToolExecutionResult::success(
+                    json!({
+                        "item_date": target_date,
+                        "items": items,
+                    })
+                    .to_string(),
+                ))
+            })
+        },
+    );
+
+    let database_path = config.database_path.clone();
     let list_due_items = ExecutableTool::new(
         ToolSpec::new(
             "list_due_items",
@@ -4120,6 +4157,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
         search_memories,
         examine_memories,
         list_agenda,
+        list_agenda_items,
         list_due_items,
         print_active_due_items,
         list_inactive_due_items_tool,
@@ -5510,6 +5548,51 @@ mod tests {
         assert!(agenda.content.contains("bring forms"));
         assert!(!printed_memories.is_error);
         assert!(printed_memories.content.contains("runner notes"));
+
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
+    fn live_tool_registry_can_list_agenda_items_for_one_date() {
+        let unique = format!(
+            "elroy-rs-app-list-agenda-items-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+        fs::write(
+            agenda_dir.join("doctor_visit.md"),
+            "---\ndate: 2026-05-15\ncompleted: false\nstatus: created\n---\n\nbring forms\n",
+        )
+        .expect("agenda file should be written");
+        fs::write(
+            agenda_dir.join("trip.md"),
+            "---\ndate: 2026-05-16\ncompleted: false\nstatus: created\n---\n\npack snacks\n",
+        )
+        .expect("agenda file should be written");
+
+        let mut config = AppConfig::defaults();
+        config.memory_dir = memory_dir;
+        config.agenda_dir = agenda_dir;
+        config.database_path = database_path;
+        elroy_db::bootstrap_database(&elroy_db::BootstrapPlan::from_config(&config))
+            .expect("bootstrap should succeed");
+
+        let registry = build_live_tool_registry(&config);
+        let listed = registry.invoke("list_agenda_items", "{\"item_date\":\"2026-05-15\"}");
+
+        assert!(!listed.is_error);
+        assert!(listed.content.contains("\"item_date\":\"2026-05-15\""));
+        assert!(listed.content.contains("\"name\":\"doctor visit\""));
+        assert!(listed.content.contains("\"text\":\"bring forms\""));
+        assert!(!listed.content.contains("\"name\":\"trip\""));
 
         fs::remove_dir_all(home).expect("home should be removed");
     }
