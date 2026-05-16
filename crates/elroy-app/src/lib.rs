@@ -3384,7 +3384,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                 return ToolExecutionResult::error("delete_task requires a string name");
             };
             let closing_comment = arguments.get("closing_comment").and_then(Value::as_str);
-            mutate_task_file_from_config_with_result(
+            let result = mutate_task_file_from_config_with_result(
                 &config_for_task_delete,
                 name,
                 || format!("Active task '{name}' not found."),
@@ -3397,7 +3397,17 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                         None => format!("Task '{name}' has been deleted."),
                     })
                 },
-            )
+            );
+            if result.is_error {
+                return result;
+            }
+            let tool_call_id = context_task_tool_call_id(name);
+            match remove_context_tool_messages_by_id(&config_for_task_delete, &tool_call_id) {
+                Ok(()) => result,
+                Err(error) => ToolExecutionResult::error(format!(
+                    "failed to remove task from context: {error}"
+                )),
+            }
         },
     );
 
@@ -5794,6 +5804,10 @@ fn context_due_item_tool_call_id(name: &str) -> String {
     format!("context-due-item:{}", name.to_ascii_lowercase())
 }
 
+fn context_task_tool_call_id(name: &str) -> String {
+    format!("context-task:{}", name.to_ascii_lowercase())
+}
+
 fn context_memory_tool_messages(memory: &elroy_db::MemoryRecord) -> Vec<ConversationMessage> {
     let content = serde_json::to_string_pretty(&json!({
         "content": format!("MEMORY: '{}' - {}", memory.name, memory.body),
@@ -6477,7 +6491,8 @@ mod tests {
         AppRuntime, LOCAL_USER_TOKEN, PromptExecutionOptions, SYNTHETIC_FIRST_USER_MESSAGE,
         argument_limit, build_live_tool_registry, build_live_tool_registry_with_codex_bin_and_hook,
         build_recall_query, codex_background_status_key, compress_context_messages,
-        count_context_tokens, drop_old_context_messages, due_item_context_messages,
+        context_task_tool_call_id, count_context_tokens, drop_old_context_messages,
+        due_item_context_messages,
         format_context_summary_message, is_context_refresh_needed, memory_recall_status_updates,
         parse_recalled_memory_names, prompt_prelude_status_updates,
         provider_config_from_app_config, recall_due_item_context_messages,
@@ -6486,7 +6501,7 @@ mod tests {
         run_prompt_with_model_and_registry_stream, select_due_items_by_overlap,
         select_recalled_due_items, select_recalled_memories, should_offer_greeting,
         should_skip_memory_recall, significant_tokens, strip_input_message_for_persistence,
-        strip_transient_context_messages,
+        strip_transient_context_messages, synthetic_tool_context_messages,
     };
     use elroy_agenda::create_agenda_file;
     use elroy_codex::{
@@ -8714,6 +8729,21 @@ mod tests {
             "{\"name\":\"Inbox Zero\",\"text\":\"Clear email backlog\"}",
         );
         assert!(!deleted_created.is_error);
+        let mut connection =
+            open_sqlite_connection(&config.database_path).expect("database should reopen");
+        let mut transcript = vec![ConversationMessage::new(MessageRole::User, "keep context")];
+        transcript.extend(synthetic_tool_context_messages(
+            context_task_tool_call_id("inbox zero"),
+            "get_fast_recall",
+            "{}",
+            "{\"content\":\"TASK: 'inbox zero' - Clear email backlog\"}",
+        ));
+        elroy_db::replace_context_messages(&mut connection, LOCAL_USER_TOKEN, &transcript)
+            .expect("task context should persist");
+        let task_context = registry.invoke("show_context_messages", "{\"limit\":20}");
+        assert!(!task_context.is_error);
+        assert!(task_context.content.contains("context-task:inbox zero"));
+
         let deleted = registry.invoke(
             "delete_task",
             "{\"name\":\"inbox zero\",\"closing_comment\":\"superseded\"}",
@@ -8728,6 +8758,10 @@ mod tests {
             fs::read_to_string(agenda_dir.join("inbox_zero.md")).expect("task file should read");
         assert!(deleted_text.contains("status: deleted"));
         assert!(deleted_text.contains("closing_comment: superseded"));
+        let stripped_context = registry.invoke("show_context_messages", "{\"limit\":20}");
+        assert!(!stripped_context.is_error);
+        assert!(!stripped_context.content.contains("context-task:inbox zero"));
+        assert!(stripped_context.content.contains("keep context"));
         let missing_deleted = registry.invoke("delete_task", "{\"name\":\"missing\"}");
         assert!(missing_deleted.is_error);
         assert_eq!(missing_deleted.content, "Active task 'missing' not found.");
