@@ -3218,6 +3218,36 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
     );
 
     let database_path = config.database_path.clone();
+    let print_memories = ExecutableTool::new(
+        ToolSpec::new(
+            "print_memories",
+            "List active memories available to Elroy.",
+            JsonSchema::object([("limit", json!({"type": "integer"}))], [] as [&str; 0]),
+        ),
+        move |arguments| {
+            let limit = argument_limit(&arguments, 10);
+            with_tool_connection(&database_path, |connection| {
+                let memories = list_active_memories(connection, limit)?;
+                let payload = memories
+                    .into_iter()
+                    .map(|memory| {
+                        json!({
+                            "name": memory.name,
+                            "file_path": memory.file_path,
+                            "excerpt": excerpt(&memory.body, 180),
+                            "updated_at_unix": memory.updated_at_unix,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                Ok(ToolExecutionResult::success(
+                    serde_json::to_string_pretty(&payload)
+                        .expect("memory payload should serialize"),
+                ))
+            })
+        },
+    );
+
+    let database_path = config.database_path.clone();
     let search_memories = ExecutableTool::new(
         ToolSpec::new(
             "search_memories",
@@ -3618,6 +3648,36 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
     );
 
     let database_path = config.database_path.clone();
+    let print_memory = ExecutableTool::new(
+        ToolSpec::new(
+            "print_memory",
+            "Show one active memory by exact name.",
+            JsonSchema::object([("name", json!({"type": "string"}))], ["name"]),
+        ),
+        move |arguments| {
+            let Some(name) = arguments.get("name").and_then(Value::as_str) else {
+                return ToolExecutionResult::error("print_memory requires a string name");
+            };
+            with_tool_connection(&database_path, |connection| {
+                let Some(memory) = find_active_memory_by_name(connection, name)? else {
+                    return Ok(ToolExecutionResult::error(format!(
+                        "memory not found: {name}"
+                    )));
+                };
+                Ok(ToolExecutionResult::success(
+                    json!({
+                        "name": memory.name,
+                        "file_path": memory.file_path,
+                        "body": memory.body,
+                        "updated_at_unix": memory.updated_at_unix,
+                    })
+                    .to_string(),
+                ))
+            })
+        },
+    );
+
+    let database_path = config.database_path.clone();
     let show_agenda_item = ExecutableTool::new(
         ToolSpec::new(
             "show_agenda_item",
@@ -3700,6 +3760,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
         list_due_tasks_tool,
         list_today_tasks_tool,
         list_memories,
+        print_memories,
         search_memories,
         examine_memories,
         list_agenda,
@@ -3711,6 +3772,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
         show_due_item,
         print_due_item,
         show_memory,
+        print_memory,
         show_agenda_item,
     ])
 }
@@ -5079,12 +5141,18 @@ mod tests {
 
         let registry = build_live_tool_registry(&config);
         let memory = registry.invoke("show_memory", "{\"name\":\"runner notes\"}");
+        let printed_memory = registry.invoke("print_memory", "{\"name\":\"runner notes\"}");
         let agenda = registry.invoke("show_agenda_item", "{\"name\":\"doctor visit\"}");
+        let printed_memories = registry.invoke("print_memories", "{\"limit\":10}");
 
         assert!(!memory.is_error);
         assert!(memory.content.contains("remember the hill workout"));
+        assert!(!printed_memory.is_error);
+        assert!(printed_memory.content.contains("remember the hill workout"));
         assert!(!agenda.is_error);
         assert!(agenda.content.contains("bring forms"));
+        assert!(!printed_memories.is_error);
+        assert!(printed_memories.content.contains("runner notes"));
 
         fs::remove_dir_all(home).expect("home should be removed");
     }
