@@ -1461,6 +1461,14 @@ fn codex_completion_followup_prompt(result: &CodexSessionResult) -> String {
     )
 }
 
+fn codex_background_status_key(session_id: &str) -> String {
+    format!("codex-session-{session_id}")
+}
+
+fn codex_background_status_message(session_id: &str) -> String {
+    format!("codex session {session_id} running...")
+}
+
 pub fn build_live_tool_registry(config: &AppConfig) -> ExecutableToolRegistry {
     build_live_tool_registry_with_codex_bin_and_hook(config, None, None)
 }
@@ -2684,6 +2692,14 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
             }
             drop(connection);
 
+            let completion_hook = {
+                let upstream_hook = codex_completion_hook_for_dispatch.clone();
+                Arc::new(move |result: CodexSessionResult| {
+                    upstream_hook(result.clone());
+                    clear_background_status(&codex_background_status_key(&result.session_id));
+                })
+            };
+
             let result = if let Some(codex_bin) = codex_bin_for_dispatch.as_deref() {
                 dispatch_codex_session_with_bin(
                     &database_path,
@@ -2692,7 +2708,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                     repo_path.map(Path::new),
                     model,
                     codex_bin,
-                    Some(codex_completion_hook_for_dispatch.clone()),
+                    Some(completion_hook),
                 )
             } else {
                 dispatch_codex_session_with_hook(
@@ -2701,11 +2717,17 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                     prompt,
                     repo_path.map(Path::new),
                     model,
-                    Some(codex_completion_hook_for_dispatch.clone()),
+                    Some(completion_hook),
                 )
             };
             match result {
-                Ok(result) => ToolExecutionResult::success(codex_session_result_payload(result)),
+                Ok(result) => {
+                    set_background_status(
+                        codex_background_status_key(&result.session_id),
+                        codex_background_status_message(&result.session_id),
+                    );
+                    ToolExecutionResult::success(codex_session_result_payload(result))
+                }
                 Err(error) => ToolExecutionResult::error(error.to_string()),
             }
         },
@@ -2748,6 +2770,14 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
             }
             drop(connection);
 
+            let completion_hook = {
+                let upstream_hook = codex_completion_hook_for_resume.clone();
+                Arc::new(move |result: CodexSessionResult| {
+                    upstream_hook(result.clone());
+                    clear_background_status(&codex_background_status_key(&result.session_id));
+                })
+            };
+
             let result = if let Some(codex_bin) = codex_bin_for_resume.as_deref() {
                 resume_codex_session_with_bin(
                     &database_path,
@@ -2756,7 +2786,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                     prompt,
                     model,
                     codex_bin,
-                    Some(codex_completion_hook_for_resume.clone()),
+                    Some(completion_hook),
                 )
             } else {
                 resume_codex_session_with_hook(
@@ -2765,11 +2795,17 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                     session_id,
                     prompt,
                     model,
-                    Some(codex_completion_hook_for_resume.clone()),
+                    Some(completion_hook),
                 )
             };
             match result {
-                Ok(result) => ToolExecutionResult::success(codex_session_result_payload(result)),
+                Ok(result) => {
+                    set_background_status(
+                        codex_background_status_key(&result.session_id),
+                        codex_background_status_message(&result.session_id),
+                    );
+                    ToolExecutionResult::success(codex_session_result_payload(result))
+                }
                 Err(error) => ToolExecutionResult::error(error.to_string()),
             }
         },
@@ -4062,12 +4098,12 @@ mod tests {
     use super::{
         AppRuntime, LOCAL_USER_TOKEN, PromptExecutionOptions, SYNTHETIC_FIRST_USER_MESSAGE,
         argument_limit, build_live_tool_registry, build_live_tool_registry_with_codex_bin_and_hook,
-        build_recall_query, compress_context_messages, count_context_tokens,
-        drop_old_context_messages, due_item_context_messages, format_context_summary_message,
-        is_context_refresh_needed, memory_recall_status_updates, parse_recalled_memory_names,
-        prompt_prelude_status_updates, provider_config_from_app_config,
-        recall_memory_context_messages, recalled_memory_names, recent_recall_context,
-        refresh_context_if_needed, run_prompt_with_model_and_registry,
+        build_recall_query, codex_background_status_key, compress_context_messages,
+        count_context_tokens, drop_old_context_messages, due_item_context_messages,
+        format_context_summary_message, is_context_refresh_needed, memory_recall_status_updates,
+        parse_recalled_memory_names, prompt_prelude_status_updates,
+        provider_config_from_app_config, recall_memory_context_messages, recalled_memory_names,
+        recent_recall_context, refresh_context_if_needed, run_prompt_with_model_and_registry,
         run_prompt_with_model_and_registry_stream, select_recalled_memories, should_offer_greeting,
         should_skip_memory_recall, significant_tokens, strip_input_message_for_persistence,
         strip_transient_context_messages,
@@ -4077,7 +4113,10 @@ mod tests {
         CodexCommandRecord, CodexSessionResult, CodexSessionUpdate, upsert_codex_session,
     };
     use elroy_config::{AppConfig, LlmProvider};
-    use elroy_core::{ConversationRequest, ModelClient, StreamingModelClient};
+    use elroy_core::{
+        ConversationRequest, ModelClient, StreamingModelClient, clear_background_status,
+        get_background_status,
+    };
     use elroy_db::{
         AgendaItemRecord, BootstrapPlan, MemoryRecord, load_memory_operation_tracker,
         load_user_preferences, open_sqlite_connection, run_migrations,
@@ -5310,6 +5349,7 @@ mod tests {
 
     #[test]
     fn live_tool_registry_can_dispatch_and_resume_codex_sessions() {
+        clear_background_status(&codex_background_status_key("thread-123"));
         let unique = format!(
             "elroy-rs-app-codex-dispatch-{}",
             std::time::SystemTime::now()
@@ -5347,6 +5387,7 @@ mod tests {
             ));
             elroy_db::replace_context_messages(&mut connection, LOCAL_USER_TOKEN, &transcript)
                 .expect("messages should persist");
+            thread::sleep(Duration::from_millis(200));
         });
 
         let registry = build_live_tool_registry_with_codex_bin_and_hook(
@@ -5363,7 +5404,13 @@ mod tests {
         );
         assert!(!dispatched.is_error);
         assert!(dispatched.content.contains("\"status\":\"running\""));
+        assert_eq!(
+            get_background_status().as_deref(),
+            Some("codex session thread-123 running...")
+        );
         wait_for_codex_status(&database_path, "thread-123", "completed");
+        thread::sleep(Duration::from_millis(250));
+        assert!(get_background_status().is_none());
 
         let resumed = registry.invoke(
             "resume_codex_session",
@@ -5371,7 +5418,13 @@ mod tests {
         );
         assert!(!resumed.is_error);
         assert!(resumed.content.contains("\"status\":\"running\""));
+        assert_eq!(
+            get_background_status().as_deref(),
+            Some("codex session thread-123 running...")
+        );
         wait_for_codex_status(&database_path, "thread-123", "completed");
+        thread::sleep(Duration::from_millis(250));
+        assert!(get_background_status().is_none());
 
         let shown = registry.invoke("show_codex_session", "{\"session_id\":\"thread-123\"}");
         assert!(!shown.is_error);
