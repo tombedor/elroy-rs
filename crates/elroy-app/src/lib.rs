@@ -7205,7 +7205,19 @@ fn recent_recall_context(transcript: &[ConversationMessage], window: usize) -> V
                     .is_empty()
         })
         .take(window)
-        .filter_map(|message| message.content.clone())
+        .filter_map(|message| {
+            let role = match message.role {
+                MessageRole::User => "user",
+                MessageRole::Assistant => "assistant",
+                _ => return None,
+            };
+            message
+                .content
+                .as_deref()
+                .map(str::trim)
+                .filter(|content| !content.is_empty())
+                .map(|content| format!("{role}: {content}"))
+        })
         .collect::<Vec<_>>()
         .into_iter()
         .rev()
@@ -15294,8 +15306,9 @@ mod tests {
         let context = recent_recall_context(&transcript, 3);
 
         assert_eq!(context.len(), 3);
-        assert_eq!(context[0], "I am training for basketball");
-        assert_eq!(context[2], "My jump shot is inconsistent");
+        assert_eq!(context[0], "user: I am training for basketball");
+        assert_eq!(context[1], "assistant: How is practice going?");
+        assert_eq!(context[2], "user: My jump shot is inconsistent");
     }
 
     #[test]
@@ -15307,7 +15320,8 @@ mod tests {
 
         let query = build_recall_query("What should I focus on?", &transcript, 4);
 
-        assert!(query.contains("I am training for basketball"));
+        assert!(query.contains("user: I am training for basketball"));
+        assert!(query.contains("assistant: How is practice going?"));
         assert!(query.contains("What should I focus on?"));
     }
 
