@@ -174,7 +174,9 @@ pub struct CommandFormState {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandPaletteState {
-    pub entries: Vec<TuiCommandPaletteEntry>,
+    pub all_entries: Vec<TuiCommandPaletteEntry>,
+    pub query: String,
+    pub filtered_indices: Vec<usize>,
     pub selected_index: usize,
 }
 
@@ -1091,8 +1093,14 @@ impl TuiApp {
     ) {
         let modal_area = centered_rect(area, 72, 60);
         Clear.render(modal_area, buf);
-        let mut lines = vec!["Commands".to_string(), String::new()];
-        for (index, entry) in command_palette.entries.iter().enumerate() {
+        let mut lines = vec![format!("Search: {}", command_palette.query), String::new()];
+        if command_palette.filtered_indices.is_empty() {
+            lines.push("  No matching commands".to_string());
+        }
+        for (index, entry_index) in command_palette.filtered_indices.iter().enumerate() {
+            let Some(entry) = command_palette.all_entries.get(*entry_index) else {
+                continue;
+            };
             let marker = if index == command_palette.selected_index {
                 ">"
             } else {
@@ -1148,10 +1156,14 @@ impl TuiApp {
                 action: TuiCommandPaletteAction::FocusAgenda,
             },
         );
-        self.command_palette = Some(CommandPaletteState {
-            entries,
+        let mut command_palette = CommandPaletteState {
+            all_entries: entries,
+            query: String::new(),
+            filtered_indices: Vec::new(),
             selected_index: 0,
-        });
+        };
+        command_palette.apply_query();
+        self.command_palette = Some(command_palette);
     }
 
     fn record_submitted_prompt(&mut self, submitted: &str) {
@@ -1582,16 +1594,48 @@ impl CommandFormState {
 
 impl CommandPaletteState {
     fn footer_text(&self) -> String {
-        "Up/Down move  Enter select  Escape close".to_string()
+        "Type to filter  Up/Down move  Enter select  Backspace edit  Escape close".to_string()
     }
 
     fn move_selection(&mut self, delta: isize) {
-        if self.entries.is_empty() {
+        if self.filtered_indices.is_empty() {
             return;
         }
-        let len = self.entries.len() as isize;
+        let len = self.filtered_indices.len() as isize;
         let current = self.selected_index as isize;
         self.selected_index = (current + delta).rem_euclid(len) as usize;
+    }
+
+    fn apply_query(&mut self) {
+        let query = self.query.to_ascii_lowercase();
+        self.filtered_indices = self
+            .all_entries
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| {
+                let haystack =
+                    format!("{} {}", entry.title, entry.description).to_ascii_lowercase();
+                haystack.contains(&query).then_some(index)
+            })
+            .collect();
+        if self.filtered_indices.is_empty() || self.selected_index >= self.filtered_indices.len() {
+            self.selected_index = 0;
+        }
+    }
+
+    fn append_query(&mut self, ch: char) {
+        self.query.push(ch);
+        self.apply_query();
+    }
+
+    fn backspace_query(&mut self) {
+        self.query.pop();
+        self.apply_query();
+    }
+
+    fn selected_entry(&self) -> Option<TuiCommandPaletteEntry> {
+        let index = *self.filtered_indices.get(self.selected_index)?;
+        self.all_entries.get(index).cloned()
     }
 }
 
@@ -1604,6 +1648,9 @@ fn handle_command_palette_key(app: &mut TuiApp, key: KeyEvent, runtime: &mut imp
         KeyCode::Esc => {
             app.command_palette = None;
         }
+        KeyCode::Backspace => {
+            command_palette.backspace_query();
+        }
         KeyCode::Up => {
             command_palette.move_selection(-1);
         }
@@ -1614,12 +1661,8 @@ fn handle_command_palette_key(app: &mut TuiApp, key: KeyEvent, runtime: &mut imp
             command_palette.move_selection(-1);
         }
         KeyCode::Enter => {
-            let Some(entry) = command_palette
-                .entries
-                .get(command_palette.selected_index)
-                .cloned()
-            else {
-                app.command_palette = None;
+            let Some(entry) = command_palette.selected_entry() else {
+                app.status = "no matching command".to_string();
                 return;
             };
             app.command_palette = None;
@@ -1661,6 +1704,12 @@ fn handle_command_palette_key(app: &mut TuiApp, key: KeyEvent, runtime: &mut imp
                     }
                 }
             }
+        }
+        KeyCode::Char(ch)
+            if !key.modifiers.contains(KeyModifiers::CONTROL)
+                && !key.modifiers.contains(KeyModifiers::ALT) =>
+        {
+            command_palette.append_query(ch);
         }
         _ => {}
     }
@@ -2684,6 +2733,100 @@ mod tests {
         assert!(app.command_palette.is_none());
         assert!(app.command_form.is_some());
         assert_eq!(app.status, "editing command: /create_memory");
+    }
+
+    #[test]
+    fn command_palette_filters_entries_from_typed_query() {
+        let mut app = TuiApp::bootstrap();
+        app.open_command_palette(vec![
+            TuiCommandPaletteEntry {
+                title: "/create_memory".to_string(),
+                description: "Create a memory".to_string(),
+                action: TuiCommandPaletteAction::ToolCommand("create_memory".to_string()),
+            },
+            TuiCommandPaletteEntry {
+                title: "/show_memory".to_string(),
+                description: "Show a memory".to_string(),
+                action: TuiCommandPaletteAction::ToolCommand("show_memory".to_string()),
+            },
+        ]);
+        let mut runtime = FakeRuntime {
+            launch_named_command_action: Some(TuiSlashCommandAction::OpenForm(TuiCommandForm {
+                command_name: "show_memory".to_string(),
+                description: "Show a memory".to_string(),
+                parameters: vec![TuiCommandParameter {
+                    name: "memory_name".to_string(),
+                    optional: false,
+                    default_text: String::new(),
+                }],
+                initial_values: vec![],
+            })),
+            ..FakeRuntime::default()
+        };
+        let mut pending = None;
+
+        apply_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE),
+            &mut runtime,
+            &mut pending,
+        );
+        apply_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE),
+            &mut runtime,
+            &mut pending,
+        );
+
+        let command_palette = app
+            .command_palette
+            .as_ref()
+            .expect("command palette should remain open");
+        assert_eq!(command_palette.query, "sh");
+        assert_eq!(command_palette.filtered_indices.len(), 1);
+        assert_eq!(
+            command_palette.selected_entry().map(|entry| entry.title),
+            Some("/show_memory".to_string())
+        );
+
+        apply_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut runtime,
+            &mut pending,
+        );
+
+        assert!(app.command_palette.is_none());
+        assert_eq!(app.status, "editing command: /show_memory");
+        assert!(app.command_form.is_some());
+    }
+
+    #[test]
+    fn command_palette_reports_no_match_without_closing() {
+        let mut app = TuiApp::bootstrap();
+        app.open_command_palette(vec![TuiCommandPaletteEntry {
+            title: "/create_memory".to_string(),
+            description: "Create a memory".to_string(),
+            action: TuiCommandPaletteAction::ToolCommand("create_memory".to_string()),
+        }]);
+        let mut runtime = FakeRuntime::default();
+        let mut pending = None;
+
+        apply_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE),
+            &mut runtime,
+            &mut pending,
+        );
+        apply_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut runtime,
+            &mut pending,
+        );
+
+        assert!(app.command_palette.is_some());
+        assert_eq!(app.status, "no matching command");
     }
 
     #[test]
