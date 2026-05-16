@@ -2,7 +2,7 @@ use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use chrono::{NaiveDateTime, Utc};
+use chrono::{Local, NaiveDateTime, Utc};
 use elroy_agenda::{
     add_checklist_item, append_agenda_update, create_agenda_file, get_checklist,
     mark_agenda_item_completed, mark_agenda_item_deleted, rename_agenda_file, update_agenda_body,
@@ -51,6 +51,9 @@ use serde_json::{Value, json};
 
 const LOCAL_USER_TOKEN: &str = "local-user";
 const SYNTHETIC_FIRST_USER_MESSAGE: &str = "The user has begun the conversation";
+const DEFAULT_MAX_LIST_ENTRIES: usize = 50;
+const DEFAULT_MAX_LIST_DEPTH: usize = 2;
+const DEFAULT_READ_LINE_LIMIT: usize = 200;
 
 #[derive(Debug)]
 pub enum AppError {
@@ -1483,6 +1486,57 @@ fn codex_background_status_message(session_id: &str) -> String {
     format!("codex session {session_id} running...")
 }
 
+fn filesystem_display_path(target: &Path) -> String {
+    let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    target
+        .strip_prefix(&current_dir)
+        .map(|relative| relative.display().to_string())
+        .unwrap_or_else(|_| target.display().to_string())
+}
+
+fn filesystem_entry_type(target: &Path) -> &'static str {
+    if target.is_symlink() {
+        "symlink"
+    } else if target.is_dir() {
+        "dir"
+    } else {
+        "file"
+    }
+}
+
+fn resolve_filesystem_tool_path(path: &str) -> Result<PathBuf, String> {
+    let candidate = Path::new(path);
+    let target = if candidate.is_absolute() {
+        candidate.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|error| format!("Unable to resolve current working directory: {error}"))?
+            .join(candidate)
+    };
+    let resolved = target
+        .canonicalize()
+        .map_err(|_| format!("Path does not exist: {path}"))?;
+    Ok(resolved)
+}
+
+fn build_filesystem_entry(target: &Path) -> Result<Value, String> {
+    let size_bytes = if target.is_dir() {
+        None
+    } else {
+        Some(
+            target
+                .metadata()
+                .map_err(|error| format!("Unable to inspect path: {error}"))?
+                .len(),
+        )
+    };
+    Ok(json!({
+        "path": filesystem_display_path(target),
+        "type": filesystem_entry_type(target),
+        "size_bytes": size_bytes,
+    }))
+}
+
 pub fn build_live_tool_registry(config: &AppConfig) -> ExecutableToolRegistry {
     build_live_tool_registry_with_codex_bin_and_hook(config, None, None)
 }
@@ -1509,6 +1563,253 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
             }
         })
     });
+
+    let get_current_date = ExecutableTool::new(
+        ToolSpec::new(
+            "get_current_date",
+            "Return the current local date and time.",
+            JsonSchema::object(Vec::<(String, Value)>::new(), [] as [&str; 0]),
+        ),
+        move |_| {
+            ToolExecutionResult::success(
+                Local::now().format("%A, %B %d, %Y %I:%M %p %Z").to_string(),
+            )
+        },
+    );
+
+    let pwd = ExecutableTool::new(
+        ToolSpec::new(
+            "pwd",
+            "Return the current working directory for filesystem tool calls.",
+            JsonSchema::object(Vec::<(String, Value)>::new(), [] as [&str; 0]),
+        ),
+        move |_| match std::env::current_dir() {
+            Ok(path) => ToolExecutionResult::success(path.display().to_string()),
+            Err(error) => ToolExecutionResult::error(format!(
+                "Unable to resolve current working directory: {error}"
+            )),
+        },
+    );
+
+    let ls = ExecutableTool::new(
+        ToolSpec::new(
+            "ls",
+            "List a file or directory, with bounded recursive expansion for directories.",
+            JsonSchema::object(
+                [
+                    ("path", json!({"type": "string"})),
+                    ("recursive", json!({"type": "boolean"})),
+                    ("max_entries", json!({"type": "integer"})),
+                    ("max_depth", json!({"type": "integer"})),
+                ],
+                [] as [&str; 0],
+            ),
+        ),
+        move |arguments| {
+            let path = arguments.get("path").and_then(Value::as_str).unwrap_or(".");
+            let recursive = arguments
+                .get("recursive")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+            let max_entries = arguments
+                .get("max_entries")
+                .and_then(Value::as_u64)
+                .map(|value| value as usize)
+                .unwrap_or(DEFAULT_MAX_LIST_ENTRIES);
+            let max_depth = arguments
+                .get("max_depth")
+                .and_then(Value::as_u64)
+                .map(|value| value as usize)
+                .unwrap_or(DEFAULT_MAX_LIST_DEPTH);
+            if max_entries < 1 {
+                return ToolExecutionResult::error("max_entries must be at least 1");
+            }
+            let target = match resolve_filesystem_tool_path(path) {
+                Ok(path) => path,
+                Err(error) => return ToolExecutionResult::error(error),
+            };
+            let target_type = filesystem_entry_type(&target);
+            if target_type != "dir" {
+                let entry = match build_filesystem_entry(&target) {
+                    Ok(entry) => entry,
+                    Err(error) => return ToolExecutionResult::error(error),
+                };
+                return ToolExecutionResult::success(
+                    json!({
+                        "path": filesystem_display_path(&target),
+                        "type": target_type,
+                        "recursive": false,
+                        "max_entries": max_entries,
+                        "max_depth": max_depth,
+                        "truncated": false,
+                        "entries": [entry],
+                    })
+                    .to_string(),
+                );
+            }
+
+            let mut entries = Vec::new();
+            let mut truncated = false;
+            fn walk_directory(
+                directory: &Path,
+                depth: usize,
+                recursive: bool,
+                max_depth: usize,
+                max_entries: usize,
+                entries: &mut Vec<Value>,
+                truncated: &mut bool,
+            ) -> Result<bool, String> {
+                let mut children = directory
+                    .read_dir()
+                    .map_err(|error| format!("Unable to inspect path: {error}"))?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| format!("Unable to inspect path: {error}"))?;
+                children.sort_by(|left, right| {
+                    let left_path = left.path();
+                    let right_path = right.path();
+                    (
+                        filesystem_entry_type(&left_path) != "dir",
+                        left.file_name().to_string_lossy().to_lowercase(),
+                        left.file_name().to_string_lossy().to_string(),
+                    )
+                        .cmp(&(
+                            filesystem_entry_type(&right_path) != "dir",
+                            right.file_name().to_string_lossy().to_lowercase(),
+                            right.file_name().to_string_lossy().to_string(),
+                        ))
+                });
+                for child in children {
+                    let child_path = child.path();
+                    entries.push(build_filesystem_entry(&child_path)?);
+                    if entries.len() >= max_entries {
+                        *truncated = true;
+                        return Ok(false);
+                    }
+                    if recursive
+                        && depth < max_depth
+                        && child_path.is_dir()
+                        && !child_path.is_symlink()
+                        && !walk_directory(
+                            &child_path,
+                            depth + 1,
+                            recursive,
+                            max_depth,
+                            max_entries,
+                            entries,
+                            truncated,
+                        )?
+                    {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
+
+            if let Err(error) = walk_directory(
+                &target,
+                0,
+                recursive,
+                max_depth,
+                max_entries,
+                &mut entries,
+                &mut truncated,
+            ) {
+                return ToolExecutionResult::error(error);
+            }
+
+            ToolExecutionResult::success(
+                json!({
+                    "path": filesystem_display_path(&target),
+                    "type": target_type,
+                    "recursive": recursive,
+                    "max_entries": max_entries,
+                    "max_depth": max_depth,
+                    "truncated": truncated,
+                    "entries": entries,
+                })
+                .to_string(),
+            )
+        },
+    );
+
+    let read_file = ExecutableTool::new(
+        ToolSpec::new(
+            "read_file",
+            "Read a text file, optionally constrained to a line range.",
+            JsonSchema::object(
+                [
+                    ("path", json!({"type": "string"})),
+                    ("start_line", json!({"type": "integer"})),
+                    ("end_line", json!({"type": "integer"})),
+                ],
+                ["path"],
+            ),
+        ),
+        move |arguments| {
+            let Some(path) = arguments.get("path").and_then(Value::as_str) else {
+                return ToolExecutionResult::error("read_file requires a string path");
+            };
+            let start_line = arguments
+                .get("start_line")
+                .and_then(Value::as_i64)
+                .unwrap_or(1);
+            let end_line = arguments.get("end_line").and_then(Value::as_i64);
+            if start_line < 1 {
+                return ToolExecutionResult::error("start_line must be at least 1");
+            }
+            if end_line.is_some_and(|value| value < start_line) {
+                return ToolExecutionResult::error(
+                    "end_line must be greater than or equal to start_line",
+                );
+            }
+            let target = match resolve_filesystem_tool_path(path) {
+                Ok(path) => path,
+                Err(error) => return ToolExecutionResult::error(error),
+            };
+            if target.is_dir() {
+                return ToolExecutionResult::error(format!(
+                    "Path is a directory, not a file: {path}"
+                ));
+            }
+            let content = match std::fs::read_to_string(&target) {
+                Ok(content) => content,
+                Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+                    return ToolExecutionResult::error(format!(
+                        "Unable to decode file as text: {path}"
+                    ));
+                }
+                Err(_) => {
+                    return ToolExecutionResult::error(format!("Unable to read file: {path}"));
+                }
+            };
+            let lines = content.lines().collect::<Vec<_>>();
+            let total_lines = lines.len();
+            let end_line = end_line.unwrap_or(start_line + DEFAULT_READ_LINE_LIMIT as i64 - 1);
+            let start_index = (start_line as usize).saturating_sub(1);
+            let end_index = usize::min(end_line as usize, total_lines);
+            let numbered_lines = if start_index >= total_lines {
+                String::new()
+            } else {
+                lines[start_index..end_index]
+                    .iter()
+                    .enumerate()
+                    .map(|(offset, line)| format!("{}: {}", start_line + offset as i64, line))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            ToolExecutionResult::success(
+                json!({
+                    "path": filesystem_display_path(&target),
+                    "start_line": start_line,
+                    "end_line": end_index,
+                    "total_lines": total_lines,
+                    "truncated": end_index < total_lines,
+                    "content": numbered_lines,
+                })
+                .to_string(),
+            )
+        },
+    );
 
     let config_for_memory_write = config.clone();
     let create_memory = ExecutableTool::new(
@@ -3764,6 +4065,10 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
     );
 
     ExecutableToolRegistry::new(vec![
+        get_current_date,
+        pwd,
+        ls,
+        read_file,
         create_memory,
         get_fast_recall,
         add_agenda_item,
@@ -6133,6 +6438,80 @@ mod tests {
 
         assert!(result.is_error);
         assert!(result.content.contains("unknown tool"));
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
+    fn live_tool_registry_can_use_filesystem_and_time_base_tools() {
+        let unique = format!(
+            "elroy-rs-app-base-tools-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        let notes_dir = home.join("notes");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+        fs::create_dir_all(&notes_dir).expect("notes dir should be created");
+        fs::write(
+            notes_dir.join("todo.txt"),
+            "alpha\nbeta\ngamma\ndelta\nepsilon\n",
+        )
+        .expect("fixture file should be written");
+
+        let mut config = AppConfig::defaults();
+        config.memory_dir = memory_dir;
+        config.agenda_dir = agenda_dir;
+        config.database_path = database_path;
+
+        let previous_dir = std::env::current_dir().expect("cwd should resolve");
+        std::env::set_current_dir(&home).expect("cwd should switch");
+
+        let registry = build_live_tool_registry(&config);
+        let current_date = registry.invoke("get_current_date", "{}");
+        let pwd = registry.invoke("pwd", "{}");
+        let listing = registry.invoke(
+            "ls",
+            "{\"path\":\"notes\",\"recursive\":true,\"max_entries\":10,\"max_depth\":2}",
+        );
+        let file = registry.invoke(
+            "read_file",
+            "{\"path\":\"notes/todo.txt\",\"start_line\":2,\"end_line\":3}",
+        );
+        let bad_range = registry.invoke(
+            "read_file",
+            "{\"path\":\"notes/todo.txt\",\"start_line\":3,\"end_line\":2}",
+        );
+
+        std::env::set_current_dir(previous_dir).expect("cwd should restore");
+
+        assert!(!current_date.is_error);
+        assert!(current_date.content.contains(","));
+        assert!(!pwd.is_error);
+        assert_eq!(
+            PathBuf::from(&pwd.content)
+                .canonicalize()
+                .expect("pwd result should canonicalize"),
+            home.canonicalize().expect("home should canonicalize")
+        );
+        assert!(!listing.is_error);
+        assert!(listing.content.contains("\"path\":\"notes\""));
+        assert!(listing.content.contains("\"path\":\"notes/todo.txt\""));
+        assert!(!file.is_error);
+        assert!(file.content.contains("\"start_line\":2"));
+        assert!(file.content.contains("2: beta\\n3: gamma"));
+        assert!(bad_range.is_error);
+        assert!(
+            bad_range
+                .content
+                .contains("end_line must be greater than or equal to start_line")
+        );
+
         fs::remove_dir_all(home).expect("home should be removed");
     }
 
