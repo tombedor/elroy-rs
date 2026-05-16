@@ -9345,6 +9345,55 @@ mod tests {
     }
 
     #[test]
+    fn list_due_tasks_excludes_future_and_context_only_tasks() {
+        let unique = format!(
+            "elroy-rs-app-due-task-filtering-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+
+        fs::write(
+            agenda_dir.join("past_due.md"),
+            "---\ndate: unscheduled\ncompleted: false\nstatus: created\ntrigger_datetime: 2000-01-01T09:00:00\n---\n\nPast due task\n",
+        )
+        .expect("past due task should be written");
+        fs::write(
+            agenda_dir.join("future_due.md"),
+            "---\ndate: unscheduled\ncompleted: false\nstatus: created\ntrigger_datetime: 2099-01-01T09:00:00\n---\n\nFuture due task\n",
+        )
+        .expect("future due task should be written");
+        fs::write(
+            agenda_dir.join("context_only.md"),
+            "---\ndate: unscheduled\ncompleted: false\nstatus: created\ntrigger_context: after breakfast\n---\n\nContext-only task\n",
+        )
+        .expect("context-only task should be written");
+
+        let mut config = AppConfig::defaults();
+        config.memory_dir = memory_dir;
+        config.agenda_dir = agenda_dir;
+        config.database_path = database_path;
+        elroy_db::bootstrap_database(&BootstrapPlan::from_config(&config))
+            .expect("bootstrap should succeed");
+
+        let registry = build_live_tool_registry(&config);
+        let due = registry.invoke("list_due_tasks", "{}");
+        assert!(!due.is_error);
+        assert!(due.content.contains("past due"));
+        assert!(!due.content.contains("future due"));
+        assert!(!due.content.contains("context-only"));
+
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
     fn live_tool_registry_can_list_and_show_codex_sessions() {
         let unique = format!(
             "elroy-rs-app-codex-sessions-{}",
