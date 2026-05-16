@@ -1736,6 +1736,16 @@ fn format_memory_search_results(
     lines.join("\n")
 }
 
+fn derive_agenda_item_name(text: &str) -> String {
+    text.lines()
+        .next()
+        .unwrap_or(text)
+        .trim()
+        .chars()
+        .take(60)
+        .collect()
+}
+
 fn formulate_memory_from_transcript(transcript: &[ConversationMessage]) -> (String, String) {
     let messages = transcript
         .iter()
@@ -2682,17 +2692,23 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                     ("trigger_datetime", json!({"type": "string"})),
                     ("trigger_context", json!({"type": "string"})),
                 ],
-                ["name", "text"],
+                ["text"],
             ),
         ),
         move |arguments| {
-            let Some(name) = arguments.get("name").and_then(Value::as_str) else {
-                return ToolExecutionResult::error("add_agenda_item requires a string name");
-            };
             let Some(text) = arguments.get("text").and_then(Value::as_str) else {
                 return ToolExecutionResult::error("add_agenda_item requires string text");
             };
+            let derived_name = derive_agenda_item_name(text);
+            let name = arguments
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|name| !name.trim().is_empty())
+                .unwrap_or(&derived_name);
             let date = arguments.get("date").and_then(Value::as_str);
+            let effective_date = date
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| Local::now().date_naive().to_string());
             let trigger_datetime = arguments.get("trigger_datetime").and_then(Value::as_str);
             let trigger_context = arguments.get("trigger_context").and_then(Value::as_str);
 
@@ -2700,7 +2716,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                 &config_for_agenda_write.agenda_dir,
                 name,
                 text,
-                date,
+                Some(&effective_date),
                 trigger_datetime,
                 trigger_context,
             )
@@ -2711,7 +2727,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
             }) {
                 Ok(path) => ToolExecutionResult::success(format!(
                     "Agenda item added for {}: {}",
-                    date.unwrap_or("unscheduled"),
+                    effective_date,
                     path.file_stem()
                         .and_then(|value| value.to_str())
                         .unwrap_or(name)
@@ -6328,7 +6344,7 @@ pub fn provider_config_from_app_config(config: &AppConfig) -> Result<ProviderCon
 
 #[cfg(test)]
 mod tests {
-    use chrono::Utc;
+    use chrono::{Local, Utc};
     use std::{
         cell::RefCell,
         collections::HashSet,
@@ -7462,6 +7478,49 @@ mod tests {
         assert!(!delete.is_error);
         assert_eq!(delete.content, "Agenda item 'call mom' deleted.");
         assert!(!agenda_dir.join("call_mom.md").exists());
+
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
+    fn add_agenda_item_can_derive_name_and_default_date_from_text() {
+        let unique = format!(
+            "elroy-rs-app-agenda-derived-name-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+
+        let mut config = AppConfig::defaults();
+        config.memory_dir = memory_dir;
+        config.agenda_dir = agenda_dir.clone();
+        config.database_path = database_path;
+        elroy_db::bootstrap_database(&elroy_db::BootstrapPlan::from_config(&config))
+            .expect("bootstrap should succeed");
+
+        let registry = build_live_tool_registry(&config);
+        let today = Local::now().date_naive().to_string();
+        let added = registry.invoke(
+            "add_agenda_item",
+            "{\"text\":\"Sprint kickoff planning\\nReview owners and milestones.\"}",
+        );
+        assert!(!added.is_error);
+        assert_eq!(
+            added.content,
+            format!("Agenda item added for {today}: sprint_kickoff_planning")
+        );
+        let stored = fs::read_to_string(agenda_dir.join("sprint_kickoff_planning.md"))
+            .expect("agenda file should read");
+        assert!(stored.contains(&format!("date: {today}")));
+        assert!(stored.contains("Sprint kickoff planning"));
+        assert!(stored.contains("Review owners and milestones."));
 
         fs::remove_dir_all(home).expect("home should be removed");
     }
