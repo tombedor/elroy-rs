@@ -4603,7 +4603,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
         ToolSpec::new(
             "list_tasks",
             "List active agenda-backed tasks.",
-            JsonSchema::object([("limit", json!({"type": "integer"}))], [] as [&str; 0]),
+            JsonSchema::object(std::iter::empty::<(&str, Value)>(), [] as [&str; 0]),
         ),
         move |arguments| {
             let limit = argument_limit(&arguments, 10);
@@ -4622,7 +4622,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
         ToolSpec::new(
             "list_triggered_tasks",
             "List active tasks that have trigger metadata.",
-            JsonSchema::object([("limit", json!({"type": "integer"}))], [] as [&str; 0]),
+            JsonSchema::object(std::iter::empty::<(&str, Value)>(), [] as [&str; 0]),
         ),
         move |arguments| {
             let limit = argument_limit(&arguments, 10);
@@ -4642,7 +4642,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
         ToolSpec::new(
             "list_due_tasks",
             "List active tasks whose trigger time is due.",
-            JsonSchema::object([("limit", json!({"type": "integer"}))], [] as [&str; 0]),
+            JsonSchema::object(std::iter::empty::<(&str, Value)>(), [] as [&str; 0]),
         ),
         move |arguments| {
             let limit = argument_limit(&arguments, 10);
@@ -4663,7 +4663,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
         ToolSpec::new(
             "list_today_tasks",
             "List active tasks scheduled for today.",
-            JsonSchema::object([("limit", json!({"type": "integer"}))], [] as [&str; 0]),
+            JsonSchema::object(std::iter::empty::<(&str, Value)>(), [] as [&str; 0]),
         ),
         move |arguments| {
             let limit = argument_limit(&arguments, 10);
@@ -7617,6 +7617,34 @@ mod tests {
             assert!(
                 !properties.contains_key("limit"),
                 "{tool_name} should not expose limit"
+            );
+        }
+    }
+
+    #[test]
+    fn task_list_tool_schemas_match_python_surface() {
+        let config = AppConfig::defaults();
+        let registry = build_live_tool_registry(&config);
+
+        for tool_name in [
+            "list_tasks",
+            "list_triggered_tasks",
+            "list_due_tasks",
+            "list_today_tasks",
+        ] {
+            let spec = registry
+                .specs()
+                .into_iter()
+                .find(|spec| spec.name == tool_name)
+                .unwrap_or_else(|| panic!("{tool_name} tool should exist"));
+
+            let properties = match &spec.parameters {
+                elroy_tools::JsonSchema::Object { properties, .. } => properties,
+            };
+
+            assert!(
+                properties.is_empty(),
+                "{tool_name} should not expose Rust-only limit parameters"
             );
         }
     }
