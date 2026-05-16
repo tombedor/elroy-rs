@@ -3392,9 +3392,76 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
     );
 
     let database_path = config.database_path.clone();
+    let print_active_due_items = ExecutableTool::new(
+        ToolSpec::new(
+            "print_active_due_items",
+            "List active due items and reminders.",
+            JsonSchema::object([("limit", json!({"type": "integer"}))], [] as [&str; 0]),
+        ),
+        move |arguments| {
+            let limit = argument_limit(&arguments, 10);
+            with_tool_connection(&database_path, |connection| {
+                let items = list_active_due_items(connection, limit)?;
+                let payload = items
+                    .into_iter()
+                    .map(|item| {
+                        json!({
+                            "name": item.name,
+                            "agenda_date": item.agenda_date,
+                            "trigger_datetime": item.trigger_datetime,
+                            "trigger_context": item.trigger_context,
+                            "status": item.status,
+                            "checklist_total": item.checklist_total,
+                            "checklist_completed": item.checklist_completed,
+                            "excerpt": excerpt(&item.body, 180),
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                Ok(ToolExecutionResult::success(
+                    serde_json::to_string_pretty(&payload)
+                        .expect("due item payload should serialize"),
+                ))
+            })
+        },
+    );
+
+    let database_path = config.database_path.clone();
     let list_inactive_due_items_tool = ExecutableTool::new(
         ToolSpec::new(
             "list_inactive_due_items",
+            "List inactive due items and reminders.",
+            JsonSchema::object([("limit", json!({"type": "integer"}))], [] as [&str; 0]),
+        ),
+        move |arguments| {
+            let limit = argument_limit(&arguments, 10);
+            with_tool_connection(&database_path, |connection| {
+                let items = list_inactive_due_items(connection, limit)?;
+                let payload = items
+                    .into_iter()
+                    .map(|item| {
+                        json!({
+                            "name": item.name,
+                            "agenda_date": item.agenda_date,
+                            "trigger_datetime": item.trigger_datetime,
+                            "trigger_context": item.trigger_context,
+                            "status": item.status,
+                            "closing_comment": item.closing_comment,
+                            "excerpt": excerpt(&item.body, 180),
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                Ok(ToolExecutionResult::success(
+                    serde_json::to_string_pretty(&payload)
+                        .expect("inactive due item payload should serialize"),
+                ))
+            })
+        },
+    );
+
+    let database_path = config.database_path.clone();
+    let print_inactive_due_items = ExecutableTool::new(
+        ToolSpec::new(
+            "print_inactive_due_items",
             "List inactive due items and reminders.",
             JsonSchema::object([("limit", json!({"type": "integer"}))], [] as [&str; 0]),
         ),
@@ -3456,6 +3523,43 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
         move |arguments| {
             let Some(name) = arguments.get("name").and_then(Value::as_str) else {
                 return ToolExecutionResult::error("show_due_item requires a string name");
+            };
+            with_tool_connection(&database_path, |connection| {
+                let Some(item) = find_active_agenda_item_by_name(connection, name)? else {
+                    return Ok(ToolExecutionResult::error(format!(
+                        "due item not found: {name}"
+                    )));
+                };
+                if item.trigger_datetime.is_none() && item.trigger_context.is_none() {
+                    return Ok(ToolExecutionResult::error(format!(
+                        "due item not found: {name}"
+                    )));
+                }
+                Ok(ToolExecutionResult::success(
+                    json!({
+                        "name": item.name,
+                        "trigger_datetime": item.trigger_datetime,
+                        "trigger_context": item.trigger_context,
+                        "status": item.status,
+                        "closing_comment": item.closing_comment,
+                        "body": item.body,
+                    })
+                    .to_string(),
+                ))
+            })
+        },
+    );
+
+    let database_path = config.database_path.clone();
+    let print_due_item = ExecutableTool::new(
+        ToolSpec::new(
+            "print_due_item",
+            "Show one active due item by exact name.",
+            JsonSchema::object([("name", json!({"type": "string"}))], ["name"]),
+        ),
+        move |arguments| {
+            let Some(name) = arguments.get("name").and_then(Value::as_str) else {
+                return ToolExecutionResult::error("print_due_item requires a string name");
             };
             with_tool_connection(&database_path, |connection| {
                 let Some(item) = find_active_agenda_item_by_name(connection, name)? else {
@@ -3600,9 +3704,12 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
         examine_memories,
         list_agenda,
         list_due_items,
+        print_active_due_items,
         list_inactive_due_items_tool,
+        print_inactive_due_items,
         show_task,
         show_due_item,
+        print_due_item,
         show_memory,
         show_agenda_item,
     ])
@@ -5396,10 +5503,23 @@ mod tests {
         assert!(shown.content.contains("Pay bill"));
         assert!(shown.content.contains("2026-05-15T09:00:00"));
 
+        let printed = registry.invoke("print_due_item", "{\"name\":\"pay bill\"}");
+        assert!(!printed.is_error);
+        assert!(printed.content.contains("Pay bill"));
+        assert!(printed.content.contains("2026-05-15T09:00:00"));
+
         let inactive = registry.invoke("list_inactive_due_items", "{\"limit\":10}");
         assert!(!inactive.is_error);
         assert!(inactive.content.contains("call mom"));
         assert!(inactive.content.contains("done"));
+
+        let printed_active = registry.invoke("print_active_due_items", "{\"limit\":10}");
+        assert!(!printed_active.is_error);
+        assert!(printed_active.content.contains("pay bill"));
+
+        let printed_inactive = registry.invoke("print_inactive_due_items", "{\"limit\":10}");
+        assert!(!printed_inactive.is_error);
+        assert!(printed_inactive.content.contains("call mom"));
     }
 
     #[test]
