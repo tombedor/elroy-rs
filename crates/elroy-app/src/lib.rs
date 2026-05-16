@@ -7056,6 +7056,11 @@ fn search_active_memories_in_scope(
 fn context_memory_tool_messages(memory: &elroy_db::MemoryRecord) -> Vec<ConversationMessage> {
     let content = serde_json::to_string_pretty(&json!({
         "content": format!("MEMORY: '{}' - {}", memory.name, memory.body),
+        "recall_metadata": [{
+            "memory_type": "Memory",
+            "memory_id": memory.id,
+            "name": memory.name,
+        }],
         "memories": [{
             "type": "memory",
             "name": memory.name,
@@ -7076,6 +7081,11 @@ fn context_memory_tool_messages(memory: &elroy_db::MemoryRecord) -> Vec<Conversa
 fn context_due_item_tool_messages(item: &AgendaItemRecord) -> Vec<ConversationMessage> {
     let content = serde_json::to_string_pretty(&json!({
         "content": format!("DUE ITEM: '{}' - {}", item.name, item.body),
+        "recall_metadata": [{
+            "memory_type": "AgendaItem",
+            "memory_id": item.id,
+            "name": item.name,
+        }],
         "due_items": [{
             "type": "due_item",
             "name": item.name,
@@ -7098,6 +7108,11 @@ fn context_due_item_tool_messages(item: &AgendaItemRecord) -> Vec<ConversationMe
 fn context_task_tool_messages(item: &AgendaItemRecord) -> Vec<ConversationMessage> {
     let content = serde_json::to_string_pretty(&json!({
         "content": format!("TASK: '{}' - {}", item.name, item.body),
+        "recall_metadata": [{
+            "memory_type": "AgendaItem",
+            "memory_id": item.id,
+            "name": item.name,
+        }],
         "tasks": [{
             "type": "task",
             "name": item.name,
@@ -8099,11 +8114,7 @@ fn recalled_item_names_by_type(
     transcript
         .iter()
         .filter(|message| message.role == MessageRole::Tool)
-        .filter_map(|message| {
-            (message.tool_call_id.as_deref() == Some("bootstrap-memory-recall"))
-                .then_some(message.content.as_deref())
-                .flatten()
-        })
+        .filter_map(|message| message.content.as_deref())
         .flat_map(|content| parse_recalled_item_names(content, memory_type))
         .collect()
 }
@@ -8505,7 +8516,8 @@ mod tests {
         argument_limit, build_live_tool_registry, build_live_tool_registry_with_codex_bin_and_hook,
         build_recall_query, classify_memory_recall_with_model, codex_background_status_key,
         compress_context_messages, consolidate_exact_duplicate_memories,
-        context_due_item_tool_call_id, context_due_item_tool_messages, count_context_tokens,
+        context_due_item_tool_call_id, context_due_item_tool_messages,
+        context_memory_tool_messages, context_task_tool_messages, count_context_tokens,
         determine_memory_recall_decision, drop_old_context_messages, due_item_context_messages,
         format_context_messages_for_summary, format_context_summary_message,
         is_context_refresh_needed, memory_recall_status_updates, message_matches_tool_call_id,
@@ -17085,6 +17097,181 @@ mod tests {
         assert!(names.contains("payroll followup"));
         assert!(names.contains("drill plan"));
         assert!(!names.contains("basketball form"));
+    }
+
+    #[test]
+    fn current_context_fast_recall_messages_expose_recall_metadata() {
+        let memory_messages = context_memory_tool_messages(&MemoryRecord {
+            id: 1,
+            legacy_frontmatter_id: None,
+            name: "basketball form".to_string(),
+            file_path: "/tmp/basketball.md".to_string(),
+            body: "Remember to follow through on your shot".to_string(),
+            is_active: true,
+            updated_at_unix: 10,
+        });
+        let due_item_messages = context_due_item_tool_messages(&AgendaItemRecord {
+            id: 2,
+            legacy_frontmatter_id: None,
+            name: "practice reminder".to_string(),
+            file_path: "/tmp/practice_reminder.md".to_string(),
+            agenda_date: Some("unscheduled".to_string()),
+            is_completed: false,
+            status: Some("created".to_string()),
+            closing_comment: None,
+            checklist_total: 0,
+            checklist_completed: 0,
+            body: "Bring the resistance bands".to_string(),
+            trigger_datetime: Some("2026-05-20T09:00:00".to_string()),
+            trigger_context: Some("before basketball practice".to_string()),
+            is_active: true,
+            updated_at_unix: 11,
+        });
+        let task_messages = context_task_tool_messages(&AgendaItemRecord {
+            id: 3,
+            legacy_frontmatter_id: None,
+            name: "drill plan".to_string(),
+            file_path: "/tmp/drill_plan.md".to_string(),
+            agenda_date: Some("2026-05-20".to_string()),
+            is_completed: false,
+            status: Some("created".to_string()),
+            closing_comment: None,
+            checklist_total: 0,
+            checklist_completed: 0,
+            body: "Focus on basketball practice footwork and follow-through".to_string(),
+            trigger_datetime: None,
+            trigger_context: None,
+            is_active: true,
+            updated_at_unix: 12,
+        });
+
+        let memory_payload = memory_messages[1]
+            .content
+            .as_deref()
+            .expect("memory payload should exist");
+        let due_item_payload = due_item_messages[1]
+            .content
+            .as_deref()
+            .expect("due-item payload should exist");
+        let task_payload = task_messages[1]
+            .content
+            .as_deref()
+            .expect("task payload should exist");
+
+        assert!(memory_payload.contains("\"recall_metadata\""));
+        assert!(memory_payload.contains("\"memory_type\": \"Memory\""));
+        assert!(due_item_payload.contains("\"recall_metadata\""));
+        assert!(due_item_payload.contains("\"memory_type\": \"AgendaItem\""));
+        assert!(task_payload.contains("\"recall_metadata\""));
+        assert!(task_payload.contains("\"memory_type\": \"AgendaItem\""));
+    }
+
+    #[test]
+    fn fast_recall_skips_items_already_pinned_in_current_context() {
+        let config = AppConfig::defaults();
+        let transcript = [
+            context_memory_tool_messages(&MemoryRecord {
+                id: 1,
+                legacy_frontmatter_id: None,
+                name: "basketball form".to_string(),
+                file_path: "/tmp/basketball.md".to_string(),
+                body: "Remember to follow through on your shot".to_string(),
+                is_active: true,
+                updated_at_unix: 10,
+            }),
+            context_due_item_tool_messages(&AgendaItemRecord {
+                id: 2,
+                legacy_frontmatter_id: None,
+                name: "practice reminder".to_string(),
+                file_path: "/tmp/practice_reminder.md".to_string(),
+                agenda_date: Some("unscheduled".to_string()),
+                is_completed: false,
+                status: Some("created".to_string()),
+                closing_comment: None,
+                checklist_total: 0,
+                checklist_completed: 0,
+                body: "Bring the resistance bands".to_string(),
+                trigger_datetime: Some("2026-05-20T09:00:00".to_string()),
+                trigger_context: Some("before basketball practice".to_string()),
+                is_active: true,
+                updated_at_unix: 11,
+            }),
+            context_task_tool_messages(&AgendaItemRecord {
+                id: 3,
+                legacy_frontmatter_id: None,
+                name: "drill plan".to_string(),
+                file_path: "/tmp/drill_plan.md".to_string(),
+                agenda_date: Some("2026-05-20".to_string()),
+                is_completed: false,
+                status: Some("created".to_string()),
+                closing_comment: None,
+                checklist_total: 0,
+                checklist_completed: 0,
+                body: "Focus on basketball practice footwork and follow-through".to_string(),
+                trigger_datetime: None,
+                trigger_context: None,
+                is_active: true,
+                updated_at_unix: 12,
+            }),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+
+        let messages = recall_memory_context_messages(
+            config.memory_recall_classifier_enabled,
+            config.memory_recall_classifier_window,
+            config.reflect,
+            "I am heading to basketball practice",
+            RecallContext {
+                transcript: &transcript,
+                memories: &[MemoryRecord {
+                    id: 1,
+                    legacy_frontmatter_id: None,
+                    name: "basketball form".to_string(),
+                    file_path: "/tmp/basketball.md".to_string(),
+                    body: "Remember to follow through on your shot".to_string(),
+                    is_active: true,
+                    updated_at_unix: 10,
+                }],
+                due_items: &[AgendaItemRecord {
+                    id: 2,
+                    legacy_frontmatter_id: None,
+                    name: "practice reminder".to_string(),
+                    file_path: "/tmp/practice_reminder.md".to_string(),
+                    agenda_date: Some("unscheduled".to_string()),
+                    is_completed: false,
+                    status: Some("created".to_string()),
+                    closing_comment: None,
+                    checklist_total: 0,
+                    checklist_completed: 0,
+                    body: "Bring the resistance bands".to_string(),
+                    trigger_datetime: Some("2026-05-20T09:00:00".to_string()),
+                    trigger_context: Some("before basketball practice".to_string()),
+                    is_active: true,
+                    updated_at_unix: 11,
+                }],
+                agenda_items: &[AgendaItemRecord {
+                    id: 3,
+                    legacy_frontmatter_id: None,
+                    name: "drill plan".to_string(),
+                    file_path: "/tmp/drill_plan.md".to_string(),
+                    agenda_date: Some("2026-05-20".to_string()),
+                    is_completed: false,
+                    status: Some("created".to_string()),
+                    closing_comment: None,
+                    checklist_total: 0,
+                    checklist_completed: 0,
+                    body: "Focus on basketball practice footwork and follow-through".to_string(),
+                    trigger_datetime: None,
+                    trigger_context: None,
+                    is_active: true,
+                    updated_at_unix: 12,
+                }],
+            },
+        );
+
+        assert!(messages.is_empty());
     }
 
     #[test]
