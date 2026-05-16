@@ -2555,10 +2555,6 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                 [
                     ("name", json!({"type": "string"})),
                     ("text", json!({"type": "string"})),
-                    ("item_date", json!({"type": "string"})),
-                    ("date", json!({"type": "string"})),
-                    ("trigger_datetime", json!({"type": "string"})),
-                    ("trigger_context", json!({"type": "string"})),
                 ],
                 ["name", "text"],
             ),
@@ -7453,6 +7449,29 @@ mod tests {
         );
 
         fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
+    fn create_memory_tool_schema_only_exposes_name_and_text() {
+        let config = AppConfig::defaults();
+        let registry = build_live_tool_registry(&config);
+        let spec = registry
+            .specs()
+            .into_iter()
+            .find(|spec| spec.name == "create_memory")
+            .expect("create_memory tool should exist");
+
+        let properties = match &spec.parameters {
+            elroy_tools::JsonSchema::Object { properties, .. } => properties,
+        };
+
+        assert_eq!(properties.len(), 2);
+        assert!(properties.contains_key("name"));
+        assert!(properties.contains_key("text"));
+        assert!(!properties.contains_key("item_date"));
+        assert!(!properties.contains_key("date"));
+        assert!(!properties.contains_key("trigger_datetime"));
+        assert!(!properties.contains_key("trigger_context"));
     }
 
     #[test]
