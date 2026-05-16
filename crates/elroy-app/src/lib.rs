@@ -20,11 +20,11 @@ use elroy_core::{
 };
 use elroy_db::{
     AgendaItemRecord, BootstrapPlan, MemoryRecord, UserPreferenceRecord,
-    find_active_agenda_item_by_name, find_active_memory_by_name,
-    get_or_create_memory_operation_tracker, list_active_due_items, list_active_memories,
-    list_active_plain_agenda_items, list_inactive_due_items, load_context_messages,
-    load_messages_by_ids, load_user_preferences, open_sqlite_connection, replace_context_messages,
-    run_migrations, save_memory_operation_tracker, save_user_preferences, search_active_memories,
+    find_active_agenda_item_by_name, get_or_create_memory_operation_tracker, list_active_due_items,
+    list_active_memories, list_active_plain_agenda_items, list_inactive_due_items,
+    load_context_messages, load_messages_by_ids, load_user_preferences, open_sqlite_connection,
+    replace_context_messages, run_migrations, save_memory_operation_tracker, save_user_preferences,
+    search_active_memories,
 };
 use elroy_feature_requests::{
     FeatureRequestRecord, find_best_feature_request_match, get_feature_request,
@@ -429,7 +429,12 @@ impl AppRuntime {
         let connection = self.open_read_connection()?;
         match section {
             SidebarSection::Memories => {
-                let Some(memory) = find_active_memory_by_name(&connection, title)? else {
+                let Some(memory) = find_active_memory_by_name_in_scope(
+                    &connection,
+                    title,
+                    &self.config.memory_dir,
+                )?
+                else {
                     return Err(AppError::Runtime(format!("memory not found: {title}")));
                 };
                 let memory_name = memory.name.clone();
@@ -3545,7 +3550,11 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                         ));
                     }
                 };
-            let memory = match find_active_memory_by_name(&connection, memory_name) {
+            let memory = match find_active_memory_by_name_in_scope(
+                &connection,
+                memory_name,
+                &config_for_outdated_memory_update.memory_dir,
+            ) {
                 Ok(Some(memory)) => memory,
                 Ok(None) => {
                     return ToolExecutionResult::success(format!(
@@ -4041,7 +4050,11 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
             if let Err(error) = run_migrations(&mut connection) {
                 return ToolExecutionResult::error(format!("failed to run migrations: {error}"));
             }
-            let Some(memory) = (match find_active_memory_by_name(&connection, memory_name) {
+            let Some(memory) = (match find_active_memory_by_name_in_scope(
+                &connection,
+                memory_name,
+                &config_for_drop_memory_from_context.memory_dir,
+            ) {
                 Ok(memory) => memory,
                 Err(error) => {
                     return ToolExecutionResult::error(format!("failed to load memory: {error}"));
@@ -5136,6 +5149,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
     );
 
     let database_path = config.database_path.clone();
+    let memory_dir_for_show_memory = config.memory_dir.clone();
     let show_memory = ExecutableTool::new(
         ToolSpec::new(
             "show_memory",
@@ -5157,7 +5171,12 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                 return ToolExecutionResult::error("show_memory requires a string name");
             };
             with_tool_connection(&database_path, |connection| {
-                let Some(memory) = find_active_memory_by_name(connection, name)? else {
+                let Some(memory) = find_active_memory_by_name_in_scope(
+                    connection,
+                    name,
+                    &memory_dir_for_show_memory,
+                )?
+                else {
                     return Ok(ToolExecutionResult::error(format!(
                         "memory not found: {name}"
                     )));
@@ -5176,6 +5195,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
     );
 
     let database_path = config.database_path.clone();
+    let memory_dir_for_print_memory = config.memory_dir.clone();
     let print_memory = ExecutableTool::new(
         ToolSpec::new(
             "print_memory",
@@ -5194,7 +5214,12 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                 return ToolExecutionResult::error("print_memory requires a string name");
             };
             with_tool_connection(&database_path, |connection| {
-                let Some(memory) = find_active_memory_by_name(connection, name)? else {
+                let Some(memory) = find_active_memory_by_name_in_scope(
+                    connection,
+                    name,
+                    &memory_dir_for_print_memory,
+                )?
+                else {
                     return Ok(ToolExecutionResult::success(format!(
                         "Memory '{name}' not found for the current user."
                     )));
@@ -5205,6 +5230,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
     );
 
     let database_path = config.database_path.clone();
+    let memory_dir_for_source_list = config.memory_dir.clone();
     let get_source_list_for_memory = ExecutableTool::new(
         ToolSpec::new(
             "get_source_list_for_memory",
@@ -5221,7 +5247,12 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                 );
             };
             with_tool_connection(&database_path, |connection| {
-                let Some(memory) = find_active_memory_by_name(connection, memory_name)? else {
+                let Some(memory) = find_active_memory_by_name_in_scope(
+                    connection,
+                    memory_name,
+                    &memory_dir_for_source_list,
+                )?
+                else {
                     return Ok(ToolExecutionResult::error(format!(
                         "Memory '{memory_name}' not found for the current user."
                     )));
@@ -5245,6 +5276,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
     );
 
     let database_path = config.database_path.clone();
+    let memory_dir_for_source_content = config.memory_dir.clone();
     let get_source_content_for_memory = ExecutableTool::new(
         ToolSpec::new(
             "get_source_content_for_memory",
@@ -5270,7 +5302,12 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                 ));
             }
             with_tool_connection(&database_path, |connection| {
-                let Some(memory) = find_active_memory_by_name(connection, memory_name)? else {
+                let Some(memory) = find_active_memory_by_name_in_scope(
+                    connection,
+                    memory_name,
+                    &memory_dir_for_source_content,
+                )?
+                else {
                     return Ok(ToolExecutionResult::error(format!(
                         "Memory '{memory_name}' not found for the current user."
                     )));
@@ -5518,7 +5555,7 @@ fn mutate_memory_file_from_config(
     if let Err(error) = run_migrations(&mut connection) {
         return ToolExecutionResult::error(format!("failed to run migrations: {error}"));
     }
-    let memory = match find_active_memory_by_name(&connection, name) {
+    let memory = match find_active_memory_by_name_in_scope(&connection, name, &config.memory_dir) {
         Ok(Some(memory)) => memory,
         Ok(None) => return ToolExecutionResult::error(format!("memory not found: {name}")),
         Err(error) => return ToolExecutionResult::error(format!("database query failed: {error}")),
@@ -5626,7 +5663,7 @@ fn archive_memory_file_from_config(
             return ToolExecutionResult::error(format!("failed to open database: {error}"));
         }
     };
-    let memory = match find_active_memory_by_name(&connection, name) {
+    let memory = match find_active_memory_by_name_in_scope(&connection, name, &config.memory_dir) {
         Ok(Some(memory)) => memory,
         Ok(None) => return ToolExecutionResult::error(format!("memory not found: {name}")),
         Err(error) => return ToolExecutionResult::error(format!("database query failed: {error}")),
@@ -5675,9 +5712,13 @@ fn create_consolidated_memory_from_plan(
 
     let mut source_memories = Vec::new();
     for source_name in source_names {
-        let memory = find_active_memory_by_name(&connection, source_name)
-            .map_err(|error| std::io::Error::other(error.to_string()))?
-            .ok_or_else(|| std::io::Error::other(format!("memory not found: {source_name}")))?;
+        let memory = find_active_memory_by_name_in_scope(
+            &connection,
+            source_name,
+            &bootstrap_plan.memory_dir,
+        )
+        .map_err(|error| std::io::Error::other(error.to_string()))?
+        .ok_or_else(|| std::io::Error::other(format!("memory not found: {source_name}")))?;
         source_memories.push(memory);
     }
 
@@ -6698,6 +6739,80 @@ mod tests {
     use elroy_llm::{ConversationMessage, MessageRole, Provider, StreamEvent};
     use elroy_memory::{create_memory_file, sanitize_filename};
     use elroy_tools::ExecutableToolRegistry;
+
+    fn seed_competing_memory_record(
+        connection: &rusqlite::Connection,
+        memory_path: &Path,
+        stored_name: &str,
+        body: &str,
+        updated_at_unix: i64,
+    ) {
+        connection
+            .execute(
+                "INSERT INTO bootstrap_documents (
+                    kind,
+                    path,
+                    stem,
+                    frontmatter_id,
+                    agenda_date,
+                    is_completed,
+                    status,
+                    body,
+                    updated_at_unix,
+                    trigger_datetime,
+                    trigger_context,
+                    closing_comment,
+                    checklist_total,
+                    checklist_completed
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                rusqlite::params![
+                    "memory",
+                    memory_path.display().to_string(),
+                    memory_path.file_stem().and_then(|value| value.to_str()),
+                    Option::<i64>::None,
+                    Option::<String>::None,
+                    0_i64,
+                    Option::<String>::None,
+                    body,
+                    updated_at_unix,
+                    Option::<String>::None,
+                    Option::<String>::None,
+                    Option::<String>::None,
+                    0_i64,
+                    0_i64,
+                ],
+            )
+            .expect("competing bootstrap document should insert");
+        let bootstrap_document_id: i64 = connection
+            .query_row(
+                "SELECT id FROM bootstrap_documents WHERE path = ?1",
+                [memory_path.display().to_string()],
+                |row| row.get(0),
+            )
+            .expect("competing bootstrap document should load");
+        connection
+            .execute(
+                "INSERT INTO memories (
+                    bootstrap_document_id,
+                    legacy_frontmatter_id,
+                    name,
+                    file_path,
+                    body,
+                    is_active,
+                    updated_at_unix
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![
+                    bootstrap_document_id,
+                    Option::<i64>::None,
+                    stored_name,
+                    memory_path.display().to_string(),
+                    body,
+                    1_i64,
+                    updated_at_unix,
+                ],
+            )
+            .expect("competing memory row should insert");
+    }
 
     struct FakeModel {
         responses: RefCell<Vec<Vec<StreamEvent>>>,
@@ -8215,6 +8330,200 @@ mod tests {
         assert!(!context.is_error);
         assert!(context.content.contains("Current user memory"));
         assert!(!context.content.contains("Other user memory"));
+
+        fs::remove_dir_all(root).expect("root should be removed");
+    }
+
+    #[test]
+    fn exact_name_memory_tools_scope_to_current_memory_dir() {
+        let unique = format!(
+            "elroy-rs-app-memory-tool-scope-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let root = std::env::temp_dir().join(unique);
+        let current_home = root.join("current-user");
+        let current_memory_dir = current_home.join("memories");
+        let other_memory_dir = root.join("other-user").join("memories");
+        let current_agenda_dir = current_home.join("agenda");
+        let database_path = root.join("shared.db");
+        fs::create_dir_all(&current_memory_dir).expect("current memory dir should be created");
+        fs::create_dir_all(&other_memory_dir).expect("other memory dir should be created");
+        fs::create_dir_all(&current_agenda_dir).expect("current agenda dir should be created");
+        fs::write(
+            current_memory_dir.join("shared_memory_name.md"),
+            "Current user memory\n",
+        )
+        .expect("current memory should be written");
+        fs::write(
+            other_memory_dir.join("shared_memory_name.md"),
+            "Other user memory\n",
+        )
+        .expect("other memory should be written");
+        fs::write(
+            other_memory_dir.join("other_only_memory.md"),
+            "Other user only memory\n",
+        )
+        .expect("other unique memory should be written");
+
+        let mut current_config = AppConfig::defaults();
+        current_config.home_dir = current_home;
+        current_config.memory_dir = current_memory_dir.clone();
+        current_config.agenda_dir = current_agenda_dir;
+        current_config.database_path = database_path.clone();
+        elroy_db::bootstrap_database(&BootstrapPlan::from_config(&current_config))
+            .expect("current bootstrap should succeed");
+
+        let mut connection =
+            open_sqlite_connection(&current_config.database_path).expect("database should open");
+        run_migrations(&mut connection).expect("migrations should run");
+        seed_competing_memory_record(
+            &connection,
+            &other_memory_dir.join("shared_memory_name.md"),
+            "Shared Memory Name",
+            "Other user memory",
+            9_999,
+        );
+        seed_competing_memory_record(
+            &connection,
+            &other_memory_dir.join("other_only_memory.md"),
+            "Other Only Memory",
+            "Other user only memory",
+            10_000,
+        );
+
+        let registry = build_live_tool_registry(&current_config);
+        let shown = registry.invoke("show_memory", "{\"memory_name\":\"Shared Memory Name\"}");
+        let printed = registry.invoke("print_memory", "{\"memory_name\":\"Shared Memory Name\"}");
+        let source_list = registry.invoke(
+            "get_source_list_for_memory",
+            "{\"memory_name\":\"Shared Memory Name\"}",
+        );
+        let source_content = registry.invoke(
+            "get_source_content_for_memory",
+            "{\"memory_name\":\"Shared Memory Name\"}",
+        );
+        let missing_other =
+            registry.invoke("show_memory", "{\"memory_name\":\"Other Only Memory\"}");
+
+        assert!(!shown.is_error);
+        assert!(shown.content.contains("Current user memory"));
+        assert!(!shown.content.contains("Other user memory"));
+        assert!(!printed.is_error);
+        assert!(printed.content.contains("Current user memory"));
+        assert!(!printed.content.contains("Other user memory"));
+        assert!(!source_list.is_error);
+        assert_eq!(source_list.content, "[]");
+        assert!(!source_content.is_error);
+        assert_eq!(
+            source_content.content,
+            "No sources found for memory 'shared memory name'"
+        );
+        assert!(missing_other.is_error);
+        assert_eq!(missing_other.content, "memory not found: Other Only Memory");
+
+        fs::remove_dir_all(root).expect("root should be removed");
+    }
+
+    #[test]
+    fn memory_mutation_tools_scope_to_current_memory_dir() {
+        let unique = format!(
+            "elroy-rs-app-memory-mutation-scope-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let root = std::env::temp_dir().join(unique);
+        let current_home = root.join("current-user");
+        let current_memory_dir = current_home.join("memories");
+        let other_memory_dir = root.join("other-user").join("memories");
+        let current_agenda_dir = current_home.join("agenda");
+        let database_path = root.join("shared.db");
+        fs::create_dir_all(&current_memory_dir).expect("current memory dir should be created");
+        fs::create_dir_all(&other_memory_dir).expect("other memory dir should be created");
+        fs::create_dir_all(&current_agenda_dir).expect("current agenda dir should be created");
+        fs::write(
+            current_memory_dir.join("runner_notes.md"),
+            "Current user memory\n",
+        )
+        .expect("current memory should be written");
+        fs::write(
+            other_memory_dir.join("runner_notes.md"),
+            "Other user memory\n",
+        )
+        .expect("other memory should be written");
+
+        let mut current_config = AppConfig::defaults();
+        current_config.home_dir = current_home;
+        current_config.memory_dir = current_memory_dir.clone();
+        current_config.agenda_dir = current_agenda_dir;
+        current_config.database_path = database_path.clone();
+        elroy_db::bootstrap_database(&BootstrapPlan::from_config(&current_config))
+            .expect("current bootstrap should succeed");
+
+        let mut connection =
+            open_sqlite_connection(&current_config.database_path).expect("database should open");
+        run_migrations(&mut connection).expect("migrations should run");
+        seed_competing_memory_record(
+            &connection,
+            &other_memory_dir.join("runner_notes.md"),
+            "Runner Notes",
+            "Other user memory",
+            9_999,
+        );
+
+        let registry = build_live_tool_registry(&current_config);
+        let updated = registry.invoke(
+            "update_memory",
+            "{\"memory_name\":\"Runner Notes\",\"text\":\"Updated current user memory\"}",
+        );
+        assert!(!updated.is_error);
+        assert!(
+            fs::read_to_string(current_memory_dir.join("runner_notes.md"))
+                .expect("current memory should be readable")
+                .contains("Updated current user memory")
+        );
+        assert!(
+            fs::read_to_string(other_memory_dir.join("runner_notes.md"))
+                .expect("other memory should be readable")
+                .contains("Other user memory")
+        );
+
+        let outdated = registry.invoke(
+            "update_outdated_or_incorrect_memory",
+            "{\"memory_name\":\"Runner Notes\",\"update_text\":\"Current correction\"}",
+        );
+        assert!(!outdated.is_error);
+        assert!(
+            fs::read_to_string(current_memory_dir.join("runner_notes.md"))
+                .expect("current memory should be readable after outdated update")
+                .contains("Current correction")
+        );
+        assert!(
+            fs::read_to_string(other_memory_dir.join("runner_notes.md"))
+                .expect("other memory should still be readable")
+                .contains("Other user memory")
+        );
+        assert!(
+            current_memory_dir
+                .join("archive")
+                .join("runner_notes.md")
+                .exists()
+        );
+        assert!(other_memory_dir.join("runner_notes.md").exists());
+
+        let archived = registry.invoke("archive_memory", "{\"memory_name\":\"Runner Notes\"}");
+        assert!(!archived.is_error);
+        assert!(
+            current_memory_dir
+                .join("archive")
+                .join("runner_notes.md")
+                .exists()
+        );
+        assert!(other_memory_dir.join("runner_notes.md").exists());
 
         fs::remove_dir_all(root).expect("root should be removed");
     }
