@@ -5296,10 +5296,9 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                 return ToolExecutionResult::error("show_agenda_item requires a string name");
             };
             with_tool_connection(&database_path, |connection| {
-                let Some(item) = find_active_agenda_item_by_name(connection, name)? else {
-                    return Ok(ToolExecutionResult::error(format!(
-                        "agenda item not found: {name}"
-                    )));
+                let item = match find_matching_active_agenda_item(connection, name) {
+                    Ok(item) => item,
+                    Err(error) => return Ok(ToolExecutionResult::error(error)),
                 };
                 Ok(ToolExecutionResult::success(
                     json!({
@@ -5679,10 +5678,9 @@ fn mutate_agenda_file_from_config_with_result(
     if let Err(error) = run_migrations(&mut connection) {
         return ToolExecutionResult::error(format!("failed to run migrations: {error}"));
     }
-    let item = match find_active_agenda_item_by_name(&connection, name) {
-        Ok(Some(item)) => item,
-        Ok(None) => return ToolExecutionResult::error(format!("agenda item not found: {name}")),
-        Err(error) => return ToolExecutionResult::error(format!("database query failed: {error}")),
+    let item = match find_matching_active_agenda_item(&connection, name) {
+        Ok(item) => item,
+        Err(error) => return ToolExecutionResult::error(error),
     };
     match operation(Path::new(&item.file_path)).and_then(|payload| {
         elroy_db::bootstrap_database(&BootstrapPlan::from_config(config))
@@ -5694,6 +5692,59 @@ fn mutate_agenda_file_from_config_with_result(
             ToolExecutionResult::error(error.to_string())
         }
         Err(error) => ToolExecutionResult::error(format!("agenda mutation failed: {error}")),
+    }
+}
+
+fn find_matching_active_agenda_item(
+    connection: &rusqlite::Connection,
+    item_name: &str,
+) -> Result<AgendaItemRecord, String> {
+    let items = list_active_tasks(connection, 1_000)
+        .map_err(|error| format!("database query failed: {error}"))?;
+    let query = item_name.to_ascii_lowercase();
+    let matches = items
+        .into_iter()
+        .filter(|item| {
+            let item_name = item.name.to_ascii_lowercase();
+            let stem = Path::new(&item.file_path)
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            item_name.contains(&query) || stem.contains(&query)
+        })
+        .collect::<Vec<_>>();
+    let mut matches = matches;
+    matches.sort_by(|left, right| {
+        Path::new(&left.file_path)
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default()
+            .cmp(
+                Path::new(&right.file_path)
+                    .file_stem()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or_default(),
+            )
+    });
+    match matches.len() {
+        0 => Err(format!("No agenda item found matching '{item_name}'.")),
+        1 => Ok(matches.into_iter().next().expect("checked len")),
+        _ => Err(format!(
+            "Multiple agenda items match '{}': {}. Be more specific.",
+            item_name,
+            matches
+                .iter()
+                .map(|item| {
+                    Path::new(&item.file_path)
+                        .file_stem()
+                        .and_then(|value| value.to_str())
+                        .unwrap_or_default()
+                        .to_string()
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
     }
 }
 
@@ -6927,6 +6978,8 @@ mod tests {
         let missing_printed_memory =
             registry.invoke("print_memory", "{\"memory_name\":\"missing\"}");
         let agenda = registry.invoke("show_agenda_item", "{\"name\":\"doctor visit\"}");
+        let substring_agenda = registry.invoke("show_agenda_item", "{\"name\":\"visit\"}");
+        let missing_agenda = registry.invoke("show_agenda_item", "{\"name\":\"dentist\"}");
         let printed_memories = registry.invoke("print_memories", "{\"n\":10}");
 
         assert!(!memory.is_error);
@@ -6941,6 +6994,13 @@ mod tests {
         );
         assert!(!agenda.is_error);
         assert!(agenda.content.contains("bring forms"));
+        assert!(!substring_agenda.is_error);
+        assert!(substring_agenda.content.contains("bring forms"));
+        assert!(missing_agenda.is_error);
+        assert_eq!(
+            missing_agenda.content,
+            "No agenda item found matching 'dentist'."
+        );
         assert!(!printed_memories.is_error);
         assert!(printed_memories.content.contains("Memories"));
         assert!(printed_memories.content.contains("runner notes"));
@@ -7634,8 +7694,19 @@ mod tests {
             "---\ndate: 2026-05-16\ncompleted: false\nstatus: created\n---\n\ncall mom\n",
         )
         .expect("second agenda file should be written");
+        fs::write(
+            agenda_dir.join("call_dad.md"),
+            "---\ndate: 2026-05-16\ncompleted: false\nstatus: created\n---\n\ncall dad\n",
+        )
+        .expect("third agenda file should be written");
         elroy_db::bootstrap_database(&elroy_db::BootstrapPlan::from_config(&config))
             .expect("bootstrap should succeed");
+        let ambiguous = registry.invoke("delete_agenda_item", "{\"item_name\":\"call\"}");
+        assert!(ambiguous.is_error);
+        assert_eq!(
+            ambiguous.content,
+            "Multiple agenda items match 'call': call_dad, call_mom. Be more specific."
+        );
         let delete = registry.invoke("delete_agenda_item", "{\"item_name\":\"call mom\"}");
         assert!(!delete.is_error);
         assert_eq!(delete.content, "Agenda item 'call mom' deleted.");
