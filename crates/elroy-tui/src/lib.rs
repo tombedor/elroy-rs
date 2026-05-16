@@ -3,7 +3,8 @@ use std::io;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{
-    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyModifiers,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -281,7 +282,12 @@ pub fn run_with_snapshot_and_runtime<R: TuiRuntime>(
 ) -> io::Result<TuiRunResult> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableBracketedPaste,
+        EnableMouseCapture
+    )?;
 
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
@@ -296,6 +302,7 @@ pub fn run_with_snapshot_and_runtime<R: TuiRuntime>(
     execute!(
         terminal.backend_mut(),
         DisableBracketedPaste,
+        DisableMouseCapture,
         LeaveAlternateScreen
     )?;
     terminal.show_cursor()?;
@@ -369,6 +376,9 @@ fn run_event_loop(
             }
             Event::Paste(text) => {
                 apply_paste_event(app, &text);
+            }
+            Event::Mouse(mouse) => {
+                apply_mouse_event(app, mouse);
             }
             Event::Resize(_, _) => {
                 app.status = "terminal resized".to_string();
@@ -646,6 +656,22 @@ fn apply_paste_event(app: &mut TuiApp, text: &str) {
         app.reset_prompt_history_navigation();
         app.input.push_str(&flattened);
         app.status = "editing prompt".to_string();
+    }
+}
+
+fn apply_mouse_event(app: &mut TuiApp, mouse: MouseEvent) {
+    match mouse.kind {
+        MouseEventKind::ScrollUp => {
+            if app.can_mouse_scroll_conversation() {
+                app.scroll_conversation_up();
+            }
+        }
+        MouseEventKind::ScrollDown => {
+            if app.can_mouse_scroll_conversation() {
+                app.scroll_conversation_down();
+            }
+        }
+        _ => {}
     }
 }
 
@@ -1502,9 +1528,7 @@ impl TuiApp {
             }
             UiIntent::MoveUp => {
                 if self.focus == FocusTarget::Command(CommandPane::Conversation) {
-                    self.follow_conversation_output = false;
-                    self.conversation_scroll = self.conversation_scroll.saturating_sub(1);
-                    self.status = "scrolled conversation up".to_string();
+                    self.scroll_conversation_up();
                 } else {
                     if self.selected_sidebar_index > 0 {
                         self.selected_sidebar_index -= 1;
@@ -1514,11 +1538,7 @@ impl TuiApp {
             }
             UiIntent::MoveDown => {
                 if self.focus == FocusTarget::Command(CommandPane::Conversation) {
-                    let max_scroll = self.conversation_lines.len().saturating_sub(1);
-                    self.follow_conversation_output = false;
-                    self.conversation_scroll =
-                        self.conversation_scroll.saturating_add(1).min(max_scroll);
-                    self.status = "scrolled conversation down".to_string();
+                    self.scroll_conversation_down();
                 } else {
                     let len = self.active_sidebar_items().len();
                     if self.selected_sidebar_index + 1 < len {
@@ -1696,6 +1716,28 @@ impl TuiApp {
         self.sidebar_section = ORDER[next_index];
         self.focus = FocusTarget::Command(CommandPane::Sidebar);
         self.last_command_pane = CommandPane::Sidebar;
+    }
+
+    fn can_mouse_scroll_conversation(&self) -> bool {
+        matches!(
+            self.focus,
+            FocusTarget::Input | FocusTarget::Command(CommandPane::Conversation)
+        ) && self.command_palette.is_none()
+            && self.command_form.is_none()
+            && self.detail_modal.is_none()
+    }
+
+    fn scroll_conversation_up(&mut self) {
+        self.follow_conversation_output = false;
+        self.conversation_scroll = self.conversation_scroll.saturating_sub(1);
+        self.status = "scrolled conversation up".to_string();
+    }
+
+    fn scroll_conversation_down(&mut self) {
+        let max_scroll = self.conversation_lines.len().saturating_sub(1);
+        self.follow_conversation_output = false;
+        self.conversation_scroll = self.conversation_scroll.saturating_add(1).min(max_scroll);
+        self.status = "scrolled conversation down".to_string();
     }
 }
 
@@ -2138,17 +2180,17 @@ mod tests {
     use std::collections::HashSet;
     use std::time::Instant;
 
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
     use ratatui::buffer::Buffer;
     use ratatui::layout::Rect;
 
     use super::{
-        CommandPane, FocusTarget, PendingPrompt, PromptAdvance, PromptUpdate, SidebarAction,
-        SidebarSection, TuiApp, TuiCommandExecution, TuiCommandForm, TuiCommandPaletteAction,
-        TuiCommandPaletteEntry, TuiCommandParameter, TuiContextMessage, TuiExit, TuiPromptStream,
-        TuiRuntime, TuiSidebarDetail, TuiSlashCommandAction, TuiSnapshot, UiIntent,
-        advance_prompt_stream, apply_intent_with_runtime, apply_key_event, apply_paste_event,
-        key_event_token, maybe_complete_command_execution,
+        CommandFormState, CommandPane, FocusTarget, PendingPrompt, PromptAdvance, PromptUpdate,
+        SidebarAction, SidebarSection, TuiApp, TuiCommandExecution, TuiCommandForm,
+        TuiCommandPaletteAction, TuiCommandPaletteEntry, TuiCommandParameter, TuiContextMessage,
+        TuiExit, TuiPromptStream, TuiRuntime, TuiSidebarDetail, TuiSlashCommandAction, TuiSnapshot,
+        UiIntent, advance_prompt_stream, apply_intent_with_runtime, apply_key_event,
+        apply_mouse_event, apply_paste_event, key_event_token, maybe_complete_command_execution,
         maybe_refresh_snapshot_after_background_completion, maybe_run_deferred_context_refresh,
         poll_context_updates, start_startup_prompt_stream,
     };
@@ -2616,6 +2658,73 @@ mod tests {
         assert_eq!(app.conversation_scroll, 0);
         assert_eq!(app.selected_sidebar_index, 1);
         assert_eq!(app.status, "scrolled conversation up");
+    }
+
+    #[test]
+    fn mouse_scroll_on_chat_input_scrolls_conversation_history() {
+        let mut app = TuiApp::bootstrap();
+        app.conversation_lines = vec![
+            "line 0".to_string(),
+            "line 1".to_string(),
+            "line 2".to_string(),
+        ];
+        app.follow_conversation_output = true;
+        app.conversation_scroll = 1;
+        app.focus = FocusTarget::Input;
+
+        apply_mouse_event(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+
+        assert_eq!(app.conversation_scroll, 0);
+        assert!(!app.follow_conversation_output);
+        assert_eq!(app.status, "scrolled conversation up");
+
+        apply_mouse_event(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+
+        assert_eq!(app.conversation_scroll, 1);
+        assert_eq!(app.status, "scrolled conversation down");
+    }
+
+    #[test]
+    fn mouse_scroll_is_ignored_when_modal_is_open() {
+        let mut app = TuiApp::bootstrap();
+        app.conversation_lines = vec!["line 0".to_string(), "line 1".to_string()];
+        app.focus = FocusTarget::Input;
+        app.command_form = Some(CommandFormState {
+            command_name: "create_memory".to_string(),
+            description: "desc".to_string(),
+            fields: vec![],
+            selected_field: 0,
+            error: None,
+        });
+
+        apply_mouse_event(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+
+        assert_eq!(app.conversation_scroll, 0);
+        assert!(app.follow_conversation_output);
     }
 
     #[test]
