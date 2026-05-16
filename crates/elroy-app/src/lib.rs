@@ -3408,14 +3408,19 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
             "Replace the body text of one active memory by exact name.",
             JsonSchema::object(
                 [
+                    ("memory_name", json!({"type": "string"})),
                     ("name", json!({"type": "string"})),
                     ("text", json!({"type": "string"})),
                 ],
-                ["name", "text"],
+                ["text"],
             ),
         ),
         move |arguments| {
-            let Some(name) = arguments.get("name").and_then(Value::as_str) else {
+            let Some(name) = arguments
+                .get("memory_name")
+                .and_then(Value::as_str)
+                .or_else(|| arguments.get("name").and_then(Value::as_str))
+            else {
                 return ToolExecutionResult::error("update_memory requires a string name");
             };
             let Some(text) = arguments.get("text").and_then(Value::as_str) else {
@@ -3522,10 +3527,20 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
         ToolSpec::new(
             "archive_memory",
             "Archive one active memory by exact name.",
-            JsonSchema::object([("name", json!({"type": "string"}))], ["name"]),
+            JsonSchema::object(
+                [
+                    ("memory_name", json!({"type": "string"})),
+                    ("name", json!({"type": "string"})),
+                ],
+                [] as [&str; 0],
+            ),
         ),
         move |arguments| {
-            let Some(name) = arguments.get("name").and_then(Value::as_str) else {
+            let Some(name) = arguments
+                .get("memory_name")
+                .and_then(Value::as_str)
+                .or_else(|| arguments.get("name").and_then(Value::as_str))
+            else {
                 return ToolExecutionResult::error("archive_memory requires a string name");
             };
             let archive_dir = config_for_memory_archive.memory_dir.join("archive");
@@ -7420,7 +7435,7 @@ mod tests {
         let registry = build_live_tool_registry(&config);
         let update = registry.invoke(
             "update_memory",
-            "{\"name\":\"runner notes\",\"text\":\"new text\"}",
+            "{\"memory_name\":\"runner notes\",\"text\":\"new text\"}",
         );
         assert!(!update.is_error);
         assert!(
@@ -7429,7 +7444,7 @@ mod tests {
                 .contains("new text")
         );
 
-        let archive = registry.invoke("archive_memory", "{\"name\":\"runner notes\"}");
+        let archive = registry.invoke("archive_memory", "{\"memory_name\":\"runner notes\"}");
         assert!(!archive.is_error);
         assert!(memory_dir.join("archive").join("runner_notes.md").exists());
 
