@@ -1819,15 +1819,16 @@ fn handle_command_palette_key(app: &mut TuiApp, key: KeyEvent, runtime: &mut imp
                 app.status = "no matching command".to_string();
                 return;
             };
-            app.command_palette = None;
             match entry.action {
                 TuiCommandPaletteAction::FocusMemories => {
+                    app.command_palette = None;
                     app.sidebar_section = SidebarSection::Memories;
                     app.focus = FocusTarget::Command(CommandPane::Sidebar);
                     app.last_command_pane = CommandPane::Sidebar;
                     app.status = "focused memories".to_string();
                 }
                 TuiCommandPaletteAction::FocusAgenda => {
+                    app.command_palette = None;
                     app.sidebar_section = SidebarSection::Agenda;
                     app.focus = FocusTarget::Command(CommandPane::Sidebar);
                     app.last_command_pane = CommandPane::Sidebar;
@@ -1836,11 +1837,17 @@ fn handle_command_palette_key(app: &mut TuiApp, key: KeyEvent, runtime: &mut imp
                 TuiCommandPaletteAction::ToolCommand(name) => {
                     match runtime.launch_named_command(&name) {
                         Ok(TuiSlashCommandAction::Execute(command)) => {
-                            if let Err(error) = start_command_execution(app, runtime, command) {
-                                app.status = format!("command launch failed: {error}");
+                            match start_command_execution(app, runtime, command) {
+                                Ok(()) => {
+                                    app.command_palette = None;
+                                }
+                                Err(error) => {
+                                    app.status = format!("command launch failed: {error}");
+                                }
                             }
                         }
                         Ok(TuiSlashCommandAction::OpenForm(form)) => {
+                            app.command_palette = None;
                             app.open_command_form(form);
                             app.status = format!(
                                 "editing command: /{}",
@@ -3284,6 +3291,45 @@ mod tests {
         assert!(app.command_palette.is_none());
         assert!(app.command_form.is_some());
         assert_eq!(app.status, "editing command: /create_memory");
+    }
+
+    #[test]
+    fn command_palette_keeps_modal_open_when_command_launch_is_blocked() {
+        let mut app = TuiApp::bootstrap();
+        app.open_command_palette(vec![TuiCommandPaletteEntry {
+            title: "/refresh_system_instructions".to_string(),
+            description: "Refresh system instructions".to_string(),
+            action: TuiCommandPaletteAction::ToolCommand("refresh_system_instructions".to_string()),
+        }]);
+        app.command_palette
+            .as_mut()
+            .expect("command palette should open")
+            .selected_index = 2;
+        app.command_active = true;
+        let mut runtime = FakeRuntime {
+            launch_named_command_action: Some(TuiSlashCommandAction::Execute(
+                TuiCommandExecution {
+                    command_name: "refresh_system_instructions".to_string(),
+                    display_name: "refresh_system_instructions".to_string(),
+                    values: vec![],
+                },
+            )),
+            ..FakeRuntime::default()
+        };
+        let mut pending = None;
+
+        apply_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut runtime,
+            &mut pending,
+        );
+
+        assert!(app.command_palette.is_some());
+        assert_eq!(
+            app.status,
+            "command launch failed: Wait for the current task to finish before sending another message."
+        );
     }
 
     #[test]
