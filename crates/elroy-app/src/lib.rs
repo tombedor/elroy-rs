@@ -6221,6 +6221,12 @@ mod tests {
         assert!(!archive.is_error);
         assert!(memory_dir.join("archive").join("runner_notes.md").exists());
 
+        let connection =
+            open_sqlite_connection(&config.database_path).expect("database should reopen");
+        let active_memories =
+            elroy_db::list_active_memories(&connection, 10).expect("active memories should list");
+        assert!(active_memories.is_empty());
+
         fs::remove_dir_all(home).expect("home should be removed");
     }
 

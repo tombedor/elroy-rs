@@ -1103,6 +1103,9 @@ fn visit_memory_files(root: &Path, files: &mut Vec<PathBuf>) {
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
+            if path.file_name().and_then(|name| name.to_str()) == Some("archive") {
+                continue;
+            }
             visit_memory_files(&path, files);
             continue;
         }
@@ -1319,6 +1322,35 @@ mod tests {
         assert_eq!(files.len(), 2);
         assert!(files.iter().any(|path| path.ends_with("a.md")));
         assert!(files.iter().any(|path| path.ends_with("b.markdown")));
+
+        fs::remove_dir_all(root).expect("temp directories should be removed");
+    }
+
+    #[test]
+    fn markdown_files_skips_archive_subtrees() {
+        let unique = format!(
+            "elroy-rs-memory-files-archive-skip-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let root = std::env::temp_dir().join(unique);
+        let archive = root.join("archive");
+        let nested = root.join("nested");
+
+        fs::create_dir_all(&archive).expect("archive dir should be created");
+        fs::create_dir_all(&nested).expect("nested dir should be created");
+        fs::write(root.join("a.md"), "# active").expect("root markdown should write");
+        fs::write(nested.join("b.md"), "# nested").expect("nested markdown should write");
+        fs::write(archive.join("c.md"), "# archived").expect("archived markdown should write");
+
+        let files = markdown_files(&root);
+
+        assert_eq!(files.len(), 2);
+        assert!(files.iter().any(|path| path.ends_with("a.md")));
+        assert!(files.iter().any(|path| path.ends_with("b.md")));
+        assert!(!files.iter().any(|path| path.ends_with("c.md")));
 
         fs::remove_dir_all(root).expect("temp directories should be removed");
     }
