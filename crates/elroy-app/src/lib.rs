@@ -6943,17 +6943,46 @@ fn format_context_summary_message(messages: &[ConversationMessage]) -> String {
     let lines = messages
         .iter()
         .filter_map(|message| {
-            let role = match message.role {
-                MessageRole::User => "User",
-                MessageRole::Assistant => "Assistant",
-                MessageRole::Tool => "Tool",
+            let mut parts = Vec::new();
+            match message.role {
                 MessageRole::System => return None,
-            };
-            let content = message.content.as_deref()?.trim();
-            if content.is_empty() {
-                return None;
+                MessageRole::User => {
+                    let content = message.content.as_deref()?.trim();
+                    if content.is_empty() {
+                        return None;
+                    }
+                    parts.push(format!("User: {}", excerpt(content, 160)));
+                }
+                MessageRole::Assistant => {
+                    if let Some(content) = message.content.as_deref().map(str::trim)
+                        && !content.is_empty()
+                    {
+                        parts.push(format!("Assistant: {}", excerpt(content, 160)));
+                    }
+                    if let Some(tool_calls) = &message.tool_calls {
+                        parts.extend(tool_calls.iter().map(|call| {
+                            format!(
+                                "Assistant Tool Call: {} {}",
+                                call.name,
+                                excerpt(&call.arguments_json, 120)
+                            )
+                        }));
+                    }
+                }
+                MessageRole::Tool => {
+                    let content = message.content.as_deref()?.trim();
+                    if content.is_empty() {
+                        return None;
+                    }
+                    parts.push(format!("Tool Result: {}", excerpt(content, 160)));
+                }
             }
-            Some(format!("{role}: {}", excerpt(content, 160)))
+
+            if parts.is_empty() {
+                None
+            } else {
+                Some(parts.join("\n"))
+            }
         })
         .collect::<Vec<_>>();
 
@@ -14247,6 +14276,26 @@ mod tests {
         assert!(summary.contains("User: A very long user message"));
         assert!(summary.contains("Assistant: A very long assistant message"));
         assert!(!summary.contains("ignore"));
+    }
+
+    #[test]
+    fn format_context_summary_message_includes_tool_interactions() {
+        let summary = format_context_summary_message(&[
+            ConversationMessage::assistant_with_tool_calls(
+                "",
+                vec![ToolCall {
+                    id: "call-1".to_string(),
+                    name: "search_memories".to_string(),
+                    arguments_json: "{\"query\":\"project update\"}".to_string(),
+                }],
+            ),
+            ConversationMessage::tool_result("call-1", "Found the project update memory."),
+        ]);
+
+        assert!(summary.starts_with("Recent conversation summary:"));
+        assert!(summary.contains("Assistant Tool Call: search_memories"));
+        assert!(summary.contains("project update"));
+        assert!(summary.contains("Tool Result: Found the project update memory."));
     }
 
     #[test]
