@@ -3252,7 +3252,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
             let Some(text) = arguments.get("text").and_then(Value::as_str) else {
                 return ToolExecutionResult::error("update_task_text requires string text");
             };
-            mutate_task_file_from_config_with_result(
+            let result = mutate_task_file_from_config_with_result(
                 &config_for_task_text,
                 name,
                 || format!("Active task '{name}' not found."),
@@ -3260,7 +3260,16 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                     update_task_text_file(path, text)?;
                     Ok(format!("Task '{name}' text has been updated."))
                 },
-            )
+            );
+            if result.is_error {
+                return result;
+            }
+            match sync_task_context_after_mutation(&config_for_task_text, name, Some(name)) {
+                Ok(()) => result,
+                Err(error) => {
+                    ToolExecutionResult::error(format!("failed to refresh task context: {error}"))
+                }
+            }
         },
     );
 
@@ -3336,7 +3345,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
             let Some(new_name) = arguments.get("new_name").and_then(Value::as_str) else {
                 return ToolExecutionResult::error("rename_task requires string new_name");
             };
-            mutate_task_file_from_config_with_result(
+            let result = mutate_task_file_from_config_with_result(
                 &config_for_task_rename,
                 name,
                 || format!("Active task '{name}' not found."),
@@ -3349,7 +3358,16 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                     let _renamed = rename_task_file(path, new_name)?;
                     Ok(format!("Task '{name}' has been renamed to '{new_name}'."))
                 },
-            )
+            );
+            if result.is_error {
+                return result;
+            }
+            match sync_task_context_after_mutation(&config_for_task_rename, name, Some(new_name)) {
+                Ok(()) => result,
+                Err(error) => {
+                    ToolExecutionResult::error(format!("failed to refresh task context: {error}"))
+                }
+            }
         },
     );
 
@@ -3411,7 +3429,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                 return ToolExecutionResult::error("complete_task requires a string name");
             };
             let closing_comment = arguments.get("closing_comment").and_then(Value::as_str);
-            mutate_task_file_from_config_with_result(
+            let result = mutate_task_file_from_config_with_result(
                 &config_for_task_complete,
                 name,
                 || format!("Active task '{name}' not found."),
@@ -3424,7 +3442,16 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                         None => format!("Task '{name}' has been marked as completed."),
                     })
                 },
-            )
+            );
+            if result.is_error {
+                return result;
+            }
+            match sync_task_context_after_mutation(&config_for_task_complete, name, None) {
+                Ok(()) => result,
+                Err(error) => {
+                    ToolExecutionResult::error(format!("failed to refresh task context: {error}"))
+                }
+            }
         },
     );
 
@@ -6229,6 +6256,36 @@ fn remove_context_tool_messages_by_id(
         .into_iter()
         .filter(|message| !message_matches_tool_call_id(message, tool_call_id))
         .collect::<Vec<_>>();
+    replace_context_messages(&mut connection, LOCAL_USER_TOKEN, &updated_transcript)?;
+    Ok(())
+}
+
+fn sync_task_context_after_mutation(
+    config: &AppConfig,
+    old_name: &str,
+    current_name: Option<&str>,
+) -> Result<(), AppError> {
+    let mut connection = open_sqlite_connection(&config.database_path)?;
+    run_migrations(&mut connection)?;
+    let transcript = load_validated_runtime_transcript(
+        &mut connection,
+        &config.assistant_name,
+        config.llm_provider() == LlmProvider::Anthropic,
+    )?;
+    let old_tool_call_id = context_task_tool_call_id(old_name);
+    let mut updated_transcript = transcript
+        .into_iter()
+        .filter(|message| !message_matches_tool_call_id(message, &old_tool_call_id))
+        .collect::<Vec<_>>();
+
+    if let Some(current_name) = current_name
+        && let Some(task) = find_active_agenda_item_by_name(&connection, current_name)?
+            .filter(|item| item.trigger_datetime.is_none() && item.trigger_context.is_none())
+        && !transcript_contains_context_task(&updated_transcript, &task.name)
+    {
+        updated_transcript.extend(context_task_tool_messages(&task));
+    }
+
     replace_context_messages(&mut connection, LOCAL_USER_TOKEN, &updated_transcript)?;
     Ok(())
 }
@@ -10396,14 +10453,66 @@ mod tests {
             "Active task 'missing' not found."
         );
 
-        let deleted_created = registry.invoke(
+        let plain_created = registry.invoke(
             "create_task",
             "{\"name\":\"Inbox Zero\",\"text\":\"Clear email backlog\"}",
         );
-        assert!(!deleted_created.is_error);
+        assert!(!plain_created.is_error);
         let task_context = registry.invoke("show_context_messages", "{\"limit\":20}");
         assert!(!task_context.is_error);
         assert!(task_context.content.contains("context-task:inbox zero"));
+        let plain_updated = registry.invoke(
+            "update_task_text",
+            "{\"name\":\"inbox zero\",\"text\":\"Clear email backlog tonight\"}",
+        );
+        assert!(!plain_updated.is_error);
+        let updated_task_context = registry.invoke("show_context_messages", "{\"limit\":20}");
+        assert!(!updated_task_context.is_error);
+        assert!(
+            updated_task_context
+                .content
+                .contains("context-task:inbox zero")
+        );
+        assert!(
+            updated_task_context
+                .content
+                .contains("Clear email backlog tonight")
+        );
+        let plain_renamed = registry.invoke(
+            "rename_task",
+            "{\"old_name\":\"inbox zero\",\"new_name\":\"Inbox Clean\"}",
+        );
+        assert!(!plain_renamed.is_error);
+        let renamed_task_context = registry.invoke("show_context_messages", "{\"limit\":20}");
+        assert!(!renamed_task_context.is_error);
+        assert!(
+            !renamed_task_context
+                .content
+                .contains("context-task:inbox zero")
+        );
+        assert!(
+            renamed_task_context
+                .content
+                .contains("context-task:inbox clean")
+        );
+        let plain_completed = registry.invoke(
+            "complete_task",
+            "{\"name\":\"inbox clean\",\"closing_comment\":\"done\"}",
+        );
+        assert!(!plain_completed.is_error);
+        let completed_task_context = registry.invoke("show_context_messages", "{\"limit\":20}");
+        assert!(!completed_task_context.is_error);
+        assert!(
+            !completed_task_context
+                .content
+                .contains("context-task:inbox clean")
+        );
+
+        let deleted_created = registry.invoke(
+            "create_task",
+            "{\"name\":\"Desk Reset\",\"text\":\"Tidy the desk\"}",
+        );
+        assert!(!deleted_created.is_error);
         let mut connection =
             open_sqlite_connection(&config.database_path).expect("database should reopen");
         let mut transcript = elroy_db::load_context_messages(&mut connection, LOCAL_USER_TOKEN)
@@ -10417,21 +10526,21 @@ mod tests {
 
         let deleted = registry.invoke(
             "delete_task",
-            "{\"name\":\"inbox zero\",\"closing_comment\":\"superseded\"}",
+            "{\"name\":\"desk reset\",\"closing_comment\":\"superseded\"}",
         );
         assert!(!deleted.is_error);
         assert_eq!(
             deleted.content,
-            "Task 'inbox zero' has been deleted. Comment: superseded"
+            "Task 'desk reset' has been deleted. Comment: superseded"
         );
 
         let deleted_text =
-            fs::read_to_string(agenda_dir.join("inbox_zero.md")).expect("task file should read");
+            fs::read_to_string(agenda_dir.join("desk_reset.md")).expect("task file should read");
         assert!(deleted_text.contains("status: deleted"));
         assert!(deleted_text.contains("closing_comment: superseded"));
         let stripped_context = registry.invoke("show_context_messages", "{\"limit\":20}");
         assert!(!stripped_context.is_error);
-        assert!(!stripped_context.content.contains("context-task:inbox zero"));
+        assert!(!stripped_context.content.contains("context-task:desk reset"));
         assert!(stripped_context.content.contains("keep context"));
         let missing_deleted = registry.invoke("delete_task", "{\"name\":\"missing\"}");
         assert!(missing_deleted.is_error);
