@@ -534,6 +534,7 @@ impl AppRuntime {
         let connection = self.open_connection()?;
         let preferences = load_user_preferences(&connection, LOCAL_USER_TOKEN)?;
         let model = live_provider_model(&self.config, preferences.as_ref())?;
+        let classifier_model = live_provider_model(&self.config, preferences.as_ref())?;
         let executable_tools = if options.enable_tools {
             build_live_tool_registry(&self.config)
         } else {
@@ -544,7 +545,7 @@ impl AppRuntime {
         } else {
             None
         };
-        run_prompt_with_model_and_registry_stream(
+        run_prompt_with_model_and_registry_stream_internal(
             connection,
             self.config.home_dir.clone(),
             prompt,
@@ -566,6 +567,7 @@ impl AppRuntime {
                 reflect: self.config.reflect,
             },
             Box::new(model),
+            Some(&classifier_model),
             executable_tools,
         )
     }
@@ -588,10 +590,11 @@ impl AppRuntime {
         } else {
             None
         };
-        let events = run_prompt_with_model_and_registry(
+        let events = run_prompt_with_model_and_registry_internal(
             &mut connection,
             prompt,
             &model,
+            Some(&model),
             executable_tools,
             PromptExecutionOptions {
                 role: options.role,
@@ -1524,10 +1527,11 @@ fn live_provider_model(
     ))
 }
 
-fn run_prompt_with_model_and_registry(
+fn run_prompt_with_model_and_registry_internal(
     connection: &mut rusqlite::Connection,
     prompt: &str,
     model: &dyn ModelClient,
+    classifier_model: Option<&dyn ModelClient>,
     executable_tools: ExecutableToolRegistry,
     options: PromptExecutionOptions<'_>,
 ) -> Result<Vec<StreamEvent>, AppError> {
@@ -1546,12 +1550,19 @@ fn run_prompt_with_model_and_registry(
         options.assistant_name,
         options.ensure_alternating_roles,
     )?;
-    let all_due_items = list_active_due_items(connection, 20)?;
-    let recall_context = recall_memory_context_messages(
+    let memory_recall_decision = determine_memory_recall_decision(
         options.memory_recall_classifier_enabled,
+        options.memory_recall_classifier_window,
+        prompt,
+        &existing_transcript,
+        classifier_model,
+    );
+    let all_due_items = list_active_due_items(connection, 20)?;
+    let recall_context = recall_memory_context_messages_with_decision(
         options.memory_recall_classifier_window,
         options.reflect,
         prompt,
+        memory_recall_decision.needs_recall,
         RecallContext {
             transcript: &existing_transcript,
             memories: &list_active_memories_in_scope(
@@ -1611,9 +1622,8 @@ fn run_prompt_with_model_and_registry(
         )?;
     }
 
-    let mut events = prompt_prelude_status_updates(
-        options.memory_recall_classifier_enabled,
-        prompt,
+    let mut events = prompt_prelude_status_updates_with_decision(
+        memory_recall_decision.used_llm,
         !recall_context.is_empty(),
         !(timed_due_item_context.is_empty() && contextual_due_item_context.is_empty()),
     );
@@ -1621,12 +1631,31 @@ fn run_prompt_with_model_and_registry(
     Ok(events)
 }
 
-fn run_prompt_with_model_and_registry_stream(
+#[cfg(test)]
+fn run_prompt_with_model_and_registry(
+    connection: &mut rusqlite::Connection,
+    prompt: &str,
+    model: &dyn ModelClient,
+    executable_tools: ExecutableToolRegistry,
+    options: PromptExecutionOptions<'_>,
+) -> Result<Vec<StreamEvent>, AppError> {
+    run_prompt_with_model_and_registry_internal(
+        connection,
+        prompt,
+        model,
+        None,
+        executable_tools,
+        options,
+    )
+}
+
+fn run_prompt_with_model_and_registry_stream_internal(
     mut connection: rusqlite::Connection,
     home_dir: PathBuf,
     prompt: &str,
     options: PromptExecutionOptions<'_>,
     model: Box<dyn StreamingModelClient>,
+    classifier_model: Option<&dyn ModelClient>,
     executable_tools: ExecutableToolRegistry,
 ) -> Result<PromptEventStream, AppError> {
     let tools = ToolRegistry::new(executable_tools.specs());
@@ -1644,12 +1673,19 @@ fn run_prompt_with_model_and_registry_stream(
         options.assistant_name,
         options.ensure_alternating_roles,
     )?;
-    let all_due_items = list_active_due_items(&connection, 20)?;
-    let recall_context = recall_memory_context_messages(
+    let memory_recall_decision = determine_memory_recall_decision(
         options.memory_recall_classifier_enabled,
+        options.memory_recall_classifier_window,
+        prompt,
+        &existing_transcript,
+        classifier_model,
+    );
+    let all_due_items = list_active_due_items(&connection, 20)?;
+    let recall_context = recall_memory_context_messages_with_decision(
         options.memory_recall_classifier_window,
         options.reflect,
         prompt,
+        memory_recall_decision.needs_recall,
         RecallContext {
             transcript: &existing_transcript,
             memories: &list_active_memories_in_scope(
@@ -1684,9 +1720,8 @@ fn run_prompt_with_model_and_registry_stream(
         prompt,
     )?;
 
-    let prelude_events = VecDeque::from(prompt_prelude_status_updates(
-        options.memory_recall_classifier_enabled,
-        prompt,
+    let prelude_events = VecDeque::from(prompt_prelude_status_updates_with_decision(
+        memory_recall_decision.used_llm,
         !recall_context.is_empty(),
         !(timed_due_item_context.is_empty() && contextual_due_item_context.is_empty()),
     ));
@@ -1709,6 +1744,26 @@ fn run_prompt_with_model_and_registry_stream(
         }),
         finalized_completion: None,
     })
+}
+
+#[cfg(test)]
+fn run_prompt_with_model_and_registry_stream(
+    connection: rusqlite::Connection,
+    home_dir: PathBuf,
+    prompt: &str,
+    options: PromptExecutionOptions<'_>,
+    model: Box<dyn StreamingModelClient>,
+    executable_tools: ExecutableToolRegistry,
+) -> Result<PromptEventStream, AppError> {
+    run_prompt_with_model_and_registry_stream_internal(
+        connection,
+        home_dir,
+        prompt,
+        options,
+        model,
+        None,
+        executable_tools,
+    )
 }
 
 fn run_self_reflection_if_needed(
@@ -2258,10 +2313,11 @@ fn run_background_codex_completion_followup(
     let preferences = load_user_preferences(&connection, LOCAL_USER_TOKEN)?;
     let model = live_provider_model(config, preferences.as_ref())?;
     let prompt = codex_completion_followup_prompt(result);
-    run_prompt_with_model_and_registry(
+    run_prompt_with_model_and_registry_internal(
         &mut connection,
         &prompt,
         &model,
+        Some(&model),
         build_live_tool_registry(config),
         PromptExecutionOptions {
             role: MessageRole::User,
@@ -7192,14 +7248,21 @@ struct RecallContext<'a> {
     agenda_items: &'a [AgendaItemRecord],
 }
 
-fn recall_memory_context_messages(
-    memory_recall_classifier_enabled: bool,
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MemoryRecallDecision {
+    needs_recall: bool,
+    reasoning: String,
+    used_llm: bool,
+}
+
+fn recall_memory_context_messages_with_decision(
     memory_recall_classifier_window: usize,
     reflect: bool,
     prompt: &str,
+    should_recall: bool,
     context: RecallContext<'_>,
 ) -> Vec<ConversationMessage> {
-    if memory_recall_classifier_enabled && should_skip_memory_recall(prompt) {
+    if !should_recall {
         return Vec::new();
     }
 
@@ -7288,6 +7351,24 @@ fn recall_memory_context_messages(
     )
 }
 
+#[cfg(test)]
+fn recall_memory_context_messages(
+    memory_recall_classifier_enabled: bool,
+    memory_recall_classifier_window: usize,
+    reflect: bool,
+    prompt: &str,
+    context: RecallContext<'_>,
+) -> Vec<ConversationMessage> {
+    let should_recall = !memory_recall_classifier_enabled || !should_skip_memory_recall(prompt);
+    recall_memory_context_messages_with_decision(
+        memory_recall_classifier_window,
+        reflect,
+        prompt,
+        should_recall,
+        context,
+    )
+}
+
 fn recall_due_item_context_messages(
     prompt: &str,
     transcript: &[ConversationMessage],
@@ -7306,14 +7387,12 @@ fn recall_due_item_context_messages(
         .collect()
 }
 
-fn memory_recall_status_updates(
-    memory_recall_classifier_enabled: bool,
-    prompt: &str,
+fn memory_recall_status_updates_with_decision(
+    used_llm_classifier: bool,
     fetched_memories: bool,
 ) -> Vec<StreamEvent> {
     let mut events = Vec::new();
-    let skipped = should_skip_memory_recall(prompt);
-    if memory_recall_classifier_enabled && !skipped {
+    if used_llm_classifier {
         events.push(StreamEvent::StatusUpdate {
             content: "classifying recall...".to_string(),
         });
@@ -7326,18 +7405,27 @@ fn memory_recall_status_updates(
     events
 }
 
-fn prompt_prelude_status_updates(
+#[cfg(test)]
+fn memory_recall_status_updates(
     memory_recall_classifier_enabled: bool,
     prompt: &str,
+    fetched_memories: bool,
+) -> Vec<StreamEvent> {
+    let used_llm_classifier =
+        memory_recall_classifier_enabled && !should_skip_memory_recall(prompt);
+    memory_recall_status_updates_with_decision(used_llm_classifier, fetched_memories)
+}
+
+fn prompt_prelude_status_updates_with_decision(
+    used_llm_classifier: bool,
     fetched_memories: bool,
     surfaced_due_items: bool,
 ) -> Vec<StreamEvent> {
     let mut events = vec![StreamEvent::StatusUpdate {
         content: "loading context...".to_string(),
     }];
-    events.extend(memory_recall_status_updates(
-        memory_recall_classifier_enabled,
-        prompt,
+    events.extend(memory_recall_status_updates_with_decision(
+        used_llm_classifier,
         fetched_memories,
     ));
     if surfaced_due_items {
@@ -7349,6 +7437,22 @@ fn prompt_prelude_status_updates(
         content: "thinking...".to_string(),
     });
     events
+}
+
+#[cfg(test)]
+fn prompt_prelude_status_updates(
+    memory_recall_classifier_enabled: bool,
+    prompt: &str,
+    fetched_memories: bool,
+    surfaced_due_items: bool,
+) -> Vec<StreamEvent> {
+    let used_llm_classifier =
+        memory_recall_classifier_enabled && !should_skip_memory_recall(prompt);
+    prompt_prelude_status_updates_with_decision(
+        used_llm_classifier,
+        fetched_memories,
+        surfaced_due_items,
+    )
 }
 
 fn should_skip_memory_recall(prompt: &str) -> bool {
@@ -7398,6 +7502,103 @@ fn should_skip_memory_recall(prompt: &str) -> bool {
     (normalized.len() < 10 && SIMPLE_SHORT.contains(&normalized.as_str()))
         || GREETINGS.contains(&normalized.as_str())
         || CLARIFICATIONS.contains(&normalized.as_str())
+}
+
+fn parse_memory_recall_decision(response: &str) -> Option<(bool, String)> {
+    let trimmed = response.trim();
+    let json_text = if trimmed.starts_with("```") {
+        trimmed
+            .lines()
+            .skip(1)
+            .take_while(|line| !line.trim_start().starts_with("```"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else {
+        trimmed.to_string()
+    };
+    let value: Value = serde_json::from_str(json_text.trim()).ok()?;
+    let needs_recall = value.get("needs_recall")?.as_bool()?;
+    let reasoning = value
+        .get("reasoning")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    Some((needs_recall, reasoning))
+}
+
+fn classify_memory_recall_with_model(
+    model: &dyn ModelClient,
+    current_message: &str,
+    recent_messages: &[ConversationMessage],
+    window_size: usize,
+) -> Result<MemoryRecallDecision, AppError> {
+    let conversation_context = recent_recall_context(recent_messages, window_size).join("\n");
+    let prompt = format!(
+        "Analyze if this message requires recalling information from long-term memory (including due items).\n\nRecent conversation:\n{conversation_context}\n\nCurrent message: {current_message}\n\nMemory recall is NEEDED if (almost always):\n- Message mentions ANY specific topic, activity, person, place, or thing\n- Message references ANY past topics, events, or context\n- Message contains substantive content beyond pure acknowledgment\n- Message mentions activities, hobbies, tasks, or appointments that commonly have due items\n- Message is a follow-up question or statement\n- Message asks about preferences, goals, or history\n- When in doubt - ALWAYS prefer recall\n\nMemory recall is NOT needed ONLY if:\n- Message is ONLY a simple greeting with no other content (hi, hello, bye)\n- Message is ONLY a simple acknowledgment with no other content (ok, thanks, yes, no)\n- Message is ONLY a clarification question with no topic content (what?, huh?)\n\nCRITICAL: If the message mentions ANY topic, activity, or substantive content, memory recall is NEEDED because there may be relevant due items or memories. Be VERY conservative - prefer false positives over false negatives.\n\nReturn exactly one JSON object with keys `needs_recall` (boolean) and `reasoning` (string)."
+    );
+    let response = model
+        .next_events(ConversationRequest {
+            user_message: &prompt,
+            tools: &[],
+            transcript: &[ConversationMessage::new(MessageRole::User, prompt.clone())],
+            force_tool: None,
+        })?
+        .into_iter()
+        .filter_map(|event| match event {
+            StreamEvent::AssistantResponse { content } => Some(content),
+            _ => None,
+        })
+        .collect::<String>();
+    let Some((needs_recall, reasoning)) = parse_memory_recall_decision(&response) else {
+        return Err(AppError::Runtime(
+            "memory recall classifier returned invalid JSON".to_string(),
+        ));
+    };
+    Ok(MemoryRecallDecision {
+        needs_recall,
+        reasoning,
+        used_llm: true,
+    })
+}
+
+fn determine_memory_recall_decision(
+    memory_recall_classifier_enabled: bool,
+    memory_recall_classifier_window: usize,
+    prompt: &str,
+    transcript: &[ConversationMessage],
+    classifier_model: Option<&dyn ModelClient>,
+) -> MemoryRecallDecision {
+    if !memory_recall_classifier_enabled {
+        return MemoryRecallDecision {
+            needs_recall: true,
+            reasoning: "classifier disabled".to_string(),
+            used_llm: false,
+        };
+    }
+    if should_skip_memory_recall(prompt) {
+        return MemoryRecallDecision {
+            needs_recall: false,
+            reasoning: "Simple greeting/acknowledgment/clarification detected by heuristic"
+                .to_string(),
+            used_llm: false,
+        };
+    }
+    if let Some(model) = classifier_model
+        && let Ok(decision) = classify_memory_recall_with_model(
+            model,
+            prompt,
+            transcript,
+            memory_recall_classifier_window,
+        )
+    {
+        return decision;
+    }
+    MemoryRecallDecision {
+        needs_recall: true,
+        reasoning: "classifier unavailable; falling back to conservative recall".to_string(),
+        used_llm: false,
+    }
 }
 
 fn build_recall_query(prompt: &str, transcript: &[ConversationMessage], window: usize) -> String {
@@ -7906,19 +8107,21 @@ mod tests {
     use super::{
         AppRuntime, LOCAL_USER_TOKEN, PromptExecutionOptions, SYNTHETIC_FIRST_USER_MESSAGE,
         argument_limit, build_live_tool_registry, build_live_tool_registry_with_codex_bin_and_hook,
-        build_recall_query, codex_background_status_key, compress_context_messages,
-        consolidate_exact_duplicate_memories, context_due_item_tool_call_id,
-        context_due_item_tool_messages, count_context_tokens, drop_old_context_messages,
-        due_item_context_messages, format_context_messages_for_summary,
-        format_context_summary_message, is_context_refresh_needed, memory_recall_status_updates,
-        message_matches_tool_call_id, parse_recalled_memory_names, prompt_prelude_status_updates,
+        build_recall_query, classify_memory_recall_with_model, codex_background_status_key,
+        compress_context_messages, consolidate_exact_duplicate_memories,
+        context_due_item_tool_call_id, context_due_item_tool_messages, count_context_tokens,
+        determine_memory_recall_decision, drop_old_context_messages, due_item_context_messages,
+        format_context_messages_for_summary, format_context_summary_message,
+        is_context_refresh_needed, memory_recall_status_updates, message_matches_tool_call_id,
+        parse_memory_recall_decision, parse_recalled_memory_names, prompt_prelude_status_updates,
         provider_config_from_app_config, recall_due_item_context_messages,
         recall_memory_context_messages, recalled_memory_names, recent_recall_context,
         refresh_context_if_needed, run_prompt_with_model_and_registry,
-        run_prompt_with_model_and_registry_stream, select_due_items_by_overlap,
-        select_recalled_due_items, select_recalled_memories, should_offer_greeting,
-        should_skip_memory_recall, significant_tokens, strip_input_message_for_persistence,
-        strip_transient_context_messages, summarize_context_messages_with_model,
+        run_prompt_with_model_and_registry_internal, run_prompt_with_model_and_registry_stream,
+        select_due_items_by_overlap, select_recalled_due_items, select_recalled_memories,
+        should_offer_greeting, should_skip_memory_recall, significant_tokens,
+        strip_input_message_for_persistence, strip_transient_context_messages,
+        summarize_context_messages_with_model,
     };
     use elroy_agenda::create_agenda_file;
     use elroy_codex::{
@@ -15332,6 +15535,168 @@ mod tests {
         assert!(!should_skip_memory_recall(
             "what about the payroll follow-up?"
         ));
+    }
+
+    #[test]
+    fn parse_memory_recall_decision_accepts_json_and_fenced_json() {
+        assert_eq!(
+            parse_memory_recall_decision(r#"{"needs_recall":true,"reasoning":"topic mentioned"}"#),
+            Some((true, "topic mentioned".to_string()))
+        );
+        assert_eq!(
+            parse_memory_recall_decision(
+                "```json\n{\"needs_recall\":false,\"reasoning\":\"pure greeting\"}\n```"
+            ),
+            Some((false, "pure greeting".to_string()))
+        );
+    }
+
+    #[test]
+    fn classify_memory_recall_with_model_parses_structured_response() {
+        let model = FakeModel::new(vec![vec![StreamEvent::AssistantResponse {
+            content: r#"{"needs_recall":true,"reasoning":"The message references prior context."}"#
+                .to_string(),
+        }]]);
+        let decision = classify_memory_recall_with_model(
+            &model,
+            "What was that library you mentioned?",
+            &[
+                ConversationMessage::new(MessageRole::User, "I'm working on a Python project"),
+                ConversationMessage::new(
+                    MessageRole::Assistant,
+                    "You should look at the requests library.",
+                ),
+            ],
+            3,
+        )
+        .expect("classifier should parse JSON");
+
+        assert!(decision.needs_recall);
+        assert!(decision.used_llm);
+        assert_eq!(decision.reasoning, "The message references prior context.");
+    }
+
+    #[test]
+    fn determine_memory_recall_decision_falls_back_to_conservative_recall() {
+        let model = FakeModel::new(vec![vec![StreamEvent::AssistantResponse {
+            content: "not json".to_string(),
+        }]]);
+        let decision = determine_memory_recall_decision(
+            true,
+            3,
+            "What was that library you mentioned?",
+            &[ConversationMessage::new(
+                MessageRole::Assistant,
+                "You should look at the requests library.",
+            )],
+            Some(&model),
+        );
+
+        assert!(decision.needs_recall);
+        assert!(!decision.used_llm);
+        assert!(decision.reasoning.contains("classifier unavailable"));
+    }
+
+    #[test]
+    fn run_prompt_with_model_and_registry_can_skip_recall_via_classifier_model() {
+        struct NoRecallPromptModel;
+
+        impl ModelClient for NoRecallPromptModel {
+            fn next_events(
+                &self,
+                request: ConversationRequest<'_>,
+            ) -> Result<Vec<StreamEvent>, elroy_core::ModelClientError> {
+                assert_eq!(request.user_message, "What was that library you mentioned?");
+                assert!(!request.transcript.iter().any(|message| {
+                    message.role == MessageRole::Tool
+                        && message.tool_call_id.as_deref() == Some("bootstrap-memory-recall")
+                }));
+                Ok(vec![StreamEvent::AssistantResponse {
+                    content: "No recall was injected.".to_string(),
+                }])
+            }
+        }
+
+        let unique = format!(
+            "elroy-rs-app-recall-classifier-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+
+        let mut config = AppConfig::defaults();
+        config.home_dir = home.clone();
+        config.memory_dir = memory_dir.clone();
+        config.agenda_dir = agenda_dir;
+        config.database_path = database_path.clone();
+
+        let mut connection = open_sqlite_connection(&database_path).expect("database should open");
+        run_migrations(&mut connection).expect("migrations should run");
+        fs::write(
+            memory_dir.join("python_library.md"),
+            "# Python Library\n\nYou mentioned the requests library for Python projects.\n",
+        )
+        .expect("memory file should be written");
+        elroy_db::bootstrap_database(&BootstrapPlan::from_config(&config))
+            .expect("bootstrap should succeed");
+        elroy_db::replace_context_messages(
+            &mut connection,
+            LOCAL_USER_TOKEN,
+            &[ConversationMessage::new(
+                MessageRole::Assistant,
+                "You should look at the requests library.",
+            )],
+        )
+        .expect("messages should persist");
+
+        let classifier = FakeModel::new(vec![vec![StreamEvent::AssistantResponse {
+            content:
+                r#"{"needs_recall":false,"reasoning":"This is only a lightweight follow-up."}"#
+                    .to_string(),
+        }]]);
+        let events = run_prompt_with_model_and_registry_internal(
+            &mut connection,
+            "What was that library you mentioned?",
+            &NoRecallPromptModel,
+            Some(&classifier),
+            ExecutableToolRegistry::new(vec![]),
+            PromptExecutionOptions {
+                role: MessageRole::User,
+                persist_input_message: true,
+                force_tool: None,
+                assistant_name: &config.assistant_name,
+                ensure_alternating_roles: config.llm_provider() == LlmProvider::Anthropic,
+                home_dir: &home,
+                bootstrap_plan: BootstrapPlan::from_config(&config),
+                messages_between_memory: config.messages_between_memory,
+                memories_between_consolidation: config.memories_between_consolidation,
+                messages_between_self_reflection: config.messages_between_self_reflection,
+                defer_auto_memory: false,
+                defer_self_reflection: false,
+                memory_recall_classifier_enabled: true,
+                memory_recall_classifier_window: 3,
+                reflect: false,
+            },
+        )
+        .expect("prompt should succeed");
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::StatusUpdate { content } if content == "classifying recall..."
+        )));
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            StreamEvent::StatusUpdate { content } if content == "fetching memories..."
+        )));
+
+        fs::remove_dir_all(home).expect("home should be removed");
     }
 
     #[test]
