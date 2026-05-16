@@ -2402,6 +2402,133 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
         },
     );
 
+    let database_path = config.database_path.clone();
+    let config_for_add_memory_to_context = config.clone();
+    let add_memory_to_current_context = ExecutableTool::new(
+        ToolSpec::new(
+            "add_memory_to_current_context",
+            "Add one active memory to the persisted local conversation context.",
+            JsonSchema::object(
+                [("memory_name", json!({"type": "string"}))],
+                ["memory_name"],
+            ),
+        ),
+        move |arguments| {
+            let Some(memory_name) = arguments.get("memory_name").and_then(Value::as_str) else {
+                return ToolExecutionResult::error(
+                    "add_memory_to_current_context requires string memory_name",
+                );
+            };
+            let mut connection = match open_sqlite_connection(&database_path) {
+                Ok(connection) => connection,
+                Err(error) => {
+                    return ToolExecutionResult::error(format!("failed to open database: {error}"));
+                }
+            };
+            if let Err(error) = run_migrations(&mut connection) {
+                return ToolExecutionResult::error(format!("failed to run migrations: {error}"));
+            }
+            let memory = match find_active_memory_by_name(&connection, memory_name) {
+                Ok(Some(memory)) => memory,
+                Ok(None) => {
+                    return ToolExecutionResult::success(format!(
+                        "Memory '{memory_name}' not found."
+                    ));
+                }
+                Err(error) => {
+                    return ToolExecutionResult::error(format!("failed to load memory: {error}"));
+                }
+            };
+            let mut transcript = match load_validated_runtime_transcript(
+                &mut connection,
+                &config_for_add_memory_to_context.assistant_name,
+                config_for_add_memory_to_context.llm_provider() == LlmProvider::Anthropic,
+            ) {
+                Ok(messages) => messages,
+                Err(error) => {
+                    return ToolExecutionResult::error(format!(
+                        "failed to load context messages: {error}"
+                    ));
+                }
+            };
+            if !transcript_contains_context_memory(&transcript, &memory.name) {
+                transcript.extend(context_memory_tool_messages(&memory));
+                if let Err(error) =
+                    replace_context_messages(&mut connection, LOCAL_USER_TOKEN, &transcript)
+                {
+                    return ToolExecutionResult::error(format!(
+                        "failed to persist context messages: {error}"
+                    ));
+                }
+            }
+            ToolExecutionResult::success(format!("Memory '{}' added to context.", memory.name))
+        },
+    );
+
+    let database_path = config.database_path.clone();
+    let config_for_drop_memory_from_context = config.clone();
+    let drop_memory_from_current_context = ExecutableTool::new(
+        ToolSpec::new(
+            "drop_memory_from_current_context",
+            "Drop one explicitly added memory from the persisted local conversation context.",
+            JsonSchema::object(
+                [("memory_name", json!({"type": "string"}))],
+                ["memory_name"],
+            ),
+        ),
+        move |arguments| {
+            let Some(memory_name) = arguments.get("memory_name").and_then(Value::as_str) else {
+                return ToolExecutionResult::error(
+                    "drop_memory_from_current_context requires string memory_name",
+                );
+            };
+            let mut connection = match open_sqlite_connection(&database_path) {
+                Ok(connection) => connection,
+                Err(error) => {
+                    return ToolExecutionResult::error(format!("failed to open database: {error}"));
+                }
+            };
+            if let Err(error) = run_migrations(&mut connection) {
+                return ToolExecutionResult::error(format!("failed to run migrations: {error}"));
+            }
+            let Some(memory) = (match find_active_memory_by_name(&connection, memory_name) {
+                Ok(memory) => memory,
+                Err(error) => {
+                    return ToolExecutionResult::error(format!("failed to load memory: {error}"));
+                }
+            }) else {
+                return ToolExecutionResult::success(format!("Memory '{memory_name}' not found."));
+            };
+            let transcript = match load_validated_runtime_transcript(
+                &mut connection,
+                &config_for_drop_memory_from_context.assistant_name,
+                config_for_drop_memory_from_context.llm_provider() == LlmProvider::Anthropic,
+            ) {
+                Ok(messages) => messages,
+                Err(error) => {
+                    return ToolExecutionResult::error(format!(
+                        "failed to load context messages: {error}"
+                    ));
+                }
+            };
+            let context_memory_tool_call_id = context_memory_tool_call_id(&memory.name);
+            let updated_transcript = transcript
+                .into_iter()
+                .filter(|message| {
+                    !message_matches_context_memory(message, &context_memory_tool_call_id)
+                })
+                .collect::<Vec<_>>();
+            if let Err(error) =
+                replace_context_messages(&mut connection, LOCAL_USER_TOKEN, &updated_transcript)
+            {
+                return ToolExecutionResult::error(format!(
+                    "failed to persist context messages: {error}"
+                ));
+            }
+            ToolExecutionResult::success(format!("Memory '{}' dropped from context.", memory.name))
+        },
+    );
+
     let config_for_clear_context = config.clone();
     let clear_context_messages = ExecutableTool::new(
         ToolSpec::new(
@@ -3281,6 +3408,8 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
         edit_agenda_checklist_item,
         complete_agenda_checklist_item,
         show_context_messages,
+        add_memory_to_current_context,
+        drop_memory_from_current_context,
         clear_context_messages,
         reset_messages,
         refresh_system_instructions,
@@ -3671,6 +3800,48 @@ fn synthetic_tool_context_messages(
         ),
         ConversationMessage::tool_result(tool_call_id, content),
     ]
+}
+
+fn context_memory_tool_call_id(name: &str) -> String {
+    format!("context-memory:{}", name.to_ascii_lowercase())
+}
+
+fn context_memory_tool_messages(memory: &elroy_db::MemoryRecord) -> Vec<ConversationMessage> {
+    let content = serde_json::to_string_pretty(&json!({
+        "content": format!("MEMORY: '{}' - {}", memory.name, memory.body),
+        "memories": [{
+            "type": "memory",
+            "name": memory.name,
+            "file_path": memory.file_path,
+            "excerpt": excerpt(&memory.body, 180),
+            "updated_at_unix": memory.updated_at_unix,
+        }],
+    }))
+    .expect("context-memory payload should serialize");
+    synthetic_tool_context_messages(
+        context_memory_tool_call_id(&memory.name),
+        "get_fast_recall",
+        "{}",
+        content,
+    )
+}
+
+fn transcript_contains_context_memory(
+    transcript: &[ConversationMessage],
+    memory_name: &str,
+) -> bool {
+    let tool_call_id = context_memory_tool_call_id(memory_name);
+    transcript
+        .iter()
+        .any(|message| message_matches_context_memory(message, &tool_call_id))
+}
+
+fn message_matches_context_memory(message: &ConversationMessage, tool_call_id: &str) -> bool {
+    message.tool_call_id.as_deref() == Some(tool_call_id)
+        || message
+            .tool_calls
+            .as_ref()
+            .is_some_and(|tool_calls| tool_calls.iter().any(|call| call.id == tool_call_id))
 }
 
 fn format_context_summary_message(messages: &[ConversationMessage]) -> String {
@@ -4626,6 +4797,83 @@ mod tests {
         assert!(memory.content.contains("remember the hill workout"));
         assert!(!agenda.is_error);
         assert!(agenda.content.contains("bring forms"));
+
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
+    fn live_tool_registry_can_add_and_drop_memory_from_current_context() {
+        let unique = format!(
+            "elroy-rs-app-context-memory-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+        fs::write(
+            memory_dir.join("travel_preference.md"),
+            "User likes window seats on long flights.\n",
+        )
+        .expect("memory should be written");
+
+        let mut config = AppConfig::defaults();
+        config.memory_dir = memory_dir;
+        config.agenda_dir = agenda_dir;
+        config.database_path = database_path;
+        elroy_db::bootstrap_database(&elroy_db::BootstrapPlan::from_config(&config))
+            .expect("bootstrap should succeed");
+
+        let registry = build_live_tool_registry(&config);
+        let add = registry.invoke(
+            "add_memory_to_current_context",
+            "{\"memory_name\":\"travel preference\"}",
+        );
+        assert!(!add.is_error);
+        assert_eq!(add.content, "Memory 'travel preference' added to context.");
+
+        let context = registry.invoke("show_context_messages", "{\"limit\":20}");
+        assert!(!context.is_error);
+        assert!(context.content.contains("get_fast_recall"));
+        assert!(context.content.contains("travel preference"));
+
+        let add_again = registry.invoke(
+            "add_memory_to_current_context",
+            "{\"memory_name\":\"travel preference\"}",
+        );
+        assert!(!add_again.is_error);
+        let context_again = registry.invoke("show_context_messages", "{\"limit\":20}");
+        assert_eq!(
+            context_again
+                .content
+                .matches("\"tool_call_id\": \"context-memory:travel preference\"")
+                .count(),
+            1
+        );
+
+        let drop_item = registry.invoke(
+            "drop_memory_from_current_context",
+            "{\"memory_name\":\"travel preference\"}",
+        );
+        assert!(!drop_item.is_error);
+        assert_eq!(
+            drop_item.content,
+            "Memory 'travel preference' dropped from context."
+        );
+
+        let stripped = registry.invoke("show_context_messages", "{\"limit\":20}");
+        assert!(!stripped.is_error);
+        assert!(
+            !stripped
+                .content
+                .contains("context-memory:travel preference")
+        );
+        assert!(!stripped.content.contains("get_fast_recall"));
 
         fs::remove_dir_all(home).expect("home should be removed");
     }
