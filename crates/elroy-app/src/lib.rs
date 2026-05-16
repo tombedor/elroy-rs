@@ -1,4 +1,4 @@
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -189,6 +189,7 @@ struct PromptEventStreamState {
     transient_context_count: usize,
     persist_input_message: bool,
     messages_between_memory: usize,
+    memories_between_consolidation: usize,
     messages_between_self_reflection: usize,
     prelude_events: VecDeque<StreamEvent>,
 }
@@ -222,6 +223,7 @@ struct PromptExecutionOptions<'a> {
     home_dir: &'a Path,
     bootstrap_plan: BootstrapPlan,
     messages_between_memory: usize,
+    memories_between_consolidation: usize,
     messages_between_self_reflection: usize,
     memory_recall_classifier_enabled: bool,
     memory_recall_classifier_window: usize,
@@ -317,6 +319,7 @@ impl AppRuntime {
                 home_dir: &self.config.home_dir,
                 bootstrap_plan: BootstrapPlan::from_config(&self.config),
                 messages_between_memory: self.config.messages_between_memory,
+                memories_between_consolidation: self.config.memories_between_consolidation,
                 messages_between_self_reflection: self.config.messages_between_self_reflection,
                 memory_recall_classifier_enabled: self.config.memory_recall_classifier_enabled,
                 memory_recall_classifier_window: self.config.memory_recall_classifier_window,
@@ -358,6 +361,7 @@ impl AppRuntime {
                 home_dir: &self.config.home_dir,
                 bootstrap_plan: BootstrapPlan::from_config(&self.config),
                 messages_between_memory: self.config.messages_between_memory,
+                memories_between_consolidation: self.config.memories_between_consolidation,
                 messages_between_self_reflection: self.config.messages_between_self_reflection,
                 memory_recall_classifier_enabled: self.config.memory_recall_classifier_enabled,
                 memory_recall_classifier_window: self.config.memory_recall_classifier_window,
@@ -1081,6 +1085,7 @@ fn finalize_prompt_event_stream(
     run_auto_memory_if_needed(
         &mut state.connection,
         &state.bootstrap_plan,
+        state.memories_between_consolidation,
         state.existing_transcript_len,
         persisted_transcript.as_slice(),
         state.messages_between_memory,
@@ -1175,6 +1180,7 @@ fn run_prompt_with_model_and_registry(
     run_auto_memory_if_needed(
         connection,
         &options.bootstrap_plan,
+        options.memories_between_consolidation,
         existing_transcript.len(),
         persisted_transcript.as_slice(),
         options.messages_between_memory,
@@ -1267,6 +1273,7 @@ fn run_prompt_with_model_and_registry_stream(
                 + contextual_due_item_context.len(),
             persist_input_message: options.persist_input_message,
             messages_between_memory: options.messages_between_memory,
+            memories_between_consolidation: options.memories_between_consolidation,
             messages_between_self_reflection: options.messages_between_self_reflection,
             prelude_events,
         }),
@@ -1330,12 +1337,11 @@ fn refresh_context_if_needed(
             elroy_db::bootstrap_database(bootstrap_plan)
                 .map_err(|error| AppError::Runtime(error.to_string()))?;
             *connection = open_sqlite_connection(&bootstrap_plan.database_path)?;
-
-            let mut tracker = get_or_create_memory_operation_tracker(connection, LOCAL_USER_TOKEN)?;
-            tracker.messages_since_memory = 0;
-            tracker.memories_since_consolidation += 1;
-            tracker.updated_at_unix = Utc::now().timestamp();
-            save_memory_operation_tracker(connection, &tracker)?;
+            record_memory_creation_and_maybe_consolidate(
+                connection,
+                bootstrap_plan,
+                config.memories_between_consolidation,
+            )?;
         }
 
         let mut refreshed_transcript = compressed;
@@ -1365,6 +1371,7 @@ fn refresh_context_if_needed(
 fn run_auto_memory_if_needed(
     connection: &mut rusqlite::Connection,
     bootstrap_plan: &BootstrapPlan,
+    memories_between_consolidation: usize,
     existing_transcript_len: usize,
     transcript: &[ConversationMessage],
     messages_between_memory: usize,
@@ -1408,23 +1415,94 @@ fn run_auto_memory_if_needed(
     elroy_db::bootstrap_database(bootstrap_plan)
         .map_err(|error| AppError::Runtime(error.to_string()))?;
     *connection = open_sqlite_connection(&bootstrap_plan.database_path)?;
-
-    tracker.messages_since_memory = 0;
-    tracker.memories_since_consolidation += 1;
-    tracker.updated_at_unix = Utc::now().timestamp();
-    save_memory_operation_tracker(connection, &tracker)?;
+    record_memory_creation_and_maybe_consolidate(
+        connection,
+        bootstrap_plan,
+        memories_between_consolidation,
+    )?;
     Ok(())
 }
 
-fn reset_memory_tracker_after_creation(config: &AppConfig) -> Result<(), AppError> {
-    let mut connection = open_sqlite_connection(&config.database_path)?;
-    run_migrations(&mut connection)?;
-    let mut tracker = get_or_create_memory_operation_tracker(&mut connection, LOCAL_USER_TOKEN)?;
+fn record_memory_creation_and_maybe_consolidate(
+    connection: &mut rusqlite::Connection,
+    bootstrap_plan: &BootstrapPlan,
+    memories_between_consolidation: usize,
+) -> Result<(), AppError> {
+    *connection = open_sqlite_connection(&bootstrap_plan.database_path)?;
+    run_migrations(connection)?;
+    let mut tracker = get_or_create_memory_operation_tracker(connection, LOCAL_USER_TOKEN)?;
     tracker.messages_since_memory = 0;
     tracker.memories_since_consolidation += 1;
     tracker.updated_at_unix = Utc::now().timestamp();
-    save_memory_operation_tracker(&mut connection, &tracker)?;
+
+    if memories_between_consolidation == 0 {
+        save_memory_operation_tracker(connection, &tracker)?;
+        return Ok(());
+    }
+
+    if tracker.memories_since_consolidation < memories_between_consolidation as i64 {
+        save_memory_operation_tracker(connection, &tracker)?;
+        return Ok(());
+    }
+
+    (|| {
+        consolidate_exact_duplicate_memories(connection, bootstrap_plan)?;
+        tracker.memories_since_consolidation = 0;
+        tracker.updated_at_unix = Utc::now().timestamp();
+        save_memory_operation_tracker(connection, &tracker)?;
+        Ok(())
+    })()
+}
+
+fn consolidate_exact_duplicate_memories(
+    connection: &mut rusqlite::Connection,
+    bootstrap_plan: &BootstrapPlan,
+) -> Result<(), AppError> {
+    let active_memories = list_active_memories(connection, 500)?;
+    let mut groups = HashMap::<String, Vec<MemoryRecord>>::new();
+    for memory in active_memories {
+        let normalized = normalize_memory_body(&memory.body);
+        if normalized.is_empty() {
+            continue;
+        }
+        groups.entry(normalized).or_default().push(memory);
+    }
+
+    let duplicate_groups = groups
+        .into_values()
+        .filter(|group| group.len() >= 2)
+        .collect::<Vec<_>>();
+
+    for group in duplicate_groups {
+        let canonical = group.first().ok_or_else(|| {
+            AppError::Runtime("duplicate memory group was unexpectedly empty".to_string())
+        })?;
+        let source_names = group
+            .iter()
+            .map(|memory| memory.name.as_str())
+            .collect::<Vec<_>>();
+        create_consolidated_memory_from_plan(
+            bootstrap_plan,
+            &canonical.name,
+            &canonical.body,
+            &source_names,
+        )
+        .map_err(AppError::Io)?;
+        *connection = open_sqlite_connection(&bootstrap_plan.database_path)?;
+        run_migrations(connection)?;
+    }
+
     Ok(())
+}
+
+fn normalize_memory_body(body: &str) -> String {
+    body.to_ascii_lowercase()
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { ' ' })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn create_memory_file_from_context_messages(
@@ -1718,6 +1796,7 @@ fn run_background_codex_completion_followup(
             home_dir: &config.home_dir,
             bootstrap_plan: BootstrapPlan::from_config(config),
             messages_between_memory: config.messages_between_memory,
+            memories_between_consolidation: config.memories_between_consolidation,
             messages_between_self_reflection: config.messages_between_self_reflection,
             memory_recall_classifier_enabled: config.memory_recall_classifier_enabled,
             memory_recall_classifier_window: config.memory_recall_classifier_window,
@@ -2472,8 +2551,12 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                 )?;
                 elroy_db::bootstrap_database(&BootstrapPlan::from_config(&config_for_memory_write))
                     .map_err(|error| std::io::Error::other(error.to_string()))?;
-                reset_memory_tracker_after_creation(&config_for_memory_write)
-                    .map_err(|error| std::io::Error::other(error.to_string()))?;
+                record_memory_creation_and_maybe_consolidate(
+                    &mut connection,
+                    &BootstrapPlan::from_config(&config_for_memory_write),
+                    config_for_memory_write.memories_between_consolidation,
+                )
+                .map_err(|error| std::io::Error::other(error.to_string()))?;
                 Ok(path)
             })();
             match created {
@@ -3167,7 +3250,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                     "update_outdated_or_incorrect_memory requires string update_text",
                 );
             };
-            let connection =
+            let mut connection =
                 match open_sqlite_connection(&config_for_outdated_memory_update.database_path) {
                     Ok(connection) => connection,
                     Err(error) => {
@@ -3222,9 +3305,11 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
             )) {
                 return ToolExecutionResult::error(format!("memory mutation failed: {error}"));
             }
-            if let Err(error) =
-                reset_memory_tracker_after_creation(&config_for_outdated_memory_update)
-            {
+            if let Err(error) = record_memory_creation_and_maybe_consolidate(
+                &mut connection,
+                &BootstrapPlan::from_config(&config_for_outdated_memory_update),
+                config_for_outdated_memory_update.memories_between_consolidation,
+            ) {
                 return ToolExecutionResult::error(format!("memory mutation failed: {error}"));
             }
             ToolExecutionResult::success(format!("Memory '{memory_name}' has been updated"))
@@ -5151,7 +5236,21 @@ fn create_consolidated_memory_from_config(
     text: &str,
     source_names: &[&str],
 ) -> std::io::Result<PathBuf> {
-    let mut connection = open_sqlite_connection(&config.database_path)
+    create_consolidated_memory_from_plan(
+        &BootstrapPlan::from_config(config),
+        name,
+        text,
+        source_names,
+    )
+}
+
+fn create_consolidated_memory_from_plan(
+    bootstrap_plan: &BootstrapPlan,
+    name: &str,
+    text: &str,
+    source_names: &[&str],
+) -> std::io::Result<PathBuf> {
+    let mut connection = open_sqlite_connection(&bootstrap_plan.database_path)
         .map_err(|error| std::io::Error::other(error.to_string()))?;
     run_migrations(&mut connection).map_err(|error| std::io::Error::other(error.to_string()))?;
 
@@ -5163,7 +5262,7 @@ fn create_consolidated_memory_from_config(
         source_memories.push(memory);
     }
 
-    let archive_dir = config.memory_dir.join("archive");
+    let archive_dir = bootstrap_plan.memory_dir.join("archive");
     let mut archived_sources = Vec::new();
     for memory in source_memories {
         let archived_path = archive_memory_file(Path::new(&memory.file_path), &archive_dir)?;
@@ -5177,12 +5276,12 @@ fn create_consolidated_memory_from_config(
             .collect::<Vec<_>>(),
     );
     let created = create_memory_file_with_frontmatter(
-        &config.memory_dir,
+        &bootstrap_plan.memory_dir,
         name,
         text,
         frontmatter.as_deref(),
     )?;
-    elroy_db::bootstrap_database(&BootstrapPlan::from_config(config))
+    elroy_db::bootstrap_database(bootstrap_plan)
         .map_err(|error| std::io::Error::other(error.to_string()))?;
     Ok(created)
 }
@@ -6708,6 +6807,66 @@ mod tests {
                 .exists()
         );
         assert!(memory_dir.join("archive").join("run_today.md").exists());
+
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
+    fn create_memory_tool_triggers_exact_duplicate_consolidation_at_threshold() {
+        let unique = format!(
+            "elroy-rs-app-duplicate-memory-consolidation-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+
+        let mut config = AppConfig::defaults();
+        config.memory_dir = memory_dir.clone();
+        config.agenda_dir = agenda_dir;
+        config.database_path = database_path.clone();
+        config.memories_between_consolidation = 2;
+
+        let registry = build_live_tool_registry(&config);
+        let first = registry.invoke(
+            "create_memory",
+            "{\"name\":\"Running progress\",\"text\":\"I ran a marathon today\"}",
+        );
+        let second = registry.invoke(
+            "create_memory",
+            "{\"name\":\"Run today\",\"text\":\"I ran a marathon today\"}",
+        );
+        assert!(!first.is_error);
+        assert!(!second.is_error);
+
+        let connection = open_sqlite_connection(&database_path).expect("database should reopen");
+        let active_memories =
+            elroy_db::list_active_memories(&connection, 10).expect("active memories should list");
+        assert_eq!(active_memories.len(), 1);
+        let consolidated_name = active_memories[0].name.clone();
+
+        let tracker = load_memory_operation_tracker(&connection, LOCAL_USER_TOKEN)
+            .expect("tracker should load")
+            .expect("tracker should exist");
+        assert_eq!(tracker.memories_since_consolidation, 0);
+
+        let source_list = registry.invoke(
+            "get_source_list_for_memory",
+            &format!("{{\"memory_name\":\"{consolidated_name}\"}}"),
+        );
+        assert!(!source_list.is_error);
+        assert!(
+            source_list
+                .content
+                .contains("\"name\":\"running progress\"")
+        );
+        assert!(source_list.content.contains("\"name\":\"run today\""));
 
         fs::remove_dir_all(home).expect("home should be removed");
     }
@@ -8541,6 +8700,7 @@ mod tests {
                 home_dir: &home,
                 bootstrap_plan: BootstrapPlan::from_config(&config),
                 messages_between_memory: config.messages_between_memory,
+                memories_between_consolidation: config.memories_between_consolidation,
                 messages_between_self_reflection: config.messages_between_self_reflection,
                 memory_recall_classifier_enabled: config.memory_recall_classifier_enabled,
                 memory_recall_classifier_window: config.memory_recall_classifier_window,
@@ -8603,6 +8763,7 @@ mod tests {
                 home_dir: &home,
                 bootstrap_plan: BootstrapPlan::from_config(&config),
                 messages_between_memory: config.messages_between_memory,
+                memories_between_consolidation: config.memories_between_consolidation,
                 messages_between_self_reflection: config.messages_between_self_reflection,
                 memory_recall_classifier_enabled: config.memory_recall_classifier_enabled,
                 memory_recall_classifier_window: config.memory_recall_classifier_window,
@@ -8666,6 +8827,7 @@ mod tests {
                 home_dir: &home,
                 bootstrap_plan: BootstrapPlan::from_config(&config),
                 messages_between_memory: config.messages_between_memory,
+                memories_between_consolidation: config.memories_between_consolidation,
                 messages_between_self_reflection: config.messages_between_self_reflection,
                 memory_recall_classifier_enabled: config.memory_recall_classifier_enabled,
                 memory_recall_classifier_window: config.memory_recall_classifier_window,
@@ -8733,6 +8895,7 @@ mod tests {
                 home_dir: &home,
                 bootstrap_plan: BootstrapPlan::from_config(&config),
                 messages_between_memory: config.messages_between_memory,
+                memories_between_consolidation: config.memories_between_consolidation,
                 messages_between_self_reflection: config.messages_between_self_reflection,
                 memory_recall_classifier_enabled: config.memory_recall_classifier_enabled,
                 memory_recall_classifier_window: config.memory_recall_classifier_window,
@@ -8810,6 +8973,7 @@ mod tests {
                 home_dir: &home,
                 bootstrap_plan: BootstrapPlan::from_config(&config),
                 messages_between_memory: config.messages_between_memory,
+                memories_between_consolidation: config.memories_between_consolidation,
                 messages_between_self_reflection: config.messages_between_self_reflection,
                 memory_recall_classifier_enabled: config.memory_recall_classifier_enabled,
                 memory_recall_classifier_window: config.memory_recall_classifier_window,
@@ -8877,6 +9041,7 @@ mod tests {
                 home_dir: &home,
                 bootstrap_plan: BootstrapPlan::from_config(&config),
                 messages_between_memory: config.messages_between_memory,
+                memories_between_consolidation: config.memories_between_consolidation,
                 messages_between_self_reflection: config.messages_between_self_reflection,
                 memory_recall_classifier_enabled: config.memory_recall_classifier_enabled,
                 memory_recall_classifier_window: config.memory_recall_classifier_window,
@@ -8902,6 +9067,7 @@ mod tests {
                 home_dir: &home,
                 bootstrap_plan: BootstrapPlan::from_config(&config),
                 messages_between_memory: config.messages_between_memory,
+                memories_between_consolidation: config.memories_between_consolidation,
                 messages_between_self_reflection: config.messages_between_self_reflection,
                 memory_recall_classifier_enabled: config.memory_recall_classifier_enabled,
                 memory_recall_classifier_window: config.memory_recall_classifier_window,
@@ -9115,6 +9281,7 @@ mod tests {
                 home_dir: &home,
                 bootstrap_plan: BootstrapPlan::from_config(&config),
                 messages_between_memory: config.messages_between_memory,
+                memories_between_consolidation: config.memories_between_consolidation,
                 messages_between_self_reflection: config.messages_between_self_reflection,
                 memory_recall_classifier_enabled: config.memory_recall_classifier_enabled,
                 memory_recall_classifier_window: config.memory_recall_classifier_window,
@@ -9164,6 +9331,7 @@ mod tests {
                 home_dir: &home,
                 bootstrap_plan: BootstrapPlan::from_config(&config),
                 messages_between_memory: config.messages_between_memory,
+                memories_between_consolidation: config.memories_between_consolidation,
                 messages_between_self_reflection: config.messages_between_self_reflection,
                 memory_recall_classifier_enabled: config.memory_recall_classifier_enabled,
                 memory_recall_classifier_window: config.memory_recall_classifier_window,
