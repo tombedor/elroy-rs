@@ -2943,7 +2943,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                 }
             }
             let date = arguments.get("date").and_then(Value::as_str);
-            match (|| -> Result<PathBuf, std::io::Error> {
+            match (|| -> Result<(), std::io::Error> {
                 let mut connection =
                     open_sqlite_connection(&config_for_due_item_write.database_path)
                         .map_err(|error| std::io::Error::other(error.to_string()))?;
@@ -2970,11 +2970,21 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                     trigger_time,
                     trigger_context,
                 )?;
+                let logical_due_item_name = sanitize_filename(name).replace('_', " ");
                 elroy_db::bootstrap_database(&BootstrapPlan::from_config(
                     &config_for_due_item_write,
                 ))
                 .map_err(|error| std::io::Error::other(error.to_string()))?;
-                let due_item = find_active_agenda_item_by_name(&connection, name)
+                connection
+                    .execute(
+                        "UPDATE agenda_items
+                         SET name = ?1
+                         WHERE file_path = ?2
+                           AND is_active = 1",
+                        rusqlite::params![logical_due_item_name, path.to_string_lossy().as_ref()],
+                    )
+                    .map_err(|error| std::io::Error::other(error.to_string()))?;
+                let due_item = find_active_agenda_item_by_name(&connection, &logical_due_item_name)
                     .map_err(|error| std::io::Error::other(error.to_string()))?
                     .filter(|item| {
                         item.trigger_datetime.is_some() || item.trigger_context.is_some()
@@ -2992,7 +3002,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                             .map_err(|error| std::io::Error::other(error.to_string()))?;
                     }
                 }
-                Ok(path)
+                Ok(())
             })() {
                 Ok(_) => {
                     let message = match (trigger_time, trigger_context) {
@@ -11267,6 +11277,31 @@ mod tests {
         assert_eq!(
             missing_deleted.content,
             "Active due item 'missing' not found. Active due items: "
+        );
+        let completed_recreated = registry.invoke(
+            "create_due_item",
+            "{\"name\":\"Call Parents\",\"text\":\"Call parents tomorrow\",\"trigger_context\":\"after dinner\"}",
+        );
+        assert!(!completed_recreated.is_error);
+        assert_eq!(
+            completed_recreated.content,
+            "Contextual due item 'Call Parents' has been created."
+        );
+        let completed_recreated_shown =
+            registry.invoke("show_due_item", "{\"name\":\"call parents\"}");
+        assert!(!completed_recreated_shown.is_error);
+        assert!(
+            completed_recreated_shown
+                .content
+                .contains("Call parents tomorrow")
+        );
+        let completed_recreated_context =
+            registry.invoke("show_context_messages", "{\"limit\":20}");
+        assert!(!completed_recreated_context.is_error);
+        assert!(
+            completed_recreated_context
+                .content
+                .contains("context-due-item:call parents")
         );
     }
 
