@@ -14,9 +14,9 @@ use elroy_codex::{
 };
 use elroy_config::{AppConfig, LlmProvider};
 use elroy_core::{
-    ConversationOrchestrator, LiveProviderModel, LocalToolExecutor, ModelClient,
-    StreamingModelClient, TurnEventStream, clear_background_status, get_background_status,
-    set_background_status, validated_transcript,
+    ConversationOrchestrator, ConversationRequest, LiveProviderModel, LocalToolExecutor,
+    ModelClient, StreamingModelClient, TurnEventStream, clear_background_status,
+    get_background_status, set_background_status, validated_transcript,
 };
 use elroy_db::{
     AgendaItemRecord, BootstrapPlan, MemoryRecord, UserPreferenceRecord,
@@ -1789,7 +1789,7 @@ fn refresh_context_if_needed(
                 tool_call_id,
                 "context_summary",
                 "{}",
-                format_context_summary_message(&dropped_messages),
+                build_context_summary_message(connection, config, &dropped_messages),
             ));
         }
 
@@ -2307,6 +2307,131 @@ fn codex_background_status_message(session_id: &str) -> String {
 
 fn codex_completion_followup_status_message(session_id: &str) -> String {
     format!("processing codex session {session_id} completion...")
+}
+
+fn context_refresh_summary_system_prompt(assistant_name: &str) -> String {
+    format!(
+        "Your job is to summarize a history of previous messages in a conversation between an AI persona and a human.\nThe conversation you are given is from a fixed context window and may not be complete.\nMessages sent by the AI are marked with the 'assistant' role.\nSummarize what happened in the conversation from the perspective of {} (use the first person).\nNote not only the content of the messages but also the context and relationship between the entities mentioned.\nAlso take note of the overall tone of the conversation.\nOnly output the summary, and keep it concise.",
+        assistant_name
+    )
+}
+
+fn format_context_messages_for_summary(
+    messages: &[ConversationMessage],
+    user_name: &str,
+    assistant_name: &str,
+) -> String {
+    messages
+        .iter()
+        .filter_map(|message| match message.role {
+            MessageRole::System => None,
+            MessageRole::User => message
+                .content
+                .as_deref()
+                .map(str::trim)
+                .filter(|content| !content.is_empty())
+                .map(|content| format!("{user_name}: {}", excerpt(content, 400))),
+            MessageRole::Assistant => {
+                let mut lines = Vec::new();
+                if let Some(content) = message.content.as_deref().map(str::trim)
+                    && !content.is_empty()
+                {
+                    lines.push(format!("{assistant_name}: {}", excerpt(content, 400)));
+                }
+                if let Some(tool_calls) = &message.tool_calls {
+                    lines.extend(tool_calls.iter().map(|call| {
+                        format!(
+                            "{assistant_name} Tool Call: {} {}",
+                            call.name,
+                            excerpt(&call.arguments_json, 200)
+                        )
+                    }));
+                }
+                (!lines.is_empty()).then_some(lines.join("\n"))
+            }
+            MessageRole::Tool => message
+                .content
+                .as_deref()
+                .map(str::trim)
+                .filter(|content| !content.is_empty())
+                .map(|content| format!("Tool Result: {}", excerpt(content, 400))),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn summarize_context_messages_with_model(
+    model: &dyn ModelClient,
+    assistant_name: &str,
+    user_name: &str,
+    messages: &[ConversationMessage],
+) -> Result<String, AppError> {
+    let prompt = format_context_messages_for_summary(messages, user_name, assistant_name);
+    if prompt.trim().is_empty() {
+        return Err(AppError::Runtime(
+            "cannot summarize empty context-refresh transcript".to_string(),
+        ));
+    }
+
+    let summary = model
+        .next_events(ConversationRequest {
+            user_message: &prompt,
+            tools: &[],
+            transcript: &[ConversationMessage::new(MessageRole::User, prompt.clone())],
+            force_tool: None,
+        })?
+        .into_iter()
+        .filter_map(|event| match event {
+            StreamEvent::AssistantResponse { content } => Some(content),
+            _ => None,
+        })
+        .collect::<String>()
+        .trim()
+        .to_string();
+
+    if summary.is_empty() {
+        return Err(AppError::Runtime(
+            "summary model returned no assistant text".to_string(),
+        ));
+    }
+
+    Ok(format!("Recent conversation summary: {summary}"))
+}
+
+fn build_context_summary_message(
+    connection: &rusqlite::Connection,
+    config: &AppConfig,
+    dropped_messages: &[ConversationMessage],
+) -> String {
+    let deterministic = format_context_summary_message(dropped_messages);
+    if dropped_messages.is_empty() {
+        return deterministic;
+    }
+
+    let Ok(preferences) = load_user_preferences(connection, LOCAL_USER_TOKEN) else {
+        return deterministic;
+    };
+    let Ok(provider_config) = provider_config_from_app_config(config) else {
+        return deterministic;
+    };
+    let Ok(client) = LiveModelClient::new(provider_config) else {
+        return deterministic;
+    };
+
+    let preferred_user_name = effective_user_preferred_name(preferences.as_ref());
+    let user_name = if preferred_user_name.trim().is_empty() {
+        "User"
+    } else {
+        preferred_user_name.as_str()
+    };
+    let assistant_name = &config.assistant_name;
+    let model = LiveProviderModel::new(
+        client,
+        context_refresh_summary_system_prompt(assistant_name),
+    );
+
+    summarize_context_messages_with_model(&model, assistant_name, user_name, dropped_messages)
+        .unwrap_or(deterministic)
 }
 
 fn restart_state() -> &'static Mutex<RestartState> {
@@ -7784,15 +7909,16 @@ mod tests {
         build_recall_query, codex_background_status_key, compress_context_messages,
         consolidate_exact_duplicate_memories, context_due_item_tool_call_id,
         context_due_item_tool_messages, count_context_tokens, drop_old_context_messages,
-        due_item_context_messages, format_context_summary_message, is_context_refresh_needed,
-        memory_recall_status_updates, message_matches_tool_call_id, parse_recalled_memory_names,
-        prompt_prelude_status_updates, provider_config_from_app_config,
-        recall_due_item_context_messages, recall_memory_context_messages, recalled_memory_names,
-        recent_recall_context, refresh_context_if_needed, run_prompt_with_model_and_registry,
+        due_item_context_messages, format_context_messages_for_summary,
+        format_context_summary_message, is_context_refresh_needed, memory_recall_status_updates,
+        message_matches_tool_call_id, parse_recalled_memory_names, prompt_prelude_status_updates,
+        provider_config_from_app_config, recall_due_item_context_messages,
+        recall_memory_context_messages, recalled_memory_names, recent_recall_context,
+        refresh_context_if_needed, run_prompt_with_model_and_registry,
         run_prompt_with_model_and_registry_stream, select_due_items_by_overlap,
         select_recalled_due_items, select_recalled_memories, should_offer_greeting,
         should_skip_memory_recall, significant_tokens, strip_input_message_for_persistence,
-        strip_transient_context_messages,
+        strip_transient_context_messages, summarize_context_messages_with_model,
     };
     use elroy_agenda::create_agenda_file;
     use elroy_codex::{
@@ -14563,6 +14689,59 @@ mod tests {
         assert!(summary.contains("project update"));
         assert!(summary.contains("Tool Result ("));
         assert!(summary.contains("): Found the project update memory."));
+    }
+
+    #[test]
+    fn format_context_messages_for_summary_uses_named_roles_and_tools() {
+        let formatted = format_context_messages_for_summary(
+            &[
+                ConversationMessage::new(MessageRole::System, "system"),
+                ConversationMessage::new(MessageRole::User, "I need to finish payroll"),
+                ConversationMessage::assistant_with_tool_calls(
+                    "I should look that up.",
+                    vec![ToolCall {
+                        id: "call-1".to_string(),
+                        name: "search_memories".to_string(),
+                        arguments_json: "{\"query\":\"payroll\"}".to_string(),
+                    }],
+                ),
+                ConversationMessage::tool_result("call-1", "Found payroll reminder."),
+            ],
+            "User",
+            "Elroy",
+        );
+
+        assert!(formatted.contains("User: I need to finish payroll"));
+        assert!(formatted.contains("Elroy: I should look that up."));
+        assert!(formatted.contains("Elroy Tool Call: search_memories"));
+        assert!(formatted.contains("Tool Result: Found payroll reminder."));
+        assert!(!formatted.contains("system"));
+    }
+
+    #[test]
+    fn summarize_context_messages_with_model_returns_prefixed_summary() {
+        let model = FakeModel::new(vec![vec![StreamEvent::AssistantResponse {
+            content: "I reminded the user about payroll and the tone stayed focused.".to_string(),
+        }]]);
+
+        let summary = summarize_context_messages_with_model(
+            &model,
+            "Elroy",
+            "User",
+            &[
+                ConversationMessage::new(MessageRole::User, "I need to finish payroll"),
+                ConversationMessage::new(
+                    MessageRole::Assistant,
+                    "You mentioned a payroll deadline.",
+                ),
+            ],
+        )
+        .expect("summary should be generated");
+
+        assert_eq!(
+            summary,
+            "Recent conversation summary: I reminded the user about payroll and the tone stayed focused."
+        );
     }
 
     #[test]
