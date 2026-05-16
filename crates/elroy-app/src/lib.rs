@@ -9754,6 +9754,55 @@ mod tests {
     }
 
     #[test]
+    fn due_item_context_messages_include_multiple_due_items() {
+        let messages = due_item_context_messages(&[
+            AgendaItemRecord {
+                id: 1,
+                legacy_frontmatter_id: None,
+                name: "call mom".to_string(),
+                file_path: "/tmp/call_mom.md".to_string(),
+                agenda_date: Some("unscheduled".to_string()),
+                is_completed: false,
+                status: Some("created".to_string()),
+                trigger_datetime: Some("2000-01-01T09:00:00".to_string()),
+                trigger_context: None,
+                closing_comment: None,
+                checklist_total: 0,
+                checklist_completed: 0,
+                body: "Call mom tonight".to_string(),
+                is_active: true,
+                updated_at_unix: 1,
+            },
+            AgendaItemRecord {
+                id: 2,
+                legacy_frontmatter_id: None,
+                name: "pay rent".to_string(),
+                file_path: "/tmp/pay_rent.md".to_string(),
+                agenda_date: Some("unscheduled".to_string()),
+                is_completed: false,
+                status: Some("created".to_string()),
+                trigger_datetime: Some("2000-01-02T09:00:00".to_string()),
+                trigger_context: None,
+                closing_comment: None,
+                checklist_total: 0,
+                checklist_completed: 0,
+                body: "Pay rent".to_string(),
+                is_active: true,
+                updated_at_unix: 2,
+            },
+        ]);
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, MessageRole::Assistant);
+        assert_eq!(messages[1].role, MessageRole::Tool);
+        let content = messages[1].content.as_deref().unwrap_or_default();
+        assert!(content.contains("Call mom tonight"));
+        assert!(content.contains("Pay rent"));
+        assert!(content.contains("2000-01-01 09:00:00"));
+        assert!(content.contains("2000-01-02 09:00:00"));
+    }
+
+    #[test]
     fn select_recalled_due_items_prefers_trigger_context_overlap() {
         let due_items = vec![
             AgendaItemRecord {
