@@ -7271,12 +7271,18 @@ fn recall_memory_context_messages_with_decision(
 
     let recall_query =
         build_recall_query(prompt, context.transcript, memory_recall_classifier_window);
+    let relevance_model = if reflect { None } else { reflective_model };
     let already_recalled_memories = recalled_item_names_by_type(context.transcript, "Memory");
-    let recalled = select_recalled_memories(
+    let recalled = filter_candidates_for_relevance(
+        relevance_model,
         &recall_query,
-        context.memories,
-        &already_recalled_memories,
-        2,
+        select_recalled_memories(
+            &recall_query,
+            context.memories,
+            &already_recalled_memories,
+            2,
+        ),
+        |memory| format!("# {}\n{}", memory.name, memory.body.trim()),
     );
     let already_recalled_due_items = recalled_item_names_by_type(context.transcript, "AgendaItem");
     let reflective_due_items = if reflect {
@@ -7553,6 +7559,81 @@ fn parse_memory_recall_decision(response: &str) -> Option<(bool, String)> {
         .trim()
         .to_string();
     Some((needs_recall, reasoning))
+}
+
+fn parse_relevance_filter_response(response: &str) -> Option<Vec<bool>> {
+    let trimmed = response.trim();
+    let json_text = if trimmed.starts_with("```") {
+        trimmed
+            .lines()
+            .skip(1)
+            .take_while(|line| !line.trim_start().starts_with("```"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else {
+        trimmed.to_string()
+    };
+    let value: Value = serde_json::from_str(json_text.trim()).ok()?;
+    value
+        .get("answers")?
+        .as_array()?
+        .iter()
+        .map(Value::as_bool)
+        .collect()
+}
+
+fn filter_candidates_for_relevance<'a, T>(
+    model: Option<&dyn ModelClient>,
+    query: &str,
+    candidates: Vec<&'a T>,
+    extraction_fn: impl Fn(&T) -> String,
+) -> Vec<&'a T> {
+    let Some(model) = model else {
+        return candidates;
+    };
+    if candidates.is_empty() {
+        return candidates;
+    }
+
+    let responses = candidates
+        .iter()
+        .enumerate()
+        .map(|(index, candidate)| format!("{index}. {}", extraction_fn(candidate)))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let prompt = format!(
+        "Your job is to determine which candidate recall items are relevant to a query.\n\
+Return exactly one JSON object with keys `answers` (array of booleans, one per candidate, in order) \
+and `reasoning` (string).\n\n\
+Query: {query}\nResponses:\n{responses}"
+    );
+    let Ok(events) = model.next_events(ConversationRequest {
+        user_message: &prompt,
+        tools: &[],
+        transcript: &[ConversationMessage::new(MessageRole::User, prompt.clone())],
+        force_tool: None,
+    }) else {
+        return candidates;
+    };
+    let response = events
+        .into_iter()
+        .filter_map(|event| match event {
+            StreamEvent::AssistantResponse { content } => Some(content),
+            _ => None,
+        })
+        .collect::<String>();
+    let Some(answers) = parse_relevance_filter_response(&response) else {
+        return candidates;
+    };
+    if answers.len() != candidates.len() {
+        return candidates;
+    }
+
+    candidates
+        .into_iter()
+        .zip(answers)
+        .filter_map(|(candidate, is_relevant)| is_relevant.then_some(candidate))
+        .collect()
 }
 
 fn classify_memory_recall_with_model(
@@ -8254,16 +8335,16 @@ mod tests {
         format_context_messages_for_summary, format_context_summary_message,
         is_context_refresh_needed, memory_recall_status_updates, message_matches_tool_call_id,
         parse_memory_recall_decision, parse_recalled_item_names, parse_recalled_memory_names,
-        parse_reflective_recall_model_response, prompt_prelude_status_updates,
-        provider_config_from_app_config, recall_due_item_context_messages,
-        recall_memory_context_messages, recall_memory_context_messages_with_decision,
-        recalled_item_names_by_type, recalled_memory_names, recent_recall_context,
-        refresh_context_if_needed, run_prompt_with_model_and_registry,
-        run_prompt_with_model_and_registry_internal, run_prompt_with_model_and_registry_stream,
-        select_due_items_by_overlap, select_recalled_due_items, select_recalled_memories,
-        should_offer_greeting, should_skip_memory_recall, significant_tokens,
-        strip_input_message_for_persistence, strip_transient_context_messages,
-        summarize_context_messages_with_model,
+        parse_reflective_recall_model_response, parse_relevance_filter_response,
+        prompt_prelude_status_updates, provider_config_from_app_config,
+        recall_due_item_context_messages, recall_memory_context_messages,
+        recall_memory_context_messages_with_decision, recalled_item_names_by_type,
+        recalled_memory_names, recent_recall_context, refresh_context_if_needed,
+        run_prompt_with_model_and_registry, run_prompt_with_model_and_registry_internal,
+        run_prompt_with_model_and_registry_stream, select_due_items_by_overlap,
+        select_recalled_due_items, select_recalled_memories, should_offer_greeting,
+        should_skip_memory_recall, significant_tokens, strip_input_message_for_persistence,
+        strip_transient_context_messages, summarize_context_messages_with_model,
     };
     use elroy_agenda::create_agenda_file;
     use elroy_codex::{
@@ -15694,6 +15775,20 @@ mod tests {
     }
 
     #[test]
+    fn parse_relevance_filter_response_accepts_json_and_fenced_json() {
+        assert_eq!(
+            parse_relevance_filter_response(r#"{"answers":[true,false],"reasoning":"only first"}"#),
+            Some(vec![true, false])
+        );
+        assert_eq!(
+            parse_relevance_filter_response(
+                "```json\n{\"answers\":[false,true],\"reasoning\":\"only second\"}\n```"
+            ),
+            Some(vec![false, true])
+        );
+    }
+
+    #[test]
     fn parse_reflective_recall_model_response_accepts_json_and_fenced_json() {
         assert_eq!(
             parse_reflective_recall_model_response(
@@ -15827,6 +15922,104 @@ mod tests {
             "What was that library you mentioned?",
             &NoRecallPromptModel,
             Some(&classifier),
+            ExecutableToolRegistry::new(vec![]),
+            PromptExecutionOptions {
+                role: MessageRole::User,
+                persist_input_message: true,
+                force_tool: None,
+                assistant_name: &config.assistant_name,
+                ensure_alternating_roles: config.llm_provider() == LlmProvider::Anthropic,
+                home_dir: &home,
+                bootstrap_plan: BootstrapPlan::from_config(&config),
+                messages_between_memory: config.messages_between_memory,
+                memories_between_consolidation: config.memories_between_consolidation,
+                messages_between_self_reflection: config.messages_between_self_reflection,
+                defer_auto_memory: false,
+                defer_self_reflection: false,
+                memory_recall_classifier_enabled: true,
+                memory_recall_classifier_window: 3,
+                reflect: false,
+            },
+        )
+        .expect("prompt should succeed");
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::StatusUpdate { content } if content == "classifying recall..."
+        )));
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            StreamEvent::StatusUpdate { content } if content == "fetching memories..."
+        )));
+
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
+    fn run_prompt_with_model_and_registry_can_filter_overlap_matches_via_relevance_model() {
+        struct NoRecallContextPromptModel;
+
+        impl ModelClient for NoRecallContextPromptModel {
+            fn next_events(
+                &self,
+                request: ConversationRequest<'_>,
+            ) -> Result<Vec<StreamEvent>, elroy_core::ModelClientError> {
+                assert_eq!(request.user_message, "What workout gear should I bring?");
+                assert!(!request.transcript.iter().any(|message| {
+                    message.role == MessageRole::Tool
+                        && message.tool_call_id.as_deref() == Some("bootstrap-memory-recall")
+                }));
+                Ok(vec![StreamEvent::AssistantResponse {
+                    content: "No recall was injected.".to_string(),
+                }])
+            }
+        }
+
+        let unique = format!(
+            "elroy-rs-app-recall-relevance-filter-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+
+        let mut config = AppConfig::defaults();
+        config.home_dir = home.clone();
+        config.memory_dir = memory_dir.clone();
+        config.agenda_dir = agenda_dir;
+        config.database_path = database_path.clone();
+
+        let mut connection = open_sqlite_connection(&database_path).expect("database should open");
+        run_migrations(&mut connection).expect("migrations should run");
+        fs::write(
+            memory_dir.join("gym_note.md"),
+            "# Gym Note\n\nBring dumbbells to the gym workout.\n",
+        )
+        .expect("memory file should be written");
+        elroy_db::bootstrap_database(&BootstrapPlan::from_config(&config))
+            .expect("bootstrap should succeed");
+
+        let classifier_and_filter = FakeModel::new(vec![
+            vec![StreamEvent::AssistantResponse {
+                content:
+                    r#"{"needs_recall":true,"reasoning":"The prompt references workout gear."}"#
+                        .to_string(),
+            }],
+            vec![StreamEvent::AssistantResponse {
+                content: r#"{"answers":[false],"reasoning":"This memory is not about gear the user should bring."}"#.to_string(),
+            }],
+        ]);
+        let events = run_prompt_with_model_and_registry_internal(
+            &mut connection,
+            "What workout gear should I bring?",
+            &NoRecallContextPromptModel,
+            Some(&classifier_and_filter),
             ExecutableToolRegistry::new(vec![]),
             PromptExecutionOptions {
                 role: MessageRole::User,
