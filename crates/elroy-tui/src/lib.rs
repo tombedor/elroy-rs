@@ -136,6 +136,9 @@ pub struct TuiCommandForm {
 pub enum TuiCommandPaletteAction {
     FocusMemories,
     FocusAgenda,
+    FocusImprovements,
+    FocusFeatureRequests,
+    FocusCodexSessions,
     ToolCommand(String),
 }
 
@@ -1351,6 +1354,30 @@ impl TuiApp {
         entries.insert(
             2,
             TuiCommandPaletteEntry {
+                title: "Focus Improvements".to_string(),
+                description: "Switch the sidebar to improvements".to_string(),
+                action: TuiCommandPaletteAction::FocusImprovements,
+            },
+        );
+        entries.insert(
+            3,
+            TuiCommandPaletteEntry {
+                title: "Focus Feature Requests".to_string(),
+                description: "Switch the sidebar to feature requests".to_string(),
+                action: TuiCommandPaletteAction::FocusFeatureRequests,
+            },
+        );
+        entries.insert(
+            4,
+            TuiCommandPaletteEntry {
+                title: "Focus Codex Sessions".to_string(),
+                description: "Switch the sidebar to codex sessions".to_string(),
+                action: TuiCommandPaletteAction::FocusCodexSessions,
+            },
+        );
+        entries.insert(
+            5,
+            TuiCommandPaletteEntry {
                 title: "Refresh System Instructions".to_string(),
                 description: "Rebuild the system instructions for the current conversation"
                     .to_string(),
@@ -1360,7 +1387,7 @@ impl TuiApp {
             },
         );
         entries.insert(
-            3,
+            6,
             TuiCommandPaletteEntry {
                 title: "Reset Messages".to_string(),
                 description: "Clear the current conversation".to_string(),
@@ -1942,6 +1969,27 @@ fn handle_command_palette_key(app: &mut TuiApp, key: KeyEvent, runtime: &mut imp
                     app.last_command_pane = CommandPane::Sidebar;
                     app.status = "focused agenda".to_string();
                 }
+                TuiCommandPaletteAction::FocusImprovements => {
+                    app.command_palette = None;
+                    app.sidebar_section = SidebarSection::Improvements;
+                    app.focus = FocusTarget::Command(CommandPane::Sidebar);
+                    app.last_command_pane = CommandPane::Sidebar;
+                    app.status = "focused improvements".to_string();
+                }
+                TuiCommandPaletteAction::FocusFeatureRequests => {
+                    app.command_palette = None;
+                    app.sidebar_section = SidebarSection::FeatureRequests;
+                    app.focus = FocusTarget::Command(CommandPane::Sidebar);
+                    app.last_command_pane = CommandPane::Sidebar;
+                    app.status = "focused feature requests".to_string();
+                }
+                TuiCommandPaletteAction::FocusCodexSessions => {
+                    app.command_palette = None;
+                    app.sidebar_section = SidebarSection::CodexSessions;
+                    app.focus = FocusTarget::Command(CommandPane::Sidebar);
+                    app.last_command_pane = CommandPane::Sidebar;
+                    app.status = "focused codex sessions".to_string();
+                }
                 TuiCommandPaletteAction::ToolCommand(name) => {
                     match runtime.launch_named_command(&name) {
                         Ok(TuiSlashCommandAction::Execute(command)) => {
@@ -2220,6 +2268,19 @@ mod tests {
         maybe_refresh_snapshot_after_background_completion, maybe_run_deferred_context_refresh,
         poll_context_updates, start_startup_prompt_stream,
     };
+
+    fn select_command_palette_entry(app: &mut TuiApp, title: &str) {
+        let palette = app
+            .command_palette
+            .as_mut()
+            .expect("command palette should open");
+        let index = palette
+            .filtered_indices
+            .iter()
+            .position(|entry_index| palette.all_entries[*entry_index].title == title)
+            .expect("command palette entry should exist");
+        palette.selected_index = index;
+    }
 
     #[derive(Default)]
     struct FakeRuntime {
@@ -3432,6 +3493,24 @@ mod tests {
             command_palette
                 .all_entries
                 .iter()
+                .any(|entry| entry.title == "Focus Improvements")
+        );
+        assert!(
+            command_palette
+                .all_entries
+                .iter()
+                .any(|entry| entry.title == "Focus Feature Requests")
+        );
+        assert!(
+            command_palette
+                .all_entries
+                .iter()
+                .any(|entry| entry.title == "Focus Codex Sessions")
+        );
+        assert!(
+            command_palette
+                .all_entries
+                .iter()
                 .any(|entry| entry.title == "Refresh System Instructions")
         );
         assert!(
@@ -3447,10 +3526,7 @@ mod tests {
     fn command_palette_can_execute_system_command_entry() {
         let mut app = TuiApp::bootstrap();
         app.open_command_palette(vec![]);
-        app.command_palette
-            .as_mut()
-            .expect("command palette should open")
-            .selected_index = 2;
+        select_command_palette_entry(&mut app, "Refresh System Instructions");
         let mut runtime = FakeRuntime {
             launch_named_command_action: Some(TuiSlashCommandAction::Execute(
                 TuiCommandExecution {
@@ -3499,6 +3575,28 @@ mod tests {
     }
 
     #[test]
+    fn command_palette_can_focus_feature_requests_section() {
+        let mut app = TuiApp::bootstrap();
+        app.open_command_palette(vec![]);
+        select_command_palette_entry(&mut app, "Focus Feature Requests");
+        let mut runtime = FakeRuntime::default();
+        let mut pending = None;
+
+        apply_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut runtime,
+            &mut pending,
+        );
+
+        assert!(app.command_palette.is_none());
+        assert_eq!(app.focus, FocusTarget::Command(CommandPane::Sidebar));
+        assert_eq!(app.last_command_pane, CommandPane::Sidebar);
+        assert_eq!(app.sidebar_section, SidebarSection::FeatureRequests);
+        assert_eq!(app.status, "focused feature requests");
+    }
+
+    #[test]
     fn background_command_completion_can_return_restart_request() {
         let mut app = TuiApp::bootstrap();
         app.command_active = true;
@@ -3529,10 +3627,7 @@ mod tests {
             description: "Create a memory".to_string(),
             action: TuiCommandPaletteAction::ToolCommand("create_memory".to_string()),
         }]);
-        app.command_palette
-            .as_mut()
-            .expect("command palette should open")
-            .selected_index = 2;
+        select_command_palette_entry(&mut app, "/create_memory");
         let mut runtime = FakeRuntime {
             launch_named_command_action: Some(TuiSlashCommandAction::OpenForm(TuiCommandForm {
                 command_name: "create_memory".to_string(),
@@ -3577,10 +3672,7 @@ mod tests {
             description: "Refresh system instructions".to_string(),
             action: TuiCommandPaletteAction::ToolCommand("refresh_system_instructions".to_string()),
         }]);
-        app.command_palette
-            .as_mut()
-            .expect("command palette should open")
-            .selected_index = 2;
+        select_command_palette_entry(&mut app, "/refresh_system_instructions");
         app.command_active = true;
         let mut runtime = FakeRuntime {
             launch_named_command_action: Some(TuiSlashCommandAction::Execute(
@@ -3616,10 +3708,7 @@ mod tests {
             description: "Refresh system instructions".to_string(),
             action: TuiCommandPaletteAction::ToolCommand("refresh_system_instructions".to_string()),
         }]);
-        app.command_palette
-            .as_mut()
-            .expect("command palette should open")
-            .selected_index = 2;
+        select_command_palette_entry(&mut app, "/refresh_system_instructions");
         app.prompt_active = true;
         let mut runtime = FakeRuntime {
             launch_named_command_action: Some(TuiSlashCommandAction::Execute(
