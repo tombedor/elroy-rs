@@ -197,6 +197,7 @@ struct PromptExecutionOptions<'a> {
     role: MessageRole,
     persist_input_message: bool,
     force_tool: Option<&'a str>,
+    assistant_name: &'a str,
     home_dir: &'a Path,
     bootstrap_plan: BootstrapPlan,
     messages_between_memory: usize,
@@ -228,7 +229,7 @@ impl AppRuntime {
 
     pub fn load_context_messages(&self) -> Result<Vec<ConversationMessage>, AppError> {
         let mut connection = self.open_connection()?;
-        load_context_messages(&mut connection, LOCAL_USER_TOKEN).map_err(AppError::from)
+        load_validated_runtime_transcript(&mut connection, &self.config.assistant_name)
     }
 
     pub fn background_status(&self) -> Option<String> {
@@ -265,6 +266,7 @@ impl AppRuntime {
                 role: options.role,
                 persist_input_message: options.persist_input_message,
                 force_tool,
+                assistant_name: &self.config.assistant_name,
                 home_dir: &self.config.home_dir,
                 bootstrap_plan: BootstrapPlan::from_config(&self.config),
                 messages_between_memory: self.config.messages_between_memory,
@@ -304,6 +306,7 @@ impl AppRuntime {
                 role: options.role,
                 persist_input_message: options.persist_input_message,
                 force_tool,
+                assistant_name: &self.config.assistant_name,
                 home_dir: &self.config.home_dir,
                 bootstrap_plan: BootstrapPlan::from_config(&self.config),
                 messages_between_memory: self.config.messages_between_memory,
@@ -680,13 +683,82 @@ fn drop_old_context_messages(
 }
 
 fn current_system_message(
-    config: &AppConfig,
+    default_assistant_name: &str,
     preferences: Option<&UserPreferenceRecord>,
 ) -> ConversationMessage {
     ConversationMessage::new(
         MessageRole::System,
-        effective_persona(preferences, &config.assistant_name),
+        effective_persona(preferences, default_assistant_name),
     )
+}
+
+fn repair_system_message_placement(
+    raw_messages: &[ConversationMessage],
+    expected_system_message: &ConversationMessage,
+) -> Vec<ConversationMessage> {
+    let Some(first_message) = raw_messages.first() else {
+        return Vec::new();
+    };
+
+    if first_message.role == MessageRole::System
+        && !raw_messages
+            .iter()
+            .skip(1)
+            .any(|message| message.role == MessageRole::System)
+        && first_message.content == expected_system_message.content
+    {
+        return raw_messages.to_vec();
+    }
+
+    let mut repaired = Vec::with_capacity(raw_messages.len().saturating_add(1));
+    if first_message.role == MessageRole::System {
+        let mut refreshed_first = first_message.clone();
+        refreshed_first.content = expected_system_message.content.clone();
+        refreshed_first.chat_model = None;
+        refreshed_first.tool_calls = None;
+        refreshed_first.tool_call_id = None;
+        repaired.push(refreshed_first);
+        repaired.extend(
+            raw_messages
+                .iter()
+                .skip(1)
+                .filter(|message| message.role != MessageRole::System)
+                .cloned(),
+        );
+    } else {
+        repaired.push(expected_system_message.clone());
+        repaired.extend(
+            raw_messages
+                .iter()
+                .filter(|message| message.role != MessageRole::System)
+                .cloned(),
+        );
+    }
+    repaired
+}
+
+fn load_validated_runtime_transcript(
+    connection: &mut rusqlite::Connection,
+    default_assistant_name: &str,
+) -> Result<Vec<ConversationMessage>, AppError> {
+    let raw_messages = load_context_messages(connection, LOCAL_USER_TOKEN)?;
+    if raw_messages.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let preferences = load_user_preferences(connection, LOCAL_USER_TOKEN)?;
+    let expected_system_message =
+        current_system_message(default_assistant_name, preferences.as_ref());
+    let repaired_messages =
+        repair_system_message_placement(&raw_messages, &expected_system_message);
+    let validated = validated_transcript(&repaired_messages);
+
+    if validated != raw_messages {
+        replace_context_messages(connection, LOCAL_USER_TOKEN, &validated)?;
+        return load_context_messages(connection, LOCAL_USER_TOKEN).map_err(AppError::from);
+    }
+
+    Ok(validated)
 }
 
 fn refreshed_context_messages_with_system(
@@ -694,7 +766,7 @@ fn refreshed_context_messages_with_system(
     config: &AppConfig,
 ) -> Result<Vec<ConversationMessage>, AppError> {
     let preferences = load_user_preferences(connection, LOCAL_USER_TOKEN)?;
-    let system_message = current_system_message(config, preferences.as_ref());
+    let system_message = current_system_message(&config.assistant_name, preferences.as_ref());
     let mut refreshed = load_context_messages(connection, LOCAL_USER_TOKEN)?
         .into_iter()
         .filter(|message| message.role != MessageRole::System)
@@ -717,7 +789,7 @@ fn reset_persisted_context(
     config: &AppConfig,
 ) -> Result<(), AppError> {
     let preferences = load_user_preferences(connection, LOCAL_USER_TOKEN)?;
-    let system_message = current_system_message(config, preferences.as_ref());
+    let system_message = current_system_message(&config.assistant_name, preferences.as_ref());
     replace_context_messages(connection, LOCAL_USER_TOKEN, &[system_message])?;
     Ok(())
 }
@@ -967,7 +1039,7 @@ fn run_prompt_with_model_and_registry(
     let orchestrator = ConversationOrchestrator::new(2);
     let tool_executor = LocalToolExecutor::new(executable_tools);
     let existing_transcript =
-        validated_transcript(&load_context_messages(connection, LOCAL_USER_TOKEN)?);
+        load_validated_runtime_transcript(connection, options.assistant_name)?;
     let recall_context = recall_memory_context_messages(
         options.memory_recall_classifier_enabled,
         options.memory_recall_classifier_window,
@@ -1043,7 +1115,7 @@ fn run_prompt_with_model_and_registry_stream(
     let orchestrator = ConversationOrchestrator::new(2);
     let tool_executor = Box::new(LocalToolExecutor::new(executable_tools));
     let existing_transcript =
-        validated_transcript(&load_context_messages(&mut connection, LOCAL_USER_TOKEN)?);
+        load_validated_runtime_transcript(&mut connection, options.assistant_name)?;
     let recall_context = recall_memory_context_messages(
         options.memory_recall_classifier_enabled,
         options.memory_recall_classifier_window,
@@ -1234,6 +1306,7 @@ fn run_background_codex_completion_followup(
             role: MessageRole::User,
             persist_input_message: false,
             force_tool: None,
+            assistant_name: &config.assistant_name,
             home_dir: &config.home_dir,
             bootstrap_plan: BootstrapPlan::from_config(config),
             messages_between_memory: config.messages_between_memory,
@@ -2125,6 +2198,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
     );
 
     let database_path = config.database_path.clone();
+    let config_for_show_context = config.clone();
     let show_context_messages = ExecutableTool::new(
         ToolSpec::new(
             "show_context_messages",
@@ -2142,7 +2216,10 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
             if let Err(error) = run_migrations(&mut connection) {
                 return ToolExecutionResult::error(format!("failed to run migrations: {error}"));
             }
-            match load_context_messages(&mut connection, LOCAL_USER_TOKEN) {
+            match load_validated_runtime_transcript(
+                &mut connection,
+                &config_for_show_context.assistant_name,
+            ) {
                 Ok(messages) => {
                     let payload = messages
                         .into_iter()
@@ -4611,6 +4688,64 @@ mod tests {
     }
 
     #[test]
+    fn app_runtime_load_context_messages_repairs_system_message_placement() {
+        let unique = format!(
+            "elroy-rs-app-repair-system-placement-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+
+        let mut connection = open_sqlite_connection(&database_path).expect("database should open");
+        run_migrations(&mut connection).expect("migrations should run");
+        elroy_db::replace_context_messages(
+            &mut connection,
+            LOCAL_USER_TOKEN,
+            &[
+                ConversationMessage::new(MessageRole::User, "hello"),
+                ConversationMessage::new(MessageRole::System, "stale system"),
+                ConversationMessage::new(MessageRole::Assistant, "hi"),
+            ],
+        )
+        .expect("messages should persist");
+
+        let mut config = AppConfig::defaults();
+        config.home_dir = home.clone();
+        config.memory_dir = memory_dir;
+        config.agenda_dir = agenda_dir;
+        config.database_path = database_path.clone();
+
+        let runtime = AppRuntime::new(config);
+        let repaired = runtime
+            .load_context_messages()
+            .expect("context messages should load");
+
+        assert_eq!(repaired.len(), 3);
+        assert_eq!(repaired[0].role, MessageRole::System);
+        assert!(
+            repaired[0]
+                .content
+                .as_deref()
+                .is_some_and(|content| content.contains("I am Elroy"))
+        );
+        assert_eq!(repaired[1].role, MessageRole::User);
+        assert_eq!(repaired[2].role, MessageRole::Assistant);
+
+        let stored =
+            elroy_db::load_context_messages(&mut connection, LOCAL_USER_TOKEN).expect("load ok");
+        assert_eq!(stored, repaired);
+
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
     fn live_tool_registry_can_disable_base_tools_from_config() {
         let unique = format!(
             "elroy-rs-app-no-base-tools-{}",
@@ -5074,6 +5209,7 @@ mod tests {
                 role: MessageRole::User,
                 persist_input_message: false,
                 force_tool: None,
+                assistant_name: &config.assistant_name,
                 home_dir: &home,
                 bootstrap_plan: BootstrapPlan::from_config(&config),
                 messages_between_memory: config.messages_between_memory,
@@ -5134,6 +5270,7 @@ mod tests {
                 role: MessageRole::System,
                 persist_input_message: true,
                 force_tool: None,
+                assistant_name: &config.assistant_name,
                 home_dir: &home,
                 bootstrap_plan: BootstrapPlan::from_config(&config),
                 messages_between_memory: config.messages_between_memory,
@@ -5153,6 +5290,68 @@ mod tests {
             Some("System bootstrap message")
         );
         assert_eq!(stored[1].role, MessageRole::Assistant);
+
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
+    fn run_prompt_with_model_and_registry_repairs_missing_system_message_before_turn() {
+        let unique = format!(
+            "elroy-rs-app-prompt-repair-system-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+
+        let mut connection = open_sqlite_connection(&database_path).expect("database should open");
+        run_migrations(&mut connection).expect("migrations should run");
+        elroy_db::replace_context_messages(
+            &mut connection,
+            LOCAL_USER_TOKEN,
+            &[ConversationMessage::new(MessageRole::User, "hello")],
+        )
+        .expect("messages should persist");
+
+        let model = FakeModel::new(vec![vec![StreamEvent::AssistantResponse {
+            content: "repaired reply".to_string(),
+        }]]);
+        let config = AppConfig::defaults();
+        run_prompt_with_model_and_registry(
+            &mut connection,
+            "what next",
+            &model,
+            ExecutableToolRegistry::new(vec![]),
+            PromptExecutionOptions {
+                role: MessageRole::User,
+                persist_input_message: true,
+                force_tool: None,
+                assistant_name: &config.assistant_name,
+                home_dir: &home,
+                bootstrap_plan: BootstrapPlan::from_config(&config),
+                messages_between_memory: config.messages_between_memory,
+                messages_between_self_reflection: config.messages_between_self_reflection,
+                memory_recall_classifier_enabled: config.memory_recall_classifier_enabled,
+                memory_recall_classifier_window: config.memory_recall_classifier_window,
+            },
+        )
+        .expect("prompt should succeed");
+
+        let stored =
+            elroy_db::load_context_messages(&mut connection, LOCAL_USER_TOKEN).expect("load ok");
+        assert_eq!(stored[0].role, MessageRole::System);
+        assert_eq!(stored[1].role, MessageRole::User);
+        assert_eq!(stored[1].content.as_deref(), Some("hello"));
+        assert_eq!(stored[2].role, MessageRole::User);
+        assert_eq!(stored[2].content.as_deref(), Some("what next"));
+        assert_eq!(stored[3].role, MessageRole::Assistant);
+        assert_eq!(stored[3].content.as_deref(), Some("repaired reply"));
 
         fs::remove_dir_all(home).expect("home should be removed");
     }
@@ -5204,6 +5403,7 @@ mod tests {
                 role: MessageRole::User,
                 persist_input_message: true,
                 force_tool: None,
+                assistant_name: &config.assistant_name,
                 home_dir: &home,
                 bootstrap_plan: BootstrapPlan::from_config(&config),
                 messages_between_memory: config.messages_between_memory,
@@ -5269,6 +5469,7 @@ mod tests {
                 role: MessageRole::User,
                 persist_input_message: true,
                 force_tool: None,
+                assistant_name: &config.assistant_name,
                 home_dir: &home,
                 bootstrap_plan: BootstrapPlan::from_config(&config),
                 messages_between_memory: config.messages_between_memory,
@@ -5292,6 +5493,7 @@ mod tests {
                 role: MessageRole::User,
                 persist_input_message: true,
                 force_tool: None,
+                assistant_name: &config.assistant_name,
                 home_dir: &home,
                 bootstrap_plan: BootstrapPlan::from_config(&config),
                 messages_between_memory: config.messages_between_memory,
@@ -5347,6 +5549,7 @@ mod tests {
                 role: MessageRole::User,
                 persist_input_message: true,
                 force_tool: Some("missing_tool"),
+                assistant_name: &config.assistant_name,
                 home_dir: &home,
                 bootstrap_plan: BootstrapPlan::from_config(&config),
                 messages_between_memory: config.messages_between_memory,
@@ -5394,6 +5597,7 @@ mod tests {
                 role: MessageRole::User,
                 persist_input_message: true,
                 force_tool: None,
+                assistant_name: &config.assistant_name,
                 home_dir: &home,
                 bootstrap_plan: BootstrapPlan::from_config(&config),
                 messages_between_memory: config.messages_between_memory,
