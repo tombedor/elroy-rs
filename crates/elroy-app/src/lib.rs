@@ -8394,14 +8394,24 @@ mod tests {
             "{\"name\":\"call mom\",\"closing_comment\":\"done\"}",
         );
         assert!(!deleted.is_error);
+        let recreated = registry.invoke(
+            "create_due_item",
+            "{\"name\":\"call mom\",\"text\":\"Call mom again\",\"trigger_context\":\"after dinner\"}",
+        );
+        assert!(!recreated.is_error);
+        assert_eq!(
+            recreated.content,
+            "Contextual due item 'call mom' has been created."
+        );
         let stripped = registry.invoke("show_context_messages", "{\"limit\":40}");
         assert!(!stripped.is_error);
-        assert!(!stripped.content.contains("context-due-item:call mom"));
+        assert!(stripped.content.contains("context-due-item:call mom"));
         assert!(stripped.content.contains("context-due-item:pay rent"));
 
         let listed = registry.invoke("list_due_items", "{\"limit\":10}");
         assert!(!listed.is_error);
         assert!(listed.content.contains("pay rent"));
+        assert!(listed.content.contains("call mom"));
     }
 
     #[test]
