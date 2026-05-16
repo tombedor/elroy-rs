@@ -3678,6 +3678,57 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
     );
 
     let database_path = config.database_path.clone();
+    let get_source_content_for_memory = ExecutableTool::new(
+        ToolSpec::new(
+            "get_source_content_for_memory",
+            "Show the file-backed source content for one active memory.",
+            JsonSchema::object(
+                [
+                    ("memory_name", json!({"type": "string"})),
+                    ("index", json!({"type": "integer"})),
+                ],
+                ["memory_name"],
+            ),
+        ),
+        move |arguments| {
+            let Some(memory_name) = arguments.get("memory_name").and_then(Value::as_str) else {
+                return ToolExecutionResult::error(
+                    "get_source_content_for_memory requires string memory_name",
+                );
+            };
+            let index = arguments.get("index").and_then(Value::as_i64).unwrap_or(0);
+            if index < 0 {
+                return ToolExecutionResult::error(format!(
+                    "index {index} out of range. Available indices: [0]"
+                ));
+            }
+            with_tool_connection(&database_path, |connection| {
+                let Some(memory) = find_active_memory_by_name(connection, memory_name)? else {
+                    return Ok(ToolExecutionResult::error(format!(
+                        "memory not found: {memory_name}"
+                    )));
+                };
+                if index > 0 {
+                    return Ok(ToolExecutionResult::error(format!(
+                        "index {index} out of range. Available indices: [0]"
+                    )));
+                }
+                let path = Path::new(&memory.file_path);
+                let Ok(source_content) = std::fs::read_to_string(path) else {
+                    return Ok(ToolExecutionResult::success(format!(
+                        "No sources found for memory '{memory_name}'"
+                    )));
+                };
+                Ok(ToolExecutionResult::success(format!(
+                    "# Source content for memory: {} (0 / 0)\n\n{}",
+                    memory.name,
+                    source_content.trim()
+                )))
+            })
+        },
+    );
+
+    let database_path = config.database_path.clone();
     let show_agenda_item = ExecutableTool::new(
         ToolSpec::new(
             "show_agenda_item",
@@ -3773,6 +3824,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
         print_due_item,
         show_memory,
         print_memory,
+        get_source_content_for_memory,
         show_agenda_item,
     ])
 }
@@ -5153,6 +5205,57 @@ mod tests {
         assert!(agenda.content.contains("bring forms"));
         assert!(!printed_memories.is_error);
         assert!(printed_memories.content.contains("runner notes"));
+
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
+    fn live_tool_registry_can_show_source_content_for_memory() {
+        let unique = format!(
+            "elroy-rs-app-memory-source-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+        fs::write(
+            memory_dir.join("runner_notes.md"),
+            "remember the hill workout\nwith the harder second interval\n",
+        )
+        .expect("memory file should be written");
+
+        let mut config = AppConfig::defaults();
+        config.memory_dir = memory_dir;
+        config.agenda_dir = agenda_dir;
+        config.database_path = database_path;
+        elroy_db::bootstrap_database(&elroy_db::BootstrapPlan::from_config(&config))
+            .expect("bootstrap should succeed");
+
+        let registry = build_live_tool_registry(&config);
+        let source = registry.invoke(
+            "get_source_content_for_memory",
+            "{\"memory_name\":\"runner notes\"}",
+        );
+        let out_of_range = registry.invoke(
+            "get_source_content_for_memory",
+            "{\"memory_name\":\"runner notes\",\"index\":1}",
+        );
+
+        assert!(!source.is_error);
+        assert!(
+            source
+                .content
+                .contains("# Source content for memory: runner notes (0 / 0)")
+        );
+        assert!(source.content.contains("with the harder second interval"));
+        assert!(out_of_range.is_error);
+        assert!(out_of_range.content.contains("Available indices: [0]"));
 
         fs::remove_dir_all(home).expect("home should be removed");
     }
