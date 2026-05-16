@@ -3046,10 +3046,22 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
             let Some(text) = arguments.get("text").and_then(Value::as_str) else {
                 return ToolExecutionResult::error("update_due_item_text requires string text");
             };
-            mutate_agenda_file_from_config_with_result(&config_for_due_item_text, name, |path| {
-                update_agenda_body(path, text)?;
-                Ok(format!("Due item '{name}' text has been updated."))
-            })
+            mutate_due_item_file_from_config_with_result(
+                &config_for_due_item_text,
+                name,
+                |due_item_names| {
+                    let mut sorted_names = due_item_names.to_vec();
+                    sorted_names.sort();
+                    format!(
+                        "Due item '{name}' not found. Valid items: {}",
+                        sorted_names.join(",")
+                    )
+                },
+                |path, _| {
+                    update_agenda_body(path, text)?;
+                    Ok(format!("Due item '{name}' text has been updated."))
+                },
+            )
         },
     );
 
@@ -3100,12 +3112,27 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
             let Some(new_name) = arguments.get("new_name").and_then(Value::as_str) else {
                 return ToolExecutionResult::error("rename_due_item requires string new_name");
             };
-            mutate_agenda_file_from_config_with_result(&config_for_due_item_rename, name, |path| {
-                let _renamed = rename_agenda_file(path, new_name)?;
-                Ok(format!(
-                    "Due item '{name}' has been renamed to '{new_name}'."
-                ))
-            })
+            mutate_due_item_file_from_config_with_result(
+                &config_for_due_item_rename,
+                name,
+                |due_item_names| {
+                    format!(
+                        "Active due item '{name}' not found. Active items: {}",
+                        due_item_names.join(", ")
+                    )
+                },
+                |path, due_item_names| {
+                    if due_item_names.iter().any(|existing| existing == new_name) {
+                        return Err(std::io::Error::other(format!(
+                            "Active due item '{new_name}' already exists."
+                        )));
+                    }
+                    let _renamed = rename_agenda_file(path, new_name)?;
+                    Ok(format!(
+                        "Due item '{name}' has been renamed to '{new_name}'."
+                    ))
+                },
+            )
         },
     );
 
@@ -3154,10 +3181,16 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                 return ToolExecutionResult::error("complete_due_item requires a string name");
             };
             let closing_comment = arguments.get("closing_comment").and_then(Value::as_str);
-            mutate_agenda_file_from_config_with_result(
+            mutate_due_item_file_from_config_with_result(
                 &config_for_due_item_complete,
                 name,
-                |path| {
+                |due_item_names| {
+                    format!(
+                        "Active due item '{name}' not found. Active due items: {}",
+                        due_item_names.join(", ")
+                    )
+                },
+                |path, _| {
                     mark_agenda_item_completed(path, closing_comment)?;
                     Ok(match closing_comment {
                         Some(closing_comment) => format!(
@@ -3218,15 +3251,27 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                 return ToolExecutionResult::error("delete_due_item requires a string name");
             };
             let closing_comment = arguments.get("closing_comment").and_then(Value::as_str);
-            mutate_agenda_file_from_config_with_result(&config_for_due_item_delete, name, |path| {
-                mark_agenda_item_deleted(path, closing_comment)?;
-                Ok(match closing_comment {
-                    Some(closing_comment) => {
-                        format!("Due item '{name}' has been deleted. Comment: {closing_comment}")
-                    }
-                    None => format!("Due item '{name}' has been deleted."),
-                })
-            })
+            mutate_due_item_file_from_config_with_result(
+                &config_for_due_item_delete,
+                name,
+                |due_item_names| {
+                    format!(
+                        "Active due item '{name}' not found. Active due items: {}",
+                        due_item_names.join(", ")
+                    )
+                },
+                |path, _| {
+                    mark_agenda_item_deleted(path, closing_comment)?;
+                    Ok(match closing_comment {
+                        Some(closing_comment) => {
+                            format!(
+                                "Due item '{name}' has been deleted. Comment: {closing_comment}"
+                            )
+                        }
+                        None => format!("Due item '{name}' has been deleted."),
+                    })
+                },
+            )
         },
     );
 
@@ -5224,6 +5269,42 @@ fn mutate_task_file_from_config_with_result(
     }) {
         Ok(payload) => ToolExecutionResult::success(payload),
         Err(error) => ToolExecutionResult::error(format!("task mutation failed: {error}")),
+    }
+}
+
+fn mutate_due_item_file_from_config_with_result(
+    config: &AppConfig,
+    name: &str,
+    missing_message: impl FnOnce(&[String]) -> String,
+    operation: impl FnOnce(&Path, &[String]) -> std::io::Result<String>,
+) -> ToolExecutionResult {
+    let mut connection = match open_sqlite_connection(&config.database_path) {
+        Ok(connection) => connection,
+        Err(error) => {
+            return ToolExecutionResult::error(format!("failed to open database: {error}"));
+        }
+    };
+    if let Err(error) = run_migrations(&mut connection) {
+        return ToolExecutionResult::error(format!("failed to run migrations: {error}"));
+    }
+    let due_items = match list_active_due_items(&connection, 1_000) {
+        Ok(items) => items,
+        Err(error) => return ToolExecutionResult::error(format!("database query failed: {error}")),
+    };
+    let due_item_names = due_items
+        .iter()
+        .map(|item| item.name.clone())
+        .collect::<Vec<_>>();
+    let Some(item) = due_items.iter().find(|item| item.name == name) else {
+        return ToolExecutionResult::error(missing_message(&due_item_names));
+    };
+    match operation(Path::new(&item.file_path), &due_item_names).and_then(|payload| {
+        elroy_db::bootstrap_database(&BootstrapPlan::from_config(config))
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        Ok(payload)
+    }) {
+        Ok(payload) => ToolExecutionResult::success(payload),
+        Err(error) => ToolExecutionResult::error(format!("due item mutation failed: {error}")),
     }
 }
 
@@ -8400,6 +8481,15 @@ mod tests {
             updated.content,
             "Due item 'call mom' text has been updated."
         );
+        let missing_updated = registry.invoke(
+            "update_due_item_text",
+            "{\"name\":\"missing\",\"text\":\"No-op\"}",
+        );
+        assert!(missing_updated.is_error);
+        assert_eq!(
+            missing_updated.content,
+            "Due item 'missing' not found. Valid items: call mom"
+        );
 
         let renamed = registry.invoke(
             "rename_due_item",
@@ -8411,6 +8501,24 @@ mod tests {
             "Due item 'call mom' has been renamed to 'Call Parents'."
         );
         assert!(agenda_dir.join("call_parents.md").exists());
+        let missing_renamed = registry.invoke(
+            "rename_due_item",
+            "{\"name\":\"missing\",\"new_name\":\"Call Family\"}",
+        );
+        assert!(missing_renamed.is_error);
+        assert_eq!(
+            missing_renamed.content,
+            "Active due item 'missing' not found. Active items: call parents"
+        );
+        let duplicate_renamed = registry.invoke(
+            "rename_due_item",
+            "{\"name\":\"call parents\",\"new_name\":\"call parents\"}",
+        );
+        assert!(duplicate_renamed.is_error);
+        assert_eq!(
+            duplicate_renamed.content,
+            "due item mutation failed: Active due item 'call parents' already exists."
+        );
 
         let completed = registry.invoke(
             "complete_due_item",
@@ -8424,6 +8532,12 @@ mod tests {
         let completed_text =
             fs::read_to_string(agenda_dir.join("call_parents.md")).expect("due item should read");
         assert!(completed_text.contains("completed: true"));
+        let missing_completed = registry.invoke("complete_due_item", "{\"name\":\"missing\"}");
+        assert!(missing_completed.is_error);
+        assert_eq!(
+            missing_completed.content,
+            "Active due item 'missing' not found. Active due items: "
+        );
 
         fs::write(
             agenda_dir.join("pay_bill.md"),
@@ -8445,6 +8559,12 @@ mod tests {
             fs::read_to_string(agenda_dir.join("pay_bill.md")).expect("due item should read");
         assert!(deleted_text.contains("status: deleted"));
         assert!(deleted_text.contains("closing_comment: paid online"));
+        let missing_deleted = registry.invoke("delete_due_item", "{\"name\":\"missing\"}");
+        assert!(missing_deleted.is_error);
+        assert_eq!(
+            missing_deleted.content,
+            "Active due item 'missing' not found. Active due items: "
+        );
     }
 
     #[test]
