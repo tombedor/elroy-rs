@@ -1677,6 +1677,15 @@ fn format_memory_detail(memory: &MemoryRecord) -> String {
     format!("Memory '{}':\n\n{}", memory.name, memory.body)
 }
 
+fn format_memory_examination(memory: &MemoryRecord) -> String {
+    format!(
+        "# Memory: {}\n\n*to view the source content this memory is based on, call tool `get_source_content_for_memory({}, idx)`\n\n{}",
+        memory.name,
+        memory.name,
+        memory.body.trim()
+    )
+}
+
 fn format_memory_listing(memories: &[MemoryRecord]) -> String {
     if memories.is_empty() {
         return "No memories found.".to_string();
@@ -4465,7 +4474,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
 
                 let mut sections = relevant_memories
                     .into_iter()
-                    .map(|memory| format!("# Memory: {}\n\n{}", memory.name, memory.body.trim()))
+                    .map(|memory| format_memory_examination(memory))
                     .collect::<Vec<_>>();
                 sections.extend(relevant_due_items.into_iter().map(|item| {
                     let mut text = format!("# Due Item: {}\n\n{}", item.name, item.body.trim());
@@ -4832,8 +4841,8 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
             };
             with_tool_connection(&database_path, |connection| {
                 let Some(memory) = find_active_memory_by_name(connection, name)? else {
-                    return Ok(ToolExecutionResult::error(format!(
-                        "memory not found: {name}"
+                    return Ok(ToolExecutionResult::success(format!(
+                        "Memory '{name}' not found for the current user."
                     )));
                 };
                 Ok(ToolExecutionResult::success(format_memory_detail(&memory)))
@@ -4860,7 +4869,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
             with_tool_connection(&database_path, |connection| {
                 let Some(memory) = find_active_memory_by_name(connection, memory_name)? else {
                     return Ok(ToolExecutionResult::error(format!(
-                        "memory not found: {memory_name}"
+                        "Memory '{memory_name}' not found for the current user."
                     )));
                 };
                 let path = Path::new(&memory.file_path);
@@ -4915,7 +4924,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
             with_tool_connection(&database_path, |connection| {
                 let Some(memory) = find_active_memory_by_name(connection, memory_name)? else {
                     return Ok(ToolExecutionResult::error(format!(
-                        "memory not found: {memory_name}"
+                        "Memory '{memory_name}' not found for the current user."
                     )));
                 };
                 let path = Path::new(&memory.file_path);
@@ -6440,6 +6449,7 @@ mod tests {
         let registry = build_live_tool_registry(&config);
         let memory = registry.invoke("show_memory", "{\"name\":\"runner notes\"}");
         let printed_memory = registry.invoke("print_memory", "{\"name\":\"runner notes\"}");
+        let missing_printed_memory = registry.invoke("print_memory", "{\"name\":\"missing\"}");
         let agenda = registry.invoke("show_agenda_item", "{\"name\":\"doctor visit\"}");
         let printed_memories = registry.invoke("print_memories", "{\"limit\":10}");
 
@@ -6448,6 +6458,11 @@ mod tests {
         assert!(!printed_memory.is_error);
         assert!(printed_memory.content.contains("Memory 'runner notes':"));
         assert!(printed_memory.content.contains("remember the hill workout"));
+        assert!(!missing_printed_memory.is_error);
+        assert_eq!(
+            missing_printed_memory.content,
+            "Memory 'missing' not found for the current user."
+        );
         assert!(!agenda.is_error);
         assert!(agenda.content.contains("bring forms"));
         assert!(!printed_memories.is_error);
@@ -6584,6 +6599,14 @@ mod tests {
             "get_source_list_for_memory",
             "{\"memory_name\":\"runner notes\"}",
         );
+        let missing_source_list = registry.invoke(
+            "get_source_list_for_memory",
+            "{\"memory_name\":\"missing\"}",
+        );
+        let missing_source = registry.invoke(
+            "get_source_content_for_memory",
+            "{\"memory_name\":\"missing\"}",
+        );
         let out_of_range = registry.invoke(
             "get_source_content_for_memory",
             "{\"memory_name\":\"runner notes\",\"index\":1}",
@@ -6595,6 +6618,16 @@ mod tests {
         assert_eq!(
             source_list.content,
             "{\"memory_name\":\"runner notes\",\"sources\":[]}"
+        );
+        assert!(missing_source_list.is_error);
+        assert_eq!(
+            missing_source_list.content,
+            "Memory 'missing' not found for the current user."
+        );
+        assert!(missing_source.is_error);
+        assert_eq!(
+            missing_source.content,
+            "Memory 'missing' not found for the current user."
         );
         assert!(!out_of_range.is_error);
         assert_eq!(
@@ -8693,6 +8726,11 @@ mod tests {
 
         assert!(!result.is_error);
         assert!(result.content.contains("# Memory: running notes"));
+        assert!(
+            result
+                .content
+                .contains("get_source_content_for_memory(running notes, idx)")
+        );
         assert!(result.content.contains("marathon in October"));
         assert!(result.content.contains("# Due Item: running follow up"));
         assert!(result.content.contains("long run recovery"));
