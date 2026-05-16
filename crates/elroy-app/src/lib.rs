@@ -6944,6 +6944,7 @@ fn format_context_summary_message(messages: &[ConversationMessage]) -> String {
         .iter()
         .filter_map(|message| {
             let mut parts = Vec::new();
+            let timestamp = format_context_summary_timestamp(message.created_at_unix);
             match message.role {
                 MessageRole::System => return None,
                 MessageRole::User => {
@@ -6951,18 +6952,21 @@ fn format_context_summary_message(messages: &[ConversationMessage]) -> String {
                     if content.is_empty() {
                         return None;
                     }
-                    parts.push(format!("User: {}", excerpt(content, 160)));
+                    parts.push(format!("User ({timestamp}): {}", excerpt(content, 160)));
                 }
                 MessageRole::Assistant => {
                     if let Some(content) = message.content.as_deref().map(str::trim)
                         && !content.is_empty()
                     {
-                        parts.push(format!("Assistant: {}", excerpt(content, 160)));
+                        parts.push(format!(
+                            "Assistant ({timestamp}): {}",
+                            excerpt(content, 160)
+                        ));
                     }
                     if let Some(tool_calls) = &message.tool_calls {
                         parts.extend(tool_calls.iter().map(|call| {
                             format!(
-                                "Assistant Tool Call: {} {}",
+                                "Assistant Tool Call ({timestamp}): {} {}",
                                 call.name,
                                 excerpt(&call.arguments_json, 120)
                             )
@@ -6974,7 +6978,10 @@ fn format_context_summary_message(messages: &[ConversationMessage]) -> String {
                     if content.is_empty() {
                         return None;
                     }
-                    parts.push(format!("Tool Result: {}", excerpt(content, 160)));
+                    parts.push(format!(
+                        "Tool Result ({timestamp}): {}",
+                        excerpt(content, 160)
+                    ));
                 }
             }
 
@@ -14312,8 +14319,10 @@ mod tests {
         ]);
 
         assert!(summary.starts_with("Recent conversation summary:"));
-        assert!(summary.contains("User: A very long user message"));
-        assert!(summary.contains("Assistant: A very long assistant message"));
+        assert!(summary.contains("User ("));
+        assert!(summary.contains("): A very long user message"));
+        assert!(summary.contains("Assistant ("));
+        assert!(summary.contains("): A very long assistant message"));
         assert!(summary.contains("Messages from "));
         assert!(!summary.contains("ignore"));
     }
@@ -14333,9 +14342,11 @@ mod tests {
         ]);
 
         assert!(summary.starts_with("Recent conversation summary:"));
-        assert!(summary.contains("Assistant Tool Call: search_memories"));
+        assert!(summary.contains("Assistant Tool Call ("));
+        assert!(summary.contains("): search_memories"));
         assert!(summary.contains("project update"));
-        assert!(summary.contains("Tool Result: Found the project update memory."));
+        assert!(summary.contains("Tool Result ("));
+        assert!(summary.contains("): Found the project update memory."));
     }
 
     #[test]
