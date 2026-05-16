@@ -1563,6 +1563,7 @@ fn run_prompt_with_model_and_registry_internal(
         options.reflect,
         prompt,
         memory_recall_decision.needs_recall,
+        classifier_model,
         RecallContext {
             transcript: &existing_transcript,
             memories: &list_active_memories_in_scope(
@@ -1686,6 +1687,7 @@ fn run_prompt_with_model_and_registry_stream_internal(
         options.reflect,
         prompt,
         memory_recall_decision.needs_recall,
+        classifier_model,
         RecallContext {
             transcript: &existing_transcript,
             memories: &list_active_memories_in_scope(
@@ -7260,6 +7262,7 @@ fn recall_memory_context_messages_with_decision(
     reflect: bool,
     prompt: &str,
     should_recall: bool,
+    reflective_model: Option<&dyn ModelClient>,
     context: RecallContext<'_>,
 ) -> Vec<ConversationMessage> {
     if !should_recall {
@@ -7299,14 +7302,26 @@ fn recall_memory_context_messages_with_decision(
 
     if reflect {
         let recent_context = recent_recall_context(context.transcript, 3);
+        let fallback_content = build_reflective_recall_content(
+            &recalled,
+            &reflective_due_items,
+            &reflective_agenda_items,
+            prompt,
+            &recent_context,
+        );
+        let Some(content) = build_reflective_recall_content_with_model(
+            reflective_model,
+            &recalled,
+            &reflective_due_items,
+            &reflective_agenda_items,
+            prompt,
+            &recent_context,
+            &fallback_content,
+        ) else {
+            return Vec::new();
+        };
         let content = serde_json::to_string_pretty(&json!({
-            "content": build_reflective_recall_content(
-                &recalled,
-                &reflective_due_items,
-                &reflective_agenda_items,
-                prompt,
-                &recent_context,
-            ),
+            "content": content,
             "recall_metadata": recalled.iter().map(|memory| {
                 json!({
                     "memory_type": "Memory",
@@ -7377,6 +7392,7 @@ fn recall_memory_context_messages(
         reflect,
         prompt,
         should_recall,
+        None,
         context,
     )
 }
@@ -7714,6 +7730,105 @@ fn build_reflective_recall_content(
         "I should use the recalled details only if they help answer the user clearly.".to_string(),
     );
     sections.join("\n\n")
+}
+
+fn build_reflective_recall_prompt(
+    memories: &[&elroy_db::MemoryRecord],
+    due_items: &[&AgendaItemRecord],
+    agenda_items: &[&AgendaItemRecord],
+    prompt: &str,
+    recent_context: &[String],
+) -> String {
+    let recalled_memory_facts = memories
+        .iter()
+        .map(|memory| format!("# {}\n{}", memory.name, memory.body.trim()))
+        .chain(due_items.iter().map(|item| {
+            let mut fact = format!("# {}\n{}", item.name, item.body.trim());
+            if let Some(trigger_datetime) = item.trigger_datetime.as_deref() {
+                fact.push_str(&format!("\ntrigger_datetime: {trigger_datetime}"));
+            }
+            if let Some(trigger_context) = item.trigger_context.as_deref() {
+                fact.push_str(&format!("\ntrigger_context: {trigger_context}"));
+            }
+            fact
+        }))
+        .chain(
+            agenda_items
+                .iter()
+                .map(|item| format!("# {}\n{}", item.name, item.body.trim())),
+        )
+        .collect::<Vec<_>>()
+        .join("\n\n");
+
+    let mut body = String::from("Recalled Memory Content\n\n");
+    body.push_str(&recalled_memory_facts);
+    body.push_str("\n\n#Conversation Transcript:\n");
+    if recent_context.is_empty() {
+        body.push_str(&format!("user: {}", prompt.trim()));
+    } else {
+        body.push_str(&recent_context.join("\n"));
+        body.push('\n');
+        body.push_str(&format!("user: {}", prompt.trim()));
+    }
+    body
+}
+
+fn parse_reflective_recall_model_response(response: &str) -> Option<(bool, Option<String>)> {
+    let trimmed = response.trim();
+    let json_text = if trimmed.starts_with("```") {
+        trimmed
+            .lines()
+            .skip(1)
+            .take_while(|line| !line.trim_start().starts_with("```"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else {
+        trimmed.to_string()
+    };
+    let value: Value = serde_json::from_str(json_text.trim()).ok()?;
+    let is_relevant = value.get("is_relevant")?.as_bool()?;
+    let content = value
+        .get("content")
+        .and_then(|content| content.as_str().map(str::trim).map(str::to_string));
+    Some((is_relevant, content))
+}
+
+fn build_reflective_recall_content_with_model(
+    model: Option<&dyn ModelClient>,
+    memories: &[&elroy_db::MemoryRecord],
+    due_items: &[&AgendaItemRecord],
+    agenda_items: &[&AgendaItemRecord],
+    prompt: &str,
+    recent_context: &[String],
+    fallback_content: &str,
+) -> Option<String> {
+    let Some(model) = model else {
+        return Some(fallback_content.to_string());
+    };
+    let model_prompt =
+        build_reflective_recall_prompt(memories, due_items, agenda_items, prompt, recent_context);
+    let response = model
+        .next_events(ConversationRequest {
+            user_message: &model_prompt,
+            tools: &[],
+            transcript: &[ConversationMessage::new(
+                MessageRole::User,
+                model_prompt.clone(),
+            )],
+            force_tool: None,
+        })
+        .ok()?
+        .into_iter()
+        .filter_map(|event| match event {
+            StreamEvent::AssistantResponse { content } => Some(content),
+            _ => None,
+        })
+        .collect::<String>();
+    match parse_reflective_recall_model_response(&response) {
+        Some((false, _)) => None,
+        Some((true, Some(content))) if !content.trim().is_empty() => Some(content),
+        _ => Some(fallback_content.to_string()),
+    }
 }
 
 #[cfg(test)]
@@ -8139,8 +8254,9 @@ mod tests {
         format_context_messages_for_summary, format_context_summary_message,
         is_context_refresh_needed, memory_recall_status_updates, message_matches_tool_call_id,
         parse_memory_recall_decision, parse_recalled_item_names, parse_recalled_memory_names,
-        prompt_prelude_status_updates, provider_config_from_app_config,
-        recall_due_item_context_messages, recall_memory_context_messages,
+        parse_reflective_recall_model_response, prompt_prelude_status_updates,
+        provider_config_from_app_config, recall_due_item_context_messages,
+        recall_memory_context_messages, recall_memory_context_messages_with_decision,
         recalled_item_names_by_type, recalled_memory_names, recent_recall_context,
         refresh_context_if_needed, run_prompt_with_model_and_registry,
         run_prompt_with_model_and_registry_internal, run_prompt_with_model_and_registry_stream,
@@ -15578,6 +15694,25 @@ mod tests {
     }
 
     #[test]
+    fn parse_reflective_recall_model_response_accepts_json_and_fenced_json() {
+        assert_eq!(
+            parse_reflective_recall_model_response(
+                r#"{"is_relevant":true,"content":"I should remind the user about payroll."}"#
+            ),
+            Some((
+                true,
+                Some("I should remind the user about payroll.".to_string())
+            ))
+        );
+        assert_eq!(
+            parse_reflective_recall_model_response(
+                "```json\n{\"is_relevant\":false,\"content\":null}\n```"
+            ),
+            Some((false, None))
+        );
+    }
+
+    #[test]
     fn classify_memory_recall_with_model_parses_structured_response() {
         let model = FakeModel::new(vec![vec![StreamEvent::AssistantResponse {
             content: r#"{"needs_recall":true,"reasoning":"The message references prior context."}"#
@@ -15980,6 +16115,100 @@ mod tests {
         assert!(
             payload.contains("The latest user message is: I am heading to basketball practice")
         );
+    }
+
+    #[test]
+    fn reflective_recall_uses_model_authored_content_when_available() {
+        let mut config = AppConfig::defaults();
+        config.memory_recall_classifier_enabled = false;
+        config.reflect = true;
+        let model = FakeModel::new(vec![vec![StreamEvent::AssistantResponse {
+            content: r#"{"is_relevant":true,"content":"I remember that the user should bring the resistance bands to practice."}"#.to_string(),
+        }]]);
+        let due_items = vec![AgendaItemRecord {
+            id: 2,
+            legacy_frontmatter_id: None,
+            name: "practice reminder".to_string(),
+            file_path: "/tmp/practice_reminder.md".to_string(),
+            agenda_date: Some("unscheduled".to_string()),
+            is_completed: false,
+            status: Some("created".to_string()),
+            closing_comment: None,
+            checklist_total: 0,
+            checklist_completed: 0,
+            body: "Bring the resistance bands".to_string(),
+            trigger_datetime: Some("2026-05-20T09:00:00".to_string()),
+            trigger_context: Some("before basketball practice".to_string()),
+            is_active: true,
+            updated_at_unix: 11,
+        }];
+
+        let messages = recall_memory_context_messages_with_decision(
+            config.memory_recall_classifier_window,
+            config.reflect,
+            "I am heading to basketball practice",
+            true,
+            Some(&model),
+            RecallContext {
+                transcript: &[],
+                memories: &[MemoryRecord {
+                    id: 1,
+                    legacy_frontmatter_id: None,
+                    name: "basketball form".to_string(),
+                    file_path: "/tmp/basketball.md".to_string(),
+                    body: "Remember to follow through on your shot".to_string(),
+                    is_active: true,
+                    updated_at_unix: 10,
+                }],
+                due_items: &due_items,
+                agenda_items: &[],
+            },
+        );
+
+        let payload = messages[1]
+            .content
+            .as_deref()
+            .expect("reflective recall payload should exist");
+        assert!(
+            payload.contains(
+                "I remember that the user should bring the resistance bands to practice."
+            )
+        );
+        assert!(!payload.contains("I remember these memory details may be relevant"));
+    }
+
+    #[test]
+    fn reflective_recall_can_be_suppressed_when_model_marks_it_irrelevant() {
+        let mut config = AppConfig::defaults();
+        config.memory_recall_classifier_enabled = false;
+        config.reflect = true;
+        let model = FakeModel::new(vec![vec![StreamEvent::AssistantResponse {
+            content: r#"{"is_relevant":false,"content":null}"#.to_string(),
+        }]]);
+
+        let messages = recall_memory_context_messages_with_decision(
+            config.memory_recall_classifier_window,
+            config.reflect,
+            "I am heading to basketball practice",
+            true,
+            Some(&model),
+            RecallContext {
+                transcript: &[],
+                memories: &[MemoryRecord {
+                    id: 1,
+                    legacy_frontmatter_id: None,
+                    name: "basketball form".to_string(),
+                    file_path: "/tmp/basketball.md".to_string(),
+                    body: "Remember to follow through on your shot".to_string(),
+                    is_active: true,
+                    updated_at_unix: 10,
+                }],
+                due_items: &[],
+                agenda_items: &[],
+            },
+        );
+
+        assert!(messages.is_empty());
     }
 
     #[test]
