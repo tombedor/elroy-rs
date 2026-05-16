@@ -11344,6 +11344,15 @@ mod tests {
     }
 
     #[test]
+    fn trivial_messages_skip_memory_recall_case_insensitively() {
+        assert!(should_skip_memory_recall("hello"));
+        assert!(should_skip_memory_recall("HELLO"));
+        assert!(should_skip_memory_recall("HeLLo"));
+        assert!(should_skip_memory_recall("OK"));
+        assert!(should_skip_memory_recall("ThAnKs"));
+    }
+
+    #[test]
     fn context_refresh_is_not_needed_without_user_messages() {
         let context_messages = vec![
             ConversationMessage::new(MessageRole::System, "system"),
