@@ -1553,6 +1553,13 @@ fn consume_session_restart_request() -> Option<String> {
     state.pending_resume_prompt.take()
 }
 
+fn redact_secret(value: Option<&str>) -> String {
+    match value {
+        Some(value) if !value.trim().is_empty() => "********".to_string(),
+        _ => "None (May be read from env vars)".to_string(),
+    }
+}
+
 fn filesystem_display_path(target: &Path) -> String {
     let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     target
@@ -1898,6 +1905,111 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                         .to_string(),
                 ),
                 Err(error) => ToolExecutionResult::error(error.to_string()),
+            }
+        },
+    );
+
+    let config_for_print_config = config.clone();
+    let print_config = ExecutableTool::new(
+        ToolSpec::new(
+            "print_config",
+            "Print the current Elroy configuration in a formatted report.",
+            JsonSchema::object(Vec::<(String, Value)>::new(), [] as [&str; 0]),
+        ),
+        move |_| {
+            let lines = [
+                "Elroy Configuration".to_string(),
+                String::new(),
+                "System Information".to_string(),
+                format!(
+                    "Config Path: {}",
+                    config_for_print_config.config_path.display()
+                ),
+                String::new(),
+                "Basic Configuration".to_string(),
+                format!(
+                    "Default Assistant Name: {}",
+                    config_for_print_config.assistant_name
+                ),
+                format!(
+                    "Database URL: sqlite:///{}",
+                    config_for_print_config.database_path.display()
+                ),
+                String::new(),
+                "Model Configuration".to_string(),
+                format!("Chat Model: {}", config_for_print_config.chat_model),
+                format!("Max Tokens: {}", config_for_print_config.max_tokens),
+                format!(
+                    "Context Refresh Target Tokens: {}",
+                    config_for_print_config.context_refresh_target_tokens()
+                ),
+                String::new(),
+                "API Configuration".to_string(),
+                format!("Chat API Base: {}", config_for_print_config.openai_base_url),
+                format!(
+                    "Chat API Key: {}",
+                    redact_secret(config_for_print_config.openai_api_key.as_deref())
+                ),
+                format!(
+                    "Anthropic API Base: {}",
+                    config_for_print_config.anthropic_base_url
+                ),
+                format!(
+                    "Anthropic API Key: {}",
+                    redact_secret(config_for_print_config.anthropic_api_key.as_deref())
+                ),
+                String::new(),
+                "Paths".to_string(),
+                format!("Home Dir: {}", config_for_print_config.home_dir.display()),
+                format!(
+                    "Memory Dir: {}",
+                    config_for_print_config.memory_dir.display()
+                ),
+                format!(
+                    "Agenda Dir: {}",
+                    config_for_print_config.agenda_dir.display()
+                ),
+            ];
+            ToolExecutionResult::success(lines.join("\n"))
+        },
+    );
+
+    let log_dir = config.home_dir.join("logs");
+    let tail_elroy_logs = ExecutableTool::new(
+        ToolSpec::new(
+            "tail_elroy_logs",
+            "Return the last lines of the Elroy log file.",
+            JsonSchema::object([("lines", json!({"type": "integer"}))], [] as [&str; 0]),
+        ),
+        move |arguments| {
+            let lines = arguments
+                .get("lines")
+                .and_then(Value::as_u64)
+                .map(|value| value as usize)
+                .unwrap_or(10);
+            let log_path = log_dir.join("elroy.log");
+            match std::fs::read_to_string(&log_path) {
+                Ok(content) => {
+                    let tail = content
+                        .lines()
+                        .rev()
+                        .take(lines)
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev()
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    ToolExecutionResult::success(if tail.is_empty() {
+                        String::new()
+                    } else {
+                        format!("{tail}\n")
+                    })
+                }
+                Err(error) => ToolExecutionResult::error(format!(
+                    "failed to read log file {}: {}",
+                    log_path.display(),
+                    error
+                )),
             }
         },
     );
@@ -4238,6 +4350,8 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
         ls,
         read_file,
         restart_session,
+        print_config,
+        tail_elroy_logs,
         create_memory,
         get_fast_recall,
         add_agenda_item,
@@ -6806,6 +6920,54 @@ mod tests {
             Some("Restarted successfully. Ready to continue.")
         );
         runtime.disable_restart_support();
+    }
+
+    #[test]
+    fn live_tool_registry_can_print_config_and_tail_logs() {
+        let unique = format!(
+            "elroy-rs-app-developer-tools-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let logs_dir = home.join("logs");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+        fs::create_dir_all(&logs_dir).expect("logs dir should be created");
+        fs::write(
+            logs_dir.join("elroy.log"),
+            "line one\nline two\nline three\n",
+        )
+        .expect("log file should be written");
+
+        let mut config = AppConfig::defaults();
+        config.home_dir = home.clone();
+        config.memory_dir = memory_dir;
+        config.agenda_dir = agenda_dir;
+        config.database_path = database_path;
+        config.config_path = home.join("elroy.conf.yaml");
+        config.openai_api_key = Some("openai-secret".to_string());
+        config.anthropic_api_key = Some("anthropic-secret".to_string());
+
+        let registry = build_live_tool_registry(&config);
+        let printed = registry.invoke("print_config", "{}");
+        let tailed = registry.invoke("tail_elroy_logs", "{\"lines\":2}");
+
+        assert!(!printed.is_error);
+        assert!(printed.content.contains("Elroy Configuration"));
+        assert!(printed.content.contains("Chat Model:"));
+        assert!(printed.content.contains("Config Path:"));
+        assert!(printed.content.contains("Chat API Key: ********"));
+        assert!(printed.content.contains("Anthropic API Key: ********"));
+        assert!(!tailed.is_error);
+        assert_eq!(tailed.content, "line two\nline three\n");
+
+        fs::remove_dir_all(home).expect("home should be removed");
     }
 
     #[test]
