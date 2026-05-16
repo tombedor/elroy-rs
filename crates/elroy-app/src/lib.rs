@@ -9544,6 +9544,66 @@ mod tests {
     }
 
     #[test]
+    fn show_agenda_item_ignores_completed_and_deleted_same_name_rows() {
+        let unique = format!(
+            "elroy-rs-app-agenda-active-lookup-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+
+        let mut config = AppConfig::defaults();
+        config.memory_dir = memory_dir;
+        config.agenda_dir = agenda_dir.clone();
+        config.database_path = database_path;
+        elroy_db::bootstrap_database(&elroy_db::BootstrapPlan::from_config(&config))
+            .expect("bootstrap should succeed");
+
+        let registry = build_live_tool_registry(&config);
+        let first = registry.invoke(
+            "add_agenda_item",
+            "{\"text\":\"Write Q2 report.\\nOriginal details\",\"item_date\":\"2026-03-20\"}",
+        );
+        assert!(!first.is_error);
+        let completed = registry.invoke(
+            "complete_agenda_item",
+            "{\"item_name\":\"write q2 report\"}",
+        );
+        assert!(!completed.is_error);
+
+        let second = registry.invoke(
+            "add_agenda_item",
+            "{\"text\":\"Write Q2 report.\\nReplacement details\",\"item_date\":\"2026-03-20\"}",
+        );
+        assert!(!second.is_error);
+        let shown_after_complete = registry.invoke("show_agenda_item", "{\"name\":\"write\"}");
+        assert!(!shown_after_complete.is_error);
+        assert!(shown_after_complete.content.contains("Replacement details"));
+        assert!(!shown_after_complete.content.contains("Original details"));
+
+        let deleted = registry.invoke("delete_agenda_item", "{\"item_name\":\"write q2 report\"}");
+        assert!(!deleted.is_error);
+        let third = registry.invoke(
+            "add_agenda_item",
+            "{\"text\":\"Write Q2 report.\\nThird details\",\"item_date\":\"2026-03-20\"}",
+        );
+        assert!(!third.is_error);
+        let shown_after_delete = registry.invoke("show_agenda_item", "{\"name\":\"write\"}");
+        assert!(!shown_after_delete.is_error);
+        assert!(shown_after_delete.content.contains("Third details"));
+        assert!(!shown_after_delete.content.contains("Replacement details"));
+
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
     fn agenda_sidebar_delete_rejects_plain_agenda_items() {
         let unique = format!(
             "elroy-rs-app-sidebar-agenda-delete-{}",
