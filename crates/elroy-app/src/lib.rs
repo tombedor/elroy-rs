@@ -630,6 +630,7 @@ impl AppRuntime {
                     MessageProcessOptions {
                         enable_tools: false,
                         persist_input_message: false,
+                        defer_auto_memory: true,
                         ..MessageProcessOptions::default()
                     },
                 )
@@ -653,6 +654,7 @@ impl AppRuntime {
             "<Empty user response>",
             MessageProcessOptions {
                 enable_tools: false,
+                defer_auto_memory: true,
                 ..MessageProcessOptions::default()
             },
         )
@@ -14386,6 +14388,7 @@ mod tests {
         config.database_path = home.join("elroy.db");
         config.openai_api_key = Some("test-key".to_string());
         config.openai_base_url = format!("{}/responses", server.url());
+        config.messages_between_memory = 1;
 
         let runtime = AppRuntime::new(config.clone());
         let mut connection =
@@ -14407,7 +14410,12 @@ mod tests {
             .expect("startup prompt should start")
             .expect("restart stream should be present");
         while stream.next().is_some() {}
-        let _ = stream.into_snapshot().expect("snapshot should finalize");
+        let completion = stream
+            .into_completion()
+            .expect("completion should finalize");
+        let deferred = completion
+            .deferred_auto_memory
+            .expect("restart stream should defer auto memory");
 
         let mut connection =
             open_sqlite_connection(&config.database_path).expect("database should reopen");
@@ -14421,6 +14429,25 @@ mod tests {
             message.role == MessageRole::Assistant
                 && message.content.as_deref() == Some("Restarted successfully. Ready to continue.")
         }));
+        let before_memories =
+            crate::list_active_memories_in_scope(&connection, &config.memory_dir, 10)
+                .expect("active memories should load");
+        assert!(before_memories.is_empty());
+        drop(connection);
+
+        runtime
+            .run_auto_memory_for_transcript(
+                deferred.existing_transcript_len,
+                deferred.transcript.clone(),
+            )
+            .expect("deferred auto memory should succeed");
+
+        let reopened =
+            open_sqlite_connection(&config.database_path).expect("database should reopen again");
+        let active_memories =
+            crate::list_active_memories_in_scope(&reopened, &config.memory_dir, 10)
+                .expect("active memories should load");
+        assert_eq!(active_memories.len(), 1);
 
         fs::remove_dir_all(home).expect("home should be removed");
     }
@@ -14460,6 +14487,7 @@ mod tests {
         config.openai_base_url = format!("{}/responses", server.url());
         config.enable_assistant_greeting = true;
         config.min_convo_age_for_greeting_minutes = 5.0;
+        config.messages_between_memory = 1;
 
         let runtime = AppRuntime::new(config.clone());
         let mut connection =
@@ -14483,7 +14511,12 @@ mod tests {
             .expect("startup prompt should evaluate")
             .expect("greeting stream should be present");
         while stream.next().is_some() {}
-        let _ = stream.into_snapshot().expect("snapshot should finalize");
+        let completion = stream
+            .into_completion()
+            .expect("completion should finalize");
+        let deferred = completion
+            .deferred_auto_memory
+            .expect("greeting stream should defer auto memory");
 
         let mut connection =
             open_sqlite_connection(&config.database_path).expect("database should reopen");
@@ -14493,6 +14526,25 @@ mod tests {
             message.role == MessageRole::Assistant
                 && message.content.as_deref() == Some("Good to see you again.")
         }));
+        let before_memories =
+            crate::list_active_memories_in_scope(&connection, &config.memory_dir, 10)
+                .expect("active memories should load");
+        assert!(before_memories.is_empty());
+        drop(connection);
+
+        runtime
+            .run_auto_memory_for_transcript(
+                deferred.existing_transcript_len,
+                deferred.transcript.clone(),
+            )
+            .expect("deferred auto memory should succeed");
+
+        let reopened =
+            open_sqlite_connection(&config.database_path).expect("database should reopen again");
+        let active_memories =
+            crate::list_active_memories_in_scope(&reopened, &config.memory_dir, 10)
+                .expect("active memories should load");
+        assert_eq!(active_memories.len(), 1);
 
         fs::remove_dir_all(home).expect("home should be removed");
     }
