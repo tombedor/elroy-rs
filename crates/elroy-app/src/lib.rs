@@ -1705,8 +1705,9 @@ fn format_memory_listing(memories: &[MemoryRecord]) -> String {
 fn format_memory_search_results(
     memories: &[MemoryRecord],
     due_items: &[&AgendaItemRecord],
+    agenda_items: &[&AgendaItemRecord],
 ) -> String {
-    if memories.is_empty() && due_items.is_empty() {
+    if memories.is_empty() && due_items.is_empty() && agenda_items.is_empty() {
         return "No relevant memories found".to_string();
     }
 
@@ -1721,6 +1722,13 @@ fn format_memory_search_results(
     for item in due_items {
         lines.push(format!(
             "- DueItem | {} | {}",
+            item.name,
+            excerpt(&item.body, 180)
+        ));
+    }
+    for item in agenda_items {
+        lines.push(format!(
+            "- AgendaItem | {} | {}",
             item.name,
             excerpt(&item.body, 180)
         ));
@@ -4541,9 +4549,13 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                 let due_items = list_active_due_items(connection, limit * 3)?;
                 let relevant_due_items =
                     select_due_items_by_overlap(query, &due_items, limit, None);
+                let agenda_items = list_active_plain_agenda_items(connection, limit * 3)?;
+                let relevant_agenda_items =
+                    select_agenda_items_by_overlap(query, &agenda_items, limit);
                 Ok(ToolExecutionResult::success(format_memory_search_results(
                     &memories,
                     &relevant_due_items,
+                    &relevant_agenda_items,
                 )))
             })
         },
@@ -4574,6 +4586,9 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                 let due_items = list_active_due_items(connection, limit * 3)?;
                 let relevant_due_items =
                     select_due_items_by_overlap(question, &due_items, limit, None);
+                let agenda_items = list_active_plain_agenda_items(connection, limit * 3)?;
+                let relevant_agenda_items =
+                    select_agenda_items_by_overlap(question, &agenda_items, limit);
 
                 let mut sections = relevant_memories
                     .into_iter()
@@ -4586,6 +4601,19 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                     }
                     if let Some(trigger_context) = item.trigger_context.as_deref() {
                         text.push_str(&format!("\nTrigger context: {trigger_context}"));
+                    }
+                    text
+                }));
+                sections.extend(relevant_agenda_items.into_iter().map(|item| {
+                    let mut text = format!("# Agenda Item: {}\n\n{}", item.name, item.body.trim());
+                    if let Some(agenda_date) = item.agenda_date.as_deref() {
+                        text.push_str(&format!("\n\nAgenda date: {agenda_date}"));
+                    }
+                    if item.checklist_total > 0 {
+                        text.push_str(&format!(
+                            "\nChecklist progress: {}/{}",
+                            item.checklist_completed, item.checklist_total
+                        ));
                     }
                     text
                 }));
@@ -5981,6 +6009,52 @@ fn select_due_items_by_overlap<'a>(
             haystack.push_str(trigger_context);
             let due_item_tokens = significant_tokens(&haystack);
             let overlap = prompt_tokens.intersection(&due_item_tokens).count();
+            (overlap > 0).then_some((overlap, item.updated_at_unix, item))
+        })
+        .collect::<Vec<_>>();
+
+    scored.sort_by(|left, right| {
+        right
+            .0
+            .cmp(&left.0)
+            .then_with(|| right.1.cmp(&left.1))
+            .then_with(|| left.2.name.cmp(&right.2.name))
+    });
+    scored
+        .into_iter()
+        .take(limit)
+        .map(|(_, _, item)| item)
+        .collect()
+}
+
+fn select_agenda_items_by_overlap<'a>(
+    prompt: &str,
+    agenda_items: &'a [AgendaItemRecord],
+    limit: usize,
+) -> Vec<&'a AgendaItemRecord> {
+    let prompt_tokens = significant_tokens(prompt);
+    if prompt_tokens.is_empty() {
+        return Vec::new();
+    }
+
+    let mut scored = agenda_items
+        .iter()
+        .filter_map(|item| {
+            let mut haystack = String::with_capacity(
+                item.name.len()
+                    + item.body.len()
+                    + item.agenda_date.as_deref().map_or(0, str::len)
+                    + 2,
+            );
+            haystack.push_str(&item.name);
+            haystack.push(' ');
+            haystack.push_str(&item.body);
+            if let Some(agenda_date) = item.agenda_date.as_deref() {
+                haystack.push(' ');
+                haystack.push_str(agenda_date);
+            }
+            let agenda_item_tokens = significant_tokens(&haystack);
+            let overlap = prompt_tokens.intersection(&agenda_item_tokens).count();
             (overlap > 0).then_some((overlap, item.updated_at_unix, item))
         })
         .collect::<Vec<_>>();
@@ -8999,6 +9073,49 @@ mod tests {
     }
 
     #[test]
+    fn live_tool_registry_search_memories_can_return_plain_agenda_items() {
+        let unique = format!(
+            "elroy-rs-app-search-memories-agenda-items-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+        fs::write(
+            agenda_dir.join("draft_launch_recap.md"),
+            "---\ndate: 2026-05-20\ncompleted: false\nstatus: created\n---\n\nDraft the launch recap for the product update.\n",
+        )
+        .expect("agenda item should be written");
+
+        let mut config = AppConfig::defaults();
+        config.memory_dir = memory_dir;
+        config.agenda_dir = agenda_dir;
+        config.database_path = database_path;
+        elroy_db::bootstrap_database(&elroy_db::BootstrapPlan::from_config(&config))
+            .expect("bootstrap should succeed");
+
+        let registry = build_live_tool_registry(&config);
+        let search = registry.invoke(
+            "search_memories",
+            "{\"query\":\"product launch recap\",\"limit\":5}",
+        );
+
+        assert!(!search.is_error);
+        assert!(search.content.contains("Search Results"));
+        assert!(search.content.contains(
+            "AgendaItem | draft launch recap | Draft the launch recap for the product update."
+        ));
+
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
     fn live_tool_registry_examine_memories_can_return_memory_and_due_item_sections() {
         let unique = format!(
             "elroy-rs-app-examine-memories-{}",
@@ -9047,6 +9164,52 @@ mod tests {
         assert!(result.content.contains("marathon in October"));
         assert!(result.content.contains("# Due Item: running follow up"));
         assert!(result.content.contains("long run recovery"));
+
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
+    fn live_tool_registry_examine_memories_can_return_agenda_item_sections() {
+        let unique = format!(
+            "elroy-rs-app-examine-memories-agenda-items-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+        fs::write(
+            agenda_dir.join("plan_team_offsite.md"),
+            "---\ndate: 2026-05-21\ncompleted: false\nstatus: created\n---\n\nPlan the team offsite agenda and venue shortlist.\n",
+        )
+        .expect("agenda item should be written");
+
+        let mut config = AppConfig::defaults();
+        config.memory_dir = memory_dir;
+        config.agenda_dir = agenda_dir;
+        config.database_path = database_path;
+        elroy_db::bootstrap_database(&BootstrapPlan::from_config(&config))
+            .expect("bootstrap should succeed");
+
+        let registry = build_live_tool_registry(&config);
+        let result = registry.invoke(
+            "examine_memories",
+            "{\"question\":\"What do I know about the offsite venue shortlist?\",\"limit\":5}",
+        );
+
+        assert!(!result.is_error);
+        assert!(result.content.contains("# Agenda Item: plan team offsite"));
+        assert!(
+            result
+                .content
+                .contains("team offsite agenda and venue shortlist")
+        );
+        assert!(result.content.contains("Agenda date: 2026-05-21"));
 
         fs::remove_dir_all(home).expect("home should be removed");
     }
