@@ -1616,6 +1616,32 @@ fn format_memory_listing(memories: &[MemoryRecord]) -> String {
     lines.join("\n")
 }
 
+fn format_memory_search_results(
+    memories: &[MemoryRecord],
+    due_items: &[&AgendaItemRecord],
+) -> String {
+    if memories.is_empty() && due_items.is_empty() {
+        return "No relevant memories found".to_string();
+    }
+
+    let mut lines = vec!["Search Results".to_string()];
+    for memory in memories {
+        lines.push(format!(
+            "- Memory | {} | {}",
+            memory.name,
+            excerpt(&memory.body, 180)
+        ));
+    }
+    for item in due_items {
+        lines.push(format!(
+            "- DueItem | {} | {}",
+            item.name,
+            excerpt(&item.body, 180)
+        ));
+    }
+    lines.join("\n")
+}
+
 fn formulate_memory_from_transcript(transcript: &[ConversationMessage]) -> (String, String) {
     let messages = transcript
         .iter()
@@ -4208,33 +4234,10 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                 let due_items = list_active_due_items(connection, limit * 3)?;
                 let relevant_due_items =
                     select_due_items_by_overlap(query, &due_items, limit, None);
-                let mut payload = memories
-                    .into_iter()
-                    .map(|memory| {
-                        json!({
-                            "type": "memory",
-                            "name": memory.name,
-                            "file_path": memory.file_path,
-                            "excerpt": excerpt(&memory.body, 180),
-                            "updated_at_unix": memory.updated_at_unix,
-                        })
-                    })
-                    .collect::<Vec<_>>();
-                payload.extend(relevant_due_items.into_iter().map(|item| {
-                    json!({
-                        "type": "due_item",
-                        "name": item.name,
-                        "file_path": item.file_path,
-                        "trigger_datetime": item.trigger_datetime,
-                        "trigger_context": item.trigger_context,
-                        "excerpt": excerpt(&item.body, 180),
-                        "updated_at_unix": item.updated_at_unix,
-                    })
-                }));
-                Ok(ToolExecutionResult::success(
-                    serde_json::to_string_pretty(&payload)
-                        .expect("memory search payload should serialize"),
-                ))
+                Ok(ToolExecutionResult::success(format_memory_search_results(
+                    &memories,
+                    &relevant_due_items,
+                )))
             })
         },
     );
@@ -8199,9 +8202,12 @@ mod tests {
         );
 
         assert!(!search.is_error);
-        assert!(search.content.contains("\"type\": \"due_item\""));
-        assert!(search.content.contains("payroll_follow_up.md"));
-        assert!(search.content.contains("after payroll email"));
+        assert!(search.content.contains("Search Results"));
+        assert!(
+            search
+                .content
+                .contains("DueItem | payroll follow up | Reply to payroll")
+        );
 
         fs::remove_dir_all(home).expect("home should be removed");
     }
