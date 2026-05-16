@@ -2062,6 +2062,30 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                 ],
                 vec![
                     String::new(),
+                    "Memories Between Consolidation".to_string(),
+                    config_for_print_config
+                        .memories_between_consolidation
+                        .to_string(),
+                ],
+                vec![
+                    String::new(),
+                    "Memory Cluster Similarity".to_string(),
+                    config_for_print_config
+                        .memory_cluster_similarity_threshold
+                        .to_string(),
+                ],
+                vec![
+                    String::new(),
+                    "Max Memory Cluster Size".to_string(),
+                    config_for_print_config.max_memory_cluster_size.to_string(),
+                ],
+                vec![
+                    String::new(),
+                    "Min Memory Cluster Size".to_string(),
+                    config_for_print_config.min_memory_cluster_size.to_string(),
+                ],
+                vec![
+                    String::new(),
                     "Messages Between Self Reflection".to_string(),
                     config_for_print_config
                         .messages_between_self_reflection
@@ -7128,6 +7152,10 @@ mod tests {
         assert!(printed.content.contains("Chat API Key"));
         assert!(printed.content.contains("********"));
         assert!(printed.content.contains("Anthropic API Key"));
+        assert!(printed.content.contains("Memories Between Consolidation"));
+        assert!(printed.content.contains("Memory Cluster Similarity"));
+        assert!(printed.content.contains("Max Memory Cluster Size"));
+        assert!(printed.content.contains("Min Memory Cluster Size"));
         assert!(!tailed.is_error);
         assert_eq!(tailed.content, "line two\nline three\n");
 

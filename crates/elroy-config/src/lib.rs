@@ -20,6 +20,10 @@ pub struct AppConfig {
     pub min_convo_age_for_greeting_minutes: f64,
     pub max_context_age_minutes: f64,
     pub messages_between_memory: usize,
+    pub memories_between_consolidation: usize,
+    pub memory_cluster_similarity_threshold: f64,
+    pub max_memory_cluster_size: usize,
+    pub min_memory_cluster_size: usize,
     pub messages_between_self_reflection: usize,
     pub memory_recall_classifier_enabled: bool,
     pub memory_recall_classifier_window: usize,
@@ -82,6 +86,10 @@ impl AppConfig {
             min_convo_age_for_greeting_minutes: 5.0,
             max_context_age_minutes: 720.0,
             messages_between_memory: 20,
+            memories_between_consolidation: 4,
+            memory_cluster_similarity_threshold: 0.21125,
+            max_memory_cluster_size: 5,
+            min_memory_cluster_size: 3,
             messages_between_self_reflection: 10,
             memory_recall_classifier_enabled: true,
             memory_recall_classifier_window: 3,
@@ -127,6 +135,20 @@ impl AppConfig {
         }
         if let Some(messages_between_memory) = file_config.messages_between_memory {
             self.messages_between_memory = messages_between_memory;
+        }
+        if let Some(memories_between_consolidation) = file_config.memories_between_consolidation {
+            self.memories_between_consolidation = memories_between_consolidation;
+        }
+        if let Some(memory_cluster_similarity_threshold) =
+            file_config.memory_cluster_similarity_threshold
+        {
+            self.memory_cluster_similarity_threshold = memory_cluster_similarity_threshold;
+        }
+        if let Some(max_memory_cluster_size) = file_config.max_memory_cluster_size {
+            self.max_memory_cluster_size = max_memory_cluster_size;
+        }
+        if let Some(min_memory_cluster_size) = file_config.min_memory_cluster_size {
+            self.min_memory_cluster_size = min_memory_cluster_size;
         }
         if let Some(messages_between_self_reflection) = file_config.messages_between_self_reflection
         {
@@ -192,6 +214,23 @@ impl AppConfig {
         if let Some(messages_between_memory) = env.get("ELROY_MESSAGES_BETWEEN_MEMORY") {
             self.messages_between_memory = parse_usize(messages_between_memory);
         }
+        if let Some(memories_between_consolidation) =
+            env.get("ELROY_MEMORIES_BETWEEN_CONSOLIDATION")
+        {
+            self.memories_between_consolidation = parse_usize(memories_between_consolidation);
+        }
+        if let Some(memory_cluster_similarity_threshold) =
+            env.get("ELROY_MEMORY_CLUSTER_SIMILARITY_THRESHOLD")
+        {
+            self.memory_cluster_similarity_threshold =
+                parse_f64(memory_cluster_similarity_threshold);
+        }
+        if let Some(max_memory_cluster_size) = env.get("ELROY_MAX_MEMORY_CLUSTER_SIZE") {
+            self.max_memory_cluster_size = parse_usize(max_memory_cluster_size);
+        }
+        if let Some(min_memory_cluster_size) = env.get("ELROY_MIN_MEMORY_CLUSTER_SIZE") {
+            self.min_memory_cluster_size = parse_usize(min_memory_cluster_size);
+        }
         if let Some(messages_between_self_reflection) =
             env.get("ELROY_MESSAGES_BETWEEN_SELF_REFLECTION")
         {
@@ -248,6 +287,10 @@ struct FileConfig {
     min_convo_age_for_greeting_minutes: Option<f64>,
     max_context_age_minutes: Option<f64>,
     messages_between_memory: Option<usize>,
+    memories_between_consolidation: Option<usize>,
+    memory_cluster_similarity_threshold: Option<f64>,
+    max_memory_cluster_size: Option<usize>,
+    min_memory_cluster_size: Option<usize>,
     messages_between_self_reflection: Option<usize>,
     memory_recall_classifier_enabled: Option<bool>,
     memory_recall_classifier_window: Option<usize>,
@@ -388,6 +431,10 @@ mod tests {
         assert_eq!(config.min_convo_age_for_greeting_minutes, 5.0);
         assert_eq!(config.max_context_age_minutes, 720.0);
         assert_eq!(config.messages_between_memory, 20);
+        assert_eq!(config.memories_between_consolidation, 4);
+        assert_eq!(config.memory_cluster_similarity_threshold, 0.21125);
+        assert_eq!(config.max_memory_cluster_size, 5);
+        assert_eq!(config.min_memory_cluster_size, 3);
         assert_eq!(config.messages_between_self_reflection, 10);
         assert!(config.memory_recall_classifier_enabled);
         assert_eq!(config.memory_recall_classifier_window, 3);
@@ -419,7 +466,7 @@ mod tests {
         let config_path = home_dir.join("elroy.conf.yaml");
         fs::write(
             &config_path,
-            "chat_model: gpt-5-nano\nmax_tokens: 9000\nenable_assistant_greeting: true\nmin_convo_age_for_greeting_minutes: 15.5\nmax_context_age_minutes: 180.0\nmessages_between_memory: 12\nmessages_between_self_reflection: 4\nmemory_recall_classifier_enabled: false\nmemory_recall_classifier_window: 7\nmemory_dir: /tmp/elroy-memories\nagenda_dir: /tmp/elroy-agenda\ndatabase_url: sqlite:////tmp/elroy.db\nirrelevant_key: ignored\n",
+            "chat_model: gpt-5-nano\nmax_tokens: 9000\nenable_assistant_greeting: true\nmin_convo_age_for_greeting_minutes: 15.5\nmax_context_age_minutes: 180.0\nmessages_between_memory: 12\nmemories_between_consolidation: 6\nmemory_cluster_similarity_threshold: 0.33\nmax_memory_cluster_size: 7\nmin_memory_cluster_size: 4\nmessages_between_self_reflection: 4\nmemory_recall_classifier_enabled: false\nmemory_recall_classifier_window: 7\nmemory_dir: /tmp/elroy-memories\nagenda_dir: /tmp/elroy-agenda\ndatabase_url: sqlite:////tmp/elroy.db\nirrelevant_key: ignored\n",
         )
         .expect("config fixture should be written");
 
@@ -438,6 +485,10 @@ mod tests {
         assert_eq!(config.min_convo_age_for_greeting_minutes, 15.5);
         assert_eq!(config.max_context_age_minutes, 180.0);
         assert_eq!(config.messages_between_memory, 12);
+        assert_eq!(config.memories_between_consolidation, 6);
+        assert_eq!(config.memory_cluster_similarity_threshold, 0.33);
+        assert_eq!(config.max_memory_cluster_size, 7);
+        assert_eq!(config.min_memory_cluster_size, 4);
         assert_eq!(config.messages_between_self_reflection, 4);
         assert!(!config.memory_recall_classifier_enabled);
         assert_eq!(config.memory_recall_classifier_window, 7);
@@ -485,6 +536,16 @@ mod tests {
                 "ELROY_MESSAGES_BETWEEN_SELF_REFLECTION".to_string(),
                 "6".to_string(),
             ),
+            (
+                "ELROY_MEMORIES_BETWEEN_CONSOLIDATION".to_string(),
+                "9".to_string(),
+            ),
+            (
+                "ELROY_MEMORY_CLUSTER_SIMILARITY_THRESHOLD".to_string(),
+                "0.44".to_string(),
+            ),
+            ("ELROY_MAX_MEMORY_CLUSTER_SIZE".to_string(), "8".to_string()),
+            ("ELROY_MIN_MEMORY_CLUSTER_SIZE".to_string(), "2".to_string()),
             (
                 "ELROY_MEMORY_RECALL_CLASSIFIER_ENABLED".to_string(),
                 "false".to_string(),
@@ -535,6 +596,10 @@ mod tests {
         assert_eq!(config.min_convo_age_for_greeting_minutes, 2.5);
         assert_eq!(config.max_context_age_minutes, 45.0);
         assert_eq!(config.messages_between_memory, 8);
+        assert_eq!(config.memories_between_consolidation, 9);
+        assert_eq!(config.memory_cluster_similarity_threshold, 0.44);
+        assert_eq!(config.max_memory_cluster_size, 8);
+        assert_eq!(config.min_memory_cluster_size, 2);
         assert_eq!(config.messages_between_self_reflection, 6);
         assert!(!config.memory_recall_classifier_enabled);
         assert_eq!(config.memory_recall_classifier_window, 9);
