@@ -1,8 +1,9 @@
+use std::collections::VecDeque;
 use std::env;
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
-use elroy_app::{AppRuntime, MessageProcessOptions};
+use elroy_app::{AppRuntime, DeferredAutoMemoryWork, MessageProcessOptions};
 use elroy_config::AppConfig;
 use elroy_core::{AppSession, TurnContext, clear_background_status, set_background_status};
 use elroy_db::{BootstrapInventory, BootstrapPlan, bootstrap_database};
@@ -153,6 +154,9 @@ struct CliTuiRuntime {
     runtime: AppRuntime,
     deferred_context_refresh: Option<BackgroundTask<()>>,
     deferred_context_refresh_error: Option<String>,
+    deferred_auto_memory: Option<BackgroundTask<()>>,
+    deferred_auto_memory_error: Option<String>,
+    deferred_auto_memory_queue: Arc<Mutex<VecDeque<DeferredAutoMemoryWork>>>,
     deferred_self_reflection: Option<BackgroundTask<()>>,
     deferred_self_reflection_error: Option<String>,
     deferred_command_execution: Option<BackgroundTask<elroy_tui::TuiSnapshot>>,
@@ -160,6 +164,7 @@ struct CliTuiRuntime {
 
 struct CliPromptStream {
     inner: elroy_app::PromptEventStream,
+    deferred_auto_memory_queue: Arc<Mutex<VecDeque<DeferredAutoMemoryWork>>>,
 }
 
 struct BackgroundTask<T> {
@@ -200,6 +205,9 @@ impl CliTuiRuntime {
             runtime,
             deferred_context_refresh: None,
             deferred_context_refresh_error: None,
+            deferred_auto_memory: None,
+            deferred_auto_memory_error: None,
+            deferred_auto_memory_queue: Arc::new(Mutex::new(VecDeque::new())),
             deferred_self_reflection: None,
             deferred_self_reflection_error: None,
             deferred_command_execution: None,
@@ -225,6 +233,46 @@ impl CliTuiRuntime {
 
     fn clear_deferred_context_refresh_error(&mut self) {
         self.deferred_context_refresh_error = None;
+    }
+
+    fn poll_deferred_auto_memory(&mut self) {
+        let finished = self
+            .deferred_auto_memory
+            .as_ref()
+            .is_some_and(BackgroundTask::is_finished);
+        if finished {
+            let task = self
+                .deferred_auto_memory
+                .take()
+                .expect("finished deferred auto memory task should exist");
+            if let Err(error) = task.join() {
+                self.deferred_auto_memory_error = Some(error);
+            }
+        }
+
+        if self.deferred_auto_memory.is_some() {
+            return;
+        }
+
+        let Some(work) = self
+            .deferred_auto_memory_queue
+            .lock()
+            .expect("deferred auto memory queue lock should work")
+            .pop_front()
+        else {
+            return;
+        };
+
+        let runtime = self.runtime.clone();
+        self.deferred_auto_memory = Some(BackgroundTask::spawn(move || {
+            runtime
+                .run_auto_memory_for_transcript(work.existing_transcript_len, work.transcript)
+                .map_err(|error| error.to_string())
+        }));
+    }
+
+    fn clear_deferred_auto_memory_error(&mut self) {
+        self.deferred_auto_memory_error = None;
     }
 
     fn poll_deferred_self_reflection(&mut self) {
@@ -275,6 +323,7 @@ impl Drop for CliTuiRuntime {
 impl TuiRuntime for CliTuiRuntime {
     fn load_snapshot(&mut self) -> Result<elroy_tui::TuiSnapshot, String> {
         self.poll_deferred_context_refresh();
+        self.poll_deferred_auto_memory();
         self.poll_deferred_self_reflection();
         let _ = self.poll_deferred_command_execution();
         self.runtime
@@ -286,9 +335,11 @@ impl TuiRuntime for CliTuiRuntime {
         &mut self,
     ) -> Result<Vec<elroy_tui::TuiCommandPaletteEntry>, String> {
         self.poll_deferred_context_refresh();
+        self.poll_deferred_auto_memory();
         self.poll_deferred_self_reflection();
         let _ = self.poll_deferred_command_execution();
         self.clear_deferred_context_refresh_error();
+        self.clear_deferred_auto_memory_error();
         self.clear_deferred_self_reflection_error();
         self.runtime
             .load_command_palette_entries()
@@ -300,9 +351,11 @@ impl TuiRuntime for CliTuiRuntime {
         name: &str,
     ) -> Result<elroy_tui::TuiSlashCommandAction, String> {
         self.poll_deferred_context_refresh();
+        self.poll_deferred_auto_memory();
         self.poll_deferred_self_reflection();
         let _ = self.poll_deferred_command_execution();
         self.clear_deferred_context_refresh_error();
+        self.clear_deferred_auto_memory_error();
         self.clear_deferred_self_reflection_error();
         self.runtime
             .launch_named_command(name)
@@ -314,9 +367,11 @@ impl TuiRuntime for CliTuiRuntime {
         prompt: &str,
     ) -> Result<elroy_tui::TuiSlashCommandAction, String> {
         self.poll_deferred_context_refresh();
+        self.poll_deferred_auto_memory();
         self.poll_deferred_self_reflection();
         let _ = self.poll_deferred_command_execution();
         self.clear_deferred_context_refresh_error();
+        self.clear_deferred_auto_memory_error();
         self.clear_deferred_self_reflection_error();
         self.runtime
             .handle_slash_command(prompt)
@@ -325,12 +380,14 @@ impl TuiRuntime for CliTuiRuntime {
 
     fn start_command_execution(&mut self, command: TuiCommandExecution) -> Result<(), String> {
         self.poll_deferred_context_refresh();
+        self.poll_deferred_auto_memory();
         self.poll_deferred_self_reflection();
         let _ = self.poll_deferred_command_execution();
         if self.deferred_command_execution.is_some() {
             return Err("command action already running".to_string());
         }
         self.clear_deferred_context_refresh_error();
+        self.clear_deferred_auto_memory_error();
         self.clear_deferred_self_reflection_error();
         let runtime = self.runtime.clone();
         self.deferred_command_execution = Some(BackgroundTask::spawn(move || {
@@ -348,14 +405,17 @@ impl TuiRuntime for CliTuiRuntime {
 
     fn poll_command_execution(&mut self) -> Result<Option<elroy_tui::TuiSnapshot>, String> {
         self.poll_deferred_context_refresh();
+        self.poll_deferred_auto_memory();
         self.poll_deferred_self_reflection();
         self.poll_deferred_command_execution()
     }
 
     fn submit_prompt(&mut self, prompt: &str) -> Result<elroy_tui::TuiSnapshot, String> {
         self.poll_deferred_context_refresh();
+        self.poll_deferred_auto_memory();
         self.poll_deferred_self_reflection();
         self.clear_deferred_context_refresh_error();
+        self.clear_deferred_auto_memory_error();
         self.clear_deferred_self_reflection_error();
         self.runtime
             .process_message(prompt, MessageProcessOptions::default())
@@ -365,31 +425,48 @@ impl TuiRuntime for CliTuiRuntime {
 
     fn start_prompt_stream(&mut self, prompt: &str) -> Result<Box<dyn TuiPromptStream>, String> {
         self.poll_deferred_context_refresh();
+        self.poll_deferred_auto_memory();
         self.poll_deferred_self_reflection();
         self.clear_deferred_context_refresh_error();
+        self.clear_deferred_auto_memory_error();
         self.clear_deferred_self_reflection_error();
+        let deferred_auto_memory_queue = Arc::clone(&self.deferred_auto_memory_queue);
         self.runtime
             .process_message_stream(
                 prompt,
                 MessageProcessOptions {
+                    defer_auto_memory: true,
                     defer_self_reflection: true,
                     ..MessageProcessOptions::default()
                 },
             )
-            .map(|inner| Box::new(CliPromptStream { inner }) as Box<dyn TuiPromptStream>)
+            .map(|inner| {
+                Box::new(CliPromptStream {
+                    inner,
+                    deferred_auto_memory_queue,
+                }) as Box<dyn TuiPromptStream>
+            })
             .map_err(|error| error.to_string())
     }
 
     fn start_startup_prompt_stream(&mut self) -> Result<Option<Box<dyn TuiPromptStream>>, String> {
         self.poll_deferred_context_refresh();
+        self.poll_deferred_auto_memory();
         self.poll_deferred_self_reflection();
         self.clear_deferred_context_refresh_error();
+        self.clear_deferred_auto_memory_error();
         self.clear_deferred_self_reflection_error();
         let restart_resume_message = std::env::var(RESTART_RESUME_MESSAGE_ENV).ok();
+        let deferred_auto_memory_queue = Arc::clone(&self.deferred_auto_memory_queue);
         self.runtime
             .startup_prompt_stream(restart_resume_message.as_deref())
             .map(|stream| {
-                stream.map(|inner| Box::new(CliPromptStream { inner }) as Box<dyn TuiPromptStream>)
+                stream.map(|inner| {
+                    Box::new(CliPromptStream {
+                        inner,
+                        deferred_auto_memory_queue,
+                    }) as Box<dyn TuiPromptStream>
+                })
             })
             .map_err(|error| error.to_string())
     }
@@ -399,12 +476,20 @@ impl TuiRuntime for CliTuiRuntime {
         resume_message: &str,
     ) -> Result<Box<dyn TuiPromptStream>, String> {
         self.poll_deferred_context_refresh();
+        self.poll_deferred_auto_memory();
         self.poll_deferred_self_reflection();
         self.clear_deferred_context_refresh_error();
+        self.clear_deferred_auto_memory_error();
         self.clear_deferred_self_reflection_error();
+        let deferred_auto_memory_queue = Arc::clone(&self.deferred_auto_memory_queue);
         self.runtime
             .restart_prompt_stream(resume_message)
-            .map(|inner| Box::new(CliPromptStream { inner }) as Box<dyn TuiPromptStream>)
+            .map(|inner| {
+                Box::new(CliPromptStream {
+                    inner,
+                    deferred_auto_memory_queue,
+                }) as Box<dyn TuiPromptStream>
+            })
             .map_err(|error| error.to_string())
     }
 
@@ -414,6 +499,7 @@ impl TuiRuntime for CliTuiRuntime {
 
     fn load_context_messages(&mut self) -> Result<Vec<TuiContextMessage>, String> {
         self.poll_deferred_context_refresh();
+        self.poll_deferred_auto_memory();
         self.poll_deferred_self_reflection();
         self.runtime
             .load_context_messages()
@@ -439,6 +525,7 @@ impl TuiRuntime for CliTuiRuntime {
 
     fn refresh_context_if_needed(&mut self) -> Result<(), String> {
         self.poll_deferred_context_refresh();
+        self.poll_deferred_auto_memory();
         self.poll_deferred_self_reflection();
         if self.deferred_context_refresh.is_some() {
             return Ok(());
@@ -457,6 +544,7 @@ impl TuiRuntime for CliTuiRuntime {
 
     fn run_self_reflection_if_needed(&mut self) -> Result<(), String> {
         self.poll_deferred_context_refresh();
+        self.poll_deferred_auto_memory();
         self.poll_deferred_self_reflection();
         if self.deferred_self_reflection.is_some() {
             return Ok(());
@@ -474,9 +562,13 @@ impl TuiRuntime for CliTuiRuntime {
 
     fn background_status(&mut self) -> Result<Option<String>, String> {
         self.poll_deferred_context_refresh();
+        self.poll_deferred_auto_memory();
         self.poll_deferred_self_reflection();
         if let Some(error) = &self.deferred_context_refresh_error {
             return Ok(Some(format!("context refresh failed: {error}")));
+        }
+        if let Some(error) = &self.deferred_auto_memory_error {
+            return Ok(Some(format!("auto memory failed: {error}")));
         }
         if let Some(error) = &self.deferred_self_reflection_error {
             return Ok(Some(format!("self reflection failed: {error}")));
@@ -490,6 +582,7 @@ impl TuiRuntime for CliTuiRuntime {
         title: &str,
     ) -> Result<TuiSidebarDetail, String> {
         self.poll_deferred_context_refresh();
+        self.poll_deferred_auto_memory();
         self.poll_deferred_self_reflection();
         self.runtime
             .open_sidebar_item(section, title)
@@ -503,6 +596,7 @@ impl TuiRuntime for CliTuiRuntime {
         action: SidebarAction,
     ) -> Result<elroy_tui::TuiSnapshot, String> {
         self.poll_deferred_context_refresh();
+        self.poll_deferred_auto_memory();
         self.poll_deferred_self_reflection();
         self.runtime
             .mutate_sidebar_item(section, title, action)
@@ -529,9 +623,17 @@ impl TuiPromptStream for CliPromptStream {
     }
 
     fn finalize(self: Box<Self>) -> Result<elroy_tui::TuiSnapshot, String> {
-        self.inner
-            .into_snapshot()
-            .map_err(|error| error.to_string())
+        let completion = self
+            .inner
+            .into_completion()
+            .map_err(|error| error.to_string())?;
+        if let Some(work) = completion.deferred_auto_memory {
+            self.deferred_auto_memory_queue
+                .lock()
+                .expect("deferred auto memory queue lock should work")
+                .push_back(work);
+        }
+        Ok(completion.snapshot)
     }
 
     fn cancel(self: Box<Self>) -> Result<elroy_tui::TuiSnapshot, String> {
@@ -541,8 +643,8 @@ impl TuiPromptStream for CliPromptStream {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-    use std::sync::mpsc;
+    use std::collections::{HashMap, VecDeque};
+    use std::sync::{Arc, Mutex, mpsc};
     use std::time::Duration;
 
     use elroy_tui::TuiRuntime;
@@ -594,6 +696,9 @@ mod tests {
                 Err("refresh exploded".to_string())
             })),
             deferred_context_refresh_error: None,
+            deferred_auto_memory: None,
+            deferred_auto_memory_error: None,
+            deferred_auto_memory_queue: Arc::new(Mutex::new(VecDeque::new())),
             deferred_self_reflection: None,
             deferred_self_reflection_error: None,
             deferred_command_execution: None,
@@ -623,6 +728,9 @@ mod tests {
             runtime: AppRuntime::new(config),
             deferred_context_refresh: None,
             deferred_context_refresh_error: None,
+            deferred_auto_memory: None,
+            deferred_auto_memory_error: None,
+            deferred_auto_memory_queue: Arc::new(Mutex::new(VecDeque::new())),
             deferred_self_reflection: Some(BackgroundTask::spawn(|| {
                 Err("reflection exploded".to_string())
             })),
@@ -645,6 +753,40 @@ mod tests {
             Some("self reflection failed: reflection exploded")
         );
         assert!(runtime.deferred_self_reflection.is_none());
+    }
+
+    #[test]
+    fn cli_tui_runtime_surfaces_deferred_auto_memory_failures_in_background_status() {
+        let config = AppConfig::from_env(&HashMap::new()).expect("config should load");
+        let mut runtime = CliTuiRuntime {
+            runtime: AppRuntime::new(config),
+            deferred_context_refresh: None,
+            deferred_context_refresh_error: None,
+            deferred_auto_memory: Some(BackgroundTask::spawn(
+                || Err("memory exploded".to_string()),
+            )),
+            deferred_auto_memory_error: None,
+            deferred_auto_memory_queue: Arc::new(Mutex::new(VecDeque::new())),
+            deferred_self_reflection: None,
+            deferred_self_reflection_error: None,
+            deferred_command_execution: None,
+        };
+
+        let background_status = loop {
+            let status = runtime
+                .background_status()
+                .expect("background status should load");
+            if status.is_some() {
+                break status;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        };
+
+        assert_eq!(
+            background_status.as_deref(),
+            Some("auto memory failed: memory exploded")
+        );
+        assert!(runtime.deferred_auto_memory.is_none());
     }
 
     #[test]

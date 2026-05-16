@@ -129,28 +129,45 @@ pub struct PromptRunResult {
     pub snapshot: TuiSnapshot,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeferredAutoMemoryWork {
+    pub existing_transcript_len: usize,
+    pub transcript: Vec<ConversationMessage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromptCompletion {
+    pub snapshot: TuiSnapshot,
+    pub deferred_auto_memory: Option<DeferredAutoMemoryWork>,
+}
+
 pub struct PromptEventStream {
     state: Option<PromptEventStreamState>,
-    finalized_snapshot: Option<Result<TuiSnapshot, AppError>>,
+    finalized_completion: Option<Result<PromptCompletion, AppError>>,
 }
 
 impl PromptEventStream {
     pub fn snapshot(&self) -> Option<&TuiSnapshot> {
-        self.finalized_snapshot
+        self.finalized_completion
             .as_ref()
             .and_then(|result| result.as_ref().ok())
+            .map(|completion| &completion.snapshot)
     }
 
-    pub fn into_snapshot(mut self) -> Result<TuiSnapshot, AppError> {
+    pub fn into_completion(mut self) -> Result<PromptCompletion, AppError> {
         while self.next().is_some() {}
-        self.finalized_snapshot
+        self.finalized_completion
             .take()
             .unwrap_or_else(|| Err(AppError::Runtime("stream did not finalize".to_string())))
     }
 
+    pub fn into_snapshot(self) -> Result<TuiSnapshot, AppError> {
+        self.into_completion().map(|completion| completion.snapshot)
+    }
+
     pub fn cancel(mut self) -> Result<TuiSnapshot, AppError> {
-        if let Some(result) = self.finalized_snapshot.take() {
-            return result;
+        if let Some(result) = self.finalized_completion.take() {
+            return result.map(|completion| completion.snapshot);
         }
         let Some(state) = self.state.take() else {
             return Err(AppError::Runtime("stream did not finalize".to_string()));
@@ -171,13 +188,13 @@ impl Iterator for PromptEventStream {
         match state.turn_stream.next() {
             Some(Ok(event)) => Some(event),
             Some(Err(error)) => {
-                self.finalized_snapshot = Some(Err(AppError::from(error)));
+                self.finalized_completion = Some(Err(AppError::from(error)));
                 self.state = None;
                 None
             }
             None => {
                 let state = self.state.take().expect("stream state should exist");
-                self.finalized_snapshot = Some(finalize_prompt_event_stream(state));
+                self.finalized_completion = Some(finalize_prompt_event_stream(state));
                 None
             }
         }
@@ -195,6 +212,7 @@ struct PromptEventStreamState {
     messages_between_memory: usize,
     memories_between_consolidation: usize,
     messages_between_self_reflection: usize,
+    defer_auto_memory: bool,
     defer_self_reflection: bool,
     prelude_events: VecDeque<StreamEvent>,
 }
@@ -205,6 +223,7 @@ pub struct MessageProcessOptions {
     pub enable_tools: bool,
     pub persist_input_message: bool,
     pub force_tool: Option<String>,
+    pub defer_auto_memory: bool,
     pub defer_self_reflection: bool,
 }
 
@@ -215,6 +234,7 @@ impl Default for MessageProcessOptions {
             enable_tools: true,
             persist_input_message: true,
             force_tool: None,
+            defer_auto_memory: false,
             defer_self_reflection: false,
         }
     }
@@ -232,6 +252,7 @@ struct PromptExecutionOptions<'a> {
     messages_between_memory: usize,
     memories_between_consolidation: usize,
     messages_between_self_reflection: usize,
+    defer_auto_memory: bool,
     defer_self_reflection: bool,
     memory_recall_classifier_enabled: bool,
     memory_recall_classifier_window: usize,
@@ -475,6 +496,27 @@ impl AppRuntime {
         )
     }
 
+    pub fn run_auto_memory_for_transcript(
+        &self,
+        existing_transcript_len: usize,
+        transcript: Vec<ConversationMessage>,
+    ) -> Result<(), AppError> {
+        set_background_status("auto-memory", "creating memory from recent conversation...");
+        let result = (|| {
+            let mut connection = self.open_connection()?;
+            run_auto_memory_if_needed(
+                &mut connection,
+                &BootstrapPlan::from_config(&self.config),
+                self.config.memories_between_consolidation,
+                existing_transcript_len,
+                transcript.as_slice(),
+                self.config.messages_between_memory,
+            )
+        })();
+        clear_background_status("auto-memory");
+        result
+    }
+
     pub fn background_status(&self) -> Option<String> {
         get_background_status()
     }
@@ -516,6 +558,7 @@ impl AppRuntime {
                 messages_between_memory: self.config.messages_between_memory,
                 memories_between_consolidation: self.config.memories_between_consolidation,
                 messages_between_self_reflection: self.config.messages_between_self_reflection,
+                defer_auto_memory: options.defer_auto_memory,
                 defer_self_reflection: options.defer_self_reflection,
                 memory_recall_classifier_enabled: self.config.memory_recall_classifier_enabled,
                 memory_recall_classifier_window: self.config.memory_recall_classifier_window,
@@ -559,6 +602,7 @@ impl AppRuntime {
                 messages_between_memory: self.config.messages_between_memory,
                 memories_between_consolidation: self.config.memories_between_consolidation,
                 messages_between_self_reflection: self.config.messages_between_self_reflection,
+                defer_auto_memory: options.defer_auto_memory,
                 defer_self_reflection: options.defer_self_reflection,
                 memory_recall_classifier_enabled: self.config.memory_recall_classifier_enabled,
                 memory_recall_classifier_window: self.config.memory_recall_classifier_window,
@@ -1404,7 +1448,7 @@ fn should_offer_greeting(
 
 fn finalize_prompt_event_stream(
     mut state: PromptEventStreamState,
-) -> Result<TuiSnapshot, AppError> {
+) -> Result<PromptCompletion, AppError> {
     let turn_run = state.turn_stream.finish()?;
     let persisted_transcript = strip_input_message_for_persistence(
         strip_transient_context_messages(
@@ -1420,14 +1464,22 @@ fn finalize_prompt_event_stream(
         LOCAL_USER_TOKEN,
         &persisted_transcript,
     )?;
-    run_auto_memory_if_needed(
-        &mut state.connection,
-        &state.bootstrap_plan,
-        state.memories_between_consolidation,
-        state.existing_transcript_len,
-        persisted_transcript.as_slice(),
-        state.messages_between_memory,
-    )?;
+    let deferred_auto_memory = if state.defer_auto_memory {
+        Some(DeferredAutoMemoryWork {
+            existing_transcript_len: state.existing_transcript_len,
+            transcript: persisted_transcript.clone(),
+        })
+    } else {
+        run_auto_memory_if_needed(
+            &mut state.connection,
+            &state.bootstrap_plan,
+            state.memories_between_consolidation,
+            state.existing_transcript_len,
+            persisted_transcript.as_slice(),
+            state.messages_between_memory,
+        )?;
+        None
+    };
     if !state.defer_self_reflection {
         run_self_reflection_if_needed(
             &state.home_dir,
@@ -1435,11 +1487,14 @@ fn finalize_prompt_event_stream(
             state.messages_between_self_reflection,
         )?;
     }
-    load_snapshot_from_connection(
-        &mut state.connection,
-        &state.home_dir,
-        &state.bootstrap_plan.memory_dir,
-    )
+    Ok(PromptCompletion {
+        snapshot: load_snapshot_from_connection(
+            &mut state.connection,
+            &state.home_dir,
+            &state.bootstrap_plan.memory_dir,
+        )?,
+        deferred_auto_memory,
+    })
 }
 
 fn cancel_prompt_event_stream(mut state: PromptEventStreamState) -> Result<TuiSnapshot, AppError> {
@@ -1625,10 +1680,11 @@ fn run_prompt_with_model_and_registry_stream(
             messages_between_memory: options.messages_between_memory,
             memories_between_consolidation: options.memories_between_consolidation,
             messages_between_self_reflection: options.messages_between_self_reflection,
+            defer_auto_memory: options.defer_auto_memory,
             defer_self_reflection: options.defer_self_reflection,
             prelude_events,
         }),
-        finalized_snapshot: None,
+        finalized_completion: None,
     })
 }
 
@@ -2195,6 +2251,7 @@ fn run_background_codex_completion_followup(
             messages_between_memory: config.messages_between_memory,
             memories_between_consolidation: config.memories_between_consolidation,
             messages_between_self_reflection: config.messages_between_self_reflection,
+            defer_auto_memory: false,
             defer_self_reflection: false,
             memory_recall_classifier_enabled: config.memory_recall_classifier_enabled,
             memory_recall_classifier_window: config.memory_recall_classifier_window,
@@ -9549,6 +9606,7 @@ mod tests {
                 messages_between_memory: config.messages_between_memory,
                 memories_between_consolidation: config.memories_between_consolidation,
                 messages_between_self_reflection: config.messages_between_self_reflection,
+                defer_auto_memory: false,
                 defer_self_reflection: false,
                 memory_recall_classifier_enabled: false,
                 memory_recall_classifier_window: config.memory_recall_classifier_window,
@@ -12828,6 +12886,7 @@ mod tests {
                 messages_between_memory: config.messages_between_memory,
                 memories_between_consolidation: config.memories_between_consolidation,
                 messages_between_self_reflection: config.messages_between_self_reflection,
+                defer_auto_memory: false,
                 defer_self_reflection: false,
                 memory_recall_classifier_enabled: config.memory_recall_classifier_enabled,
                 memory_recall_classifier_window: config.memory_recall_classifier_window,
@@ -12903,6 +12962,7 @@ mod tests {
                 messages_between_memory: config.messages_between_memory,
                 memories_between_consolidation: config.memories_between_consolidation,
                 messages_between_self_reflection: config.messages_between_self_reflection,
+                defer_auto_memory: false,
                 defer_self_reflection: false,
                 memory_recall_classifier_enabled: config.memory_recall_classifier_enabled,
                 memory_recall_classifier_window: config.memory_recall_classifier_window,
@@ -12988,6 +13048,7 @@ mod tests {
                 messages_between_memory: config.messages_between_memory,
                 memories_between_consolidation: config.memories_between_consolidation,
                 messages_between_self_reflection: config.messages_between_self_reflection,
+                defer_auto_memory: false,
                 defer_self_reflection: false,
                 memory_recall_classifier_enabled: config.memory_recall_classifier_enabled,
                 memory_recall_classifier_window: config.memory_recall_classifier_window,
@@ -13068,6 +13129,7 @@ mod tests {
                 messages_between_memory: config.messages_between_memory,
                 memories_between_consolidation: config.memories_between_consolidation,
                 messages_between_self_reflection: config.messages_between_self_reflection,
+                defer_auto_memory: false,
                 defer_self_reflection: true,
                 memory_recall_classifier_enabled: config.memory_recall_classifier_enabled,
                 memory_recall_classifier_window: config.memory_recall_classifier_window,
@@ -13082,6 +13144,106 @@ mod tests {
 
         let records = list_feature_requests(&home).expect("feature requests should load");
         assert!(records.is_empty());
+
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
+    fn run_prompt_with_model_and_registry_stream_can_defer_auto_memory() {
+        let unique = format!(
+            "elroy-rs-app-deferred-auto-memory-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+
+        let mut connection = open_sqlite_connection(&database_path).expect("database should open");
+        run_migrations(&mut connection).expect("migrations should run");
+        elroy_db::replace_context_messages(
+            &mut connection,
+            LOCAL_USER_TOKEN,
+            &[
+                ConversationMessage::new(MessageRole::User, "We agreed to save this summary."),
+                ConversationMessage::new(MessageRole::Assistant, "I'll remember it."),
+            ],
+        )
+        .expect("messages should persist");
+
+        let model = FakeModel::new(vec![vec![StreamEvent::AssistantResponse {
+            content: "Adding the missing detail now.".to_string(),
+        }]]);
+        let mut config = AppConfig::defaults();
+        config.home_dir = home.clone();
+        config.memory_dir = memory_dir.clone();
+        config.agenda_dir = agenda_dir;
+        config.database_path = database_path.clone();
+        config.messages_between_memory = 2;
+
+        let mut stream = run_prompt_with_model_and_registry_stream(
+            connection,
+            home.clone(),
+            "The main point was the Friday launch deadline.",
+            PromptExecutionOptions {
+                role: MessageRole::User,
+                persist_input_message: true,
+                force_tool: None,
+                assistant_name: &config.assistant_name,
+                ensure_alternating_roles: config.llm_provider() == LlmProvider::Anthropic,
+                home_dir: &home,
+                bootstrap_plan: BootstrapPlan::from_config(&config),
+                messages_between_memory: config.messages_between_memory,
+                memories_between_consolidation: config.memories_between_consolidation,
+                messages_between_self_reflection: config.messages_between_self_reflection,
+                defer_auto_memory: true,
+                defer_self_reflection: false,
+                memory_recall_classifier_enabled: config.memory_recall_classifier_enabled,
+                memory_recall_classifier_window: config.memory_recall_classifier_window,
+            },
+            Box::new(model),
+            ExecutableToolRegistry::new(vec![]),
+        )
+        .expect("prompt should stream");
+
+        while stream.next().is_some() {}
+        let completion = stream
+            .into_completion()
+            .expect("completion should finalize");
+        let deferred = completion
+            .deferred_auto_memory
+            .expect("auto memory should be deferred");
+
+        let before_memories = crate::list_active_memories_in_scope(
+            &open_sqlite_connection(&database_path).expect("database should reopen"),
+            &memory_dir,
+            10,
+        )
+        .expect("active memories should load");
+        assert!(before_memories.is_empty());
+
+        let runtime = AppRuntime::new(config);
+        runtime
+            .run_auto_memory_for_transcript(
+                deferred.existing_transcript_len,
+                deferred.transcript.clone(),
+            )
+            .expect("deferred auto memory should succeed");
+
+        let mut reopened = open_sqlite_connection(&database_path).expect("database should reopen");
+        let active_memories = crate::list_active_memories_in_scope(&reopened, &memory_dir, 10)
+            .expect("active memories should load");
+        assert_eq!(active_memories.len(), 1);
+        let tracker =
+            elroy_db::get_or_create_memory_operation_tracker(&mut reopened, LOCAL_USER_TOKEN)
+                .expect("tracker should load");
+        assert_eq!(tracker.messages_since_memory, 0);
+        assert_eq!(tracker.memories_since_consolidation, 1);
 
         fs::remove_dir_all(home).expect("home should be removed");
     }
@@ -13139,6 +13301,7 @@ mod tests {
                 messages_between_memory: config.messages_between_memory,
                 memories_between_consolidation: config.memories_between_consolidation,
                 messages_between_self_reflection: config.messages_between_self_reflection,
+                defer_auto_memory: false,
                 defer_self_reflection: false,
                 memory_recall_classifier_enabled: config.memory_recall_classifier_enabled,
                 memory_recall_classifier_window: config.memory_recall_classifier_window,
@@ -13204,6 +13367,7 @@ mod tests {
                 messages_between_memory: config.messages_between_memory,
                 memories_between_consolidation: config.memories_between_consolidation,
                 messages_between_self_reflection: config.messages_between_self_reflection,
+                defer_auto_memory: false,
                 defer_self_reflection: false,
                 memory_recall_classifier_enabled: config.memory_recall_classifier_enabled,
                 memory_recall_classifier_window: config.memory_recall_classifier_window,
@@ -13268,6 +13432,7 @@ mod tests {
                 messages_between_memory: config.messages_between_memory,
                 memories_between_consolidation: config.memories_between_consolidation,
                 messages_between_self_reflection: config.messages_between_self_reflection,
+                defer_auto_memory: false,
                 defer_self_reflection: false,
                 memory_recall_classifier_enabled: config.memory_recall_classifier_enabled,
                 memory_recall_classifier_window: config.memory_recall_classifier_window,
@@ -13307,6 +13472,7 @@ mod tests {
                 messages_between_memory: config.messages_between_memory,
                 memories_between_consolidation: config.memories_between_consolidation,
                 messages_between_self_reflection: config.messages_between_self_reflection,
+                defer_auto_memory: false,
                 defer_self_reflection: false,
                 memory_recall_classifier_enabled: config.memory_recall_classifier_enabled,
                 memory_recall_classifier_window: config.memory_recall_classifier_window,
@@ -13371,6 +13537,7 @@ mod tests {
                 messages_between_memory: config.messages_between_memory,
                 memories_between_consolidation: config.memories_between_consolidation,
                 messages_between_self_reflection: config.messages_between_self_reflection,
+                defer_auto_memory: false,
                 defer_self_reflection: false,
                 memory_recall_classifier_enabled: config.memory_recall_classifier_enabled,
                 memory_recall_classifier_window: config.memory_recall_classifier_window,
@@ -13436,6 +13603,7 @@ mod tests {
                 messages_between_memory: config.messages_between_memory,
                 memories_between_consolidation: config.memories_between_consolidation,
                 messages_between_self_reflection: config.messages_between_self_reflection,
+                defer_auto_memory: false,
                 defer_self_reflection: false,
                 memory_recall_classifier_enabled: config.memory_recall_classifier_enabled,
                 memory_recall_classifier_window: config.memory_recall_classifier_window,
@@ -13505,6 +13673,7 @@ mod tests {
                 messages_between_memory: config.messages_between_memory,
                 memories_between_consolidation: config.memories_between_consolidation,
                 messages_between_self_reflection: config.messages_between_self_reflection,
+                defer_auto_memory: false,
                 defer_self_reflection: false,
                 memory_recall_classifier_enabled: config.memory_recall_classifier_enabled,
                 memory_recall_classifier_window: config.memory_recall_classifier_window,
@@ -13584,6 +13753,7 @@ mod tests {
                 messages_between_memory: config.messages_between_memory,
                 memories_between_consolidation: config.memories_between_consolidation,
                 messages_between_self_reflection: config.messages_between_self_reflection,
+                defer_auto_memory: false,
                 defer_self_reflection: false,
                 memory_recall_classifier_enabled: config.memory_recall_classifier_enabled,
                 memory_recall_classifier_window: config.memory_recall_classifier_window,
@@ -13653,6 +13823,7 @@ mod tests {
                 messages_between_memory: config.messages_between_memory,
                 memories_between_consolidation: config.memories_between_consolidation,
                 messages_between_self_reflection: config.messages_between_self_reflection,
+                defer_auto_memory: false,
                 defer_self_reflection: false,
                 memory_recall_classifier_enabled: config.memory_recall_classifier_enabled,
                 memory_recall_classifier_window: config.memory_recall_classifier_window,
@@ -13680,6 +13851,7 @@ mod tests {
                 messages_between_memory: config.messages_between_memory,
                 memories_between_consolidation: config.memories_between_consolidation,
                 messages_between_self_reflection: config.messages_between_self_reflection,
+                defer_auto_memory: false,
                 defer_self_reflection: false,
                 memory_recall_classifier_enabled: config.memory_recall_classifier_enabled,
                 memory_recall_classifier_window: config.memory_recall_classifier_window,
@@ -13751,6 +13923,7 @@ mod tests {
                 messages_between_memory: config.messages_between_memory,
                 memories_between_consolidation: config.memories_between_consolidation,
                 messages_between_self_reflection: config.messages_between_self_reflection,
+                defer_auto_memory: false,
                 defer_self_reflection: false,
                 memory_recall_classifier_enabled: config.memory_recall_classifier_enabled,
                 memory_recall_classifier_window: config.memory_recall_classifier_window,
@@ -13795,6 +13968,7 @@ mod tests {
                 messages_between_memory: config.messages_between_memory,
                 memories_between_consolidation: config.memories_between_consolidation,
                 messages_between_self_reflection: config.messages_between_self_reflection,
+                defer_auto_memory: false,
                 defer_self_reflection: false,
                 memory_recall_classifier_enabled: config.memory_recall_classifier_enabled,
                 memory_recall_classifier_window: config.memory_recall_classifier_window,
@@ -14009,6 +14183,7 @@ mod tests {
                 messages_between_memory: config.messages_between_memory,
                 memories_between_consolidation: config.memories_between_consolidation,
                 messages_between_self_reflection: config.messages_between_self_reflection,
+                defer_auto_memory: false,
                 defer_self_reflection: false,
                 memory_recall_classifier_enabled: config.memory_recall_classifier_enabled,
                 memory_recall_classifier_window: config.memory_recall_classifier_window,
@@ -14060,6 +14235,7 @@ mod tests {
                 messages_between_memory: config.messages_between_memory,
                 memories_between_consolidation: config.memories_between_consolidation,
                 messages_between_self_reflection: config.messages_between_self_reflection,
+                defer_auto_memory: false,
                 defer_self_reflection: false,
                 memory_recall_classifier_enabled: config.memory_recall_classifier_enabled,
                 memory_recall_classifier_window: config.memory_recall_classifier_window,
