@@ -2811,6 +2811,29 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                     &config_for_due_item_write,
                 ))
                 .map_err(|error| std::io::Error::other(error.to_string()))?;
+                let mut connection =
+                    open_sqlite_connection(&config_for_due_item_write.database_path)
+                        .map_err(|error| std::io::Error::other(error.to_string()))?;
+                run_migrations(&mut connection)
+                    .map_err(|error| std::io::Error::other(error.to_string()))?;
+                let due_item = find_active_agenda_item_by_name(&connection, name)
+                    .map_err(|error| std::io::Error::other(error.to_string()))?
+                    .filter(|item| {
+                        item.trigger_datetime.is_some() || item.trigger_context.is_some()
+                    });
+                if let Some(due_item) = due_item {
+                    let mut transcript = load_validated_runtime_transcript(
+                        &mut connection,
+                        &config_for_due_item_write.assistant_name,
+                        config_for_due_item_write.llm_provider() == LlmProvider::Anthropic,
+                    )
+                    .map_err(|error| std::io::Error::other(error.to_string()))?;
+                    if !transcript_contains_context_due_item(&transcript, &due_item.name) {
+                        transcript.extend(context_due_item_tool_messages(&due_item));
+                        replace_context_messages(&mut connection, LOCAL_USER_TOKEN, &transcript)
+                            .map_err(|error| std::io::Error::other(error.to_string()))?;
+                    }
+                }
                 Ok(path)
             }) {
                 Ok(_) => {
@@ -5590,6 +5613,10 @@ fn context_memory_tool_call_id(name: &str) -> String {
     format!("context-memory:{}", name.to_ascii_lowercase())
 }
 
+fn context_due_item_tool_call_id(name: &str) -> String {
+    format!("context-due-item:{}", name.to_ascii_lowercase())
+}
+
 fn context_memory_tool_messages(memory: &elroy_db::MemoryRecord) -> Vec<ConversationMessage> {
     let content = serde_json::to_string_pretty(&json!({
         "content": format!("MEMORY: '{}' - {}", memory.name, memory.body),
@@ -5610,6 +5637,28 @@ fn context_memory_tool_messages(memory: &elroy_db::MemoryRecord) -> Vec<Conversa
     )
 }
 
+fn context_due_item_tool_messages(item: &AgendaItemRecord) -> Vec<ConversationMessage> {
+    let content = serde_json::to_string_pretty(&json!({
+        "content": format!("DUE ITEM: '{}' - {}", item.name, item.body),
+        "due_items": [{
+            "type": "due_item",
+            "name": item.name,
+            "trigger_datetime": item.trigger_datetime,
+            "trigger_context": item.trigger_context,
+            "status": item.status,
+            "closing_comment": item.closing_comment,
+            "excerpt": excerpt(&item.body, 180),
+        }],
+    }))
+    .expect("context-due-item payload should serialize");
+    synthetic_tool_context_messages(
+        context_due_item_tool_call_id(&item.name),
+        "get_fast_recall",
+        "{}",
+        content,
+    )
+}
+
 fn transcript_contains_context_memory(
     transcript: &[ConversationMessage],
     memory_name: &str,
@@ -5617,10 +5666,24 @@ fn transcript_contains_context_memory(
     let tool_call_id = context_memory_tool_call_id(memory_name);
     transcript
         .iter()
-        .any(|message| message_matches_context_memory(message, &tool_call_id))
+        .any(|message| message_matches_tool_call_id(message, &tool_call_id))
+}
+
+fn transcript_contains_context_due_item(
+    transcript: &[ConversationMessage],
+    due_item_name: &str,
+) -> bool {
+    let tool_call_id = context_due_item_tool_call_id(due_item_name);
+    transcript
+        .iter()
+        .any(|message| message_matches_tool_call_id(message, &tool_call_id))
 }
 
 fn message_matches_context_memory(message: &ConversationMessage, tool_call_id: &str) -> bool {
+    message_matches_tool_call_id(message, tool_call_id)
+}
+
+fn message_matches_tool_call_id(message: &ConversationMessage, tool_call_id: &str) -> bool {
     message.tool_call_id.as_deref() == Some(tool_call_id)
         || message
             .tool_calls
@@ -7434,6 +7497,11 @@ mod tests {
             "Contextual due item 'call mom' has been created."
         );
         assert!(agenda_dir.join("call_mom.md").exists());
+        let context = registry.invoke("show_context_messages", "{\"limit\":20}");
+        assert!(!context.is_error);
+        assert!(context.content.contains("get_fast_recall"));
+        assert!(context.content.contains("context-due-item:call mom"));
+        assert!(context.content.contains("call mom"));
 
         let timed = registry.invoke(
             "create_due_item",
@@ -7444,6 +7512,10 @@ mod tests {
             timed.content,
             "Timed due item 'pay rent' has been created for 2026-05-16 09:00."
         );
+        let timed_context = registry.invoke("show_context_messages", "{\"limit\":40}");
+        assert!(!timed_context.is_error);
+        assert!(timed_context.content.contains("context-due-item:pay rent"));
+        assert!(timed_context.content.contains("pay rent"));
 
         let listed = registry.invoke("list_due_items", "{\"limit\":10}");
         assert!(!listed.is_error);
