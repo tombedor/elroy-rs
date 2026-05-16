@@ -4,12 +4,12 @@ use std::thread::{self, JoinHandle};
 
 use elroy_app::{AppRuntime, MessageProcessOptions};
 use elroy_config::AppConfig;
-use elroy_core::{AppSession, TurnContext};
+use elroy_core::{AppSession, TurnContext, clear_background_status, set_background_status};
 use elroy_db::{BootstrapInventory, BootstrapPlan, bootstrap_database};
 use elroy_llm::StreamEvent;
 use elroy_tui::{
-    PromptUpdate, SidebarAction, SidebarSection, TuiContextMessage, TuiPromptStream, TuiRunResult,
-    TuiRuntime, TuiSidebarDetail, run_with_snapshot_and_runtime,
+    PromptUpdate, SidebarAction, SidebarSection, TuiCommandExecution, TuiContextMessage,
+    TuiPromptStream, TuiRunResult, TuiRuntime, TuiSidebarDetail, run_with_snapshot_and_runtime,
 };
 
 const RESTART_RESUME_MESSAGE_ENV: &str = "ELROY_RESTART_RESUME_MESSAGE";
@@ -151,45 +151,45 @@ fn restart_current_process(args: &[String], resume_message: &str) -> ! {
 
 struct CliTuiRuntime {
     runtime: AppRuntime,
-    deferred_context_refresh: Option<BackgroundRefreshTask>,
+    deferred_context_refresh: Option<BackgroundTask<()>>,
     deferred_context_refresh_error: Option<String>,
-    deferred_self_reflection: Option<BackgroundRefreshTask>,
+    deferred_self_reflection: Option<BackgroundTask<()>>,
     deferred_self_reflection_error: Option<String>,
+    deferred_command_execution: Option<BackgroundTask<elroy_tui::TuiSnapshot>>,
 }
 
 struct CliPromptStream {
     inner: elroy_app::PromptEventStream,
 }
 
-struct BackgroundRefreshTask {
+struct BackgroundTask<T> {
     handle: JoinHandle<()>,
-    error: Arc<Mutex<Option<String>>>,
+    result: Arc<Mutex<Option<Result<T, String>>>>,
 }
 
-impl BackgroundRefreshTask {
-    fn spawn(task: impl FnOnce() -> Result<(), String> + Send + 'static) -> Self {
-        let error = Arc::new(Mutex::new(None));
-        let error_sink = Arc::clone(&error);
+impl<T: Send + 'static> BackgroundTask<T> {
+    fn spawn(task: impl FnOnce() -> Result<T, String> + Send + 'static) -> Self {
+        let result = Arc::new(Mutex::new(None));
+        let result_sink = Arc::clone(&result);
         let handle = thread::spawn(move || {
-            if let Err(task_error) = task() {
-                *error_sink
-                    .lock()
-                    .expect("background refresh error lock should work") = Some(task_error);
-            }
+            *result_sink
+                .lock()
+                .expect("background task result lock should work") = Some(task());
         });
-        Self { handle, error }
+        Self { handle, result }
     }
 
     fn is_finished(&self) -> bool {
         self.handle.is_finished()
     }
 
-    fn join(self) -> Option<String> {
+    fn join(self) -> Result<T, String> {
         let _ = self.handle.join();
-        self.error
+        self.result
             .lock()
-            .expect("background refresh error lock should work")
+            .expect("background task result lock should work")
             .take()
+            .expect("finished background task should produce a result")
     }
 }
 
@@ -202,6 +202,7 @@ impl CliTuiRuntime {
             deferred_context_refresh_error: None,
             deferred_self_reflection: None,
             deferred_self_reflection_error: None,
+            deferred_command_execution: None,
         }
     }
 
@@ -217,7 +218,7 @@ impl CliTuiRuntime {
             .deferred_context_refresh
             .take()
             .expect("finished deferred refresh task should exist");
-        if let Some(error) = task.join() {
+        if let Err(error) = task.join() {
             self.deferred_context_refresh_error = Some(error);
         }
     }
@@ -238,13 +239,30 @@ impl CliTuiRuntime {
             .deferred_self_reflection
             .take()
             .expect("finished deferred self reflection task should exist");
-        if let Some(error) = task.join() {
+        if let Err(error) = task.join() {
             self.deferred_self_reflection_error = Some(error);
         }
     }
 
     fn clear_deferred_self_reflection_error(&mut self) {
         self.deferred_self_reflection_error = None;
+    }
+
+    fn poll_deferred_command_execution(
+        &mut self,
+    ) -> Result<Option<elroy_tui::TuiSnapshot>, String> {
+        let Some(task) = self.deferred_command_execution.as_ref() else {
+            return Ok(None);
+        };
+        if !task.is_finished() {
+            return Ok(None);
+        }
+
+        let task = self
+            .deferred_command_execution
+            .take()
+            .expect("finished deferred command task should exist");
+        task.join().map(Some)
     }
 }
 
@@ -258,6 +276,7 @@ impl TuiRuntime for CliTuiRuntime {
     fn load_snapshot(&mut self) -> Result<elroy_tui::TuiSnapshot, String> {
         self.poll_deferred_context_refresh();
         self.poll_deferred_self_reflection();
+        let _ = self.poll_deferred_command_execution();
         self.runtime
             .load_snapshot()
             .map_err(|error| error.to_string())
@@ -268,6 +287,7 @@ impl TuiRuntime for CliTuiRuntime {
     ) -> Result<Vec<elroy_tui::TuiCommandPaletteEntry>, String> {
         self.poll_deferred_context_refresh();
         self.poll_deferred_self_reflection();
+        let _ = self.poll_deferred_command_execution();
         self.clear_deferred_context_refresh_error();
         self.clear_deferred_self_reflection_error();
         self.runtime
@@ -281,6 +301,7 @@ impl TuiRuntime for CliTuiRuntime {
     ) -> Result<elroy_tui::TuiSlashCommandAction, String> {
         self.poll_deferred_context_refresh();
         self.poll_deferred_self_reflection();
+        let _ = self.poll_deferred_command_execution();
         self.clear_deferred_context_refresh_error();
         self.clear_deferred_self_reflection_error();
         self.runtime
@@ -294,6 +315,7 @@ impl TuiRuntime for CliTuiRuntime {
     ) -> Result<elroy_tui::TuiSlashCommandAction, String> {
         self.poll_deferred_context_refresh();
         self.poll_deferred_self_reflection();
+        let _ = self.poll_deferred_command_execution();
         self.clear_deferred_context_refresh_error();
         self.clear_deferred_self_reflection_error();
         self.runtime
@@ -301,18 +323,33 @@ impl TuiRuntime for CliTuiRuntime {
             .map_err(|error| error.to_string())
     }
 
-    fn submit_command_form(
-        &mut self,
-        command_name: &str,
-        values: &[(String, String)],
-    ) -> Result<elroy_tui::TuiSnapshot, String> {
+    fn start_command_execution(&mut self, command: TuiCommandExecution) -> Result<(), String> {
         self.poll_deferred_context_refresh();
         self.poll_deferred_self_reflection();
+        let _ = self.poll_deferred_command_execution();
+        if self.deferred_command_execution.is_some() {
+            return Err("command action already running".to_string());
+        }
         self.clear_deferred_context_refresh_error();
         self.clear_deferred_self_reflection_error();
-        self.runtime
-            .submit_command_form(command_name, values)
-            .map_err(|error| error.to_string())
+        let runtime = self.runtime.clone();
+        self.deferred_command_execution = Some(BackgroundTask::spawn(move || {
+            set_background_status("command-action", "running command...");
+            let result = runtime.execute_command(
+                &command.command_name,
+                &command.display_name,
+                &command.values,
+            );
+            clear_background_status("command-action");
+            result.map_err(|error| error.to_string())
+        }));
+        Ok(())
+    }
+
+    fn poll_command_execution(&mut self) -> Result<Option<elroy_tui::TuiSnapshot>, String> {
+        self.poll_deferred_context_refresh();
+        self.poll_deferred_self_reflection();
+        self.poll_deferred_command_execution()
     }
 
     fn submit_prompt(&mut self, prompt: &str) -> Result<elroy_tui::TuiSnapshot, String> {
@@ -409,7 +446,7 @@ impl TuiRuntime for CliTuiRuntime {
 
         self.clear_deferred_context_refresh_error();
         let runtime = self.runtime.clone();
-        self.deferred_context_refresh = Some(BackgroundRefreshTask::spawn(move || {
+        self.deferred_context_refresh = Some(BackgroundTask::spawn(move || {
             runtime
                 .refresh_context_if_needed()
                 .map(|_| ())
@@ -427,7 +464,7 @@ impl TuiRuntime for CliTuiRuntime {
 
         self.clear_deferred_self_reflection_error();
         let runtime = self.runtime.clone();
-        self.deferred_self_reflection = Some(BackgroundRefreshTask::spawn(move || {
+        self.deferred_self_reflection = Some(BackgroundTask::spawn(move || {
             runtime
                 .run_self_reflection_if_needed()
                 .map_err(|error| error.to_string())
@@ -510,7 +547,7 @@ mod tests {
 
     use elroy_tui::TuiRuntime;
 
-    use super::{AppConfig, AppRuntime, BackgroundRefreshTask, CliTuiRuntime, prompt_arg};
+    use super::{AppConfig, AppRuntime, BackgroundTask, CliTuiRuntime, prompt_arg};
 
     #[test]
     fn prompt_arg_collects_remaining_words() {
@@ -525,17 +562,17 @@ mod tests {
 
     #[test]
     fn background_refresh_task_captures_errors() {
-        let task = BackgroundRefreshTask::spawn(|| Err("boom".to_string()));
+        let task = BackgroundTask::<()>::spawn(|| Err("boom".to_string()));
         while !task.is_finished() {
             std::thread::sleep(Duration::from_millis(1));
         }
-        assert_eq!(task.join().as_deref(), Some("boom"));
+        assert_eq!(task.join().expect_err("task should fail"), "boom");
     }
 
     #[test]
     fn background_refresh_task_reports_running_state() {
         let (tx, rx) = mpsc::channel();
-        let task = BackgroundRefreshTask::spawn(move || {
+        let task = BackgroundTask::spawn(move || {
             rx.recv().expect("signal should arrive");
             Ok(())
         });
@@ -545,7 +582,7 @@ mod tests {
         while !task.is_finished() {
             std::thread::sleep(Duration::from_millis(1));
         }
-        assert_eq!(task.join(), None);
+        assert_eq!(task.join(), Ok(()));
     }
 
     #[test]
@@ -553,12 +590,13 @@ mod tests {
         let config = AppConfig::from_env(&HashMap::new()).expect("config should load");
         let mut runtime = CliTuiRuntime {
             runtime: AppRuntime::new(config),
-            deferred_context_refresh: Some(BackgroundRefreshTask::spawn(|| {
+            deferred_context_refresh: Some(BackgroundTask::spawn(|| {
                 Err("refresh exploded".to_string())
             })),
             deferred_context_refresh_error: None,
             deferred_self_reflection: None,
             deferred_self_reflection_error: None,
+            deferred_command_execution: None,
         };
 
         let background_status = loop {
@@ -585,10 +623,11 @@ mod tests {
             runtime: AppRuntime::new(config),
             deferred_context_refresh: None,
             deferred_context_refresh_error: None,
-            deferred_self_reflection: Some(BackgroundRefreshTask::spawn(|| {
+            deferred_self_reflection: Some(BackgroundTask::spawn(|| {
                 Err("reflection exploded".to_string())
             })),
             deferred_self_reflection_error: None,
+            deferred_command_execution: None,
         };
 
         let background_status = loop {

@@ -49,8 +49,9 @@ use elroy_tools::{
     ExecutableTool, ExecutableToolRegistry, JsonSchema, ToolExecutionResult, ToolRegistry, ToolSpec,
 };
 use elroy_tui::{
-    SidebarAction, SidebarSection, TuiCommandForm, TuiCommandPaletteAction, TuiCommandPaletteEntry,
-    TuiCommandParameter, TuiSidebarDetail, TuiSlashCommandAction, TuiSnapshot,
+    SidebarAction, SidebarSection, TuiCommandExecution, TuiCommandForm, TuiCommandPaletteAction,
+    TuiCommandPaletteEntry, TuiCommandParameter, TuiSidebarDetail, TuiSlashCommandAction,
+    TuiSnapshot,
 };
 use elroy_user::{effective_persona, effective_user_full_name, effective_user_preferred_name};
 use serde_json::{Map, Value, json};
@@ -322,9 +323,11 @@ impl AppRuntime {
             .filter(|parameter| !parameter.optional)
             .count();
         if required_count == 0 {
-            return self
-                .execute_command_with_values(name, display_command_name(name), &[])
-                .map(TuiSlashCommandAction::Execute);
+            return Ok(TuiSlashCommandAction::Execute(TuiCommandExecution {
+                command_name: name.to_string(),
+                display_name: display_command_name(name).to_string(),
+                values: vec![],
+            }));
         }
         Ok(TuiSlashCommandAction::OpenForm(TuiCommandForm {
             command_name: name.to_string(),
@@ -388,25 +391,24 @@ impl AppRuntime {
             }));
         }
 
-        let snapshot = self.execute_command_with_values(
-            command_name,
-            slash_name,
-            parameters
+        Ok(TuiSlashCommandAction::Execute(TuiCommandExecution {
+            command_name: command_name.to_string(),
+            display_name: slash_name.to_string(),
+            values: parameters
                 .iter()
                 .zip(raw_values.iter())
                 .map(|(parameter, value)| (parameter.name.clone(), (*value).to_string()))
-                .collect::<Vec<_>>()
-                .as_slice(),
-        )?;
-        Ok(TuiSlashCommandAction::Execute(snapshot))
+                .collect(),
+        }))
     }
 
-    pub fn submit_command_form(
+    pub fn execute_command(
         &self,
         command_name: &str,
+        display_name: &str,
         values: &[(String, String)],
     ) -> Result<TuiSnapshot, AppError> {
-        self.execute_command_with_values(command_name, command_name, values)
+        self.execute_command_with_values(command_name, display_name, values)
     }
 
     fn execute_command_with_values(
@@ -7447,7 +7449,7 @@ mod tests {
     use elroy_llm::{ConversationMessage, MessageRole, Provider, StreamEvent};
     use elroy_memory::{create_memory_file, sanitize_filename};
     use elroy_tools::ExecutableToolRegistry;
-    use elroy_tui::{TuiCommandPaletteAction, TuiSlashCommandAction};
+    use elroy_tui::{TuiCommandExecution, TuiCommandPaletteAction, TuiSlashCommandAction};
 
     fn seed_competing_memory_record(
         connection: &rusqlite::Connection,
@@ -10967,12 +10969,27 @@ mod tests {
         config.database_path = database_path;
 
         let runtime = AppRuntime::new(config);
-        let TuiSlashCommandAction::Execute(help_snapshot) = runtime
+        let TuiSlashCommandAction::Execute(help_execution) = runtime
             .handle_slash_command("/help")
             .expect("slash command should execute")
         else {
             panic!("help should execute immediately");
         };
+        assert_eq!(
+            help_execution,
+            TuiCommandExecution {
+                command_name: "get_help".to_string(),
+                display_name: "help".to_string(),
+                values: vec![],
+            }
+        );
+        let help_snapshot = runtime
+            .execute_command(
+                &help_execution.command_name,
+                &help_execution.display_name,
+                &help_execution.values,
+            )
+            .expect("help command should execute");
         assert_eq!(
             help_snapshot.status.as_deref(),
             Some("slash command executed: /help")
@@ -10996,12 +11013,27 @@ mod tests {
         );
         assert!(!create_memory.is_error);
 
-        let TuiSlashCommandAction::Execute(shown_snapshot) = runtime
+        let TuiSlashCommandAction::Execute(shown_execution) = runtime
             .handle_slash_command("/show_memory runner")
             .expect("parameterized slash command should execute")
         else {
             panic!("show_memory should execute when all values are provided");
         };
+        assert_eq!(
+            shown_execution,
+            TuiCommandExecution {
+                command_name: "show_memory".to_string(),
+                display_name: "show_memory".to_string(),
+                values: vec![("memory_name".to_string(), "runner".to_string())],
+            }
+        );
+        let shown_snapshot = runtime
+            .execute_command(
+                &shown_execution.command_name,
+                &shown_execution.display_name,
+                &shown_execution.values,
+            )
+            .expect("show_memory command should execute");
         assert_eq!(
             shown_snapshot.status.as_deref(),
             Some("slash command executed: /show_memory")
@@ -11049,7 +11081,8 @@ mod tests {
         );
 
         let submitted_snapshot = runtime
-            .submit_command_form(
+            .execute_command(
+                "create_memory",
                 "create_memory",
                 &[
                     ("name".to_string(), "trip".to_string()),
@@ -11147,12 +11180,27 @@ mod tests {
             vec!["trip note".to_string()]
         );
 
-        let TuiSlashCommandAction::Execute(snapshot) = runtime
+        let TuiSlashCommandAction::Execute(execution) = runtime
             .launch_named_command("get_help")
             .expect("zero-arg command should execute from the palette path")
         else {
             panic!("get_help should execute immediately from the palette path");
         };
+        assert_eq!(
+            execution,
+            TuiCommandExecution {
+                command_name: "get_help".to_string(),
+                display_name: "help".to_string(),
+                values: vec![],
+            }
+        );
+        let snapshot = runtime
+            .execute_command(
+                &execution.command_name,
+                &execution.display_name,
+                &execution.values,
+            )
+            .expect("get_help command should execute from the palette path");
         assert_eq!(
             snapshot.status.as_deref(),
             Some("slash command executed: /help")

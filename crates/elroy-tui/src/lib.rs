@@ -62,6 +62,7 @@ pub struct TuiApp {
     pub model_name: String,
     pub status: String,
     pub prompt_active: bool,
+    pub command_active: bool,
     pub background_status: Option<String>,
     pub input: String,
     pub input_completions: Vec<String>,
@@ -144,9 +145,16 @@ pub struct TuiCommandPaletteEntry {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TuiCommandExecution {
+    pub command_name: String,
+    pub display_name: String,
+    pub values: Vec<(String, String)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TuiSlashCommandAction {
     NotHandled,
-    Execute(TuiSnapshot),
+    Execute(TuiCommandExecution),
     OpenForm(TuiCommandForm),
 }
 
@@ -218,11 +226,8 @@ pub trait TuiRuntime {
     fn load_command_palette_entries(&mut self) -> Result<Vec<TuiCommandPaletteEntry>, String>;
     fn launch_named_command(&mut self, name: &str) -> Result<TuiSlashCommandAction, String>;
     fn handle_slash_command(&mut self, prompt: &str) -> Result<TuiSlashCommandAction, String>;
-    fn submit_command_form(
-        &mut self,
-        command_name: &str,
-        values: &[(String, String)],
-    ) -> Result<TuiSnapshot, String>;
+    fn start_command_execution(&mut self, command: TuiCommandExecution) -> Result<(), String>;
+    fn poll_command_execution(&mut self) -> Result<Option<TuiSnapshot>, String>;
     fn submit_prompt(&mut self, prompt: &str) -> Result<TuiSnapshot, String>;
     fn start_prompt_stream(&mut self, prompt: &str) -> Result<Box<dyn TuiPromptStream>, String>;
     fn start_startup_prompt_stream(&mut self) -> Result<Option<Box<dyn TuiPromptStream>>, String>;
@@ -309,6 +314,7 @@ fn run_event_loop(
     let mut previous_background_status = None;
 
     loop {
+        maybe_complete_command_execution(app, runtime);
         match advance_prompt_stream(app, runtime, pending_prompt) {
             PromptAdvance::CompletedTurn => {
                 deferred_context_refresh_at = Some(Instant::now() + Duration::from_secs(5));
@@ -484,17 +490,16 @@ fn apply_intent_with_runtime(
                 app.status = "prompt was empty".to_string();
                 return;
             }
-            if pending_prompt.is_some() {
+            if pending_prompt.is_some() || app.command_active {
                 app.status = "Wait for the current task to finish before sending another message."
                     .to_string();
                 return;
             }
             match runtime.handle_slash_command(&submitted) {
-                Ok(TuiSlashCommandAction::Execute(snapshot)) => {
+                Ok(TuiSlashCommandAction::Execute(command)) => {
                     app.record_submitted_prompt(&submitted);
                     app.input.clear();
-                    app.apply_snapshot(snapshot);
-                    app.focus = FocusTarget::Input;
+                    start_command_execution(app, runtime, command);
                     return;
                 }
                 Ok(TuiSlashCommandAction::OpenForm(form)) => {
@@ -596,6 +601,30 @@ fn apply_intent_with_runtime(
     }
 }
 
+fn start_command_execution(
+    app: &mut TuiApp,
+    runtime: &mut impl TuiRuntime,
+    command: TuiCommandExecution,
+) {
+    if app.command_active {
+        app.status =
+            "Wait for the current task to finish before sending another message.".to_string();
+        return;
+    }
+
+    let display_name = command.display_name.clone();
+    match runtime.start_command_execution(command) {
+        Ok(()) => {
+            app.command_active = true;
+            app.focus = FocusTarget::Input;
+            app.status = format!("running command: /{display_name}");
+        }
+        Err(error) => {
+            app.status = format!("command launch failed: {error}");
+        }
+    }
+}
+
 fn apply_paste_event(app: &mut TuiApp, text: &str) {
     let flattened = flatten_pasted_text(text);
     if flattened.is_empty() {
@@ -606,6 +635,26 @@ fn apply_paste_event(app: &mut TuiApp, text: &str) {
         app.reset_prompt_history_navigation();
         app.input.push_str(&flattened);
         app.status = "editing prompt".to_string();
+    }
+}
+
+fn maybe_complete_command_execution(app: &mut TuiApp, runtime: &mut impl TuiRuntime) {
+    if !app.command_active {
+        return;
+    }
+
+    match runtime.poll_command_execution() {
+        Ok(Some(snapshot)) => {
+            app.command_active = false;
+            app.apply_snapshot(snapshot);
+            app.focus = FocusTarget::Input;
+        }
+        Ok(None) => {}
+        Err(error) => {
+            app.command_active = false;
+            app.status = format!("command failed: {error}");
+            app.focus = FocusTarget::Input;
+        }
     }
 }
 
@@ -813,6 +862,7 @@ impl TuiApp {
             model_name: "gpt-5".to_string(),
             status: "bootstrap".to_string(),
             prompt_active: false,
+            command_active: false,
             background_status: None,
             input: String::new(),
             input_completions: Vec::new(),
@@ -1047,7 +1097,7 @@ impl TuiApp {
     }
 
     pub fn footer_status_text(&self) -> String {
-        if self.prompt_active {
+        if self.prompt_active || self.command_active {
             return self.status.clone();
         }
         if let Some(background_status) = &self.background_status {
@@ -1762,9 +1812,8 @@ fn handle_command_palette_key(app: &mut TuiApp, key: KeyEvent, runtime: &mut imp
                 }
                 TuiCommandPaletteAction::ToolCommand(name) => {
                     match runtime.launch_named_command(&name) {
-                        Ok(TuiSlashCommandAction::Execute(snapshot)) => {
-                            app.apply_snapshot(snapshot);
-                            app.focus = FocusTarget::Input;
+                        Ok(TuiSlashCommandAction::Execute(command)) => {
+                            start_command_execution(app, runtime, command);
                         }
                         Ok(TuiSlashCommandAction::OpenForm(form)) => {
                             app.open_command_form(form);
@@ -1851,18 +1900,18 @@ fn handle_command_form_key(app: &mut TuiApp, key: KeyEvent, runtime: &mut impl T
                 .iter()
                 .map(|field| (field.name.clone(), field.value.trim().to_string()))
                 .collect::<Vec<_>>();
-            match runtime.submit_command_form(&command_name, &values) {
-                Ok(snapshot) => {
-                    app.command_form = None;
-                    app.apply_snapshot(snapshot);
-                    app.focus = FocusTarget::Input;
-                }
-                Err(error) => {
-                    if let Some(form) = app.command_form.as_mut() {
-                        form.error = Some(error);
-                    }
-                }
+            let command = TuiCommandExecution {
+                command_name: command_name.clone(),
+                display_name: command_name,
+                values,
+            };
+            app.command_form = None;
+            if app.command_active {
+                app.status = "Wait for the current task to finish before sending another message."
+                    .to_string();
+                return;
             }
+            start_command_execution(app, runtime, command);
         }
         _ => {}
     }
@@ -1938,12 +1987,12 @@ impl TuiRuntime for NoopRuntime {
         Ok(TuiSlashCommandAction::NotHandled)
     }
 
-    fn submit_command_form(
-        &mut self,
-        _command_name: &str,
-        _values: &[(String, String)],
-    ) -> Result<TuiSnapshot, String> {
-        Ok(TuiSnapshot::default())
+    fn start_command_execution(&mut self, _command: TuiCommandExecution) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn poll_command_execution(&mut self) -> Result<Option<TuiSnapshot>, String> {
+        Ok(None)
     }
 
     fn submit_prompt(&mut self, _prompt: &str) -> Result<TuiSnapshot, String> {
@@ -2020,10 +2069,11 @@ mod tests {
 
     use super::{
         CommandPane, FocusTarget, PendingPrompt, PromptAdvance, PromptUpdate, SidebarAction,
-        SidebarSection, TuiApp, TuiCommandForm, TuiCommandPaletteAction, TuiCommandPaletteEntry,
-        TuiCommandParameter, TuiContextMessage, TuiExit, TuiPromptStream, TuiRuntime,
-        TuiSidebarDetail, TuiSlashCommandAction, TuiSnapshot, UiIntent, advance_prompt_stream,
-        apply_intent_with_runtime, apply_key_event, apply_paste_event, key_event_token,
+        SidebarSection, TuiApp, TuiCommandExecution, TuiCommandForm, TuiCommandPaletteAction,
+        TuiCommandPaletteEntry, TuiCommandParameter, TuiContextMessage, TuiExit, TuiPromptStream,
+        TuiRuntime, TuiSidebarDetail, TuiSlashCommandAction, TuiSnapshot, UiIntent,
+        advance_prompt_stream, apply_intent_with_runtime, apply_key_event, apply_paste_event,
+        key_event_token, maybe_complete_command_execution,
         maybe_refresh_snapshot_after_background_completion, maybe_run_deferred_context_refresh,
         poll_context_updates, start_startup_prompt_stream,
     };
@@ -2035,7 +2085,9 @@ mod tests {
         launch_named_command_action: Option<TuiSlashCommandAction>,
         slash_command_action: Option<TuiSlashCommandAction>,
         slash_command_error: Option<String>,
-        submitted_command_forms: Vec<(String, Vec<(String, String)>)>,
+        started_command_executions: Vec<TuiCommandExecution>,
+        completed_command_execution_snapshot: Option<TuiSnapshot>,
+        command_execution_error: Option<String>,
         submitted_prompts: Vec<String>,
         self_reflection_runs: usize,
         last_opened: Option<(SidebarSection, String)>,
@@ -2102,18 +2154,16 @@ mod tests {
             }
         }
 
-        fn submit_command_form(
-            &mut self,
-            command_name: &str,
-            values: &[(String, String)],
-        ) -> Result<TuiSnapshot, String> {
-            self.submitted_command_forms
-                .push((command_name.to_string(), values.to_vec()));
-            Ok(TuiSnapshot {
-                conversation_lines: vec![format!("tool result: submitted /{command_name}")],
-                status: Some(format!("slash command executed: /{command_name}")),
-                ..TuiSnapshot::default()
-            })
+        fn start_command_execution(&mut self, command: TuiCommandExecution) -> Result<(), String> {
+            self.started_command_executions.push(command);
+            Ok(())
+        }
+
+        fn poll_command_execution(&mut self) -> Result<Option<TuiSnapshot>, String> {
+            if let Some(error) = self.command_execution_error.take() {
+                return Err(error);
+            }
+            Ok(self.completed_command_execution_snapshot.take())
         }
 
         fn submit_prompt(&mut self, prompt: &str) -> Result<TuiSnapshot, String> {
@@ -2593,6 +2643,16 @@ mod tests {
     }
 
     #[test]
+    fn footer_status_text_prefers_active_status_during_command_action() {
+        let mut app = TuiApp::bootstrap();
+        app.command_active = true;
+        app.status = "running command: /help".to_string();
+        app.background_status = Some("running command...".to_string());
+
+        assert_eq!(app.footer_status_text(), "running command: /help");
+    }
+
+    #[test]
     fn key_event_token_maps_terminal_keys_to_existing_ui_tokens() {
         assert_eq!(
             key_event_token(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::CONTROL)),
@@ -2672,10 +2732,10 @@ mod tests {
         let mut app = TuiApp::bootstrap();
         app.input = "/help".to_string();
         let mut runtime = FakeRuntime {
-            slash_command_action: Some(TuiSlashCommandAction::Execute(TuiSnapshot {
-                conversation_lines: vec!["tool result: Available commands...".to_string()],
-                status: Some("slash command executed: /help".to_string()),
-                ..TuiSnapshot::default()
+            slash_command_action: Some(TuiSlashCommandAction::Execute(TuiCommandExecution {
+                command_name: "get_help".to_string(),
+                display_name: "help".to_string(),
+                values: vec![],
             })),
             ..FakeRuntime::default()
         };
@@ -2687,6 +2747,23 @@ mod tests {
         assert!(runtime.submitted_prompts.is_empty());
         assert_eq!(app.input, "");
         assert_eq!(app.focus, FocusTarget::Input);
+        assert!(app.command_active);
+        assert_eq!(app.status, "running command: /help");
+        assert_eq!(
+            runtime.started_command_executions,
+            vec![TuiCommandExecution {
+                command_name: "get_help".to_string(),
+                display_name: "help".to_string(),
+                values: vec![],
+            }]
+        );
+        runtime.completed_command_execution_snapshot = Some(TuiSnapshot {
+            conversation_lines: vec!["tool result: Available commands...".to_string()],
+            status: Some("slash command executed: /help".to_string()),
+            ..TuiSnapshot::default()
+        });
+        maybe_complete_command_execution(&mut app, &mut runtime);
+        assert!(!app.command_active);
         assert_eq!(app.status, "slash command executed: /help");
         assert_eq!(
             app.conversation_lines.last().map(String::as_str),
@@ -2819,20 +2896,66 @@ mod tests {
         assert!(app.command_form.is_none());
         assert_eq!(app.focus, FocusTarget::Input);
         assert_eq!(
-            runtime.submitted_command_forms,
-            vec![(
-                "create_memory".to_string(),
-                vec![
+            runtime.started_command_executions,
+            vec![TuiCommandExecution {
+                command_name: "create_memory".to_string(),
+                display_name: "create_memory".to_string(),
+                values: vec![
                     ("name".to_string(), "trip".to_string()),
                     ("text".to_string(), "note".to_string()),
                 ],
-            )]
+            }]
         );
+        assert!(app.command_active);
+        assert_eq!(app.status, "running command: /create_memory");
+        runtime.completed_command_execution_snapshot = Some(TuiSnapshot {
+            conversation_lines: vec!["tool result: submitted /create_memory".to_string()],
+            status: Some("slash command executed: /create_memory".to_string()),
+            ..TuiSnapshot::default()
+        });
+        maybe_complete_command_execution(&mut app, &mut runtime);
+        assert!(!app.command_active);
         assert_eq!(
             app.conversation_lines.last().map(String::as_str),
             Some("tool result: submitted /create_memory")
         );
         assert_eq!(app.status, "slash command executed: /create_memory");
+    }
+
+    #[test]
+    fn command_action_keeps_input_editable_and_blocks_submit() {
+        let mut app = TuiApp::bootstrap();
+        app.command_active = true;
+        app.status = "running command: /refresh_system_instructions".to_string();
+        let mut runtime = FakeRuntime::default();
+        let mut pending = None;
+
+        apply_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+            &mut runtime,
+            &mut pending,
+        );
+        apply_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+            &mut runtime,
+            &mut pending,
+        );
+        apply_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut runtime,
+            &mut pending,
+        );
+
+        assert_eq!(app.input, "dr");
+        assert!(pending.is_none());
+        assert!(runtime.submitted_prompts.is_empty());
+        assert_eq!(
+            app.status,
+            "Wait for the current task to finish before sending another message."
+        );
     }
 
     #[test]
@@ -2940,11 +3063,13 @@ mod tests {
             .expect("command palette should open")
             .selected_index = 2;
         let mut runtime = FakeRuntime {
-            launch_named_command_action: Some(TuiSlashCommandAction::Execute(TuiSnapshot {
-                conversation_lines: vec!["assistant: refreshed".to_string()],
-                status: Some("slash command executed: /refresh_system_instructions".to_string()),
-                ..TuiSnapshot::default()
-            })),
+            launch_named_command_action: Some(TuiSlashCommandAction::Execute(
+                TuiCommandExecution {
+                    command_name: "refresh_system_instructions".to_string(),
+                    display_name: "refresh_system_instructions".to_string(),
+                    values: vec![],
+                },
+            )),
             ..FakeRuntime::default()
         };
         let mut pending = None;
@@ -2958,6 +3083,22 @@ mod tests {
 
         assert!(app.command_palette.is_none());
         assert_eq!(app.focus, FocusTarget::Input);
+        assert!(app.command_active);
+        assert_eq!(
+            runtime.started_command_executions,
+            vec![TuiCommandExecution {
+                command_name: "refresh_system_instructions".to_string(),
+                display_name: "refresh_system_instructions".to_string(),
+                values: vec![],
+            }]
+        );
+        runtime.completed_command_execution_snapshot = Some(TuiSnapshot {
+            conversation_lines: vec!["assistant: refreshed".to_string()],
+            status: Some("slash command executed: /refresh_system_instructions".to_string()),
+            ..TuiSnapshot::default()
+        });
+        maybe_complete_command_execution(&mut app, &mut runtime);
+        assert!(!app.command_active);
         assert_eq!(
             app.conversation_lines.last().map(String::as_str),
             Some("assistant: refreshed")
