@@ -3155,14 +3155,19 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
             "Rename one active due item.",
             JsonSchema::object(
                 [
+                    ("old_name", json!({"type": "string"})),
                     ("name", json!({"type": "string"})),
                     ("new_name", json!({"type": "string"})),
                 ],
-                ["name", "new_name"],
+                ["new_name"],
             ),
         ),
         move |arguments| {
-            let Some(name) = arguments.get("name").and_then(Value::as_str) else {
+            let Some(name) = arguments
+                .get("old_name")
+                .and_then(Value::as_str)
+                .or_else(|| arguments.get("name").and_then(Value::as_str))
+            else {
                 return ToolExecutionResult::error("rename_due_item requires a string name");
             };
             let Some(new_name) = arguments.get("new_name").and_then(Value::as_str) else {
@@ -3199,14 +3204,19 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
             "Rename one active task.",
             JsonSchema::object(
                 [
+                    ("old_name", json!({"type": "string"})),
                     ("name", json!({"type": "string"})),
                     ("new_name", json!({"type": "string"})),
                 ],
-                ["name", "new_name"],
+                ["new_name"],
             ),
         ),
         move |arguments| {
-            let Some(name) = arguments.get("name").and_then(Value::as_str) else {
+            let Some(name) = arguments
+                .get("old_name")
+                .and_then(Value::as_str)
+                .or_else(|| arguments.get("name").and_then(Value::as_str))
+            else {
                 return ToolExecutionResult::error("rename_task requires a string name");
             };
             let Some(new_name) = arguments.get("new_name").and_then(Value::as_str) else {
@@ -8594,7 +8604,7 @@ mod tests {
 
         let renamed = registry.invoke(
             "rename_task",
-            "{\"name\":\"job search\",\"new_name\":\"Career Search\"}",
+            "{\"old_name\":\"job search\",\"new_name\":\"Career Search\"}",
         );
         assert!(!renamed.is_error);
         assert_eq!(
@@ -8604,13 +8614,13 @@ mod tests {
         assert!(agenda_dir.join("career_search.md").exists());
         let missing_renamed = registry.invoke(
             "rename_task",
-            "{\"name\":\"missing\",\"new_name\":\"Backup Search\"}",
+            "{\"old_name\":\"missing\",\"new_name\":\"Backup Search\"}",
         );
         assert!(missing_renamed.is_error);
         assert_eq!(missing_renamed.content, "Active task 'missing' not found.");
         let duplicate_renamed = registry.invoke(
             "rename_task",
-            "{\"name\":\"career search\",\"new_name\":\"career search\"}",
+            "{\"old_name\":\"career search\",\"new_name\":\"career search\"}",
         );
         assert!(duplicate_renamed.is_error);
         assert_eq!(
@@ -8896,7 +8906,7 @@ mod tests {
 
         let renamed = registry.invoke(
             "rename_due_item",
-            "{\"name\":\"call mom\",\"new_name\":\"Call Parents\"}",
+            "{\"old_name\":\"call mom\",\"new_name\":\"Call Parents\"}",
         );
         assert!(!renamed.is_error);
         assert_eq!(
@@ -8906,7 +8916,7 @@ mod tests {
         assert!(agenda_dir.join("call_parents.md").exists());
         let missing_renamed = registry.invoke(
             "rename_due_item",
-            "{\"name\":\"missing\",\"new_name\":\"Call Family\"}",
+            "{\"old_name\":\"missing\",\"new_name\":\"Call Family\"}",
         );
         assert!(missing_renamed.is_error);
         assert_eq!(
@@ -8915,7 +8925,7 @@ mod tests {
         );
         let duplicate_renamed = registry.invoke(
             "rename_due_item",
-            "{\"name\":\"call parents\",\"new_name\":\"call parents\"}",
+            "{\"old_name\":\"call parents\",\"new_name\":\"call parents\"}",
         );
         assert!(duplicate_renamed.is_error);
         assert_eq!(
