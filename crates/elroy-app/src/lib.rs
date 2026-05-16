@@ -7072,7 +7072,20 @@ fn prompt_prelude_status_updates(
 }
 
 fn should_skip_memory_recall(prompt: &str) -> bool {
-    let normalized = prompt.trim().to_ascii_lowercase();
+    let normalized = prompt
+        .trim()
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch.is_ascii_whitespace() {
+                ch.to_ascii_lowercase()
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
     if normalized.is_empty() {
         return true;
     }
@@ -14660,6 +14673,15 @@ mod tests {
         assert!(should_skip_memory_recall("HeLLo"));
         assert!(should_skip_memory_recall("OK"));
         assert!(should_skip_memory_recall("ThAnKs"));
+    }
+
+    #[test]
+    fn trivial_messages_skip_memory_recall_with_punctuation() {
+        assert!(should_skip_memory_recall("hello!"));
+        assert!(should_skip_memory_recall("Thanks!!!"));
+        assert!(should_skip_memory_recall("ok?"));
+        assert!(should_skip_memory_recall("good morning,"));
+        assert!(!should_skip_memory_recall("what about bob?"));
     }
 
     #[test]
