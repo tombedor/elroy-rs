@@ -170,6 +170,15 @@ pub struct UserPreferenceRecord {
     pub updated_at_unix: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryOperationTrackerRecord {
+    pub user_token: String,
+    pub memories_since_consolidation: i64,
+    pub messages_since_memory: i64,
+    pub created_at_unix: i64,
+    pub updated_at_unix: i64,
+}
+
 #[derive(Debug)]
 pub enum BootstrapError {
     Io(std::io::Error),
@@ -880,6 +889,76 @@ pub fn save_user_preferences(
     Ok(())
 }
 
+pub fn load_memory_operation_tracker(
+    connection: &Connection,
+    user_token: &str,
+) -> rusqlite::Result<Option<MemoryOperationTrackerRecord>> {
+    let mut statement = connection.prepare(
+        "SELECT user_token, memories_since_consolidation, messages_since_memory, created_at_unix, updated_at_unix
+         FROM memory_operation_tracker
+         WHERE user_token = ?1",
+    )?;
+    let mut rows = statement.query(params![user_token])?;
+    let Some(row) = rows.next()? else {
+        return Ok(None);
+    };
+    Ok(Some(MemoryOperationTrackerRecord {
+        user_token: row.get(0)?,
+        memories_since_consolidation: row.get(1)?,
+        messages_since_memory: row.get(2)?,
+        created_at_unix: row.get(3)?,
+        updated_at_unix: row.get(4)?,
+    }))
+}
+
+pub fn get_or_create_memory_operation_tracker(
+    connection: &mut Connection,
+    user_token: &str,
+) -> rusqlite::Result<MemoryOperationTrackerRecord> {
+    if let Some(record) = load_memory_operation_tracker(connection, user_token)? {
+        return Ok(record);
+    }
+
+    let now = unix_timestamp_now();
+    let record = MemoryOperationTrackerRecord {
+        user_token: user_token.to_string(),
+        memories_since_consolidation: 0,
+        messages_since_memory: 0,
+        created_at_unix: now,
+        updated_at_unix: now,
+    };
+    save_memory_operation_tracker(connection, &record)?;
+    Ok(record)
+}
+
+pub fn save_memory_operation_tracker(
+    connection: &mut Connection,
+    record: &MemoryOperationTrackerRecord,
+) -> rusqlite::Result<()> {
+    connection.execute(
+        "INSERT INTO memory_operation_tracker (
+            user_token,
+            memories_since_consolidation,
+            messages_since_memory,
+            created_at_unix,
+            updated_at_unix
+        ) VALUES (?1, ?2, ?3, ?4, ?5)
+        ON CONFLICT(user_token) DO UPDATE SET
+            memories_since_consolidation = excluded.memories_since_consolidation,
+            messages_since_memory = excluded.messages_since_memory,
+            created_at_unix = excluded.created_at_unix,
+            updated_at_unix = excluded.updated_at_unix",
+        params![
+            record.user_token,
+            record.memories_since_consolidation,
+            record.messages_since_memory,
+            record.created_at_unix,
+            record.updated_at_unix,
+        ],
+    )?;
+    Ok(())
+}
+
 fn get_or_create_context_message_set(
     connection: &mut Connection,
     user_token: &str,
@@ -1137,13 +1216,14 @@ mod tests {
     use std::fs;
 
     use super::{
-        BootstrapInventory, BootstrapPlan, UserPreferenceRecord, bootstrap_database,
-        bootstrap_documents, derived_counts, find_active_agenda_item_by_name,
-        find_active_memory_by_name, list_active_agenda_items, list_active_due_items,
-        list_active_memories, list_active_plain_agenda_items, load_context_messages,
+        BootstrapInventory, BootstrapPlan, MemoryOperationTrackerRecord, UserPreferenceRecord,
+        bootstrap_database, bootstrap_documents, derived_counts, find_active_agenda_item_by_name,
+        find_active_memory_by_name, get_or_create_memory_operation_tracker,
+        list_active_agenda_items, list_active_due_items, list_active_memories,
+        list_active_plain_agenda_items, load_context_messages, load_memory_operation_tracker,
         load_user_preferences, markdown_files, open_sqlite_connection, persist_bootstrap_documents,
-        replace_context_messages, run_migrations, save_user_preferences, search_active_memories,
-        sync_derived_domain_tables,
+        replace_context_messages, run_migrations, save_memory_operation_tracker,
+        save_user_preferences, search_active_memories, sync_derived_domain_tables,
     };
     use elroy_config::AppConfig;
     use elroy_llm::{ConversationMessage, MessageRole, ToolCall};
@@ -1590,6 +1670,34 @@ mod tests {
     }
 
     #[test]
+    fn memory_operation_tracker_round_trip_for_user_token() {
+        let mut connection = Connection::open_in_memory().expect("sqlite should open");
+        run_migrations(&mut connection).expect("migrations should run");
+
+        let mut tracker = get_or_create_memory_operation_tracker(&mut connection, "local-user")
+            .expect("tracker should load");
+        assert_eq!(tracker.messages_since_memory, 0);
+        assert_eq!(tracker.memories_since_consolidation, 0);
+
+        tracker.messages_since_memory = 2;
+        tracker.memories_since_consolidation = 1;
+        save_memory_operation_tracker(&mut connection, &tracker).expect("tracker should persist");
+
+        let loaded = load_memory_operation_tracker(&connection, "local-user")
+            .expect("tracker should reload");
+        assert_eq!(
+            loaded,
+            Some(MemoryOperationTrackerRecord {
+                user_token: "local-user".to_string(),
+                messages_since_memory: 2,
+                memories_since_consolidation: 1,
+                created_at_unix: tracker.created_at_unix,
+                updated_at_unix: tracker.updated_at_unix,
+            })
+        );
+    }
+
+    #[test]
     fn migrations_create_codex_sessions_table() {
         let mut connection = Connection::open_in_memory().expect("sqlite should open");
 
@@ -1604,5 +1712,22 @@ mod tests {
             .expect("codex_sessions table should exist");
 
         assert_eq!(table_name, "codex_sessions");
+    }
+
+    #[test]
+    fn migrations_create_memory_operation_tracker_table() {
+        let mut connection = Connection::open_in_memory().expect("sqlite should open");
+
+        run_migrations(&mut connection).expect("migrations should run");
+
+        let table_name: String = connection
+            .query_row(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'memory_operation_tracker'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("memory_operation_tracker table should exist");
+
+        assert_eq!(table_name, "memory_operation_tracker");
     }
 }

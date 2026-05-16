@@ -20,10 +20,10 @@ use elroy_core::{
 };
 use elroy_db::{
     AgendaItemRecord, BootstrapPlan, UserPreferenceRecord, find_active_agenda_item_by_name,
-    find_active_memory_by_name, list_active_due_items, list_active_memories,
-    list_active_plain_agenda_items, load_context_messages, load_user_preferences,
-    open_sqlite_connection, replace_context_messages, run_migrations, save_user_preferences,
-    search_active_memories,
+    find_active_memory_by_name, get_or_create_memory_operation_tracker, list_active_due_items,
+    list_active_memories, list_active_plain_agenda_items, load_context_messages,
+    load_user_preferences, open_sqlite_connection, replace_context_messages, run_migrations,
+    save_memory_operation_tracker, save_user_preferences, search_active_memories,
 };
 use elroy_feature_requests::{
     FeatureRequestRecord, find_best_feature_request_match, get_feature_request,
@@ -162,11 +162,13 @@ impl Iterator for PromptEventStream {
 
 struct PromptEventStreamState {
     home_dir: PathBuf,
+    bootstrap_plan: BootstrapPlan,
     connection: rusqlite::Connection,
     turn_stream: TurnEventStream,
     existing_transcript_len: usize,
     transient_context_count: usize,
     persist_input_message: bool,
+    messages_between_memory: usize,
     messages_between_self_reflection: usize,
     prelude_events: VecDeque<StreamEvent>,
 }
@@ -196,6 +198,8 @@ struct PromptExecutionOptions<'a> {
     persist_input_message: bool,
     force_tool: Option<&'a str>,
     home_dir: &'a Path,
+    bootstrap_plan: BootstrapPlan,
+    messages_between_memory: usize,
     messages_between_self_reflection: usize,
     memory_recall_classifier_enabled: bool,
     memory_recall_classifier_window: usize,
@@ -262,6 +266,8 @@ impl AppRuntime {
                 persist_input_message: options.persist_input_message,
                 force_tool,
                 home_dir: &self.config.home_dir,
+                bootstrap_plan: BootstrapPlan::from_config(&self.config),
+                messages_between_memory: self.config.messages_between_memory,
                 messages_between_self_reflection: self.config.messages_between_self_reflection,
                 memory_recall_classifier_enabled: self.config.memory_recall_classifier_enabled,
                 memory_recall_classifier_window: self.config.memory_recall_classifier_window,
@@ -299,6 +305,8 @@ impl AppRuntime {
                 persist_input_message: options.persist_input_message,
                 force_tool,
                 home_dir: &self.config.home_dir,
+                bootstrap_plan: BootstrapPlan::from_config(&self.config),
+                messages_between_memory: self.config.messages_between_memory,
                 messages_between_self_reflection: self.config.messages_between_self_reflection,
                 memory_recall_classifier_enabled: self.config.memory_recall_classifier_enabled,
                 memory_recall_classifier_window: self.config.memory_recall_classifier_window,
@@ -833,6 +841,13 @@ fn finalize_prompt_event_stream(
         LOCAL_USER_TOKEN,
         &persisted_transcript,
     )?;
+    run_auto_memory_if_needed(
+        &mut state.connection,
+        &state.bootstrap_plan,
+        state.existing_transcript_len,
+        persisted_transcript.as_slice(),
+        state.messages_between_memory,
+    )?;
     run_self_reflection_if_needed(
         &state.home_dir,
         persisted_transcript.as_slice(),
@@ -911,6 +926,13 @@ fn run_prompt_with_model_and_registry(
         options.persist_input_message,
     );
     replace_context_messages(connection, LOCAL_USER_TOKEN, &persisted_transcript)?;
+    run_auto_memory_if_needed(
+        connection,
+        &options.bootstrap_plan,
+        existing_transcript.len(),
+        persisted_transcript.as_slice(),
+        options.messages_between_memory,
+    )?;
     run_self_reflection_if_needed(
         options.home_dir,
         persisted_transcript.as_slice(),
@@ -981,11 +1003,13 @@ fn run_prompt_with_model_and_registry_stream(
     Ok(PromptEventStream {
         state: Some(PromptEventStreamState {
             home_dir,
+            bootstrap_plan: options.bootstrap_plan,
             connection,
             turn_stream,
             existing_transcript_len: existing_transcript.len(),
             transient_context_count: recall_context.len() + due_item_context.len(),
             persist_input_message: options.persist_input_message,
+            messages_between_memory: options.messages_between_memory,
             messages_between_self_reflection: options.messages_between_self_reflection,
             prelude_events,
         }),
@@ -1003,6 +1027,118 @@ fn run_self_reflection_if_needed(
     })
     .run(home_dir, transcript)?;
     Ok(())
+}
+
+fn run_auto_memory_if_needed(
+    connection: &mut rusqlite::Connection,
+    bootstrap_plan: &BootstrapPlan,
+    existing_transcript_len: usize,
+    transcript: &[ConversationMessage],
+    messages_between_memory: usize,
+) -> Result<(), AppError> {
+    if messages_between_memory == 0 {
+        return Ok(());
+    }
+
+    let new_message_count = transcript
+        .iter()
+        .skip(existing_transcript_len)
+        .filter(|message| {
+            matches!(message.role, MessageRole::User | MessageRole::Assistant)
+                && message
+                    .content
+                    .as_deref()
+                    .is_some_and(|content| !content.trim().is_empty())
+        })
+        .count() as i64;
+    if new_message_count == 0 {
+        return Ok(());
+    }
+
+    let mut tracker = get_or_create_memory_operation_tracker(connection, LOCAL_USER_TOKEN)?;
+    tracker.messages_since_memory += new_message_count;
+    tracker.updated_at_unix = Utc::now().timestamp();
+
+    if tracker.messages_since_memory < messages_between_memory as i64 {
+        save_memory_operation_tracker(connection, &tracker)?;
+        return Ok(());
+    }
+
+    let (name, text) = formulate_memory_from_transcript(transcript);
+    create_memory_file(&bootstrap_plan.memory_dir, &name, &text)?;
+    elroy_db::bootstrap_database(bootstrap_plan)
+        .map_err(|error| AppError::Runtime(error.to_string()))?;
+    *connection = open_sqlite_connection(&bootstrap_plan.database_path)?;
+
+    tracker.messages_since_memory = 0;
+    tracker.memories_since_consolidation += 1;
+    tracker.updated_at_unix = Utc::now().timestamp();
+    save_memory_operation_tracker(connection, &tracker)?;
+    Ok(())
+}
+
+fn reset_memory_tracker_after_creation(config: &AppConfig) -> Result<(), AppError> {
+    let mut connection = open_sqlite_connection(&config.database_path)?;
+    run_migrations(&mut connection)?;
+    let mut tracker = get_or_create_memory_operation_tracker(&mut connection, LOCAL_USER_TOKEN)?;
+    tracker.messages_since_memory = 0;
+    tracker.memories_since_consolidation += 1;
+    tracker.updated_at_unix = Utc::now().timestamp();
+    save_memory_operation_tracker(&mut connection, &tracker)?;
+    Ok(())
+}
+
+fn formulate_memory_from_transcript(transcript: &[ConversationMessage]) -> (String, String) {
+    let messages = transcript
+        .iter()
+        .filter(|message| {
+            matches!(message.role, MessageRole::User | MessageRole::Assistant)
+                && message
+                    .content
+                    .as_deref()
+                    .is_some_and(|content| !content.trim().is_empty())
+        })
+        .rev()
+        .take(6)
+        .cloned()
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>();
+
+    let title_seed = messages
+        .iter()
+        .find(|message| message.role == MessageRole::User)
+        .and_then(|message| message.content.as_deref())
+        .unwrap_or("Conversation memory");
+    let title_words = title_seed
+        .split_whitespace()
+        .take(6)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let title = if title_words.is_empty() {
+        format!(
+            "Conversation memory {}",
+            Utc::now().format("%Y-%m-%d %H:%M")
+        )
+    } else {
+        format!("Conversation memory: {title_words}")
+    };
+
+    let body = messages
+        .into_iter()
+        .map(|message| {
+            let role = match message.role {
+                MessageRole::User => "User",
+                MessageRole::Assistant => "Assistant",
+                _ => unreachable!("filtered to user/assistant"),
+            };
+            format!("{role}: {}", message.content.unwrap_or_default().trim())
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    (title, body)
 }
 
 fn run_background_codex_completion_followup(
@@ -1024,6 +1160,8 @@ fn run_background_codex_completion_followup(
             persist_input_message: false,
             force_tool: None,
             home_dir: &config.home_dir,
+            bootstrap_plan: BootstrapPlan::from_config(config),
+            messages_between_memory: config.messages_between_memory,
             messages_between_self_reflection: config.messages_between_self_reflection,
             memory_recall_classifier_enabled: config.memory_recall_classifier_enabled,
             memory_recall_classifier_window: config.memory_recall_classifier_window,
@@ -1101,6 +1239,8 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                         &config_for_memory_write,
                     ))
                     .map_err(|error| std::io::Error::other(error.to_string()))?;
+                    reset_memory_tracker_after_creation(&config_for_memory_write)
+                        .map_err(|error| std::io::Error::other(error.to_string()))?;
                     Ok(path)
                 },
             ) {
@@ -3448,8 +3588,8 @@ mod tests {
     use elroy_config::{AppConfig, LlmProvider};
     use elroy_core::{ConversationRequest, ModelClient, StreamingModelClient};
     use elroy_db::{
-        AgendaItemRecord, MemoryRecord, load_user_preferences, open_sqlite_connection,
-        run_migrations,
+        AgendaItemRecord, BootstrapPlan, MemoryRecord, load_memory_operation_tracker,
+        load_user_preferences, open_sqlite_connection, run_migrations,
     };
     use elroy_feature_requests::{list_feature_requests, write_new_feature_request};
     use elroy_llm::{ConversationMessage, MessageRole, Provider, StreamEvent};
@@ -4717,6 +4857,8 @@ mod tests {
                 persist_input_message: false,
                 force_tool: None,
                 home_dir: &home,
+                bootstrap_plan: BootstrapPlan::from_config(&config),
+                messages_between_memory: config.messages_between_memory,
                 messages_between_self_reflection: config.messages_between_self_reflection,
                 memory_recall_classifier_enabled: config.memory_recall_classifier_enabled,
                 memory_recall_classifier_window: config.memory_recall_classifier_window,
@@ -4775,6 +4917,8 @@ mod tests {
                 persist_input_message: true,
                 force_tool: None,
                 home_dir: &home,
+                bootstrap_plan: BootstrapPlan::from_config(&config),
+                messages_between_memory: config.messages_between_memory,
                 messages_between_self_reflection: config.messages_between_self_reflection,
                 memory_recall_classifier_enabled: config.memory_recall_classifier_enabled,
                 memory_recall_classifier_window: config.memory_recall_classifier_window,
@@ -4843,6 +4987,8 @@ mod tests {
                 persist_input_message: true,
                 force_tool: None,
                 home_dir: &home,
+                bootstrap_plan: BootstrapPlan::from_config(&config),
+                messages_between_memory: config.messages_between_memory,
                 messages_between_self_reflection: config.messages_between_self_reflection,
                 memory_recall_classifier_enabled: config.memory_recall_classifier_enabled,
                 memory_recall_classifier_window: config.memory_recall_classifier_window,
@@ -4859,6 +5005,96 @@ mod tests {
                 .as_deref()
                 .is_some_and(|value| value.contains("You forgot the main deadline."))
         );
+
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
+    fn run_prompt_with_model_and_registry_can_auto_create_memory_on_message_threshold() {
+        let unique = format!(
+            "elroy-rs-app-auto-memory-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+
+        let mut connection = open_sqlite_connection(&database_path).expect("database should open");
+        run_migrations(&mut connection).expect("migrations should run");
+        let model = FakeModel::new(vec![
+            vec![StreamEvent::AssistantResponse {
+                content: "Test response 1".to_string(),
+            }],
+            vec![StreamEvent::AssistantResponse {
+                content: "Test response 2".to_string(),
+            }],
+        ]);
+        let mut config = AppConfig::defaults();
+        config.home_dir = home.clone();
+        config.memory_dir = memory_dir.clone();
+        config.agenda_dir = agenda_dir;
+        config.database_path = database_path.clone();
+        config.messages_between_memory = 3;
+
+        run_prompt_with_model_and_registry(
+            &mut connection,
+            "Test message 1",
+            &model,
+            ExecutableToolRegistry::new(vec![]),
+            PromptExecutionOptions {
+                role: MessageRole::User,
+                persist_input_message: true,
+                force_tool: None,
+                home_dir: &home,
+                bootstrap_plan: BootstrapPlan::from_config(&config),
+                messages_between_memory: config.messages_between_memory,
+                messages_between_self_reflection: config.messages_between_self_reflection,
+                memory_recall_classifier_enabled: config.memory_recall_classifier_enabled,
+                memory_recall_classifier_window: config.memory_recall_classifier_window,
+            },
+        )
+        .expect("prompt should succeed");
+        let tracker = load_memory_operation_tracker(&connection, LOCAL_USER_TOKEN)
+            .expect("tracker should load")
+            .expect("tracker should exist");
+        assert_eq!(tracker.messages_since_memory, 2);
+
+        run_prompt_with_model_and_registry(
+            &mut connection,
+            "Test message 2",
+            &model,
+            ExecutableToolRegistry::new(vec![]),
+            PromptExecutionOptions {
+                role: MessageRole::User,
+                persist_input_message: true,
+                force_tool: None,
+                home_dir: &home,
+                bootstrap_plan: BootstrapPlan::from_config(&config),
+                messages_between_memory: config.messages_between_memory,
+                messages_between_self_reflection: config.messages_between_self_reflection,
+                memory_recall_classifier_enabled: config.memory_recall_classifier_enabled,
+                memory_recall_classifier_window: config.memory_recall_classifier_window,
+            },
+        )
+        .expect("second prompt should succeed");
+
+        let memories =
+            elroy_db::list_active_memories(&connection, 10).expect("memories should list");
+        assert_eq!(memories.len(), 1);
+        assert!(memories[0].body.contains("Test message 1"));
+        assert!(memories[0].body.contains("Test response 2"));
+
+        let tracker = load_memory_operation_tracker(&connection, LOCAL_USER_TOKEN)
+            .expect("tracker should load")
+            .expect("tracker should exist");
+        assert_eq!(tracker.messages_since_memory, 0);
+        assert_eq!(tracker.memories_since_consolidation, 1);
 
         fs::remove_dir_all(home).expect("home should be removed");
     }
@@ -4894,6 +5130,8 @@ mod tests {
                 persist_input_message: true,
                 force_tool: Some("missing_tool"),
                 home_dir: &home,
+                bootstrap_plan: BootstrapPlan::from_config(&config),
+                messages_between_memory: config.messages_between_memory,
                 messages_between_self_reflection: config.messages_between_self_reflection,
                 memory_recall_classifier_enabled: config.memory_recall_classifier_enabled,
                 memory_recall_classifier_window: config.memory_recall_classifier_window,
@@ -4939,6 +5177,8 @@ mod tests {
                 persist_input_message: true,
                 force_tool: None,
                 home_dir: &home,
+                bootstrap_plan: BootstrapPlan::from_config(&config),
+                messages_between_memory: config.messages_between_memory,
                 messages_between_self_reflection: config.messages_between_self_reflection,
                 memory_recall_classifier_enabled: config.memory_recall_classifier_enabled,
                 memory_recall_classifier_window: config.memory_recall_classifier_window,
