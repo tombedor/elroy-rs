@@ -6977,7 +6977,7 @@ fn recall_memory_context_messages(
 
     let recall_query = build_recall_query(prompt, transcript, memory_recall_classifier_window);
     let already_recalled = recalled_memory_names(transcript);
-    let recalled = select_recalled_memories(&recall_query, memories, &already_recalled, 3);
+    let recalled = select_recalled_memories(&recall_query, memories, &already_recalled, 2);
     if recalled.is_empty() {
         return Vec::new();
     }
@@ -14843,6 +14843,56 @@ mod tests {
                 .as_deref()
                 .is_some_and(|content| content.contains("basketball form"))
         );
+    }
+
+    #[test]
+    fn recall_memory_context_messages_limits_to_two_memories() {
+        let mut config = AppConfig::defaults();
+        config.memory_recall_classifier_enabled = false;
+        let messages = recall_memory_context_messages(
+            config.memory_recall_classifier_enabled,
+            config.memory_recall_classifier_window,
+            "basketball shooting drills",
+            &[],
+            &[
+                MemoryRecord {
+                    id: 1,
+                    legacy_frontmatter_id: None,
+                    name: "basketball form".to_string(),
+                    file_path: "/tmp/basketball.md".to_string(),
+                    body: "Focus on shooting form during basketball drills".to_string(),
+                    is_active: true,
+                    updated_at_unix: 30,
+                },
+                MemoryRecord {
+                    id: 2,
+                    legacy_frontmatter_id: None,
+                    name: "basketball warmup".to_string(),
+                    file_path: "/tmp/warmup.md".to_string(),
+                    body: "Warm up shoulders before basketball shooting".to_string(),
+                    is_active: true,
+                    updated_at_unix: 20,
+                },
+                MemoryRecord {
+                    id: 3,
+                    legacy_frontmatter_id: None,
+                    name: "basketball recovery".to_string(),
+                    file_path: "/tmp/recovery.md".to_string(),
+                    body: "Stretch after basketball practice and shooting".to_string(),
+                    is_active: true,
+                    updated_at_unix: 10,
+                },
+            ],
+        );
+
+        assert_eq!(messages.len(), 2);
+        let tool_payload = messages[1]
+            .content
+            .as_deref()
+            .expect("tool payload should exist");
+        assert!(tool_payload.contains("basketball form"));
+        assert!(tool_payload.contains("basketball warmup"));
+        assert!(!tool_payload.contains("basketball recovery"));
     }
 
     #[test]
