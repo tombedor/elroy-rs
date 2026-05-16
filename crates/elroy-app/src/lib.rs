@@ -310,12 +310,13 @@ impl AppRuntime {
         let Some(spec) = registry.specs().into_iter().find(|spec| spec.name == name) else {
             return Err(AppError::Runtime(format!("Invalid command: {name}")));
         };
+        let input_suggestions = self.load_command_form_suggestions()?;
         let JsonSchema::Object {
             properties,
             required,
             ..
         } = &spec.parameters;
-        let parameters = ordered_command_parameters(name, properties, required);
+        let parameters = ordered_command_parameters(name, properties, required, &input_suggestions);
         let required_count = parameters
             .iter()
             .filter(|parameter| !parameter.optional)
@@ -357,12 +358,14 @@ impl AppRuntime {
         else {
             return Err(AppError::Runtime(format!("Invalid command: {slash_name}")));
         };
+        let input_suggestions = self.load_command_form_suggestions()?;
         let JsonSchema::Object {
             properties,
             required,
             ..
         } = &spec.parameters;
-        let parameters = ordered_command_parameters(command_name, properties, required);
+        let parameters =
+            ordered_command_parameters(command_name, properties, required, &input_suggestions);
         if raw_values.len() > parameters.len() {
             return Err(AppError::Runtime(format!(
                 "Too many values provided for '{slash_name}'"
@@ -848,12 +851,24 @@ impl AppRuntime {
         let connection = open_sqlite_connection(&self.config.database_path)?;
         Ok(connection)
     }
+
+    fn load_command_form_suggestions(&self) -> Result<Vec<String>, AppError> {
+        let bootstrap_plan = BootstrapPlan::from_config(&self.config);
+        elroy_db::bootstrap_database(&bootstrap_plan)
+            .map_err(|error| AppError::Runtime(error.to_string()))?;
+        let connection = self.open_connection()?;
+        Ok(list_active_plain_agenda_items(&connection, 50)?
+            .into_iter()
+            .map(|item| item.name)
+            .collect())
+    }
 }
 
 fn ordered_command_parameters(
     command_name: &str,
     properties: &Map<String, Value>,
     required: &[String],
+    input_suggestions: &[String],
 ) -> Vec<TuiCommandParameter> {
     let mut names = properties.keys().cloned().collect::<Vec<_>>();
     drop_legacy_alias(&mut names, "memory_name", "name");
@@ -867,9 +882,17 @@ fn ordered_command_parameters(
             optional: !required.contains(&name)
                 && !canonical_alias_field_is_required(&name, properties),
             default_text: String::new(),
+            suggestions: command_parameter_suggestions(&name, input_suggestions),
             name,
         })
         .collect()
+}
+
+fn command_parameter_suggestions(name: &str, input_suggestions: &[String]) -> Vec<String> {
+    if name.ends_with("name") {
+        return input_suggestions.to_vec();
+    }
+    Vec::new()
 }
 
 fn display_command_name(name: &str) -> &str {
@@ -11063,6 +11086,15 @@ mod tests {
         let database_path = home.join("elroy.db");
         fs::create_dir_all(&memory_dir).expect("memory dir should be created");
         fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+        create_agenda_file(
+            &agenda_dir,
+            "Trip note",
+            "Remember the aisle seat preference.",
+            Some("2026-05-16"),
+            None,
+            None,
+        )
+        .expect("agenda item should be created");
 
         let mut config = AppConfig::defaults();
         config.home_dir = home.clone();
@@ -11091,6 +11123,28 @@ mod tests {
                 .iter()
                 .map(|parameter| parameter.name.as_str())
                 .eq(["name", "text"])
+        );
+        assert_eq!(
+            form.parameters
+                .first()
+                .expect("first parameter should exist")
+                .suggestions,
+            vec!["trip note".to_string()]
+        );
+
+        let TuiSlashCommandAction::OpenForm(show_task_form) = runtime
+            .launch_named_command("show_task")
+            .expect("show_task should launch a form")
+        else {
+            panic!("show_task should launch a form from the palette path");
+        };
+        assert_eq!(
+            show_task_form
+                .parameters
+                .first()
+                .expect("show_task parameter should exist")
+                .suggestions,
+            vec!["trip note".to_string()]
         );
 
         let TuiSlashCommandAction::Execute(snapshot) = runtime

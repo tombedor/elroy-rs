@@ -115,6 +115,7 @@ pub struct TuiCommandParameter {
     pub name: String,
     pub optional: bool,
     pub default_text: String,
+    pub suggestions: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -161,6 +162,7 @@ pub struct CommandFormFieldState {
     pub name: String,
     pub value: String,
     pub optional: bool,
+    pub suggestions: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1556,6 +1558,7 @@ impl From<TuiCommandForm> for CommandFormState {
                     .unwrap_or(parameter.default_text),
                 name: parameter.name,
                 optional: parameter.optional,
+                suggestions: parameter.suggestions,
             })
             .collect::<Vec<_>>();
         let selected_field = fields
@@ -1574,7 +1577,7 @@ impl From<TuiCommandForm> for CommandFormState {
 
 impl CommandFormState {
     fn footer_text(&self) -> String {
-        "Type to edit  Tab/Shift+Tab move  Enter run  Escape cancel".to_string()
+        "Type to edit  Tab complete/move  Shift+Tab move  Enter run  Escape cancel".to_string()
     }
 
     fn move_selection(&mut self, delta: isize) {
@@ -1589,6 +1592,24 @@ impl CommandFormState {
 
     fn selected_field_mut(&mut self) -> Option<&mut CommandFormFieldState> {
         self.fields.get_mut(self.selected_field)
+    }
+
+    fn accept_selected_field_suggestion(&mut self) -> bool {
+        let Some(field) = self.selected_field_mut() else {
+            return false;
+        };
+        let prefix = field.value.trim();
+        let Some(suggestion) = field.suggestions.iter().find(|suggestion| {
+            suggestion.len() != prefix.len()
+                && suggestion
+                    .to_ascii_lowercase()
+                    .starts_with(&prefix.to_ascii_lowercase())
+        }) else {
+            return false;
+        };
+        field.value = suggestion.clone();
+        self.error = None;
+        true
     }
 }
 
@@ -1727,7 +1748,12 @@ fn handle_command_form_key(app: &mut TuiApp, key: KeyEvent, runtime: &mut impl T
         (KeyCode::Tab, KeyModifiers::SHIFT) | (KeyCode::BackTab, _) => {
             command_form.move_selection(-1);
         }
-        (KeyCode::Tab, _) | (KeyCode::Down, _) => {
+        (KeyCode::Tab, _) => {
+            if !command_form.accept_selected_field_suggestion() {
+                command_form.move_selection(1);
+            }
+        }
+        (KeyCode::Down, _) => {
             command_form.move_selection(1);
         }
         (KeyCode::Up, _) => {
@@ -2563,11 +2589,13 @@ mod tests {
                         name: "name".to_string(),
                         optional: false,
                         default_text: String::new(),
+                        suggestions: vec![],
                     },
                     TuiCommandParameter {
                         name: "text".to_string(),
                         optional: false,
                         default_text: String::new(),
+                        suggestions: vec![],
                     },
                 ],
                 initial_values: vec![("name".to_string(), "trip".to_string())],
@@ -2602,11 +2630,13 @@ mod tests {
                     name: "name".to_string(),
                     optional: false,
                     default_text: String::new(),
+                    suggestions: vec![],
                 },
                 TuiCommandParameter {
                     name: "text".to_string(),
                     optional: false,
                     default_text: String::new(),
+                    suggestions: vec![],
                 },
             ],
             initial_values: vec![("name".to_string(), "trip".to_string())],
@@ -2665,6 +2695,65 @@ mod tests {
     }
 
     #[test]
+    fn command_form_tab_accepts_matching_suggestion_before_moving() {
+        let mut app = TuiApp::bootstrap();
+        app.open_command_form(TuiCommandForm {
+            command_name: "show_task".to_string(),
+            description: "Show a task".to_string(),
+            parameters: vec![
+                TuiCommandParameter {
+                    name: "name".to_string(),
+                    optional: false,
+                    default_text: String::new(),
+                    suggestions: vec!["trip note".to_string()],
+                },
+                TuiCommandParameter {
+                    name: "text".to_string(),
+                    optional: true,
+                    default_text: String::new(),
+                    suggestions: vec![],
+                },
+            ],
+            initial_values: vec![],
+        });
+        let mut runtime = FakeRuntime::default();
+        let mut pending = None;
+
+        apply_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE),
+            &mut runtime,
+            &mut pending,
+        );
+        apply_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+            &mut runtime,
+            &mut pending,
+        );
+
+        let command_form = app
+            .command_form
+            .as_ref()
+            .expect("command form should remain open");
+        assert_eq!(command_form.fields[0].value, "trip note");
+        assert_eq!(command_form.selected_field, 0);
+
+        apply_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+            &mut runtime,
+            &mut pending,
+        );
+
+        let command_form = app
+            .command_form
+            .as_ref()
+            .expect("command form should remain open");
+        assert_eq!(command_form.selected_field, 1);
+    }
+
+    #[test]
     fn ctrl_p_opens_command_palette_from_input() {
         let mut app = TuiApp::bootstrap();
         let mut runtime = FakeRuntime {
@@ -2710,11 +2799,13 @@ mod tests {
                         name: "name".to_string(),
                         optional: false,
                         default_text: String::new(),
+                        suggestions: vec![],
                     },
                     TuiCommandParameter {
                         name: "text".to_string(),
                         optional: false,
                         default_text: String::new(),
+                        suggestions: vec![],
                     },
                 ],
                 initial_values: vec![],
@@ -2758,6 +2849,7 @@ mod tests {
                     name: "memory_name".to_string(),
                     optional: false,
                     default_text: String::new(),
+                    suggestions: vec![],
                 }],
                 initial_values: vec![],
             })),
