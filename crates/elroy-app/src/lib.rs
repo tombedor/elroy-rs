@@ -2014,6 +2014,29 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
         },
     );
 
+    let config_for_get_help = config.clone();
+    let get_help = ExecutableTool::new(
+        ToolSpec::new(
+            "get_help",
+            "Print the available system commands.",
+            JsonSchema::object(Vec::<(String, Value)>::new(), [] as [&str; 0]),
+        ),
+        move |_| {
+            let mut commands = build_live_tool_registry(&config_for_get_help)
+                .specs()
+                .into_iter()
+                .map(|spec| (spec.name, spec.description))
+                .collect::<Vec<_>>();
+            commands.sort_by(|left, right| left.0.cmp(&right.0));
+
+            let mut lines = vec!["Available Slash Commands".to_string()];
+            for (name, description) in commands {
+                lines.push(format!("{name}: {description}"));
+            }
+            ToolExecutionResult::success(lines.join("\n"))
+        },
+    );
+
     let config_for_memory_write = config.clone();
     let create_memory = ExecutableTool::new(
         ToolSpec::new(
@@ -4350,6 +4373,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
         ls,
         read_file,
         restart_session,
+        get_help,
         print_config,
         tail_elroy_logs,
         create_memory,
@@ -6968,6 +6992,28 @@ mod tests {
         assert_eq!(tailed.content, "line two\nline three\n");
 
         fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
+    fn live_tool_registry_can_print_help() {
+        let config = AppConfig::defaults();
+        let registry = build_live_tool_registry(&config);
+
+        let help = registry.invoke("get_help", "{}");
+
+        assert!(!help.is_error);
+        assert!(help.content.contains("Available Slash Commands"));
+        assert!(
+            help.content
+                .contains("get_help: Print the available system commands.")
+        );
+        assert!(help.content.contains(
+            "print_config: Print the current Elroy configuration in a formatted report."
+        ));
+        assert!(
+            help.content
+                .contains("tail_elroy_logs: Return the last lines of the Elroy log file.")
+        );
     }
 
     #[test]
