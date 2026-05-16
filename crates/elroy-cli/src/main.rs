@@ -1,4 +1,6 @@
 use std::env;
+use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
 
 use elroy_app::{AppRuntime, MessageProcessOptions};
 use elroy_config::AppConfig;
@@ -109,16 +111,75 @@ fn run_live_prompt(runtime: &AppRuntime, prompt: &str) {
 
 struct CliTuiRuntime {
     runtime: AppRuntime,
+    deferred_context_refresh: Option<BackgroundRefreshTask>,
+    deferred_context_refresh_error: Option<String>,
 }
 
 struct CliPromptStream {
     inner: elroy_app::PromptEventStream,
 }
 
+struct BackgroundRefreshTask {
+    handle: JoinHandle<()>,
+    error: Arc<Mutex<Option<String>>>,
+}
+
+impl BackgroundRefreshTask {
+    fn spawn(task: impl FnOnce() -> Result<(), String> + Send + 'static) -> Self {
+        let error = Arc::new(Mutex::new(None));
+        let error_sink = Arc::clone(&error);
+        let handle = thread::spawn(move || {
+            if let Err(task_error) = task() {
+                *error_sink
+                    .lock()
+                    .expect("background refresh error lock should work") = Some(task_error);
+            }
+        });
+        Self { handle, error }
+    }
+
+    fn is_finished(&self) -> bool {
+        self.handle.is_finished()
+    }
+
+    fn join(self) -> Option<String> {
+        let _ = self.handle.join();
+        self.error
+            .lock()
+            .expect("background refresh error lock should work")
+            .take()
+    }
+}
+
 impl CliTuiRuntime {
     fn new(runtime: AppRuntime) -> Self {
         runtime.enable_restart_support();
-        Self { runtime }
+        Self {
+            runtime,
+            deferred_context_refresh: None,
+            deferred_context_refresh_error: None,
+        }
+    }
+
+    fn poll_deferred_context_refresh(&mut self) {
+        let Some(task) = self.deferred_context_refresh.as_ref() else {
+            return;
+        };
+        if !task.is_finished() {
+            return;
+        }
+
+        let task = self
+            .deferred_context_refresh
+            .take()
+            .expect("finished deferred refresh task should exist");
+        if let Some(error) = task.join() {
+            self.deferred_context_refresh_error = Some(error);
+        }
+    }
+
+    fn clear_deferred_context_refresh_error(&mut self) {
+        self.deferred_context_refresh_error = None;
     }
 }
 
@@ -130,6 +191,8 @@ impl Drop for CliTuiRuntime {
 
 impl TuiRuntime for CliTuiRuntime {
     fn submit_prompt(&mut self, prompt: &str) -> Result<elroy_tui::TuiSnapshot, String> {
+        self.poll_deferred_context_refresh();
+        self.clear_deferred_context_refresh_error();
         self.runtime
             .process_message(prompt, MessageProcessOptions::default())
             .map(|result| result.snapshot)
@@ -137,6 +200,8 @@ impl TuiRuntime for CliTuiRuntime {
     }
 
     fn start_prompt_stream(&mut self, prompt: &str) -> Result<Box<dyn TuiPromptStream>, String> {
+        self.poll_deferred_context_refresh();
+        self.clear_deferred_context_refresh_error();
         self.runtime
             .process_message_stream(prompt, MessageProcessOptions::default())
             .map(|inner| Box::new(CliPromptStream { inner }) as Box<dyn TuiPromptStream>)
@@ -144,6 +209,8 @@ impl TuiRuntime for CliTuiRuntime {
     }
 
     fn start_startup_prompt_stream(&mut self) -> Result<Option<Box<dyn TuiPromptStream>>, String> {
+        self.poll_deferred_context_refresh();
+        self.clear_deferred_context_refresh_error();
         let restart_resume_message = std::env::var(RESTART_RESUME_MESSAGE_ENV).ok();
         self.runtime
             .startup_prompt_stream(restart_resume_message.as_deref())
@@ -157,6 +224,8 @@ impl TuiRuntime for CliTuiRuntime {
         &mut self,
         resume_message: &str,
     ) -> Result<Box<dyn TuiPromptStream>, String> {
+        self.poll_deferred_context_refresh();
+        self.clear_deferred_context_refresh_error();
         self.runtime
             .restart_prompt_stream(resume_message)
             .map(|inner| Box::new(CliPromptStream { inner }) as Box<dyn TuiPromptStream>)
@@ -168,6 +237,7 @@ impl TuiRuntime for CliTuiRuntime {
     }
 
     fn load_context_messages(&mut self) -> Result<Vec<TuiContextMessage>, String> {
+        self.poll_deferred_context_refresh();
         self.runtime
             .load_context_messages()
             .map(|messages| {
@@ -191,13 +261,27 @@ impl TuiRuntime for CliTuiRuntime {
     }
 
     fn refresh_context_if_needed(&mut self) -> Result<(), String> {
-        self.runtime
-            .refresh_context_if_needed()
-            .map(|_| ())
-            .map_err(|error| error.to_string())
+        self.poll_deferred_context_refresh();
+        if self.deferred_context_refresh.is_some() {
+            return Ok(());
+        }
+
+        self.clear_deferred_context_refresh_error();
+        let runtime = self.runtime.clone();
+        self.deferred_context_refresh = Some(BackgroundRefreshTask::spawn(move || {
+            runtime
+                .refresh_context_if_needed()
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        }));
+        Ok(())
     }
 
     fn background_status(&mut self) -> Result<Option<String>, String> {
+        self.poll_deferred_context_refresh();
+        if let Some(error) = &self.deferred_context_refresh_error {
+            return Ok(Some(format!("context refresh failed: {error}")));
+        }
         Ok(self.runtime.background_status())
     }
 
@@ -206,6 +290,7 @@ impl TuiRuntime for CliTuiRuntime {
         section: SidebarSection,
         title: &str,
     ) -> Result<TuiSidebarDetail, String> {
+        self.poll_deferred_context_refresh();
         self.runtime
             .open_sidebar_item(section, title)
             .map_err(|error| error.to_string())
@@ -217,6 +302,7 @@ impl TuiRuntime for CliTuiRuntime {
         title: &str,
         action: SidebarAction,
     ) -> Result<elroy_tui::TuiSnapshot, String> {
+        self.poll_deferred_context_refresh();
         self.runtime
             .mutate_sidebar_item(section, title, action)
             .map_err(|error| error.to_string())
@@ -254,7 +340,13 @@ impl TuiPromptStream for CliPromptStream {
 
 #[cfg(test)]
 mod tests {
-    use super::prompt_arg;
+    use std::collections::HashMap;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    use elroy_tui::TuiRuntime;
+
+    use super::{AppConfig, AppRuntime, BackgroundRefreshTask, CliTuiRuntime, prompt_arg};
 
     #[test]
     fn prompt_arg_collects_remaining_words() {
@@ -265,5 +357,58 @@ mod tests {
         ];
 
         assert_eq!(prompt_arg(&args).as_deref(), Some("hello there"));
+    }
+
+    #[test]
+    fn background_refresh_task_captures_errors() {
+        let task = BackgroundRefreshTask::spawn(|| Err("boom".to_string()));
+        while !task.is_finished() {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(task.join().as_deref(), Some("boom"));
+    }
+
+    #[test]
+    fn background_refresh_task_reports_running_state() {
+        let (tx, rx) = mpsc::channel();
+        let task = BackgroundRefreshTask::spawn(move || {
+            rx.recv().expect("signal should arrive");
+            Ok(())
+        });
+
+        assert!(!task.is_finished());
+        tx.send(()).expect("task should receive completion signal");
+        while !task.is_finished() {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(task.join(), None);
+    }
+
+    #[test]
+    fn cli_tui_runtime_surfaces_deferred_refresh_failures_in_background_status() {
+        let config = AppConfig::from_env(&HashMap::new()).expect("config should load");
+        let mut runtime = CliTuiRuntime {
+            runtime: AppRuntime::new(config),
+            deferred_context_refresh: Some(BackgroundRefreshTask::spawn(|| {
+                Err("refresh exploded".to_string())
+            })),
+            deferred_context_refresh_error: None,
+        };
+
+        let background_status = loop {
+            let status = runtime
+                .background_status()
+                .expect("background status should load");
+            if status.is_some() {
+                break status;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        };
+
+        assert_eq!(
+            background_status.as_deref(),
+            Some("context refresh failed: refresh exploded")
+        );
+        assert!(runtime.deferred_context_refresh.is_none());
     }
 }
