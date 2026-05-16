@@ -2,7 +2,9 @@ use std::collections::HashSet;
 use std::io;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{
+    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyModifiers,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -273,7 +275,7 @@ pub fn run_with_snapshot_and_runtime<R: TuiRuntime>(
 ) -> io::Result<TuiRunResult> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
 
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
@@ -285,7 +287,11 @@ pub fn run_with_snapshot_and_runtime<R: TuiRuntime>(
     let result = run_event_loop(&mut terminal, &mut app, runtime, &mut pending_prompt);
 
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(
+        terminal.backend_mut(),
+        DisableBracketedPaste,
+        LeaveAlternateScreen
+    )?;
     terminal.show_cursor()?;
 
     result
@@ -351,6 +357,9 @@ fn run_event_loop(
                 if apply_key_event(app, key, runtime, pending_prompt) == TuiExit::Quit {
                     return Ok(TuiRunResult::Quit);
                 }
+            }
+            Event::Paste(text) => {
+                apply_paste_event(app, &text);
             }
             Event::Resize(_, _) => {
                 app.status = "terminal resized".to_string();
@@ -585,6 +594,23 @@ fn apply_intent_with_runtime(
         }
         _ => app.apply_intent(intent),
     }
+}
+
+fn apply_paste_event(app: &mut TuiApp, text: &str) {
+    let flattened = flatten_pasted_text(text);
+    if flattened.is_empty() {
+        return;
+    }
+
+    if app.focus == FocusTarget::Input {
+        app.reset_prompt_history_navigation();
+        app.input.push_str(&flattened);
+        app.status = "editing prompt".to_string();
+    }
+}
+
+fn flatten_pasted_text(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 struct PendingPrompt {
@@ -1997,7 +2023,7 @@ mod tests {
         SidebarSection, TuiApp, TuiCommandForm, TuiCommandPaletteAction, TuiCommandPaletteEntry,
         TuiCommandParameter, TuiContextMessage, TuiExit, TuiPromptStream, TuiRuntime,
         TuiSidebarDetail, TuiSlashCommandAction, TuiSnapshot, UiIntent, advance_prompt_stream,
-        apply_intent_with_runtime, apply_key_event, key_event_token,
+        apply_intent_with_runtime, apply_key_event, apply_paste_event, key_event_token,
         maybe_refresh_snapshot_after_background_completion, maybe_run_deferred_context_refresh,
         poll_context_updates, start_startup_prompt_stream,
     };
@@ -2504,6 +2530,26 @@ mod tests {
         assert_eq!(app.handle_key("down"), UiIntent::HistoryNext);
         assert_eq!(app.handle_key("tab"), UiIntent::CompleteInput);
         assert_eq!(app.focus, FocusTarget::Input);
+    }
+
+    #[test]
+    fn multiline_paste_is_flattened_in_chat_input() {
+        let mut app = TuiApp::bootstrap();
+
+        apply_paste_event(&mut app, "---\ntitle: note\n---\nhello world");
+
+        assert_eq!(app.input, "--- title: note --- hello world");
+        assert_eq!(app.status, "editing prompt");
+    }
+
+    #[test]
+    fn paste_is_ignored_outside_chat_input() {
+        let mut app = TuiApp::bootstrap();
+        app.focus = FocusTarget::Command(CommandPane::Sidebar);
+
+        apply_paste_event(&mut app, "hello\nworld");
+
+        assert_eq!(app.input, "");
     }
 
     #[test]
