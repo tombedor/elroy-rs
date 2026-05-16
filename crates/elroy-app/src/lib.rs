@@ -7113,9 +7113,11 @@ fn should_skip_memory_recall(prompt: &str) -> bool {
         "goodbye",
         "bye",
     ];
+    const CLARIFICATIONS: &[&str] = &["what", "huh", "pardon", "sorry", "excuse me"];
 
     (normalized.len() < 10 && SIMPLE_SHORT.contains(&normalized.as_str()))
         || GREETINGS.contains(&normalized.as_str())
+        || CLARIFICATIONS.contains(&normalized.as_str())
 }
 
 fn build_recall_query(prompt: &str, transcript: &[ConversationMessage], window: usize) -> String {
@@ -14821,6 +14823,18 @@ mod tests {
         assert!(should_skip_memory_recall("ok?"));
         assert!(should_skip_memory_recall("good morning,"));
         assert!(!should_skip_memory_recall("what about bob?"));
+    }
+
+    #[test]
+    fn clarification_only_messages_skip_memory_recall() {
+        assert!(should_skip_memory_recall("what?"));
+        assert!(should_skip_memory_recall("huh"));
+        assert!(should_skip_memory_recall("pardon?"));
+        assert!(should_skip_memory_recall("sorry!"));
+        assert!(should_skip_memory_recall("excuse me."));
+        assert!(!should_skip_memory_recall(
+            "what about the payroll follow-up?"
+        ));
     }
 
     #[test]
