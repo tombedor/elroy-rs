@@ -2752,6 +2752,10 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                 [
                     ("name", json!({"type": "string"})),
                     ("text", json!({"type": "string"})),
+                    ("item_date", json!({"type": "string"})),
+                    ("date", json!({"type": "string"})),
+                    ("trigger_datetime", json!({"type": "string"})),
+                    ("trigger_context", json!({"type": "string"})),
                 ],
                 ["name", "text"],
             ),
@@ -2763,7 +2767,10 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
             let Some(text) = arguments.get("text").and_then(Value::as_str) else {
                 return ToolExecutionResult::error("create_task requires string text");
             };
-            let date = arguments.get("date").and_then(Value::as_str);
+            let date = arguments
+                .get("item_date")
+                .and_then(Value::as_str)
+                .or_else(|| arguments.get("date").and_then(Value::as_str));
             let trigger_datetime = arguments.get("trigger_datetime").and_then(Value::as_str);
             let trigger_context = arguments.get("trigger_context").and_then(Value::as_str);
             match create_task_file_with_schedule(
@@ -8766,11 +8773,15 @@ mod tests {
         let registry = build_live_tool_registry(&config);
         let created = registry.invoke(
             "create_task",
-            "{\"name\":\"Job Search\",\"text\":\"Reach out to three contacts\",\"date\":\"2026-05-20\",\"trigger_context\":\"after breakfast\"}",
+            "{\"name\":\"Job Search\",\"text\":\"Reach out to three contacts\",\"item_date\":\"2026-05-20\",\"trigger_context\":\"after breakfast\"}",
         );
         assert!(!created.is_error);
         assert_eq!(created.content, "Task 'job search' has been created.");
         assert!(agenda_dir.join("job_search.md").exists());
+        let created_text =
+            fs::read_to_string(agenda_dir.join("job_search.md")).expect("task file should read");
+        assert!(created_text.contains("date: 2026-05-20"));
+        assert!(created_text.contains("trigger_context: after breakfast"));
 
         let triggered = registry.invoke("list_triggered_tasks", "{\"limit\":10}");
         assert!(!triggered.is_error);
