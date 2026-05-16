@@ -73,6 +73,7 @@ pub struct TuiApp {
     pub focus: FocusTarget,
     pub last_command_pane: CommandPane,
     pub conversation_lines: Vec<String>,
+    pub conversation_scroll: usize,
     pub memory_titles: Vec<String>,
     pub agenda_titles: Vec<String>,
     pub improvement_titles: Vec<String>,
@@ -799,6 +800,7 @@ impl TuiApp {
             focus: FocusTarget::Input,
             last_command_pane: CommandPane::Conversation,
             conversation_lines: vec!["Conversation history and streaming output".to_string()],
+            conversation_scroll: 0,
             memory_titles: Vec::new(),
             agenda_titles: Vec::new(),
             improvement_titles: Vec::new(),
@@ -918,6 +920,7 @@ impl TuiApp {
                     .title(self.title.as_str())
                     .borders(Borders::ALL),
             )
+            .scroll((self.conversation_scroll as u16, 0))
             .render(body[0], buf);
 
         Paragraph::new(self.sidebar_text())
@@ -1363,17 +1366,29 @@ impl TuiApp {
                 self.accept_input_completion();
             }
             UiIntent::MoveUp => {
-                if self.selected_sidebar_index > 0 {
-                    self.selected_sidebar_index -= 1;
+                if self.focus == FocusTarget::Command(CommandPane::Conversation) {
+                    self.conversation_scroll = self.conversation_scroll.saturating_sub(1);
+                    self.status = "scrolled conversation up".to_string();
+                } else {
+                    if self.selected_sidebar_index > 0 {
+                        self.selected_sidebar_index -= 1;
+                    }
+                    self.status = "moved selection up".to_string();
                 }
-                self.status = "moved selection up".to_string();
             }
             UiIntent::MoveDown => {
-                let len = self.active_sidebar_items().len();
-                if self.selected_sidebar_index + 1 < len {
-                    self.selected_sidebar_index += 1;
+                if self.focus == FocusTarget::Command(CommandPane::Conversation) {
+                    let max_scroll = self.conversation_lines.len().saturating_sub(1);
+                    self.conversation_scroll =
+                        self.conversation_scroll.saturating_add(1).min(max_scroll);
+                    self.status = "scrolled conversation down".to_string();
+                } else {
+                    let len = self.active_sidebar_items().len();
+                    if self.selected_sidebar_index + 1 < len {
+                        self.selected_sidebar_index += 1;
+                    }
+                    self.status = "moved selection down".to_string();
                 }
-                self.status = "moved selection down".to_string();
             }
             UiIntent::OpenSelected => {
                 let label = self
@@ -2417,6 +2432,67 @@ mod tests {
 
         app.handle_key("s");
         assert_eq!(app.handle_key("d"), UiIntent::Noop);
+    }
+
+    #[test]
+    fn command_mode_conversation_keys_scroll_history_instead_of_sidebar() {
+        let mut app = TuiApp::bootstrap();
+        app.conversation_lines = vec![
+            "line 0".to_string(),
+            "line 1".to_string(),
+            "line 2".to_string(),
+        ];
+        app.memory_titles = vec!["One".to_string(), "Two".to_string()];
+        app.selected_sidebar_index = 1;
+        app.handle_key("escape");
+        assert_eq!(app.focus, FocusTarget::Command(CommandPane::Conversation));
+
+        let down = app.handle_key("j");
+        assert_eq!(down, UiIntent::MoveDown);
+        app.apply_intent(down);
+        assert_eq!(app.conversation_scroll, 1);
+        assert_eq!(app.selected_sidebar_index, 1);
+        assert_eq!(app.status, "scrolled conversation down");
+
+        let up = app.handle_key("k");
+        assert_eq!(up, UiIntent::MoveUp);
+        app.apply_intent(up);
+        assert_eq!(app.conversation_scroll, 0);
+        assert_eq!(app.selected_sidebar_index, 1);
+        assert_eq!(app.status, "scrolled conversation up");
+    }
+
+    #[test]
+    fn render_applies_conversation_scroll_offset() {
+        let mut app = TuiApp::bootstrap();
+        app.title = "Elroy".to_string();
+        app.conversation_lines = vec![
+            "line 0".to_string(),
+            "line 1".to_string(),
+            "line 2".to_string(),
+            "line 3".to_string(),
+            "line 4".to_string(),
+        ];
+        app.conversation_scroll = 2;
+        let area = Rect::new(0, 0, 80, 8);
+        let mut buf = Buffer::empty(area);
+        app.render(area, &mut buf);
+        let text = buf
+            .content
+            .chunks(area.width as usize)
+            .map(|row| {
+                row.iter()
+                    .map(|cell| cell.symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(!text.contains("line 0"));
+        assert!(!text.contains("line 1"));
+        assert!(text.contains("line 2"));
     }
 
     #[test]
