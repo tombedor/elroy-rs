@@ -2140,6 +2140,51 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
         },
     );
 
+    let config_for_outdated_memory_update = config.clone();
+    let update_outdated_or_incorrect_memory = ExecutableTool::new(
+        ToolSpec::new(
+            "update_outdated_or_incorrect_memory",
+            "Append corrective information to one active memory by exact name.",
+            JsonSchema::object(
+                [
+                    ("memory_name", json!({"type": "string"})),
+                    ("update_text", json!({"type": "string"})),
+                ],
+                ["memory_name", "update_text"],
+            ),
+        ),
+        move |arguments| {
+            let Some(memory_name) = arguments.get("memory_name").and_then(Value::as_str) else {
+                return ToolExecutionResult::error(
+                    "update_outdated_or_incorrect_memory requires string memory_name",
+                );
+            };
+            let Some(update_text) = arguments.get("update_text").and_then(Value::as_str) else {
+                return ToolExecutionResult::error(
+                    "update_outdated_or_incorrect_memory requires string update_text",
+                );
+            };
+            mutate_memory_file_from_config(
+                &config_for_outdated_memory_update,
+                memory_name,
+                |path| {
+                    let existing = std::fs::read_to_string(path)?;
+                    let mut updated = existing.trim_end_matches('\n').to_string();
+                    if !updated.is_empty() {
+                        updated.push_str("\n\n");
+                    }
+                    updated.push_str(&format!(
+                        "Update ({}):\n{}",
+                        Utc::now().format("%Y-%m-%d %H:%M:%S UTC"),
+                        update_text.trim()
+                    ));
+                    update_memory_body(path, &updated)
+                },
+            );
+            ToolExecutionResult::success(format!("Memory '{memory_name}' has been updated"))
+        },
+    );
+
     let config_for_memory_archive = config.clone();
     let archive_memory = ExecutableTool::new(
         ToolSpec::new(
@@ -3462,6 +3507,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
         delete_task,
         delete_due_item,
         update_memory,
+        update_outdated_or_incorrect_memory,
         archive_memory,
         add_agenda_item_update,
         complete_agenda_item,
@@ -4990,6 +5036,48 @@ mod tests {
         let archive = registry.invoke("archive_memory", "{\"name\":\"runner notes\"}");
         assert!(!archive.is_error);
         assert!(memory_dir.join("archive").join("runner_notes.md").exists());
+
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
+    fn live_tool_registry_can_append_outdated_memory_update() {
+        let unique = format!(
+            "elroy-rs-app-outdated-memory-update-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+        fs::write(memory_dir.join("runner_notes.md"), "old text\n")
+            .expect("memory file should be written");
+
+        let mut config = AppConfig::defaults();
+        config.memory_dir = memory_dir.clone();
+        config.agenda_dir = agenda_dir;
+        config.database_path = database_path;
+        elroy_db::bootstrap_database(&BootstrapPlan::from_config(&config))
+            .expect("bootstrap should succeed");
+
+        let registry = build_live_tool_registry(&config);
+        let update = registry.invoke(
+            "update_outdated_or_incorrect_memory",
+            "{\"memory_name\":\"runner notes\",\"update_text\":\"new correction\"}",
+        );
+        assert!(!update.is_error);
+        assert_eq!(update.content, "Memory 'runner notes' has been updated");
+
+        let file_text =
+            fs::read_to_string(memory_dir.join("runner_notes.md")).expect("memory should read");
+        assert!(file_text.contains("old text"));
+        assert!(file_text.contains("Update ("));
+        assert!(file_text.contains("new correction"));
 
         fs::remove_dir_all(home).expect("home should be removed");
     }
