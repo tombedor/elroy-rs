@@ -829,7 +829,12 @@ pub fn build_openai_request(
     force_tool: Option<&str>,
 ) -> Value {
     let mut request_messages = vec![json!({"role": "system", "content": system_prompt})];
-    request_messages.extend(messages.iter().map(ConversationMessage::to_openai_message));
+    request_messages.extend(
+        messages
+            .iter()
+            .filter(|message| message.role != MessageRole::System)
+            .map(ConversationMessage::to_openai_message),
+    );
 
     let mut request = json!({
         "messages": request_messages,
@@ -877,7 +882,10 @@ pub fn build_openai_responses_request(
             "content": system_prompt,
         }));
     }
-    for message in messages {
+    for message in messages
+        .iter()
+        .filter(|message| message.role != MessageRole::System)
+    {
         input.extend(openai_input_items(message));
     }
 
@@ -1153,16 +1161,20 @@ mod tests {
     }
 
     #[test]
-    fn openai_request_includes_system_messages_and_function_tools() {
+    fn openai_request_uses_system_prompt_and_ignores_transcript_system_messages() {
         let request = build_openai_request(
             "You are Elroy.",
-            &[ConversationMessage::new(MessageRole::User, "Hello")],
+            &[
+                ConversationMessage::new(MessageRole::System, "Old system"),
+                ConversationMessage::new(MessageRole::User, "Hello"),
+            ],
             &weather_registry(),
             None,
         );
 
         assert_eq!(request["messages"][0]["role"], "system");
         assert_eq!(request["messages"][1]["role"], "user");
+        assert_eq!(request["messages"].as_array().map(Vec::len), Some(2));
         assert_eq!(request["tools"][0]["type"], "function");
     }
 
@@ -1248,6 +1260,7 @@ mod tests {
             "gpt-5.4",
             "You are Elroy.",
             &[
+                ConversationMessage::new(MessageRole::System, "Old system"),
                 ConversationMessage::new(MessageRole::User, "Hello"),
                 ConversationMessage::assistant_with_tool_calls(
                     "",
@@ -1269,6 +1282,7 @@ mod tests {
         assert_eq!(request["input"][1]["role"], "user");
         assert_eq!(request["input"][2]["type"], "function_call");
         assert_eq!(request["input"][3]["type"], "function_call_output");
+        assert_eq!(request["input"].as_array().map(Vec::len), Some(4));
         assert_eq!(request["max_output_tokens"], 1024);
     }
 

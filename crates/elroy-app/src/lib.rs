@@ -679,6 +679,49 @@ fn drop_old_context_messages(
     Ok(())
 }
 
+fn current_system_message(
+    config: &AppConfig,
+    preferences: Option<&UserPreferenceRecord>,
+) -> ConversationMessage {
+    ConversationMessage::new(
+        MessageRole::System,
+        effective_persona(preferences, &config.assistant_name),
+    )
+}
+
+fn refreshed_context_messages_with_system(
+    connection: &mut rusqlite::Connection,
+    config: &AppConfig,
+) -> Result<Vec<ConversationMessage>, AppError> {
+    let preferences = load_user_preferences(connection, LOCAL_USER_TOKEN)?;
+    let system_message = current_system_message(config, preferences.as_ref());
+    let mut refreshed = load_context_messages(connection, LOCAL_USER_TOKEN)?
+        .into_iter()
+        .filter(|message| message.role != MessageRole::System)
+        .collect::<Vec<_>>();
+    refreshed.insert(0, system_message);
+    Ok(refreshed)
+}
+
+fn refresh_persisted_system_instructions(
+    connection: &mut rusqlite::Connection,
+    config: &AppConfig,
+) -> Result<(), AppError> {
+    let refreshed = refreshed_context_messages_with_system(connection, config)?;
+    replace_context_messages(connection, LOCAL_USER_TOKEN, &refreshed)?;
+    Ok(())
+}
+
+fn reset_persisted_context(
+    connection: &mut rusqlite::Connection,
+    config: &AppConfig,
+) -> Result<(), AppError> {
+    let preferences = load_user_preferences(connection, LOCAL_USER_TOKEN)?;
+    let system_message = current_system_message(config, preferences.as_ref());
+    replace_context_messages(connection, LOCAL_USER_TOKEN, &[system_message])?;
+    Ok(())
+}
+
 fn format_agenda_sidebar_title(item: &AgendaItemRecord, now: NaiveDateTime) -> String {
     let mut title = item.name.clone();
     if let Some(trigger_datetime) = item
@@ -2178,7 +2221,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
             if let Err(error) = run_migrations(&mut connection) {
                 return ToolExecutionResult::error(format!("failed to run migrations: {error}"));
             }
-            match replace_context_messages(&mut connection, LOCAL_USER_TOKEN, &[]) {
+            match reset_persisted_context(&mut connection, &config_for_reset_context) {
                 Ok(()) => ToolExecutionResult::success("Context reset complete".to_string()),
                 Err(error) => {
                     ToolExecutionResult::error(format!("failed to reset context: {error}"))
@@ -2187,16 +2230,39 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
         },
     );
 
+    let config_for_refresh_system = config.clone();
     let refresh_system_instructions = ExecutableTool::new(
         ToolSpec::new(
             "refresh_system_instructions",
             "Refresh the effective system instructions for the local user.",
             JsonSchema::object(Vec::<(String, Value)>::new(), [] as [&str; 0]),
         ),
-        move |_| ToolExecutionResult::success("System instruction refresh complete".to_string()),
+        move |_| {
+            let mut connection =
+                match open_sqlite_connection(&config_for_refresh_system.database_path) {
+                    Ok(connection) => connection,
+                    Err(error) => {
+                        return ToolExecutionResult::error(format!(
+                            "failed to open database: {error}"
+                        ));
+                    }
+                };
+            if let Err(error) = run_migrations(&mut connection) {
+                return ToolExecutionResult::error(format!("failed to run migrations: {error}"));
+            }
+            match refresh_persisted_system_instructions(&mut connection, &config_for_refresh_system)
+            {
+                Ok(()) => {
+                    ToolExecutionResult::success("System instruction refresh complete".to_string())
+                }
+                Err(error) => ToolExecutionResult::error(format!(
+                    "failed to refresh system instructions: {error}"
+                )),
+            }
+        },
     );
 
-    let database_path = config.database_path.clone();
+    let config_for_assistant_name = config.clone();
     let set_assistant_name = ExecutableTool::new(
         ToolSpec::new(
             "set_assistant_name",
@@ -2213,14 +2279,14 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                     "set_assistant_name requires string assistant_name",
                 );
             };
-            mutate_user_preferences_at_path(&database_path, |record| {
+            mutate_user_preferences_in_config(&config_for_assistant_name, |record| {
                 record.assistant_name = Some(assistant_name.to_string());
                 Ok(format!("Assistant name updated to {assistant_name}."))
             })
         },
     );
 
-    let database_path = config.database_path.clone();
+    let config_for_persona = config.clone();
     let set_persona = ExecutableTool::new(
         ToolSpec::new(
             "set_persona",
@@ -2239,7 +2305,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
             if system_persona.is_empty() {
                 return ToolExecutionResult::error("System persona cannot be blank.");
             }
-            mutate_user_preferences_at_path(&database_path, |record| {
+            mutate_user_preferences_in_config(&config_for_persona, |record| {
                 if record.system_persona.as_deref() == Some(system_persona) {
                     return Ok("New system persona and old system persona are identical".into());
                 }
@@ -2249,7 +2315,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
         },
     );
 
-    let database_path = config.database_path.clone();
+    let config_for_reset_system_persona = config.clone();
     let reset_system_persona = ExecutableTool::new(
         ToolSpec::new(
             "reset_system_persona",
@@ -2257,14 +2323,14 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
             JsonSchema::object(Vec::<(String, Value)>::new(), [] as [&str; 0]),
         ),
         move |_| {
-            mutate_user_preferences_at_path(&database_path, |record| {
+            mutate_user_preferences_in_config(&config_for_reset_system_persona, |record| {
                 record.system_persona = None;
                 Ok("System persona cleared, will now use default persona.".into())
             })
         },
     );
 
-    let database_path = config.database_path.clone();
+    let config_for_preferred_name = config.clone();
     let set_user_preferred_name = ExecutableTool::new(
         ToolSpec::new(
             "set_user_preferred_name",
@@ -2288,7 +2354,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                 .get("override_existing")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
-            mutate_user_preferences_at_path(&database_path, |record| {
+            mutate_user_preferences_in_config(&config_for_preferred_name, |record| {
                 let existing = effective_user_preferred_name(Some(record));
                 if existing != elroy_user::DEFAULT_USER_PREFERRED_NAME && !override_existing {
                     return Ok(format!(
@@ -2321,7 +2387,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
         },
     );
 
-    let database_path = config.database_path.clone();
+    let config_for_full_name = config.clone();
     let set_user_full_name = ExecutableTool::new(
         ToolSpec::new(
             "set_user_full_name",
@@ -2342,7 +2408,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                 .get("override_existing")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
-            mutate_user_preferences_at_path(&database_path, |record| {
+            mutate_user_preferences_in_config(&config_for_full_name, |record| {
                 let existing = effective_user_full_name(Some(record));
                 if existing != elroy_user::UNKNOWN_FULL_NAME && !override_existing {
                     return Ok(format!(
@@ -2985,11 +3051,11 @@ fn with_user_preferences_at_path(
     }
 }
 
-fn mutate_user_preferences_at_path(
-    database_path: &Path,
+fn mutate_user_preferences_in_config(
+    config: &AppConfig,
     operation: impl FnOnce(&mut UserPreferenceRecord) -> rusqlite::Result<String>,
 ) -> ToolExecutionResult {
-    let mut connection = match open_sqlite_connection(database_path) {
+    let mut connection = match open_sqlite_connection(&config.database_path) {
         Ok(connection) => connection,
         Err(error) => {
             return ToolExecutionResult::error(format!("failed to open database: {error}"));
@@ -3013,6 +3079,8 @@ fn mutate_user_preferences_at_path(
 
     match operation(&mut record).and_then(|message| {
         save_user_preferences(&mut connection, &record)?;
+        refresh_persisted_system_instructions(&mut connection, config)
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
         Ok(message)
     }) {
         Ok(message) => ToolExecutionResult::success(message),
@@ -4352,8 +4420,16 @@ mod tests {
         assert!(!persona.is_error);
         assert_eq!(persona.content, "System persona updated.");
 
-        let connection =
+        let mut connection =
             open_sqlite_connection(&config.database_path).expect("database should open");
+        let context =
+            elroy_db::load_context_messages(&mut connection, LOCAL_USER_TOKEN).expect("load ok");
+        assert_eq!(context[0].role, MessageRole::System);
+        assert_eq!(
+            context[0].content.as_deref(),
+            Some("You are Nova helping Jimmy.")
+        );
+
         let persisted = load_user_preferences(&connection, LOCAL_USER_TOKEN)
             .expect("preferences should load")
             .expect("preferences should exist");
@@ -4373,6 +4449,15 @@ mod tests {
             .expect("preferences should load")
             .expect("preferences should exist");
         assert_eq!(cleared.system_persona, None);
+        let context =
+            elroy_db::load_context_messages(&mut connection, LOCAL_USER_TOKEN).expect("load ok");
+        assert_eq!(context[0].role, MessageRole::System);
+        assert!(
+            context[0]
+                .content
+                .as_deref()
+                .is_some_and(|content| content.contains("I am Nova"))
+        );
 
         fs::remove_dir_all(home).expect("home should be removed");
     }
@@ -4505,11 +4590,22 @@ mod tests {
 
         let stored =
             elroy_db::load_context_messages(&mut connection, LOCAL_USER_TOKEN).expect("load ok");
-        assert!(stored.is_empty());
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].role, MessageRole::System);
+        assert!(
+            stored[0]
+                .content
+                .as_deref()
+                .is_some_and(|content| content.contains("I am Elroy"))
+        );
 
         let refresh = registry.invoke("refresh_system_instructions", "{}");
         assert!(!refresh.is_error);
         assert_eq!(refresh.content, "System instruction refresh complete");
+        let refreshed =
+            elroy_db::load_context_messages(&mut connection, LOCAL_USER_TOKEN).expect("load ok");
+        assert_eq!(refreshed.len(), 1);
+        assert_eq!(refreshed[0].role, MessageRole::System);
 
         fs::remove_dir_all(home).expect("home should be removed");
     }
