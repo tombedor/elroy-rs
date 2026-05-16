@@ -2835,6 +2835,24 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                 )?;
                 elroy_db::bootstrap_database(&BootstrapPlan::from_config(&config_for_task_write))
                     .map_err(|error| std::io::Error::other(error.to_string()))?;
+                let task = find_active_agenda_item_by_name(&connection, name)
+                    .map_err(|error| std::io::Error::other(error.to_string()))?
+                    .filter(|item| {
+                        item.trigger_datetime.is_none() && item.trigger_context.is_none()
+                    });
+                if let Some(task) = task {
+                    let mut transcript = load_validated_runtime_transcript(
+                        &mut connection,
+                        &config_for_task_write.assistant_name,
+                        config_for_task_write.llm_provider() == LlmProvider::Anthropic,
+                    )
+                    .map_err(|error| std::io::Error::other(error.to_string()))?;
+                    if !transcript_contains_context_task(&transcript, &task.name) {
+                        transcript.extend(context_task_tool_messages(&task));
+                        replace_context_messages(&mut connection, LOCAL_USER_TOKEN, &transcript)
+                            .map_err(|error| std::io::Error::other(error.to_string()))?;
+                    }
+                }
                 Ok(path)
             })() {
                 Ok(path) => ToolExecutionResult::success(format!(
@@ -6134,6 +6152,29 @@ fn context_due_item_tool_messages(item: &AgendaItemRecord) -> Vec<ConversationMe
     )
 }
 
+fn context_task_tool_messages(item: &AgendaItemRecord) -> Vec<ConversationMessage> {
+    let content = serde_json::to_string_pretty(&json!({
+        "content": format!("TASK: '{}' - {}", item.name, item.body),
+        "tasks": [{
+            "type": "task",
+            "name": item.name,
+            "agenda_date": item.agenda_date,
+            "trigger_datetime": item.trigger_datetime,
+            "trigger_context": item.trigger_context,
+            "status": item.status,
+            "closing_comment": item.closing_comment,
+            "excerpt": excerpt(&item.body, 180),
+        }],
+    }))
+    .expect("context-task payload should serialize");
+    synthetic_tool_context_messages(
+        context_task_tool_call_id(&item.name),
+        "get_fast_recall",
+        "{}",
+        content,
+    )
+}
+
 fn transcript_contains_context_memory(
     transcript: &[ConversationMessage],
     memory_name: &str,
@@ -6149,6 +6190,13 @@ fn transcript_contains_context_due_item(
     due_item_name: &str,
 ) -> bool {
     let tool_call_id = context_due_item_tool_call_id(due_item_name);
+    transcript
+        .iter()
+        .any(|message| message_matches_tool_call_id(message, &tool_call_id))
+}
+
+fn transcript_contains_context_task(transcript: &[ConversationMessage], task_name: &str) -> bool {
+    let tool_call_id = context_task_tool_call_id(task_name);
     transcript
         .iter()
         .any(|message| message_matches_tool_call_id(message, &tool_call_id))
@@ -6761,17 +6809,16 @@ mod tests {
         argument_limit, build_live_tool_registry, build_live_tool_registry_with_codex_bin_and_hook,
         build_recall_query, codex_background_status_key, compress_context_messages,
         consolidate_exact_duplicate_memories, context_due_item_tool_call_id,
-        context_due_item_tool_messages, context_task_tool_call_id, count_context_tokens,
-        drop_old_context_messages, due_item_context_messages, format_context_summary_message,
-        is_context_refresh_needed, memory_recall_status_updates, message_matches_tool_call_id,
-        parse_recalled_memory_names, prompt_prelude_status_updates,
-        provider_config_from_app_config, recall_due_item_context_messages,
-        recall_memory_context_messages, recalled_memory_names, recent_recall_context,
-        refresh_context_if_needed, run_prompt_with_model_and_registry,
+        context_due_item_tool_messages, count_context_tokens, drop_old_context_messages,
+        due_item_context_messages, format_context_summary_message, is_context_refresh_needed,
+        memory_recall_status_updates, message_matches_tool_call_id, parse_recalled_memory_names,
+        prompt_prelude_status_updates, provider_config_from_app_config,
+        recall_due_item_context_messages, recall_memory_context_messages, recalled_memory_names,
+        recent_recall_context, refresh_context_if_needed, run_prompt_with_model_and_registry,
         run_prompt_with_model_and_registry_stream, select_due_items_by_overlap,
         select_recalled_due_items, select_recalled_memories, should_offer_greeting,
         should_skip_memory_recall, significant_tokens, strip_input_message_for_persistence,
-        strip_transient_context_messages, synthetic_tool_context_messages,
+        strip_transient_context_messages,
     };
     use elroy_agenda::create_agenda_file;
     use elroy_codex::{
@@ -10354,20 +10401,19 @@ mod tests {
             "{\"name\":\"Inbox Zero\",\"text\":\"Clear email backlog\"}",
         );
         assert!(!deleted_created.is_error);
-        let mut connection =
-            open_sqlite_connection(&config.database_path).expect("database should reopen");
-        let mut transcript = vec![ConversationMessage::new(MessageRole::User, "keep context")];
-        transcript.extend(synthetic_tool_context_messages(
-            context_task_tool_call_id("inbox zero"),
-            "get_fast_recall",
-            "{}",
-            "{\"content\":\"TASK: 'inbox zero' - Clear email backlog\"}",
-        ));
-        elroy_db::replace_context_messages(&mut connection, LOCAL_USER_TOKEN, &transcript)
-            .expect("task context should persist");
         let task_context = registry.invoke("show_context_messages", "{\"limit\":20}");
         assert!(!task_context.is_error);
         assert!(task_context.content.contains("context-task:inbox zero"));
+        let mut connection =
+            open_sqlite_connection(&config.database_path).expect("database should reopen");
+        let mut transcript = elroy_db::load_context_messages(&mut connection, LOCAL_USER_TOKEN)
+            .expect("context should load");
+        transcript.insert(
+            0,
+            ConversationMessage::new(MessageRole::User, "keep context"),
+        );
+        elroy_db::replace_context_messages(&mut connection, LOCAL_USER_TOKEN, &transcript)
+            .expect("task context should persist");
 
         let deleted = registry.invoke(
             "delete_task",
