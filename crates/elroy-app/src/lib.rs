@@ -9482,6 +9482,68 @@ mod tests {
     }
 
     #[test]
+    fn list_agenda_items_excludes_deleted_and_due_items() {
+        let unique = format!(
+            "elroy-rs-app-agenda-list-filtering-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+
+        let mut config = AppConfig::defaults();
+        config.memory_dir = memory_dir;
+        config.agenda_dir = agenda_dir.clone();
+        config.database_path = database_path;
+        elroy_db::bootstrap_database(&elroy_db::BootstrapPlan::from_config(&config))
+            .expect("bootstrap should succeed");
+
+        let registry = build_live_tool_registry(&config);
+        let added = registry.invoke(
+            "add_agenda_item",
+            "{\"text\":\"Write the Q2 report.\",\"item_date\":\"2026-03-20\"}",
+        );
+        assert!(!added.is_error);
+        let deleted = registry.invoke(
+            "delete_agenda_item",
+            "{\"item_name\":\"write the q2 report\"}",
+        );
+        assert!(!deleted.is_error);
+
+        let readded = registry.invoke(
+            "add_agenda_item",
+            "{\"text\":\"Write the Q2 report.\",\"item_date\":\"2026-03-20\"}",
+        );
+        assert!(!readded.is_error);
+
+        let due_item = registry.invoke(
+            "create_due_item",
+            "{\"name\":\"Pay rent\",\"text\":\"Pay rent before the first of the month.\",\"trigger_context\":\"when I mention rent\"}",
+        );
+        assert!(!due_item.is_error);
+
+        let listed = registry.invoke("list_agenda_items", "{\"item_date\":\"2026-03-20\"}");
+        assert!(!listed.is_error);
+        let payload: serde_json::Value =
+            serde_json::from_str(&listed.content).expect("agenda listing should be valid json");
+        assert_eq!(payload["item_date"], "2026-03-20");
+        let items = payload["items"]
+            .as_array()
+            .expect("agenda listing should contain items");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["name"], "write the q2 report");
+        assert_eq!(items[0]["text"], "Write the Q2 report.");
+
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
     fn agenda_sidebar_delete_rejects_plain_agenda_items() {
         let unique = format!(
             "elroy-rs-app-sidebar-agenda-delete-{}",
