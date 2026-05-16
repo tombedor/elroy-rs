@@ -3085,10 +3085,15 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
             let Some(text) = arguments.get("text").and_then(Value::as_str) else {
                 return ToolExecutionResult::error("update_task_text requires string text");
             };
-            mutate_task_file_from_config_with_result(&config_for_task_text, name, |path| {
-                update_task_text_file(path, text)?;
-                Ok(format!("Task '{name}' text has been updated."))
-            })
+            mutate_task_file_from_config_with_result(
+                &config_for_task_text,
+                name,
+                || format!("Active task '{name}' not found."),
+                |path, _| {
+                    update_task_text_file(path, text)?;
+                    Ok(format!("Task '{name}' text has been updated."))
+                },
+            )
         },
     );
 
@@ -3156,10 +3161,20 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
             let Some(new_name) = arguments.get("new_name").and_then(Value::as_str) else {
                 return ToolExecutionResult::error("rename_task requires string new_name");
             };
-            mutate_task_file_from_config_with_result(&config_for_task_rename, name, |path| {
-                let _renamed = rename_task_file(path, new_name)?;
-                Ok(format!("Task '{name}' has been renamed to '{new_name}'."))
-            })
+            mutate_task_file_from_config_with_result(
+                &config_for_task_rename,
+                name,
+                || format!("Active task '{name}' not found."),
+                |path, task_names| {
+                    if task_names.iter().any(|existing| existing == new_name) {
+                        return Err(std::io::Error::other(format!(
+                            "Active task '{new_name}' already exists."
+                        )));
+                    }
+                    let _renamed = rename_task_file(path, new_name)?;
+                    Ok(format!("Task '{name}' has been renamed to '{new_name}'."))
+                },
+            )
         },
     );
 
@@ -3221,15 +3236,20 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                 return ToolExecutionResult::error("complete_task requires a string name");
             };
             let closing_comment = arguments.get("closing_comment").and_then(Value::as_str);
-            mutate_task_file_from_config_with_result(&config_for_task_complete, name, |path| {
-                complete_task_file(path, closing_comment)?;
-                Ok(match closing_comment {
-                    Some(closing_comment) => format!(
-                        "Task '{name}' has been marked as completed. Comment: {closing_comment}"
-                    ),
-                    None => format!("Task '{name}' has been marked as completed."),
-                })
-            })
+            mutate_task_file_from_config_with_result(
+                &config_for_task_complete,
+                name,
+                || format!("Active task '{name}' not found."),
+                |path, _| {
+                    complete_task_file(path, closing_comment)?;
+                    Ok(match closing_comment {
+                        Some(closing_comment) => format!(
+                            "Task '{name}' has been marked as completed. Comment: {closing_comment}"
+                        ),
+                        None => format!("Task '{name}' has been marked as completed."),
+                    })
+                },
+            )
         },
     );
 
@@ -3293,15 +3313,20 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                 return ToolExecutionResult::error("delete_task requires a string name");
             };
             let closing_comment = arguments.get("closing_comment").and_then(Value::as_str);
-            mutate_task_file_from_config_with_result(&config_for_task_delete, name, |path| {
-                delete_task_file(path, closing_comment)?;
-                Ok(match closing_comment {
-                    Some(closing_comment) => {
-                        format!("Task '{name}' has been deleted. Comment: {closing_comment}")
-                    }
-                    None => format!("Task '{name}' has been deleted."),
-                })
-            })
+            mutate_task_file_from_config_with_result(
+                &config_for_task_delete,
+                name,
+                || format!("Active task '{name}' not found."),
+                |path, _| {
+                    delete_task_file(path, closing_comment)?;
+                    Ok(match closing_comment {
+                        Some(closing_comment) => {
+                            format!("Task '{name}' has been deleted. Comment: {closing_comment}")
+                        }
+                        None => format!("Task '{name}' has been deleted."),
+                    })
+                },
+            )
         },
     );
 
@@ -5246,7 +5271,8 @@ fn mutate_memory_file_from_config(
 fn mutate_task_file_from_config_with_result(
     config: &AppConfig,
     name: &str,
-    operation: impl FnOnce(&Path) -> std::io::Result<String>,
+    missing_message: impl FnOnce() -> String,
+    operation: impl FnOnce(&Path, &[String]) -> std::io::Result<String>,
 ) -> ToolExecutionResult {
     let mut connection = match open_sqlite_connection(&config.database_path) {
         Ok(connection) => connection,
@@ -5257,12 +5283,19 @@ fn mutate_task_file_from_config_with_result(
     if let Err(error) = run_migrations(&mut connection) {
         return ToolExecutionResult::error(format!("failed to run migrations: {error}"));
     }
-    let task = match find_task_by_name(&connection, name) {
-        Ok(Some(task)) => task,
-        Ok(None) => return ToolExecutionResult::error(format!("task not found: {name}")),
+    let tasks = match list_active_tasks(&connection, 1_000) {
+        Ok(tasks) => tasks,
         Err(error) => return ToolExecutionResult::error(format!("database query failed: {error}")),
     };
-    match operation(Path::new(&task.file_path)).and_then(|payload| {
+    let task_names = tasks
+        .iter()
+        .map(|task| task.name.clone())
+        .collect::<Vec<_>>();
+    let task = match tasks.iter().find(|task| task.name == name) {
+        Some(task) => task,
+        None => return ToolExecutionResult::error(missing_message()),
+    };
+    match operation(Path::new(&task.file_path), &task_names).and_then(|payload| {
         elroy_db::bootstrap_database(&BootstrapPlan::from_config(config))
             .map_err(|error| std::io::Error::other(error.to_string()))?;
         Ok(payload)
@@ -8212,6 +8245,12 @@ mod tests {
         );
         assert!(!updated.is_error);
         assert_eq!(updated.content, "Task 'job search' text has been updated.");
+        let missing_updated = registry.invoke(
+            "update_task_text",
+            "{\"name\":\"missing\",\"text\":\"No-op\"}",
+        );
+        assert!(missing_updated.is_error);
+        assert_eq!(missing_updated.content, "Active task 'missing' not found.");
 
         let renamed = registry.invoke(
             "rename_task",
@@ -8223,6 +8262,21 @@ mod tests {
             "Task 'job search' has been renamed to 'Career Search'."
         );
         assert!(agenda_dir.join("career_search.md").exists());
+        let missing_renamed = registry.invoke(
+            "rename_task",
+            "{\"name\":\"missing\",\"new_name\":\"Backup Search\"}",
+        );
+        assert!(missing_renamed.is_error);
+        assert_eq!(missing_renamed.content, "Active task 'missing' not found.");
+        let duplicate_renamed = registry.invoke(
+            "rename_task",
+            "{\"name\":\"career search\",\"new_name\":\"career search\"}",
+        );
+        assert!(duplicate_renamed.is_error);
+        assert_eq!(
+            duplicate_renamed.content,
+            "task mutation failed: Active task 'career search' already exists."
+        );
 
         let listed = registry.invoke("list_tasks", "{\"limit\":10}");
         assert!(!listed.is_error);
@@ -8240,6 +8294,12 @@ mod tests {
         assert_eq!(
             completed.content,
             "Task 'career search' has been marked as completed. Comment: done"
+        );
+        let missing_completed = registry.invoke("complete_task", "{\"name\":\"missing\"}");
+        assert!(missing_completed.is_error);
+        assert_eq!(
+            missing_completed.content,
+            "Active task 'missing' not found."
         );
 
         let deleted_created = registry.invoke(
@@ -8261,6 +8321,9 @@ mod tests {
             fs::read_to_string(agenda_dir.join("inbox_zero.md")).expect("task file should read");
         assert!(deleted_text.contains("status: deleted"));
         assert!(deleted_text.contains("closing_comment: superseded"));
+        let missing_deleted = registry.invoke("delete_task", "{\"name\":\"missing\"}");
+        assert!(missing_deleted.is_error);
+        assert_eq!(missing_deleted.content, "Active task 'missing' not found.");
 
         fs::remove_dir_all(home).expect("home should be removed");
     }
