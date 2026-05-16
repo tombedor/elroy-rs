@@ -256,7 +256,11 @@ impl AppRuntime {
 
     pub fn load_snapshot(&self) -> Result<TuiSnapshot, AppError> {
         let mut connection = self.open_connection()?;
-        let mut snapshot = load_snapshot_from_connection(&mut connection, &self.config.home_dir)?;
+        let mut snapshot = load_snapshot_from_connection(
+            &mut connection,
+            &self.config.home_dir,
+            &self.config.memory_dir,
+        )?;
         snapshot.model_name = Some(self.config.chat_model.clone());
         Ok(snapshot)
     }
@@ -369,7 +373,11 @@ impl AppRuntime {
 
         Ok(PromptRunResult {
             events,
-            snapshot: load_snapshot_from_connection(&mut connection, &self.config.home_dir)?,
+            snapshot: load_snapshot_from_connection(
+                &mut connection,
+                &self.config.home_dir,
+                &self.config.memory_dir,
+            )?,
         })
     }
 
@@ -663,6 +671,7 @@ impl AppRuntime {
 fn load_snapshot_from_connection(
     connection: &mut rusqlite::Connection,
     home_dir: &Path,
+    memory_dir: &Path,
 ) -> Result<TuiSnapshot, AppError> {
     let conversation_lines = load_context_messages(connection, LOCAL_USER_TOKEN)?
         .into_iter()
@@ -681,7 +690,7 @@ fn load_snapshot_from_connection(
             format!("{role}: {content}")
         })
         .collect::<Vec<_>>();
-    let memory_titles = list_active_memories(connection, 15)?
+    let memory_titles = list_active_memories_in_scope(connection, memory_dir, 15)?
         .into_iter()
         .map(|memory| memory.name)
         .collect::<Vec<_>>();
@@ -1099,11 +1108,19 @@ fn finalize_prompt_event_stream(
         persisted_transcript.as_slice(),
         state.messages_between_self_reflection,
     )?;
-    load_snapshot_from_connection(&mut state.connection, &state.home_dir)
+    load_snapshot_from_connection(
+        &mut state.connection,
+        &state.home_dir,
+        &state.bootstrap_plan.memory_dir,
+    )
 }
 
 fn cancel_prompt_event_stream(mut state: PromptEventStreamState) -> Result<TuiSnapshot, AppError> {
-    load_snapshot_from_connection(&mut state.connection, &state.home_dir)
+    load_snapshot_from_connection(
+        &mut state.connection,
+        &state.home_dir,
+        &state.bootstrap_plan.memory_dir,
+    )
 }
 
 fn live_provider_model(
@@ -1147,7 +1164,7 @@ fn run_prompt_with_model_and_registry(
         options.memory_recall_classifier_window,
         prompt,
         &existing_transcript,
-        &list_active_memories(connection, 50)?,
+        &list_active_memories_in_scope(connection, &options.bootstrap_plan.memory_dir, 50)?,
     );
     let now_iso = Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string();
     let all_due_items = list_active_due_items(connection, 20)?;
@@ -1233,7 +1250,7 @@ fn run_prompt_with_model_and_registry_stream(
         options.memory_recall_classifier_window,
         prompt,
         &existing_transcript,
-        &list_active_memories(&connection, 50)?,
+        &list_active_memories_in_scope(&connection, &options.bootstrap_plan.memory_dir, 50)?,
     );
     let now_iso = Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string();
     let all_due_items = list_active_due_items(&connection, 20)?;
@@ -4697,6 +4714,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
     );
 
     let database_path = config.database_path.clone();
+    let memory_dir_for_list_memories = config.memory_dir.clone();
     let list_memories = ExecutableTool::new(
         ToolSpec::new(
             "list_memories",
@@ -4706,7 +4724,11 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
         move |arguments| {
             let limit = argument_limit(&arguments, 10);
             with_tool_connection(&database_path, |connection| {
-                let memories = list_active_memories(connection, limit)?;
+                let memories = list_active_memories_in_scope(
+                    connection,
+                    &memory_dir_for_list_memories,
+                    limit,
+                )?;
                 let payload = memories
                     .into_iter()
                     .map(|memory| {
@@ -4727,6 +4749,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
     );
 
     let database_path = config.database_path.clone();
+    let memory_dir_for_print_memories = config.memory_dir.clone();
     let print_memories = ExecutableTool::new(
         ToolSpec::new(
             "print_memories",
@@ -4736,7 +4759,11 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
         move |arguments| {
             let limit = argument_limit(&arguments, 10);
             with_tool_connection(&database_path, |connection| {
-                let memories = list_active_memories(connection, limit)?;
+                let memories = list_active_memories_in_scope(
+                    connection,
+                    &memory_dir_for_print_memories,
+                    limit,
+                )?;
                 Ok(ToolExecutionResult::success(format_memory_listing(
                     &memories,
                 )))
@@ -4745,6 +4772,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
     );
 
     let database_path = config.database_path.clone();
+    let memory_dir_for_search_memories = config.memory_dir.clone();
     let search_memories = ExecutableTool::new(
         ToolSpec::new(
             "search_memories",
@@ -4757,7 +4785,12 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
             };
             let limit = argument_limit(&arguments, 10);
             with_tool_connection(&database_path, |connection| {
-                let memories = search_active_memories(connection, query, limit)?;
+                let memories = search_active_memories_in_scope(
+                    connection,
+                    &memory_dir_for_search_memories,
+                    query,
+                    limit,
+                )?;
                 let due_items = list_active_due_items(connection, limit * 3)?;
                 let relevant_due_items =
                     select_due_items_by_overlap(query, &due_items, limit, None);
@@ -4774,6 +4807,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
     );
 
     let database_path = config.database_path.clone();
+    let memory_dir_for_examine_memories = config.memory_dir.clone();
     let examine_memories = ExecutableTool::new(
         ToolSpec::new(
             "examine_memories",
@@ -4786,7 +4820,11 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
             };
             let limit = argument_limit(&arguments, 10);
             with_tool_connection(&database_path, |connection| {
-                let memories = list_active_memories(connection, limit * 3)?;
+                let memories = list_active_memories_in_scope(
+                    connection,
+                    &memory_dir_for_examine_memories,
+                    limit * 3,
+                )?;
                 let relevant_memories =
                     select_recalled_memories(question, &memories, &HashSet::new(), limit);
                 let due_items = list_active_due_items(connection, limit * 3)?;
@@ -6018,12 +6056,36 @@ fn find_active_memory_by_name_in_scope(
     name: &str,
     memory_dir: &Path,
 ) -> rusqlite::Result<Option<elroy_db::MemoryRecord>> {
+    Ok(
+        list_active_memories_in_scope(connection, memory_dir, 10_000)?
+            .into_iter()
+            .find(|memory| memory.name.eq_ignore_ascii_case(name)),
+    )
+}
+
+fn list_active_memories_in_scope(
+    connection: &rusqlite::Connection,
+    memory_dir: &Path,
+    limit: usize,
+) -> rusqlite::Result<Vec<elroy_db::MemoryRecord>> {
     Ok(elroy_db::list_active_memories(connection, 10_000)?
         .into_iter()
-        .find(|memory| {
-            memory.name.eq_ignore_ascii_case(name)
-                && Path::new(&memory.file_path).starts_with(memory_dir)
-        }))
+        .filter(|memory| Path::new(&memory.file_path).starts_with(memory_dir))
+        .take(limit)
+        .collect())
+}
+
+fn search_active_memories_in_scope(
+    connection: &rusqlite::Connection,
+    memory_dir: &Path,
+    query: &str,
+    limit: usize,
+) -> rusqlite::Result<Vec<elroy_db::MemoryRecord>> {
+    Ok(search_active_memories(connection, query, 10_000)?
+        .into_iter()
+        .filter(|memory| Path::new(&memory.file_path).starts_with(memory_dir))
+        .take(limit)
+        .collect())
 }
 
 fn context_memory_tool_messages(memory: &elroy_db::MemoryRecord) -> Vec<ConversationMessage> {
@@ -7050,6 +7112,41 @@ mod tests {
     }
 
     impl StreamingModelClient for ContextualDueItemModel {
+        fn stream_events(
+            &self,
+            request: ConversationRequest<'_>,
+        ) -> Result<
+            Box<dyn Iterator<Item = Result<StreamEvent, elroy_core::ModelClientError>>>,
+            elroy_core::ModelClientError,
+        > {
+            let events = self.next_events(request)?;
+            Ok(Box::new(events.into_iter().map(Ok)))
+        }
+    }
+
+    struct MemoryRecallScopeModel;
+
+    impl ModelClient for MemoryRecallScopeModel {
+        fn next_events(
+            &self,
+            request: ConversationRequest<'_>,
+        ) -> Result<Vec<StreamEvent>, elroy_core::ModelClientError> {
+            assert_eq!(request.user_message, "What preference did I mention?");
+            assert!(request.transcript.iter().any(|message| {
+                message.role == MessageRole::Tool
+                    && message.tool_call_id.as_deref() == Some("bootstrap-memory-recall")
+                    && message.content.as_deref().is_some_and(|content| {
+                        content.contains("Current preference is tea")
+                            && !content.contains("Current preference is coffee")
+                    })
+            }));
+            Ok(vec![StreamEvent::AssistantResponse {
+                content: "You prefer tea.".to_string(),
+            }])
+        }
+    }
+
+    impl StreamingModelClient for MemoryRecallScopeModel {
         fn stream_events(
             &self,
             request: ConversationRequest<'_>,
@@ -8524,6 +8621,155 @@ mod tests {
                 .exists()
         );
         assert!(other_memory_dir.join("runner_notes.md").exists());
+
+        fs::remove_dir_all(root).expect("root should be removed");
+    }
+
+    #[test]
+    fn memory_query_tools_scope_to_current_memory_dir() {
+        let unique = format!(
+            "elroy-rs-app-memory-query-scope-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let root = std::env::temp_dir().join(unique);
+        let current_home = root.join("current-user");
+        let current_memory_dir = current_home.join("memories");
+        let other_memory_dir = root.join("other-user").join("memories");
+        let current_agenda_dir = current_home.join("agenda");
+        let database_path = root.join("shared.db");
+        fs::create_dir_all(&current_memory_dir).expect("current memory dir should be created");
+        fs::create_dir_all(&other_memory_dir).expect("other memory dir should be created");
+        fs::create_dir_all(&current_agenda_dir).expect("current agenda dir should be created");
+        fs::write(
+            current_memory_dir.join("tea_preference.md"),
+            "Current preference is tea\n",
+        )
+        .expect("current memory should be written");
+        fs::write(
+            other_memory_dir.join("coffee_preference.md"),
+            "Current preference is coffee\n",
+        )
+        .expect("other memory should be written");
+
+        let mut current_config = AppConfig::defaults();
+        current_config.home_dir = current_home;
+        current_config.memory_dir = current_memory_dir.clone();
+        current_config.agenda_dir = current_agenda_dir;
+        current_config.database_path = database_path.clone();
+        elroy_db::bootstrap_database(&BootstrapPlan::from_config(&current_config))
+            .expect("current bootstrap should succeed");
+
+        let mut connection =
+            open_sqlite_connection(&current_config.database_path).expect("database should open");
+        run_migrations(&mut connection).expect("migrations should run");
+        seed_competing_memory_record(
+            &connection,
+            &other_memory_dir.join("coffee_preference.md"),
+            "Coffee Preference",
+            "Current preference is coffee",
+            9_999,
+        );
+
+        let registry = build_live_tool_registry(&current_config);
+        let listed = registry.invoke("list_memories", "{\"limit\":10}");
+        let printed = registry.invoke("print_memories", "{\"n\":10}");
+        let searched = registry.invoke("search_memories", "{\"query\":\"coffee\"}");
+        let examined = registry.invoke(
+            "examine_memories",
+            "{\"question\":\"What coffee note do I have?\"}",
+        );
+
+        assert!(!listed.is_error);
+        assert!(listed.content.contains("tea preference"));
+        assert!(!listed.content.contains("coffee preference"));
+        assert!(!printed.is_error);
+        assert!(printed.content.contains("tea preference"));
+        assert!(!printed.content.contains("coffee preference"));
+        assert!(!searched.is_error);
+        assert_eq!(searched.content, "No relevant memories found");
+        assert!(!examined.is_error);
+        assert_eq!(examined.content, "No relevant memories found");
+
+        fs::remove_dir_all(root).expect("root should be removed");
+    }
+
+    #[test]
+    fn run_prompt_with_model_and_registry_scopes_memory_recall_to_current_memory_dir() {
+        let unique = format!(
+            "elroy-rs-app-memory-recall-scope-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let root = std::env::temp_dir().join(unique);
+        let current_home = root.join("current-user");
+        let current_memory_dir = current_home.join("memories");
+        let other_memory_dir = root.join("other-user").join("memories");
+        let current_agenda_dir = current_home.join("agenda");
+        let database_path = root.join("shared.db");
+        fs::create_dir_all(&current_memory_dir).expect("current memory dir should be created");
+        fs::create_dir_all(&other_memory_dir).expect("other memory dir should be created");
+        fs::create_dir_all(&current_agenda_dir).expect("current agenda dir should be created");
+        fs::write(
+            current_memory_dir.join("tea_preference.md"),
+            "Current preference is tea\n",
+        )
+        .expect("current memory should be written");
+        fs::write(
+            other_memory_dir.join("coffee_preference.md"),
+            "Current preference is coffee\n",
+        )
+        .expect("other memory should be written");
+
+        let mut config = AppConfig::defaults();
+        config.home_dir = current_home.clone();
+        config.memory_dir = current_memory_dir.clone();
+        config.agenda_dir = current_agenda_dir;
+        config.database_path = database_path.clone();
+        elroy_db::bootstrap_database(&BootstrapPlan::from_config(&config))
+            .expect("current bootstrap should succeed");
+
+        let mut connection = open_sqlite_connection(&database_path).expect("database should open");
+        run_migrations(&mut connection).expect("migrations should run");
+        seed_competing_memory_record(
+            &connection,
+            &other_memory_dir.join("coffee_preference.md"),
+            "Coffee Preference",
+            "Current preference is coffee",
+            9_999,
+        );
+
+        let model = MemoryRecallScopeModel;
+        let events = run_prompt_with_model_and_registry(
+            &mut connection,
+            "What preference did I mention?",
+            &model,
+            ExecutableToolRegistry::new(vec![]),
+            PromptExecutionOptions {
+                role: MessageRole::User,
+                persist_input_message: true,
+                force_tool: None,
+                assistant_name: &config.assistant_name,
+                ensure_alternating_roles: config.llm_provider() == LlmProvider::Anthropic,
+                home_dir: &current_home,
+                bootstrap_plan: BootstrapPlan::from_config(&config),
+                messages_between_memory: config.messages_between_memory,
+                memories_between_consolidation: config.memories_between_consolidation,
+                messages_between_self_reflection: config.messages_between_self_reflection,
+                memory_recall_classifier_enabled: false,
+                memory_recall_classifier_window: config.memory_recall_classifier_window,
+            },
+        )
+        .expect("prompt should succeed");
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::AssistantResponse { content } if content == "You prefer tea."
+        )));
 
         fs::remove_dir_all(root).expect("root should be removed");
     }
