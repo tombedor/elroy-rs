@@ -288,20 +288,18 @@ impl AppRuntime {
         )
     }
 
-    pub fn execute_zero_arg_slash_command(
-        &self,
-        prompt: &str,
-    ) -> Result<Option<TuiSnapshot>, AppError> {
+    pub fn execute_slash_command(&self, prompt: &str) -> Result<Option<TuiSnapshot>, AppError> {
         let trimmed = prompt.trim();
         let Some(command_text) = trimmed.strip_prefix('/') else {
             return Ok(None);
         };
         let parts = command_text.split_whitespace().collect::<Vec<_>>();
-        if parts.len() != 1 {
-            return Ok(None);
+        if parts.is_empty() {
+            return Err(AppError::Runtime("Invalid command: /".to_string()));
         }
 
         let slash_name = parts[0];
+        let raw_values = &parts[1..];
         let command_name = match slash_name {
             "help" => "get_help",
             _ => slash_name,
@@ -312,18 +310,36 @@ impl AppRuntime {
             .into_iter()
             .find(|spec| spec.name == command_name)
         else {
-            return Ok(None);
+            return Err(AppError::Runtime(format!("Invalid command: {slash_name}")));
         };
         let JsonSchema::Object {
             properties,
             required,
             ..
         } = &spec.parameters;
-        if !properties.is_empty() || !required.is_empty() {
-            return Ok(None);
+        if raw_values.len() < required.len() {
+            let missing_name = required
+                .get(raw_values.len())
+                .cloned()
+                .unwrap_or_else(|| "value".to_string());
+            return Err(AppError::Runtime(format!(
+                "Missing required value for '{missing_name}'"
+            )));
+        }
+        if raw_values.len() > properties.len() {
+            return Err(AppError::Runtime(format!(
+                "Too many values provided for '{slash_name}'"
+            )));
         }
 
-        let result = registry.invoke(command_name, "{}");
+        let arguments = Value::Object(
+            properties
+                .keys()
+                .zip(raw_values.iter())
+                .map(|(name, value)| (name.clone(), Value::String((*value).to_string())))
+                .collect(),
+        );
+        let result = registry.invoke(command_name, &arguments.to_string());
         let mut snapshot = self.load_snapshot()?;
         if !result.content.trim().is_empty() {
             let label = if result.is_error {
@@ -10748,7 +10764,7 @@ mod tests {
     }
 
     #[test]
-    fn execute_zero_arg_slash_command_runs_help_but_not_parameterized_tools() {
+    fn execute_slash_command_runs_help_and_parameterized_commands() {
         let unique = format!(
             "elroy-rs-app-slash-command-exec-{}",
             std::time::SystemTime::now()
@@ -10771,7 +10787,7 @@ mod tests {
 
         let runtime = AppRuntime::new(config);
         let help_snapshot = runtime
-            .execute_zero_arg_slash_command("/help")
+            .execute_slash_command("/help")
             .expect("slash command should execute")
             .expect("help should execute as zero-arg command");
         assert_eq!(
@@ -10791,11 +10807,45 @@ mod tests {
                 .is_some_and(|line| line.contains("get_help"))
         );
 
+        let create_memory = build_live_tool_registry(&runtime.config).invoke(
+            "create_memory",
+            "{\"name\":\"runner\",\"text\":\"Remember the training plan.\"}",
+        );
+        assert!(!create_memory.is_error);
+
+        let shown_snapshot = runtime
+            .execute_slash_command("/show_memory runner")
+            .expect("parameterized slash command should execute")
+            .expect("show_memory should execute when all values are provided");
+        assert_eq!(
+            shown_snapshot.status.as_deref(),
+            Some("slash command executed: /show_memory")
+        );
+        assert!(
+            shown_snapshot
+                .conversation_lines
+                .last()
+                .is_some_and(|line| line.contains("Remember the training plan."))
+        );
+
+        let missing_value_snapshot = runtime
+            .execute_slash_command("/show_memory")
+            .expect("underspecified slash command should stay local")
+            .expect("underspecified known command should return a failed snapshot");
+        assert_eq!(
+            missing_value_snapshot.status.as_deref(),
+            Some("slash command failed: /show_memory")
+        );
+        assert!(
+            missing_value_snapshot
+                .conversation_lines
+                .last()
+                .is_some_and(|line| line.contains("tool error: show_memory requires a string name"))
+        );
         assert!(
             runtime
-                .execute_zero_arg_slash_command("/show_memory runner notes")
-                .expect("slash command lookup should succeed")
-                .is_none()
+                .execute_slash_command("/missing_command")
+                .is_err_and(|error| error.to_string() == "Invalid command: missing_command")
         );
 
         fs::remove_dir_all(home).expect("home should be removed");

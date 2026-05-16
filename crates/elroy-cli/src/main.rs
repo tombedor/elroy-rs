@@ -272,7 +272,7 @@ impl TuiRuntime for CliTuiRuntime {
         self.clear_deferred_context_refresh_error();
         self.clear_deferred_self_reflection_error();
         self.runtime
-            .execute_zero_arg_slash_command(prompt)
+            .execute_slash_command(prompt)
             .map_err(|error| error.to_string())
     }
 

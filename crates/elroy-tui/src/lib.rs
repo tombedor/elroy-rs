@@ -1466,6 +1466,7 @@ mod tests {
     struct FakeRuntime {
         snapshot: TuiSnapshot,
         slash_command_snapshot: Option<TuiSnapshot>,
+        slash_command_error: Option<String>,
         submitted_prompts: Vec<String>,
         self_reflection_runs: usize,
         last_opened: Option<(SidebarSection, String)>,
@@ -1509,6 +1510,9 @@ mod tests {
 
         fn execute_slash_command(&mut self, prompt: &str) -> Result<Option<TuiSnapshot>, String> {
             if prompt.starts_with('/') {
+                if let Some(error) = &self.slash_command_error {
+                    return Err(error.clone());
+                }
                 Ok(self.slash_command_snapshot.clone())
             } else {
                 Ok(None)
@@ -2011,6 +2015,28 @@ mod tests {
             Some("tool result: Available commands...")
         );
         assert_eq!(app.input_history, vec!["/help".to_string()]);
+    }
+
+    #[test]
+    fn slash_command_submit_error_preserves_input_and_does_not_start_prompt_stream() {
+        let mut app = TuiApp::bootstrap();
+        app.input = "/show_memory".to_string();
+        let mut runtime = FakeRuntime {
+            slash_command_error: Some("Missing required value for 'memory_name'".to_string()),
+            ..FakeRuntime::default()
+        };
+        let mut pending = None;
+
+        apply_intent_with_runtime(&mut app, UiIntent::SubmitPrompt, &mut runtime, &mut pending);
+
+        assert!(pending.is_none());
+        assert!(runtime.submitted_prompts.is_empty());
+        assert_eq!(app.input, "/show_memory");
+        assert_eq!(
+            app.status,
+            "slash command failed: Missing required value for 'memory_name'"
+        );
+        assert!(app.input_history.is_empty());
     }
 
     #[test]
