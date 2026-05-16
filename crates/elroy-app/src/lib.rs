@@ -1103,10 +1103,15 @@ fn run_prompt_with_model_and_registry(
         &list_active_memories(connection, 50)?,
     );
     let now_iso = Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string();
-    let due_item_context = due_item_context_messages(&list_due_tasks(connection, 20, &now_iso)?);
+    let all_due_items = list_active_due_items(connection, 20)?;
+    let timed_due_item_context =
+        due_item_context_messages(&list_due_tasks(connection, 20, &now_iso)?);
+    let contextual_due_item_context =
+        recall_due_item_context_messages(prompt, &existing_transcript, &all_due_items, &now_iso);
     let mut model_transcript = existing_transcript.clone();
     model_transcript.extend(recall_context.iter().cloned());
-    model_transcript.extend(due_item_context.iter().cloned());
+    model_transcript.extend(timed_due_item_context.iter().cloned());
+    model_transcript.extend(contextual_due_item_context.iter().cloned());
 
     let turn_run = orchestrator.run_turn_with_transcript_and_options(
         model,
@@ -1123,7 +1128,7 @@ fn run_prompt_with_model_and_registry(
         strip_transient_context_messages(
             turn_run.transcript.clone(),
             existing_transcript.len(),
-            recall_context.len() + due_item_context.len(),
+            recall_context.len() + timed_due_item_context.len() + contextual_due_item_context.len(),
         ),
         existing_transcript.len(),
         options.persist_input_message,
@@ -1146,7 +1151,7 @@ fn run_prompt_with_model_and_registry(
         options.memory_recall_classifier_enabled,
         prompt,
         !recall_context.is_empty(),
-        !due_item_context.is_empty(),
+        !(timed_due_item_context.is_empty() && contextual_due_item_context.is_empty()),
     );
     events.extend(turn_run.events);
     Ok(events)
@@ -1183,10 +1188,15 @@ fn run_prompt_with_model_and_registry_stream(
         &list_active_memories(&connection, 50)?,
     );
     let now_iso = Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string();
-    let due_item_context = due_item_context_messages(&list_due_tasks(&connection, 20, &now_iso)?);
+    let all_due_items = list_active_due_items(&connection, 20)?;
+    let timed_due_item_context =
+        due_item_context_messages(&list_due_tasks(&connection, 20, &now_iso)?);
+    let contextual_due_item_context =
+        recall_due_item_context_messages(prompt, &existing_transcript, &all_due_items, &now_iso);
     let mut model_transcript = existing_transcript.clone();
     model_transcript.extend(recall_context.iter().cloned());
-    model_transcript.extend(due_item_context.iter().cloned());
+    model_transcript.extend(timed_due_item_context.iter().cloned());
+    model_transcript.extend(contextual_due_item_context.iter().cloned());
 
     let turn_stream = orchestrator.stream_turn_with_transcript_and_options(
         model,
@@ -1204,7 +1214,7 @@ fn run_prompt_with_model_and_registry_stream(
         options.memory_recall_classifier_enabled,
         prompt,
         !recall_context.is_empty(),
-        !due_item_context.is_empty(),
+        !(timed_due_item_context.is_empty() && contextual_due_item_context.is_empty()),
     ));
 
     Ok(PromptEventStream {
@@ -1214,7 +1224,9 @@ fn run_prompt_with_model_and_registry_stream(
             connection,
             turn_stream,
             existing_transcript_len: existing_transcript.len(),
-            transient_context_count: recall_context.len() + due_item_context.len(),
+            transient_context_count: recall_context.len()
+                + timed_due_item_context.len()
+                + contextual_due_item_context.len(),
             persist_input_message: options.persist_input_message,
             messages_between_memory: options.messages_between_memory,
             messages_between_self_reflection: options.messages_between_self_reflection,
@@ -3715,6 +3727,39 @@ fn recall_memory_context_messages(
     )
 }
 
+fn recall_due_item_context_messages(
+    prompt: &str,
+    transcript: &[ConversationMessage],
+    due_items: &[AgendaItemRecord],
+    now_iso: &str,
+) -> Vec<ConversationMessage> {
+    let recall_query = build_recall_query(prompt, transcript, 6);
+    let recalled = select_recalled_due_items(&recall_query, due_items, now_iso, 2);
+    if recalled.is_empty() {
+        return Vec::new();
+    }
+
+    let lines = recalled
+        .iter()
+        .map(|item| {
+            let trigger_context = item.trigger_context.as_deref().unwrap_or("relevant context");
+            format!(
+                "RELEVANT DUE ITEM: '{}' - {}\n\nThis item should surface when the conversation matches this context: {}.",
+                item.name,
+                item.body,
+                trigger_context,
+            )
+        })
+        .collect::<Vec<_>>();
+
+    synthetic_tool_context_messages(
+        "bootstrap-contextual-due-items",
+        "get_due_items",
+        "{}",
+        lines.join("\n\n"),
+    )
+}
+
 fn memory_recall_status_updates(
     memory_recall_classifier_enabled: bool,
     prompt: &str,
@@ -3832,6 +3877,57 @@ fn recalled_memory_names(transcript: &[ConversationMessage]) -> HashSet<String> 
                 .flatten()
         })
         .flat_map(parse_recalled_memory_names)
+        .collect()
+}
+
+fn select_recalled_due_items<'a>(
+    prompt: &str,
+    due_items: &'a [AgendaItemRecord],
+    now_iso: &str,
+    limit: usize,
+) -> Vec<&'a AgendaItemRecord> {
+    let prompt_tokens = significant_tokens(prompt);
+    if prompt_tokens.is_empty() {
+        return Vec::new();
+    }
+
+    let mut scored = due_items
+        .iter()
+        .filter_map(|item| {
+            let trigger_context = item.trigger_context.as_deref()?;
+            if item
+                .trigger_datetime
+                .as_deref()
+                .is_some_and(|trigger_datetime| trigger_datetime <= now_iso)
+            {
+                return None;
+            }
+
+            let mut haystack = String::with_capacity(
+                item.name.len() + item.body.len() + trigger_context.len() + 2,
+            );
+            haystack.push_str(&item.name);
+            haystack.push(' ');
+            haystack.push_str(&item.body);
+            haystack.push(' ');
+            haystack.push_str(trigger_context);
+            let due_item_tokens = significant_tokens(&haystack);
+            let overlap = prompt_tokens.intersection(&due_item_tokens).count();
+            (overlap > 0).then_some((overlap, item.updated_at_unix, item))
+        })
+        .collect::<Vec<_>>();
+
+    scored.sort_by(|left, right| {
+        right
+            .0
+            .cmp(&left.0)
+            .then_with(|| right.1.cmp(&left.1))
+            .then_with(|| left.2.name.cmp(&right.2.name))
+    });
+    scored
+        .into_iter()
+        .take(limit)
+        .map(|(_, _, item)| item)
         .collect()
 }
 
@@ -4100,11 +4196,12 @@ mod tests {
         count_context_tokens, drop_old_context_messages, due_item_context_messages,
         format_context_summary_message, is_context_refresh_needed, memory_recall_status_updates,
         parse_recalled_memory_names, prompt_prelude_status_updates,
-        provider_config_from_app_config, recall_memory_context_messages, recalled_memory_names,
-        recent_recall_context, refresh_context_if_needed, run_prompt_with_model_and_registry,
-        run_prompt_with_model_and_registry_stream, select_recalled_memories, should_offer_greeting,
-        should_skip_memory_recall, significant_tokens, strip_input_message_for_persistence,
-        strip_transient_context_messages,
+        provider_config_from_app_config, recall_due_item_context_messages,
+        recall_memory_context_messages, recalled_memory_names, recent_recall_context,
+        refresh_context_if_needed, run_prompt_with_model_and_registry,
+        run_prompt_with_model_and_registry_stream, select_recalled_due_items,
+        select_recalled_memories, should_offer_greeting, should_skip_memory_recall,
+        significant_tokens, strip_input_message_for_persistence, strip_transient_context_messages,
     };
     use elroy_agenda::create_agenda_file;
     use elroy_codex::{
@@ -5576,6 +5673,132 @@ mod tests {
         }]);
 
         assert!(messages.is_empty());
+    }
+
+    #[test]
+    fn select_recalled_due_items_prefers_trigger_context_overlap() {
+        let due_items = vec![
+            AgendaItemRecord {
+                id: 1,
+                legacy_frontmatter_id: None,
+                name: "Payroll Follow-up".to_string(),
+                file_path: "/tmp/payroll.md".to_string(),
+                agenda_date: Some("unscheduled".to_string()),
+                is_completed: false,
+                status: Some("created".to_string()),
+                trigger_datetime: None,
+                trigger_context: Some("after payroll email".to_string()),
+                closing_comment: None,
+                checklist_total: 0,
+                checklist_completed: 0,
+                body: "Reply to payroll".to_string(),
+                is_active: true,
+                updated_at_unix: 20,
+            },
+            AgendaItemRecord {
+                id: 2,
+                legacy_frontmatter_id: None,
+                name: "Dinner".to_string(),
+                file_path: "/tmp/dinner.md".to_string(),
+                agenda_date: Some("unscheduled".to_string()),
+                is_completed: false,
+                status: Some("created".to_string()),
+                trigger_datetime: None,
+                trigger_context: Some("after dinner".to_string()),
+                closing_comment: None,
+                checklist_total: 0,
+                checklist_completed: 0,
+                body: "Call family".to_string(),
+                is_active: true,
+                updated_at_unix: 10,
+            },
+        ];
+
+        let recalled = select_recalled_due_items(
+            "I just got the payroll email",
+            &due_items,
+            "2026-05-15T12:00:00",
+            2,
+        );
+
+        assert_eq!(recalled.len(), 1);
+        assert_eq!(recalled[0].name, "Payroll Follow-up");
+    }
+
+    #[test]
+    fn select_recalled_due_items_skips_time_due_items() {
+        let due_items = vec![AgendaItemRecord {
+            id: 1,
+            legacy_frontmatter_id: None,
+            name: "Payroll Follow-up".to_string(),
+            file_path: "/tmp/payroll.md".to_string(),
+            agenda_date: Some("unscheduled".to_string()),
+            is_completed: false,
+            status: Some("created".to_string()),
+            trigger_datetime: Some("2000-01-01T09:00:00".to_string()),
+            trigger_context: Some("after payroll email".to_string()),
+            closing_comment: None,
+            checklist_total: 0,
+            checklist_completed: 0,
+            body: "Reply to payroll".to_string(),
+            is_active: true,
+            updated_at_unix: 20,
+        }];
+
+        let recalled = select_recalled_due_items(
+            "I just got the payroll email",
+            &due_items,
+            "2026-05-15T12:00:00",
+            2,
+        );
+
+        assert!(recalled.is_empty());
+    }
+
+    #[test]
+    fn recall_due_item_context_messages_creates_contextual_tool_message() {
+        let transcript = vec![ConversationMessage::new(
+            MessageRole::Assistant,
+            "Tell me when payroll follows up.",
+        )];
+        let due_items = vec![AgendaItemRecord {
+            id: 1,
+            legacy_frontmatter_id: None,
+            name: "Payroll Follow-up".to_string(),
+            file_path: "/tmp/payroll.md".to_string(),
+            agenda_date: Some("unscheduled".to_string()),
+            is_completed: false,
+            status: Some("created".to_string()),
+            trigger_datetime: None,
+            trigger_context: Some("after payroll email".to_string()),
+            closing_comment: None,
+            checklist_total: 0,
+            checklist_completed: 0,
+            body: "Reply to payroll".to_string(),
+            is_active: true,
+            updated_at_unix: 20,
+        }];
+
+        let messages = recall_due_item_context_messages(
+            "I just got the payroll email",
+            &transcript,
+            &due_items,
+            "2026-05-15T12:00:00",
+        );
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(
+            messages[0]
+                .tool_calls
+                .as_ref()
+                .map(|calls| calls[0].id.as_str()),
+            Some("bootstrap-contextual-due-items")
+        );
+        assert!(messages[1].content.as_deref().is_some_and(|content| {
+            content.contains("RELEVANT DUE ITEM")
+                && content.contains("after payroll email")
+                && content.contains("Reply to payroll")
+        }));
     }
 
     #[test]
