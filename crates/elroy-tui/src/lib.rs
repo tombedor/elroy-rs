@@ -314,7 +314,9 @@ fn run_event_loop(
     let mut previous_background_status = None;
 
     loop {
-        maybe_complete_command_execution(app, runtime);
+        if let Some(resume_message) = maybe_complete_command_execution(app, runtime) {
+            return Ok(TuiRunResult::RestartRequested(resume_message));
+        }
         match advance_prompt_stream(app, runtime, pending_prompt) {
             PromptAdvance::CompletedTurn => {
                 deferred_context_refresh_at = Some(Instant::now() + Duration::from_secs(5));
@@ -638,9 +640,12 @@ fn apply_paste_event(app: &mut TuiApp, text: &str) {
     }
 }
 
-fn maybe_complete_command_execution(app: &mut TuiApp, runtime: &mut impl TuiRuntime) {
+fn maybe_complete_command_execution(
+    app: &mut TuiApp,
+    runtime: &mut impl TuiRuntime,
+) -> Option<String> {
     if !app.command_active {
-        return;
+        return None;
     }
 
     match runtime.poll_command_execution() {
@@ -648,6 +653,13 @@ fn maybe_complete_command_execution(app: &mut TuiApp, runtime: &mut impl TuiRunt
             app.command_active = false;
             app.apply_snapshot(snapshot);
             app.focus = FocusTarget::Input;
+            match runtime.take_restart_request() {
+                Ok(Some(resume_message)) => return Some(resume_message),
+                Ok(None) => {}
+                Err(error) => {
+                    app.status = format!("restart failed: {error}");
+                }
+            }
         }
         Ok(None) => {}
         Err(error) => {
@@ -656,6 +668,7 @@ fn maybe_complete_command_execution(app: &mut TuiApp, runtime: &mut impl TuiRunt
             app.focus = FocusTarget::Input;
         }
     }
+    None
 }
 
 fn flatten_pasted_text(text: &str) -> String {
@@ -3107,6 +3120,29 @@ mod tests {
             app.status,
             "slash command executed: /refresh_system_instructions"
         );
+    }
+
+    #[test]
+    fn background_command_completion_can_return_restart_request() {
+        let mut app = TuiApp::bootstrap();
+        app.command_active = true;
+        let mut runtime = FakeRuntime {
+            completed_command_execution_snapshot: Some(TuiSnapshot {
+                status: Some("slash command executed: /restart_session".to_string()),
+                ..TuiSnapshot::default()
+            }),
+            pending_restart_request: Some("Restarted successfully. Ready to continue.".to_string()),
+            ..FakeRuntime::default()
+        };
+
+        let restart = maybe_complete_command_execution(&mut app, &mut runtime);
+
+        assert_eq!(
+            restart.as_deref(),
+            Some("Restarted successfully. Ready to continue.")
+        );
+        assert!(!app.command_active);
+        assert_eq!(app.focus, FocusTarget::Input);
     }
 
     #[test]
