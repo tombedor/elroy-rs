@@ -49,6 +49,7 @@ use elroy_user::{effective_persona, effective_user_full_name, effective_user_pre
 use serde_json::{Value, json};
 
 const LOCAL_USER_TOKEN: &str = "local-user";
+const SYNTHETIC_FIRST_USER_MESSAGE: &str = "The user has begun the conversation";
 
 #[derive(Debug)]
 pub enum AppError {
@@ -198,6 +199,7 @@ struct PromptExecutionOptions<'a> {
     persist_input_message: bool,
     force_tool: Option<&'a str>,
     assistant_name: &'a str,
+    ensure_alternating_roles: bool,
     home_dir: &'a Path,
     bootstrap_plan: BootstrapPlan,
     messages_between_memory: usize,
@@ -229,7 +231,11 @@ impl AppRuntime {
 
     pub fn load_context_messages(&self) -> Result<Vec<ConversationMessage>, AppError> {
         let mut connection = self.open_connection()?;
-        load_validated_runtime_transcript(&mut connection, &self.config.assistant_name)
+        load_validated_runtime_transcript(
+            &mut connection,
+            &self.config.assistant_name,
+            self.config.llm_provider() == LlmProvider::Anthropic,
+        )
     }
 
     pub fn background_status(&self) -> Option<String> {
@@ -267,6 +273,7 @@ impl AppRuntime {
                 persist_input_message: options.persist_input_message,
                 force_tool,
                 assistant_name: &self.config.assistant_name,
+                ensure_alternating_roles: self.config.llm_provider() == LlmProvider::Anthropic,
                 home_dir: &self.config.home_dir,
                 bootstrap_plan: BootstrapPlan::from_config(&self.config),
                 messages_between_memory: self.config.messages_between_memory,
@@ -307,6 +314,7 @@ impl AppRuntime {
                 persist_input_message: options.persist_input_message,
                 force_tool,
                 assistant_name: &self.config.assistant_name,
+                ensure_alternating_roles: self.config.llm_provider() == LlmProvider::Anthropic,
                 home_dir: &self.config.home_dir,
                 bootstrap_plan: BootstrapPlan::from_config(&self.config),
                 messages_between_memory: self.config.messages_between_memory,
@@ -602,6 +610,10 @@ fn load_snapshot_from_connection(
 ) -> Result<TuiSnapshot, AppError> {
     let conversation_lines = load_context_messages(connection, LOCAL_USER_TOKEN)?
         .into_iter()
+        .filter(|message| {
+            !(message.role == MessageRole::User
+                && message.content.as_deref() == Some(SYNTHETIC_FIRST_USER_MESSAGE))
+        })
         .map(|message| {
             let role = match message.role {
                 elroy_llm::MessageRole::System => "system",
@@ -737,9 +749,37 @@ fn repair_system_message_placement(
     repaired
 }
 
+fn repair_first_user_precedes_first_assistant(
+    raw_messages: &[ConversationMessage],
+    ensure_alternating_roles: bool,
+) -> Vec<ConversationMessage> {
+    if !ensure_alternating_roles {
+        return raw_messages.to_vec();
+    }
+
+    let first_non_system_index = raw_messages
+        .iter()
+        .position(|message| message.role != MessageRole::System);
+    let Some(index) = first_non_system_index else {
+        return raw_messages.to_vec();
+    };
+
+    if raw_messages[index].role != MessageRole::Assistant {
+        return raw_messages.to_vec();
+    }
+
+    let mut repaired = raw_messages.to_vec();
+    repaired.insert(
+        index,
+        ConversationMessage::new(MessageRole::User, SYNTHETIC_FIRST_USER_MESSAGE),
+    );
+    repaired
+}
+
 fn load_validated_runtime_transcript(
     connection: &mut rusqlite::Connection,
     default_assistant_name: &str,
+    ensure_alternating_roles: bool,
 ) -> Result<Vec<ConversationMessage>, AppError> {
     let raw_messages = load_context_messages(connection, LOCAL_USER_TOKEN)?;
     if raw_messages.is_empty() {
@@ -749,8 +789,10 @@ fn load_validated_runtime_transcript(
     let preferences = load_user_preferences(connection, LOCAL_USER_TOKEN)?;
     let expected_system_message =
         current_system_message(default_assistant_name, preferences.as_ref());
-    let repaired_messages =
-        repair_system_message_placement(&raw_messages, &expected_system_message);
+    let repaired_messages = repair_first_user_precedes_first_assistant(
+        &repair_system_message_placement(&raw_messages, &expected_system_message),
+        ensure_alternating_roles,
+    );
     let validated = validated_transcript(&repaired_messages);
 
     if validated != raw_messages {
@@ -1038,8 +1080,11 @@ fn run_prompt_with_model_and_registry(
     }
     let orchestrator = ConversationOrchestrator::new(2);
     let tool_executor = LocalToolExecutor::new(executable_tools);
-    let existing_transcript =
-        load_validated_runtime_transcript(connection, options.assistant_name)?;
+    let existing_transcript = load_validated_runtime_transcript(
+        connection,
+        options.assistant_name,
+        options.ensure_alternating_roles,
+    )?;
     let recall_context = recall_memory_context_messages(
         options.memory_recall_classifier_enabled,
         options.memory_recall_classifier_window,
@@ -1114,8 +1159,11 @@ fn run_prompt_with_model_and_registry_stream(
     }
     let orchestrator = ConversationOrchestrator::new(2);
     let tool_executor = Box::new(LocalToolExecutor::new(executable_tools));
-    let existing_transcript =
-        load_validated_runtime_transcript(&mut connection, options.assistant_name)?;
+    let existing_transcript = load_validated_runtime_transcript(
+        &mut connection,
+        options.assistant_name,
+        options.ensure_alternating_roles,
+    )?;
     let recall_context = recall_memory_context_messages(
         options.memory_recall_classifier_enabled,
         options.memory_recall_classifier_window,
@@ -1307,6 +1355,7 @@ fn run_background_codex_completion_followup(
             persist_input_message: false,
             force_tool: None,
             assistant_name: &config.assistant_name,
+            ensure_alternating_roles: config.llm_provider() == LlmProvider::Anthropic,
             home_dir: &config.home_dir,
             bootstrap_plan: BootstrapPlan::from_config(config),
             messages_between_memory: config.messages_between_memory,
@@ -2219,6 +2268,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
             match load_validated_runtime_transcript(
                 &mut connection,
                 &config_for_show_context.assistant_name,
+                config_for_show_context.llm_provider() == LlmProvider::Anthropic,
             ) {
                 Ok(messages) => {
                     let payload = messages
@@ -3788,8 +3838,8 @@ mod tests {
     };
 
     use super::{
-        AppRuntime, LOCAL_USER_TOKEN, PromptExecutionOptions, argument_limit,
-        build_live_tool_registry, build_live_tool_registry_with_codex_bin_and_hook,
+        AppRuntime, LOCAL_USER_TOKEN, PromptExecutionOptions, SYNTHETIC_FIRST_USER_MESSAGE,
+        argument_limit, build_live_tool_registry, build_live_tool_registry_with_codex_bin_and_hook,
         build_recall_query, drop_old_context_messages, due_item_context_messages,
         memory_recall_status_updates, parse_recalled_memory_names, prompt_prelude_status_updates,
         provider_config_from_app_config, recall_memory_context_messages, recalled_memory_names,
@@ -4746,6 +4796,114 @@ mod tests {
     }
 
     #[test]
+    fn app_runtime_load_context_messages_inserts_synthetic_first_user_for_anthropic() {
+        let unique = format!(
+            "elroy-rs-app-repair-first-user-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+
+        let mut connection = open_sqlite_connection(&database_path).expect("database should open");
+        run_migrations(&mut connection).expect("migrations should run");
+        elroy_db::replace_context_messages(
+            &mut connection,
+            LOCAL_USER_TOKEN,
+            &[ConversationMessage::new(
+                MessageRole::Assistant,
+                "hello first",
+            )],
+        )
+        .expect("messages should persist");
+
+        let mut config = AppConfig::defaults();
+        config.home_dir = home.clone();
+        config.memory_dir = memory_dir;
+        config.agenda_dir = agenda_dir;
+        config.database_path = database_path.clone();
+        config.chat_model = "claude-sonnet-4-20250514".to_string();
+
+        let runtime = AppRuntime::new(config);
+        let repaired = runtime
+            .load_context_messages()
+            .expect("context messages should load");
+
+        assert_eq!(repaired.len(), 3);
+        assert_eq!(repaired[0].role, MessageRole::System);
+        assert_eq!(repaired[1].role, MessageRole::User);
+        assert_eq!(
+            repaired[1].content.as_deref(),
+            Some(SYNTHETIC_FIRST_USER_MESSAGE)
+        );
+        assert_eq!(repaired[2].role, MessageRole::Assistant);
+        assert_eq!(repaired[2].content.as_deref(), Some("hello first"));
+
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
+    fn load_snapshot_filters_synthetic_first_user_line() {
+        let unique = format!(
+            "elroy-rs-app-snapshot-filter-synthetic-user-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+
+        let mut config = AppConfig::defaults();
+        config.home_dir = home.clone();
+        config.memory_dir = memory_dir;
+        config.agenda_dir = agenda_dir;
+        config.database_path = database_path.clone();
+
+        let mut connection = open_sqlite_connection(&database_path).expect("database should open");
+        run_migrations(&mut connection).expect("migrations should run");
+        elroy_db::replace_context_messages(
+            &mut connection,
+            LOCAL_USER_TOKEN,
+            &[
+                ConversationMessage::new(MessageRole::System, "system"),
+                ConversationMessage::new(MessageRole::User, SYNTHETIC_FIRST_USER_MESSAGE),
+                ConversationMessage::new(MessageRole::Assistant, "hello"),
+            ],
+        )
+        .expect("messages should persist");
+        drop(connection);
+
+        let snapshot = AppRuntime::new(config)
+            .load_snapshot()
+            .expect("snapshot should load");
+        assert!(
+            !snapshot
+                .conversation_lines
+                .iter()
+                .any(|line| line.contains(SYNTHETIC_FIRST_USER_MESSAGE))
+        );
+        assert!(
+            snapshot
+                .conversation_lines
+                .iter()
+                .any(|line| line == "assistant: hello")
+        );
+
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
     fn live_tool_registry_can_disable_base_tools_from_config() {
         let unique = format!(
             "elroy-rs-app-no-base-tools-{}",
@@ -5210,6 +5368,7 @@ mod tests {
                 persist_input_message: false,
                 force_tool: None,
                 assistant_name: &config.assistant_name,
+                ensure_alternating_roles: config.llm_provider() == LlmProvider::Anthropic,
                 home_dir: &home,
                 bootstrap_plan: BootstrapPlan::from_config(&config),
                 messages_between_memory: config.messages_between_memory,
@@ -5271,6 +5430,7 @@ mod tests {
                 persist_input_message: true,
                 force_tool: None,
                 assistant_name: &config.assistant_name,
+                ensure_alternating_roles: config.llm_provider() == LlmProvider::Anthropic,
                 home_dir: &home,
                 bootstrap_plan: BootstrapPlan::from_config(&config),
                 messages_between_memory: config.messages_between_memory,
@@ -5333,6 +5493,7 @@ mod tests {
                 persist_input_message: true,
                 force_tool: None,
                 assistant_name: &config.assistant_name,
+                ensure_alternating_roles: config.llm_provider() == LlmProvider::Anthropic,
                 home_dir: &home,
                 bootstrap_plan: BootstrapPlan::from_config(&config),
                 messages_between_memory: config.messages_between_memory,
@@ -5352,6 +5513,78 @@ mod tests {
         assert_eq!(stored[2].content.as_deref(), Some("what next"));
         assert_eq!(stored[3].role, MessageRole::Assistant);
         assert_eq!(stored[3].content.as_deref(), Some("repaired reply"));
+
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
+    fn run_prompt_with_model_and_registry_inserts_synthetic_first_user_for_anthropic() {
+        let unique = format!(
+            "elroy-rs-app-prompt-repair-first-user-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+
+        let mut connection = open_sqlite_connection(&database_path).expect("database should open");
+        run_migrations(&mut connection).expect("migrations should run");
+        elroy_db::replace_context_messages(
+            &mut connection,
+            LOCAL_USER_TOKEN,
+            &[ConversationMessage::new(
+                MessageRole::Assistant,
+                "assistant opened first",
+            )],
+        )
+        .expect("messages should persist");
+
+        let model = FakeModel::new(vec![vec![StreamEvent::AssistantResponse {
+            content: "anthropic reply".to_string(),
+        }]]);
+        let mut config = AppConfig::defaults();
+        config.chat_model = "claude-sonnet-4-20250514".to_string();
+        run_prompt_with_model_and_registry(
+            &mut connection,
+            "continue",
+            &model,
+            ExecutableToolRegistry::new(vec![]),
+            PromptExecutionOptions {
+                role: MessageRole::User,
+                persist_input_message: true,
+                force_tool: None,
+                assistant_name: &config.assistant_name,
+                ensure_alternating_roles: true,
+                home_dir: &home,
+                bootstrap_plan: BootstrapPlan::from_config(&config),
+                messages_between_memory: config.messages_between_memory,
+                messages_between_self_reflection: config.messages_between_self_reflection,
+                memory_recall_classifier_enabled: config.memory_recall_classifier_enabled,
+                memory_recall_classifier_window: config.memory_recall_classifier_window,
+            },
+        )
+        .expect("prompt should succeed");
+
+        let stored =
+            elroy_db::load_context_messages(&mut connection, LOCAL_USER_TOKEN).expect("load ok");
+        assert_eq!(stored[0].role, MessageRole::System);
+        assert_eq!(stored[1].role, MessageRole::User);
+        assert_eq!(
+            stored[1].content.as_deref(),
+            Some(SYNTHETIC_FIRST_USER_MESSAGE)
+        );
+        assert_eq!(stored[2].role, MessageRole::Assistant);
+        assert_eq!(stored[2].content.as_deref(), Some("assistant opened first"));
+        assert_eq!(stored[3].role, MessageRole::User);
+        assert_eq!(stored[3].content.as_deref(), Some("continue"));
+        assert_eq!(stored[4].role, MessageRole::Assistant);
+        assert_eq!(stored[4].content.as_deref(), Some("anthropic reply"));
 
         fs::remove_dir_all(home).expect("home should be removed");
     }
@@ -5404,6 +5637,7 @@ mod tests {
                 persist_input_message: true,
                 force_tool: None,
                 assistant_name: &config.assistant_name,
+                ensure_alternating_roles: config.llm_provider() == LlmProvider::Anthropic,
                 home_dir: &home,
                 bootstrap_plan: BootstrapPlan::from_config(&config),
                 messages_between_memory: config.messages_between_memory,
@@ -5470,6 +5704,7 @@ mod tests {
                 persist_input_message: true,
                 force_tool: None,
                 assistant_name: &config.assistant_name,
+                ensure_alternating_roles: config.llm_provider() == LlmProvider::Anthropic,
                 home_dir: &home,
                 bootstrap_plan: BootstrapPlan::from_config(&config),
                 messages_between_memory: config.messages_between_memory,
@@ -5494,6 +5729,7 @@ mod tests {
                 persist_input_message: true,
                 force_tool: None,
                 assistant_name: &config.assistant_name,
+                ensure_alternating_roles: config.llm_provider() == LlmProvider::Anthropic,
                 home_dir: &home,
                 bootstrap_plan: BootstrapPlan::from_config(&config),
                 messages_between_memory: config.messages_between_memory,
@@ -5550,6 +5786,7 @@ mod tests {
                 persist_input_message: true,
                 force_tool: Some("missing_tool"),
                 assistant_name: &config.assistant_name,
+                ensure_alternating_roles: config.llm_provider() == LlmProvider::Anthropic,
                 home_dir: &home,
                 bootstrap_plan: BootstrapPlan::from_config(&config),
                 messages_between_memory: config.messages_between_memory,
@@ -5598,6 +5835,7 @@ mod tests {
                 persist_input_message: true,
                 force_tool: None,
                 assistant_name: &config.assistant_name,
+                ensure_alternating_roles: config.llm_provider() == LlmProvider::Anthropic,
                 home_dir: &home,
                 bootstrap_plan: BootstrapPlan::from_config(&config),
                 messages_between_memory: config.messages_between_memory,
