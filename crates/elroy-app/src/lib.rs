@@ -7268,15 +7268,27 @@ fn recall_memory_context_messages_with_decision(
 
     let recall_query =
         build_recall_query(prompt, context.transcript, memory_recall_classifier_window);
-    let already_recalled = recalled_memory_names(context.transcript);
-    let recalled = select_recalled_memories(&recall_query, context.memories, &already_recalled, 2);
+    let already_recalled_memories = recalled_item_names_by_type(context.transcript, "Memory");
+    let recalled = select_recalled_memories(
+        &recall_query,
+        context.memories,
+        &already_recalled_memories,
+        2,
+    );
+    let already_recalled_due_items = recalled_item_names_by_type(context.transcript, "AgendaItem");
     let reflective_due_items = if reflect {
         select_due_items_by_overlap(&recall_query, context.due_items, 2, None)
+            .into_iter()
+            .filter(|item| !already_recalled_due_items.contains(&item.name))
+            .collect()
     } else {
         Vec::new()
     };
     let reflective_agenda_items = if reflect {
         select_agenda_items_by_overlap(&recall_query, context.agenda_items, 2)
+            .into_iter()
+            .filter(|item| !already_recalled_due_items.contains(&item.name))
+            .collect()
     } else {
         Vec::new()
     };
@@ -7704,7 +7716,15 @@ fn build_reflective_recall_content(
     sections.join("\n\n")
 }
 
+#[cfg(test)]
 fn recalled_memory_names(transcript: &[ConversationMessage]) -> HashSet<String> {
+    recalled_item_names_by_type(transcript, "Memory")
+}
+
+fn recalled_item_names_by_type(
+    transcript: &[ConversationMessage],
+    memory_type: &str,
+) -> HashSet<String> {
     transcript
         .iter()
         .filter(|message| message.role == MessageRole::Tool)
@@ -7713,7 +7733,7 @@ fn recalled_memory_names(transcript: &[ConversationMessage]) -> HashSet<String> 
                 .then_some(message.content.as_deref())
                 .flatten()
         })
-        .flat_map(parse_recalled_memory_names)
+        .flat_map(|content| parse_recalled_item_names(content, memory_type))
         .collect()
 }
 
@@ -7823,7 +7843,12 @@ fn select_recalled_due_items<'a>(
     select_due_items_by_overlap(prompt, due_items, limit, Some(now_iso))
 }
 
+#[cfg(test)]
 fn parse_recalled_memory_names(content: &str) -> Vec<String> {
+    parse_recalled_item_names(content, "Memory")
+}
+
+fn parse_recalled_item_names(content: &str, desired_memory_type: &str) -> Vec<String> {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(content) else {
         return Vec::new();
     };
@@ -7850,7 +7875,7 @@ fn parse_recalled_memory_names(content: &str) -> Vec<String> {
                 .get("memory_type")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("Memory");
-            (memory_type == "Memory").then(|| {
+            (memory_type == desired_memory_type).then(|| {
                 item.get("name")
                     .and_then(serde_json::Value::as_str)
                     .map(|name| name.to_ascii_lowercase())
@@ -8113,9 +8138,10 @@ mod tests {
         determine_memory_recall_decision, drop_old_context_messages, due_item_context_messages,
         format_context_messages_for_summary, format_context_summary_message,
         is_context_refresh_needed, memory_recall_status_updates, message_matches_tool_call_id,
-        parse_memory_recall_decision, parse_recalled_memory_names, prompt_prelude_status_updates,
-        provider_config_from_app_config, recall_due_item_context_messages,
-        recall_memory_context_messages, recalled_memory_names, recent_recall_context,
+        parse_memory_recall_decision, parse_recalled_item_names, parse_recalled_memory_names,
+        prompt_prelude_status_updates, provider_config_from_app_config,
+        recall_due_item_context_messages, recall_memory_context_messages,
+        recalled_item_names_by_type, recalled_memory_names, recent_recall_context,
         refresh_context_if_needed, run_prompt_with_model_and_registry,
         run_prompt_with_model_and_registry_internal, run_prompt_with_model_and_registry_stream,
         select_due_items_by_overlap, select_recalled_due_items, select_recalled_memories,
@@ -15957,6 +15983,80 @@ mod tests {
     }
 
     #[test]
+    fn reflective_recall_skips_already_recalled_due_items_and_agenda_items() {
+        let mut config = AppConfig::defaults();
+        config.memory_recall_classifier_enabled = false;
+        config.reflect = true;
+        let transcript = vec![ConversationMessage::tool_result(
+            "bootstrap-memory-recall",
+            r#"{"content":"Earlier reflective recall.","recall_metadata":[{"memory_type":"AgendaItem","memory_id":2,"name":"Practice Reminder"},{"memory_type":"AgendaItem","memory_id":3,"name":"Drill Plan"}]}"#,
+        )];
+        let due_items = vec![AgendaItemRecord {
+            id: 2,
+            legacy_frontmatter_id: None,
+            name: "practice reminder".to_string(),
+            file_path: "/tmp/practice_reminder.md".to_string(),
+            agenda_date: Some("unscheduled".to_string()),
+            is_completed: false,
+            status: Some("created".to_string()),
+            closing_comment: None,
+            checklist_total: 0,
+            checklist_completed: 0,
+            body: "Bring the resistance bands".to_string(),
+            trigger_datetime: Some("2026-05-20T09:00:00".to_string()),
+            trigger_context: Some("before basketball practice".to_string()),
+            is_active: true,
+            updated_at_unix: 11,
+        }];
+        let agenda_items = vec![AgendaItemRecord {
+            id: 3,
+            legacy_frontmatter_id: None,
+            name: "drill plan".to_string(),
+            file_path: "/tmp/drill_plan.md".to_string(),
+            agenda_date: Some("2026-05-20".to_string()),
+            is_completed: false,
+            status: Some("created".to_string()),
+            closing_comment: None,
+            checklist_total: 0,
+            checklist_completed: 0,
+            body: "Focus on footwork and follow-through".to_string(),
+            trigger_datetime: None,
+            trigger_context: None,
+            is_active: true,
+            updated_at_unix: 12,
+        }];
+
+        let messages = recall_memory_context_messages(
+            config.memory_recall_classifier_enabled,
+            config.memory_recall_classifier_window,
+            config.reflect,
+            "I am heading to basketball practice",
+            RecallContext {
+                transcript: &transcript,
+                memories: &[MemoryRecord {
+                    id: 1,
+                    legacy_frontmatter_id: None,
+                    name: "basketball form".to_string(),
+                    file_path: "/tmp/basketball.md".to_string(),
+                    body: "Remember to follow through on your shot".to_string(),
+                    is_active: true,
+                    updated_at_unix: 10,
+                }],
+                due_items: &due_items,
+                agenda_items: &agenda_items,
+            },
+        );
+
+        let payload = messages[1]
+            .content
+            .as_deref()
+            .expect("reflective recall payload should exist");
+        assert!(payload.contains("basketball form"));
+        assert!(!payload.contains("practice reminder"));
+        assert!(!payload.contains("drill plan"));
+    }
+
+    #[test]
     fn recall_memory_context_messages_limits_to_two_memories() {
         let mut config = AppConfig::defaults();
         config.memory_recall_classifier_enabled = false;
@@ -16223,6 +16323,25 @@ mod tests {
         assert!(names.contains("basketball form"));
         assert!(names.contains("sleep routine"));
         assert!(!names.contains("payroll followup"));
+    }
+
+    #[test]
+    fn parse_reflective_recall_agenda_item_names_from_transcript() {
+        let transcript = vec![ConversationMessage::tool_result(
+            "bootstrap-memory-recall",
+            r#"{"content":"I remember these details may be relevant.","recall_metadata":[{"memory_type":"Memory","memory_id":1,"name":"Basketball Form"},{"memory_type":"AgendaItem","memory_id":9,"name":"Payroll Followup"},{"memory_type":"AgendaItem","memory_id":10,"name":"Drill Plan"}]}"#,
+        )];
+
+        let parsed = parse_recalled_item_names(
+            r#"{"content":"I remember these details may be relevant.","recall_metadata":[{"memory_type":"Memory","memory_id":1,"name":"Basketball Form"},{"memory_type":"AgendaItem","memory_id":9,"name":"Payroll Followup"},{"memory_type":"AgendaItem","memory_id":10,"name":"Drill Plan"}]}"#,
+            "AgendaItem",
+        );
+        let names = recalled_item_names_by_type(&transcript, "AgendaItem");
+
+        assert_eq!(parsed.len(), 2);
+        assert!(names.contains("payroll followup"));
+        assert!(names.contains("drill plan"));
+        assert!(!names.contains("basketball form"));
     }
 
     #[test]
