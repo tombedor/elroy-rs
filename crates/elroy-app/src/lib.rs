@@ -22,8 +22,9 @@ use elroy_db::{
     AgendaItemRecord, BootstrapPlan, MemoryRecord, UserPreferenceRecord,
     find_active_agenda_item_by_name, get_or_create_memory_operation_tracker, list_active_due_items,
     list_active_plain_agenda_items, list_inactive_due_items, load_context_messages,
-    load_messages_by_ids, load_user_preferences, open_sqlite_connection, replace_context_messages,
-    run_migrations, save_memory_operation_tracker, save_user_preferences, search_active_memories,
+    load_messages_by_ids, load_user_preferences, open_sqlite_connection,
+    record_deleted_due_item_tombstone, replace_context_messages, run_migrations,
+    save_memory_operation_tracker, save_user_preferences, search_active_memories,
 };
 use elroy_feature_requests::{
     FeatureRequestRecord, find_best_feature_request_match, get_feature_request,
@@ -1699,10 +1700,14 @@ fn format_due_item_listing(items: &[AgendaItemRecord], active: bool) -> String {
             })
             .unwrap_or_else(|| "N/A".to_string());
         let context = item.trigger_context.as_deref().unwrap_or("N/A").to_string();
-        lines.push(format!(
+        let mut line = format!(
             "- {} | Type: {} | Trigger Time: {} | Context: {} | Text: {}",
             item.name, item_type, trigger_time, context, item.body
-        ));
+        );
+        if !active && let Some(closing_comment) = item.closing_comment.as_deref() {
+            line.push_str(&format!(" | Comment: {closing_comment}"));
+        }
+        lines.push(line);
     }
     lines.join("\n")
 }
@@ -3539,6 +3544,16 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                 return ToolExecutionResult::error("delete_due_item requires a string name");
             };
             let closing_comment = arguments.get("closing_comment").and_then(Value::as_str);
+            let due_item_before_delete = (|| -> Result<Option<AgendaItemRecord>, String> {
+                let mut connection =
+                    open_sqlite_connection(&config_for_due_item_delete.database_path)
+                        .map_err(|error| format!("failed to open database: {error}"))?;
+                run_migrations(&mut connection)
+                    .map_err(|error| format!("failed to run migrations: {error}"))?;
+                let items = list_active_due_items(&connection, 1_000)
+                    .map_err(|error| format!("database query failed: {error}"))?;
+                Ok(items.into_iter().find(|item| item.name == name))
+            })();
             let result = mutate_due_item_file_from_config_with_result(
                 &config_for_due_item_delete,
                 name,
@@ -3562,6 +3577,27 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
             );
             if result.is_error {
                 return result;
+            }
+            match due_item_before_delete {
+                Ok(Some(item)) => {
+                    let persisted = (|| -> Result<(), String> {
+                        let mut connection =
+                            open_sqlite_connection(&config_for_due_item_delete.database_path)
+                                .map_err(|error| format!("failed to open database: {error}"))?;
+                        run_migrations(&mut connection)
+                            .map_err(|error| format!("failed to run migrations: {error}"))?;
+                        record_deleted_due_item_tombstone(&connection, &item, closing_comment)
+                            .map_err(|error| format!("database query failed: {error}"))?;
+                        Ok(())
+                    })();
+                    if let Err(error) = persisted {
+                        return ToolExecutionResult::error(format!(
+                            "failed to persist deleted due item history: {error}"
+                        ));
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => return ToolExecutionResult::error(error),
             }
             let tool_call_id = context_due_item_tool_call_id(name);
             match remove_context_tool_messages_by_id(&config_for_due_item_delete, &tool_call_id) {
@@ -9942,6 +9978,26 @@ mod tests {
         assert!(printed_inactive.content.contains("Inactive Due Items"));
         assert!(printed_inactive.content.contains("call mom"));
         assert!(printed_inactive.content.contains("Type: Contextual"));
+
+        let deleted = registry.invoke(
+            "delete_due_item",
+            "{\"name\":\"pay bill\",\"closing_comment\":\"paid online\"}",
+        );
+        assert!(!deleted.is_error);
+        let inactive_after_delete = registry.invoke("list_inactive_due_items", "{\"limit\":10}");
+        assert!(!inactive_after_delete.is_error);
+        assert!(inactive_after_delete.content.contains("pay bill"));
+        assert!(inactive_after_delete.content.contains("paid online"));
+
+        let printed_inactive_after_delete =
+            registry.invoke("print_inactive_due_items", "{\"n\":10}");
+        assert!(!printed_inactive_after_delete.is_error);
+        assert!(printed_inactive_after_delete.content.contains("pay bill"));
+        assert!(
+            printed_inactive_after_delete
+                .content
+                .contains("Comment: paid online")
+        );
     }
 
     #[test]

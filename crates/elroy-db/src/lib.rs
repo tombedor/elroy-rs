@@ -163,6 +163,19 @@ pub struct AgendaItemRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeletedDueItemTombstoneRecord {
+    pub id: i64,
+    pub name: String,
+    pub agenda_date: Option<String>,
+    pub trigger_datetime: Option<String>,
+    pub trigger_context: Option<String>,
+    pub closing_comment: Option<String>,
+    pub body: String,
+    pub original_file_path: String,
+    pub deleted_at_unix: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserPreferenceRecord {
     pub user_token: String,
     pub assistant_name: Option<String>,
@@ -737,6 +750,105 @@ pub fn list_inactive_due_items(
             body: row.get(12)?,
             is_active: sqlite_flag_is_true(row.get(13)?),
             updated_at_unix: row.get(14)?,
+        })
+    })?;
+    let mut items = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    let tombstones = list_deleted_due_item_tombstones(connection, limit)?;
+    items.extend(tombstones.into_iter().map(|item| AgendaItemRecord {
+        id: item.id,
+        legacy_frontmatter_id: None,
+        name: item.name,
+        file_path: format!(
+            "{}#deleted:{}",
+            item.original_file_path, item.deleted_at_unix
+        ),
+        agenda_date: item.agenda_date,
+        is_completed: false,
+        status: Some("deleted".to_string()),
+        trigger_datetime: item.trigger_datetime,
+        trigger_context: item.trigger_context,
+        closing_comment: item.closing_comment,
+        checklist_total: 0,
+        checklist_completed: 0,
+        body: item.body,
+        is_active: false,
+        updated_at_unix: item.deleted_at_unix,
+    }));
+    items.sort_by(|left, right| {
+        right
+            .updated_at_unix
+            .cmp(&left.updated_at_unix)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    items.truncate(limit);
+    Ok(items)
+}
+
+pub fn record_deleted_due_item_tombstone(
+    connection: &Connection,
+    item: &AgendaItemRecord,
+    closing_comment: Option<&str>,
+) -> rusqlite::Result<i64> {
+    connection.execute(
+        "INSERT INTO deleted_due_item_tombstones (
+            name,
+            agenda_date,
+            trigger_datetime,
+            trigger_context,
+            closing_comment,
+            body,
+            original_file_path,
+            deleted_at_unix
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            item.name,
+            item.agenda_date,
+            item.trigger_datetime,
+            item.trigger_context,
+            closing_comment.or(item.closing_comment.as_deref()),
+            item.body,
+            item.file_path,
+            item.updated_at_unix.max(
+                std::time::SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as i64,
+            ),
+        ],
+    )?;
+    Ok(connection.last_insert_rowid())
+}
+
+pub fn list_deleted_due_item_tombstones(
+    connection: &Connection,
+    limit: usize,
+) -> rusqlite::Result<Vec<DeletedDueItemTombstoneRecord>> {
+    let mut statement = connection.prepare(
+        "SELECT
+            id,
+            name,
+            agenda_date,
+            trigger_datetime,
+            trigger_context,
+            closing_comment,
+            body,
+            original_file_path,
+            deleted_at_unix
+        FROM deleted_due_item_tombstones
+        ORDER BY deleted_at_unix DESC, name ASC
+        LIMIT ?1",
+    )?;
+    let rows = statement.query_map([limit as i64], |row| {
+        Ok(DeletedDueItemTombstoneRecord {
+            id: row.get(0)?,
+            name: row.get(1)?,
+            agenda_date: row.get(2)?,
+            trigger_datetime: row.get(3)?,
+            trigger_context: row.get(4)?,
+            closing_comment: row.get(5)?,
+            body: row.get(6)?,
+            original_file_path: row.get(7)?,
+            deleted_at_unix: row.get(8)?,
         })
     })?;
     rows.collect()
@@ -1359,16 +1471,16 @@ mod tests {
     use std::fs;
 
     use super::{
-        BootstrapInventory, BootstrapPlan, MemoryOperationTrackerRecord, UserPreferenceRecord,
-        archived_markdown_files, bootstrap_database, bootstrap_documents, derived_counts,
-        find_active_agenda_item_by_name, find_active_memory_by_name,
+        AgendaItemRecord, BootstrapInventory, BootstrapPlan, MemoryOperationTrackerRecord,
+        UserPreferenceRecord, archived_markdown_files, bootstrap_database, bootstrap_documents,
+        derived_counts, find_active_agenda_item_by_name, find_active_memory_by_name,
         get_or_create_context_message_set, get_or_create_memory_operation_tracker,
         list_active_agenda_items, list_active_due_items, list_active_memories,
         list_active_plain_agenda_items, list_inactive_due_items, load_context_messages,
         load_memory_operation_tracker, load_messages_by_ids, load_user_preferences, markdown_files,
-        open_sqlite_connection, persist_bootstrap_documents, replace_context_messages,
-        run_migrations, save_memory_operation_tracker, save_user_preferences,
-        search_active_memories, sync_derived_domain_tables,
+        open_sqlite_connection, persist_bootstrap_documents, record_deleted_due_item_tombstone,
+        replace_context_messages, run_migrations, save_memory_operation_tracker,
+        save_user_preferences, search_active_memories, sync_derived_domain_tables,
     };
     use elroy_config::AppConfig;
     use elroy_llm::{ConversationMessage, MessageRole, ToolCall};
@@ -1952,6 +2064,47 @@ mod tests {
         assert_eq!(deleted_flags, None);
 
         fs::remove_dir_all(home).expect("temp directories should be removed");
+    }
+
+    #[test]
+    fn deleted_due_item_tombstones_round_trip_through_inactive_listing() {
+        let mut connection = Connection::open_in_memory().expect("sqlite should open");
+        run_migrations(&mut connection).expect("migrations should run");
+
+        record_deleted_due_item_tombstone(
+            &connection,
+            &AgendaItemRecord {
+                id: 42,
+                legacy_frontmatter_id: None,
+                name: "pay bill".to_string(),
+                file_path: "/tmp/pay_bill.md".to_string(),
+                agenda_date: Some("unscheduled".to_string()),
+                is_completed: false,
+                status: Some("created".to_string()),
+                trigger_datetime: Some("2026-05-15T09:00:00".to_string()),
+                trigger_context: None,
+                closing_comment: None,
+                checklist_total: 0,
+                checklist_completed: 0,
+                body: "Pay bill".to_string(),
+                is_active: true,
+                updated_at_unix: 100,
+            },
+            Some("paid online"),
+        )
+        .expect("tombstone should persist");
+
+        let inactive_due_items =
+            list_inactive_due_items(&connection, 10).expect("inactive due items should query");
+
+        assert_eq!(inactive_due_items.len(), 1);
+        assert_eq!(inactive_due_items[0].name, "pay bill");
+        assert_eq!(inactive_due_items[0].status.as_deref(), Some("deleted"));
+        assert_eq!(
+            inactive_due_items[0].closing_comment.as_deref(),
+            Some("paid online")
+        );
+        assert!(!inactive_due_items[0].is_active);
     }
 
     #[test]
