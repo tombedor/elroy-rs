@@ -20,12 +20,12 @@ use elroy_core::{
     set_background_status, validated_transcript,
 };
 use elroy_db::{
-    AgendaItemRecord, BootstrapPlan, UserPreferenceRecord, find_active_agenda_item_by_name,
-    find_active_memory_by_name, get_or_create_memory_operation_tracker, list_active_due_items,
-    list_active_memories, list_active_plain_agenda_items, list_inactive_due_items,
-    load_context_messages, load_messages_by_ids, load_user_preferences, open_sqlite_connection,
-    replace_context_messages, run_migrations, save_memory_operation_tracker, save_user_preferences,
-    search_active_memories,
+    AgendaItemRecord, BootstrapPlan, MemoryRecord, UserPreferenceRecord,
+    find_active_agenda_item_by_name, find_active_memory_by_name,
+    get_or_create_memory_operation_tracker, list_active_due_items, list_active_memories,
+    list_active_plain_agenda_items, list_inactive_due_items, load_context_messages,
+    load_messages_by_ids, load_user_preferences, open_sqlite_connection, replace_context_messages,
+    run_migrations, save_memory_operation_tracker, save_user_preferences, search_active_memories,
 };
 use elroy_feature_requests::{
     FeatureRequestRecord, find_best_feature_request_match, get_feature_request,
@@ -1591,6 +1591,26 @@ fn format_due_item_listing(items: &[AgendaItemRecord], active: bool) -> String {
         lines.push(format!(
             "- {} | Type: {} | Trigger Time: {} | Context: {} | Text: {}",
             item.name, item_type, trigger_time, context, item.body
+        ));
+    }
+    lines.join("\n")
+}
+
+fn format_memory_detail(memory: &MemoryRecord) -> String {
+    format!("Memory '{}':\n\n{}", memory.name, memory.body)
+}
+
+fn format_memory_listing(memories: &[MemoryRecord]) -> String {
+    if memories.is_empty() {
+        return "No memories found.".to_string();
+    }
+
+    let mut lines = vec!["Memories".to_string()];
+    for memory in memories {
+        lines.push(format!(
+            "- {} | Text: {}",
+            memory.name,
+            excerpt(&memory.body, 180)
         ));
     }
     lines.join("\n")
@@ -4158,21 +4178,9 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
             let limit = argument_limit(&arguments, 10);
             with_tool_connection(&database_path, |connection| {
                 let memories = list_active_memories(connection, limit)?;
-                let payload = memories
-                    .into_iter()
-                    .map(|memory| {
-                        json!({
-                            "name": memory.name,
-                            "file_path": memory.file_path,
-                            "excerpt": excerpt(&memory.body, 180),
-                            "updated_at_unix": memory.updated_at_unix,
-                        })
-                    })
-                    .collect::<Vec<_>>();
-                Ok(ToolExecutionResult::success(
-                    serde_json::to_string_pretty(&payload)
-                        .expect("memory payload should serialize"),
-                ))
+                Ok(ToolExecutionResult::success(format_memory_listing(
+                    &memories,
+                )))
             })
         },
     );
@@ -4630,15 +4638,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                         "memory not found: {name}"
                     )));
                 };
-                Ok(ToolExecutionResult::success(
-                    json!({
-                        "name": memory.name,
-                        "file_path": memory.file_path,
-                        "body": memory.body,
-                        "updated_at_unix": memory.updated_at_unix,
-                    })
-                    .to_string(),
-                ))
+                Ok(ToolExecutionResult::success(format_memory_detail(&memory)))
             })
         },
     );
@@ -6259,10 +6259,12 @@ mod tests {
         assert!(!memory.is_error);
         assert!(memory.content.contains("remember the hill workout"));
         assert!(!printed_memory.is_error);
+        assert!(printed_memory.content.contains("Memory 'runner notes':"));
         assert!(printed_memory.content.contains("remember the hill workout"));
         assert!(!agenda.is_error);
         assert!(agenda.content.contains("bring forms"));
         assert!(!printed_memories.is_error);
+        assert!(printed_memories.content.contains("Memories"));
         assert!(printed_memories.content.contains("runner notes"));
 
         fs::remove_dir_all(home).expect("home should be removed");
