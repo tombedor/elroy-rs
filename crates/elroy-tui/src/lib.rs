@@ -66,6 +66,7 @@ pub struct TuiApp {
     pub input_history: Vec<String>,
     pub history_index: Option<usize>,
     pub history_draft: Option<String>,
+    pub command_form: Option<CommandFormState>,
     pub detail_modal: Option<DetailModalState>,
     pub sidebar_section: SidebarSection,
     pub focus: FocusTarget,
@@ -109,6 +110,28 @@ pub struct TuiSidebarDetail {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TuiCommandParameter {
+    pub name: String,
+    pub optional: bool,
+    pub default_text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TuiCommandForm {
+    pub command_name: String,
+    pub description: String,
+    pub parameters: Vec<TuiCommandParameter>,
+    pub initial_values: Vec<(String, String)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TuiSlashCommandAction {
+    NotHandled,
+    Execute(TuiSnapshot),
+    OpenForm(TuiCommandForm),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DetailModalState {
     pub title: String,
     pub content: String,
@@ -116,6 +139,22 @@ pub struct DetailModalState {
     pub destructive_action: Option<SidebarAction>,
     pub destructive_label: Option<String>,
     pub confirming_destructive: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandFormFieldState {
+    pub name: String,
+    pub value: String,
+    pub optional: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandFormState {
+    pub command_name: String,
+    pub description: String,
+    pub fields: Vec<CommandFormFieldState>,
+    pub selected_field: usize,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -148,7 +187,12 @@ pub trait TuiPromptStream {
 
 pub trait TuiRuntime {
     fn load_snapshot(&mut self) -> Result<TuiSnapshot, String>;
-    fn execute_slash_command(&mut self, prompt: &str) -> Result<Option<TuiSnapshot>, String>;
+    fn handle_slash_command(&mut self, prompt: &str) -> Result<TuiSlashCommandAction, String>;
+    fn submit_command_form(
+        &mut self,
+        command_name: &str,
+        values: &[(String, String)],
+    ) -> Result<TuiSnapshot, String>;
     fn submit_prompt(&mut self, prompt: &str) -> Result<TuiSnapshot, String>;
     fn start_prompt_stream(&mut self, prompt: &str) -> Result<Box<dyn TuiPromptStream>, String>;
     fn start_startup_prompt_stream(&mut self) -> Result<Option<Box<dyn TuiPromptStream>>, String>;
@@ -333,6 +377,11 @@ fn apply_key_event(
         return TuiExit::Continue;
     }
 
+    if app.command_form.is_some() {
+        handle_command_form_key(app, key, runtime);
+        return TuiExit::Continue;
+    }
+
     if app.detail_modal.is_some() {
         if let Some(token) = modal_key_token(key) {
             let intent = app.handle_modal_key(token);
@@ -385,15 +434,28 @@ fn apply_intent_with_runtime(
                     .to_string();
                 return;
             }
-            match runtime.execute_slash_command(&submitted) {
-                Ok(Some(snapshot)) => {
+            match runtime.handle_slash_command(&submitted) {
+                Ok(TuiSlashCommandAction::Execute(snapshot)) => {
                     app.record_submitted_prompt(&submitted);
                     app.input.clear();
                     app.apply_snapshot(snapshot);
                     app.focus = FocusTarget::Input;
                     return;
                 }
-                Ok(None) => {}
+                Ok(TuiSlashCommandAction::OpenForm(form)) => {
+                    app.record_submitted_prompt(&submitted);
+                    app.input.clear();
+                    app.open_command_form(form);
+                    app.status = format!(
+                        "editing slash command: /{}",
+                        app.command_form
+                            .as_ref()
+                            .expect("command form should open")
+                            .command_name
+                    );
+                    return;
+                }
+                Ok(TuiSlashCommandAction::NotHandled) => {}
                 Err(error) => {
                     app.status = format!("slash command failed: {error}");
                     return;
@@ -685,6 +747,7 @@ impl TuiApp {
             input_history: Vec::new(),
             history_index: None,
             history_draft: None,
+            command_form: None,
             detail_modal: None,
             sidebar_section: SidebarSection::Memories,
             focus: FocusTarget::Input,
@@ -830,7 +893,9 @@ impl TuiApp {
         ))
         .render(vertical[2], buf);
 
-        if let Some(detail_modal) = &self.detail_modal {
+        if let Some(command_form) = &self.command_form {
+            self.render_command_form_modal(command_form, area, buf);
+        } else if let Some(detail_modal) = &self.detail_modal {
             self.render_detail_modal(detail_modal, area, buf);
         }
     }
@@ -933,6 +998,47 @@ impl TuiApp {
             .render(sections[1], buf);
     }
 
+    fn render_command_form_modal(
+        &self,
+        command_form: &CommandFormState,
+        area: Rect,
+        buf: &mut Buffer,
+    ) {
+        let modal_area = centered_rect(area, 72, 60);
+        Clear.render(modal_area, buf);
+        let mut lines = vec![
+            format!("/{}", command_form.command_name),
+            command_form.description.clone(),
+            String::new(),
+        ];
+        for (index, field) in command_form.fields.iter().enumerate() {
+            let marker = if index == command_form.selected_field {
+                ">"
+            } else {
+                " "
+            };
+            let optional = if field.optional { " (optional)" } else { "" };
+            lines.push(format!(
+                "{marker} {}{}: {}",
+                field.name, optional, field.value
+            ));
+        }
+        if let Some(error) = &command_form.error {
+            lines.push(String::new());
+            lines.push(format!("Error: {error}"));
+        }
+        let sections = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(1), Constraint::Length(1)])
+            .split(modal_area);
+        Paragraph::new(lines.join("\n"))
+            .block(Block::default().title("Command").borders(Borders::ALL))
+            .render(sections[0], buf);
+        Paragraph::new(command_form.footer_text())
+            .block(Block::default().borders(Borders::LEFT | Borders::RIGHT | Borders::BOTTOM))
+            .render(sections[1], buf);
+    }
+
     pub fn open_detail_modal(&mut self, detail: TuiSidebarDetail) {
         self.detail_modal = Some(DetailModalState {
             title: detail.title,
@@ -942,6 +1048,10 @@ impl TuiApp {
             destructive_label: detail.destructive_label,
             confirming_destructive: false,
         });
+    }
+
+    pub fn open_command_form(&mut self, command_form: TuiCommandForm) {
+        self.command_form = Some(CommandFormState::from(command_form));
     }
 
     fn record_submitted_prompt(&mut self, submitted: &str) {
@@ -1320,6 +1430,123 @@ impl DetailModalState {
     }
 }
 
+impl From<TuiCommandForm> for CommandFormState {
+    fn from(value: TuiCommandForm) -> Self {
+        let fields = value
+            .parameters
+            .into_iter()
+            .map(|parameter| CommandFormFieldState {
+                value: value
+                    .initial_values
+                    .iter()
+                    .find(|(name, _)| *name == parameter.name)
+                    .map(|(_, field_value)| field_value.clone())
+                    .unwrap_or(parameter.default_text),
+                name: parameter.name,
+                optional: parameter.optional,
+            })
+            .collect::<Vec<_>>();
+        let selected_field = fields
+            .iter()
+            .position(|field| !field.optional && field.value.trim().is_empty())
+            .unwrap_or(0);
+        Self {
+            command_name: value.command_name,
+            description: value.description,
+            fields,
+            selected_field,
+            error: None,
+        }
+    }
+}
+
+impl CommandFormState {
+    fn footer_text(&self) -> String {
+        "Type to edit  Tab/Shift+Tab move  Enter run  Escape cancel".to_string()
+    }
+
+    fn move_selection(&mut self, delta: isize) {
+        if self.fields.is_empty() {
+            return;
+        }
+        let len = self.fields.len() as isize;
+        let current = self.selected_field as isize;
+        self.selected_field = (current + delta).rem_euclid(len) as usize;
+        self.error = None;
+    }
+
+    fn selected_field_mut(&mut self) -> Option<&mut CommandFormFieldState> {
+        self.fields.get_mut(self.selected_field)
+    }
+}
+
+fn handle_command_form_key(app: &mut TuiApp, key: KeyEvent, runtime: &mut impl TuiRuntime) {
+    let Some(command_form) = app.command_form.as_mut() else {
+        return;
+    };
+
+    match (key.code, key.modifiers) {
+        (KeyCode::Esc, _) => {
+            app.command_form = None;
+        }
+        (KeyCode::Tab, KeyModifiers::SHIFT) | (KeyCode::BackTab, _) => {
+            command_form.move_selection(-1);
+        }
+        (KeyCode::Tab, _) | (KeyCode::Down, _) => {
+            command_form.move_selection(1);
+        }
+        (KeyCode::Up, _) => {
+            command_form.move_selection(-1);
+        }
+        (KeyCode::Backspace, _) => {
+            if let Some(field) = command_form.selected_field_mut() {
+                field.value.pop();
+                command_form.error = None;
+            }
+        }
+        (KeyCode::Char(ch), modifiers) if !modifiers.contains(KeyModifiers::CONTROL) => {
+            if let Some(field) = command_form.selected_field_mut() {
+                field.value.push(ch);
+                command_form.error = None;
+            }
+        }
+        (KeyCode::Enter, _) => {
+            if let Some(field) = command_form
+                .fields
+                .iter()
+                .find(|field| !field.optional && field.value.trim().is_empty())
+            {
+                command_form.error = Some(format!("Missing required value for '{}'", field.name));
+                command_form.selected_field = command_form
+                    .fields
+                    .iter()
+                    .position(|candidate| candidate.name == field.name)
+                    .unwrap_or(command_form.selected_field);
+                return;
+            }
+            let command_name = command_form.command_name.clone();
+            let values = command_form
+                .fields
+                .iter()
+                .map(|field| (field.name.clone(), field.value.trim().to_string()))
+                .collect::<Vec<_>>();
+            match runtime.submit_command_form(&command_name, &values) {
+                Ok(snapshot) => {
+                    app.command_form = None;
+                    app.apply_snapshot(snapshot);
+                    app.focus = FocusTarget::Input;
+                }
+                Err(error) => {
+                    if let Some(form) = app.command_form.as_mut() {
+                        form.error = Some(error);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 fn centered_rect(area: Rect, width_percent: u16, height_percent: u16) -> Rect {
     let popup_layout = Layout::default()
         .direction(Direction::Vertical)
@@ -1378,8 +1605,16 @@ impl TuiRuntime for NoopRuntime {
         Ok(TuiSnapshot::default())
     }
 
-    fn execute_slash_command(&mut self, _prompt: &str) -> Result<Option<TuiSnapshot>, String> {
-        Ok(None)
+    fn handle_slash_command(&mut self, _prompt: &str) -> Result<TuiSlashCommandAction, String> {
+        Ok(TuiSlashCommandAction::NotHandled)
+    }
+
+    fn submit_command_form(
+        &mut self,
+        _command_name: &str,
+        _values: &[(String, String)],
+    ) -> Result<TuiSnapshot, String> {
+        Ok(TuiSnapshot::default())
     }
 
     fn submit_prompt(&mut self, _prompt: &str) -> Result<TuiSnapshot, String> {
@@ -1456,17 +1691,19 @@ mod tests {
 
     use super::{
         CommandPane, FocusTarget, PendingPrompt, PromptAdvance, PromptUpdate, SidebarAction,
-        SidebarSection, TuiApp, TuiContextMessage, TuiExit, TuiPromptStream, TuiRuntime,
-        TuiSidebarDetail, TuiSnapshot, UiIntent, advance_prompt_stream, apply_intent_with_runtime,
-        apply_key_event, key_event_token, maybe_refresh_snapshot_after_background_completion,
+        SidebarSection, TuiApp, TuiCommandForm, TuiCommandParameter, TuiContextMessage, TuiExit,
+        TuiPromptStream, TuiRuntime, TuiSidebarDetail, TuiSlashCommandAction, TuiSnapshot,
+        UiIntent, advance_prompt_stream, apply_intent_with_runtime, apply_key_event,
+        key_event_token, maybe_refresh_snapshot_after_background_completion,
         maybe_run_deferred_context_refresh, poll_context_updates, start_startup_prompt_stream,
     };
 
     #[derive(Default)]
     struct FakeRuntime {
         snapshot: TuiSnapshot,
-        slash_command_snapshot: Option<TuiSnapshot>,
+        slash_command_action: Option<TuiSlashCommandAction>,
         slash_command_error: Option<String>,
+        submitted_command_forms: Vec<(String, Vec<(String, String)>)>,
         submitted_prompts: Vec<String>,
         self_reflection_runs: usize,
         last_opened: Option<(SidebarSection, String)>,
@@ -1508,15 +1745,32 @@ mod tests {
             Ok(self.snapshot.clone())
         }
 
-        fn execute_slash_command(&mut self, prompt: &str) -> Result<Option<TuiSnapshot>, String> {
+        fn handle_slash_command(&mut self, prompt: &str) -> Result<TuiSlashCommandAction, String> {
             if prompt.starts_with('/') {
                 if let Some(error) = &self.slash_command_error {
                     return Err(error.clone());
                 }
-                Ok(self.slash_command_snapshot.clone())
+                Ok(self
+                    .slash_command_action
+                    .clone()
+                    .unwrap_or(TuiSlashCommandAction::NotHandled))
             } else {
-                Ok(None)
+                Ok(TuiSlashCommandAction::NotHandled)
             }
+        }
+
+        fn submit_command_form(
+            &mut self,
+            command_name: &str,
+            values: &[(String, String)],
+        ) -> Result<TuiSnapshot, String> {
+            self.submitted_command_forms
+                .push((command_name.to_string(), values.to_vec()));
+            Ok(TuiSnapshot {
+                conversation_lines: vec![format!("tool result: submitted /{command_name}")],
+                status: Some(format!("slash command executed: /{command_name}")),
+                ..TuiSnapshot::default()
+            })
         }
 
         fn submit_prompt(&mut self, prompt: &str) -> Result<TuiSnapshot, String> {
@@ -1994,11 +2248,11 @@ mod tests {
         let mut app = TuiApp::bootstrap();
         app.input = "/help".to_string();
         let mut runtime = FakeRuntime {
-            slash_command_snapshot: Some(TuiSnapshot {
+            slash_command_action: Some(TuiSlashCommandAction::Execute(TuiSnapshot {
                 conversation_lines: vec!["tool result: Available commands...".to_string()],
                 status: Some("slash command executed: /help".to_string()),
                 ..TuiSnapshot::default()
-            }),
+            })),
             ..FakeRuntime::default()
         };
         let mut pending = None;
@@ -2037,6 +2291,120 @@ mod tests {
             "slash command failed: Missing required value for 'memory_name'"
         );
         assert!(app.input_history.is_empty());
+    }
+
+    #[test]
+    fn slash_command_submit_opens_prefilled_command_form() {
+        let mut app = TuiApp::bootstrap();
+        app.input = "/create_memory trip".to_string();
+        let mut runtime = FakeRuntime {
+            slash_command_action: Some(TuiSlashCommandAction::OpenForm(TuiCommandForm {
+                command_name: "create_memory".to_string(),
+                description: "Create a memory".to_string(),
+                parameters: vec![
+                    TuiCommandParameter {
+                        name: "name".to_string(),
+                        optional: false,
+                        default_text: String::new(),
+                    },
+                    TuiCommandParameter {
+                        name: "text".to_string(),
+                        optional: false,
+                        default_text: String::new(),
+                    },
+                ],
+                initial_values: vec![("name".to_string(), "trip".to_string())],
+            })),
+            ..FakeRuntime::default()
+        };
+        let mut pending = None;
+
+        apply_intent_with_runtime(&mut app, UiIntent::SubmitPrompt, &mut runtime, &mut pending);
+
+        assert!(pending.is_none());
+        assert!(runtime.submitted_prompts.is_empty());
+        assert_eq!(app.input, "");
+        assert_eq!(app.input_history, vec!["/create_memory trip".to_string()]);
+        let command_form = app.command_form.as_ref().expect("command form should open");
+        assert_eq!(command_form.command_name, "create_memory");
+        assert_eq!(command_form.selected_field, 1);
+        assert_eq!(command_form.fields[0].name, "name");
+        assert_eq!(command_form.fields[0].value, "trip");
+        assert_eq!(command_form.fields[1].name, "text");
+        assert_eq!(command_form.fields[1].value, "");
+    }
+
+    #[test]
+    fn command_form_submit_executes_runtime_command() {
+        let mut app = TuiApp::bootstrap();
+        app.open_command_form(TuiCommandForm {
+            command_name: "create_memory".to_string(),
+            description: "Create a memory".to_string(),
+            parameters: vec![
+                TuiCommandParameter {
+                    name: "name".to_string(),
+                    optional: false,
+                    default_text: String::new(),
+                },
+                TuiCommandParameter {
+                    name: "text".to_string(),
+                    optional: false,
+                    default_text: String::new(),
+                },
+            ],
+            initial_values: vec![("name".to_string(), "trip".to_string())],
+        });
+        let mut runtime = FakeRuntime::default();
+        let mut pending = None;
+
+        apply_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+            &mut runtime,
+            &mut pending,
+        );
+        apply_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE),
+            &mut runtime,
+            &mut pending,
+        );
+        apply_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE),
+            &mut runtime,
+            &mut pending,
+        );
+        apply_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+            &mut runtime,
+            &mut pending,
+        );
+        apply_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut runtime,
+            &mut pending,
+        );
+
+        assert!(app.command_form.is_none());
+        assert_eq!(app.focus, FocusTarget::Input);
+        assert_eq!(
+            runtime.submitted_command_forms,
+            vec![(
+                "create_memory".to_string(),
+                vec![
+                    ("name".to_string(), "trip".to_string()),
+                    ("text".to_string(), "note".to_string()),
+                ],
+            )]
+        );
+        assert_eq!(
+            app.conversation_lines.last().map(String::as_str),
+            Some("tool result: submitted /create_memory")
+        );
+        assert_eq!(app.status, "slash command executed: /create_memory");
     }
 
     #[test]

@@ -48,9 +48,12 @@ use elroy_tasks::{
 use elroy_tools::{
     ExecutableTool, ExecutableToolRegistry, JsonSchema, ToolExecutionResult, ToolRegistry, ToolSpec,
 };
-use elroy_tui::{SidebarAction, SidebarSection, TuiSidebarDetail, TuiSnapshot};
+use elroy_tui::{
+    SidebarAction, SidebarSection, TuiCommandForm, TuiCommandParameter, TuiSidebarDetail,
+    TuiSlashCommandAction, TuiSnapshot,
+};
 use elroy_user::{effective_persona, effective_user_full_name, effective_user_preferred_name};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 const LOCAL_USER_TOKEN: &str = "local-user";
 const SYNTHETIC_FIRST_USER_MESSAGE: &str = "The user has begun the conversation";
@@ -288,10 +291,10 @@ impl AppRuntime {
         )
     }
 
-    pub fn execute_slash_command(&self, prompt: &str) -> Result<Option<TuiSnapshot>, AppError> {
+    pub fn handle_slash_command(&self, prompt: &str) -> Result<TuiSlashCommandAction, AppError> {
         let trimmed = prompt.trim();
         let Some(command_text) = trimmed.strip_prefix('/') else {
-            return Ok(None);
+            return Ok(TuiSlashCommandAction::NotHandled);
         };
         let parts = command_text.split_whitespace().collect::<Vec<_>>();
         if parts.is_empty() {
@@ -317,26 +320,62 @@ impl AppRuntime {
             required,
             ..
         } = &spec.parameters;
-        if raw_values.len() < required.len() {
-            let missing_name = required
-                .get(raw_values.len())
-                .cloned()
-                .unwrap_or_else(|| "value".to_string());
-            return Err(AppError::Runtime(format!(
-                "Missing required value for '{missing_name}'"
-            )));
-        }
-        if raw_values.len() > properties.len() {
+        let parameters = ordered_command_parameters(command_name, properties, required);
+        if raw_values.len() > parameters.len() {
             return Err(AppError::Runtime(format!(
                 "Too many values provided for '{slash_name}'"
             )));
         }
+        let required_count = parameters
+            .iter()
+            .filter(|parameter| !parameter.optional)
+            .count();
+        if raw_values.len() < required_count {
+            return Ok(TuiSlashCommandAction::OpenForm(TuiCommandForm {
+                command_name: command_name.to_string(),
+                description: spec.description,
+                parameters: parameters.clone(),
+                initial_values: parameters
+                    .iter()
+                    .zip(raw_values.iter())
+                    .map(|(parameter, value)| (parameter.name.clone(), (*value).to_string()))
+                    .collect(),
+            }));
+        }
 
-        let arguments = Value::Object(
-            properties
-                .keys()
+        let snapshot = self.execute_command_with_values(
+            command_name,
+            slash_name,
+            parameters
+                .iter()
                 .zip(raw_values.iter())
-                .map(|(name, value)| (name.clone(), Value::String((*value).to_string())))
+                .map(|(parameter, value)| (parameter.name.clone(), (*value).to_string()))
+                .collect::<Vec<_>>()
+                .as_slice(),
+        )?;
+        Ok(TuiSlashCommandAction::Execute(snapshot))
+    }
+
+    pub fn submit_command_form(
+        &self,
+        command_name: &str,
+        values: &[(String, String)],
+    ) -> Result<TuiSnapshot, AppError> {
+        self.execute_command_with_values(command_name, command_name, values)
+    }
+
+    fn execute_command_with_values(
+        &self,
+        command_name: &str,
+        slash_name: &str,
+        values: &[(String, String)],
+    ) -> Result<TuiSnapshot, AppError> {
+        let registry = build_live_tool_registry(&self.config);
+        let arguments = Value::Object(
+            values
+                .iter()
+                .filter(|(_, value)| !value.trim().is_empty())
+                .map(|(name, value)| (name.clone(), Value::String(value.clone())))
                 .collect(),
         );
         let result = registry.invoke(command_name, &arguments.to_string());
@@ -356,7 +395,7 @@ impl AppRuntime {
         } else {
             format!("slash command executed: /{slash_name}")
         });
-        Ok(Some(snapshot))
+        Ok(snapshot)
     }
 
     pub fn refresh_context_if_needed(&self) -> Result<bool, AppError> {
@@ -767,6 +806,78 @@ impl AppRuntime {
         let connection = open_sqlite_connection(&self.config.database_path)?;
         Ok(connection)
     }
+}
+
+fn ordered_command_parameters(
+    command_name: &str,
+    properties: &Map<String, Value>,
+    required: &[String],
+) -> Vec<TuiCommandParameter> {
+    let mut names = properties.keys().cloned().collect::<Vec<_>>();
+    drop_legacy_alias(&mut names, "memory_name", "name");
+    drop_legacy_alias(&mut names, "item_date", "date");
+    drop_legacy_alias(&mut names, "old_name", "name");
+    drop_legacy_alias(&mut names, "new_text", "text");
+    names.sort_by_key(|name| preferred_command_parameter_rank(command_name, name));
+    names
+        .into_iter()
+        .map(|name| TuiCommandParameter {
+            optional: !required.contains(&name)
+                && !canonical_alias_field_is_required(&name, properties),
+            default_text: String::new(),
+            name,
+        })
+        .collect()
+}
+
+fn drop_legacy_alias(names: &mut Vec<String>, canonical: &str, alias: &str) {
+    if names.iter().any(|name| name == canonical) {
+        names.retain(|name| name != alias);
+    }
+}
+
+fn canonical_alias_field_is_required(name: &str, properties: &Map<String, Value>) -> bool {
+    matches!(name, "memory_name" | "item_date" | "old_name" | "new_text")
+        && match name {
+            "memory_name" => properties.contains_key("name"),
+            "item_date" => properties.contains_key("date"),
+            "old_name" => properties.contains_key("name"),
+            "new_text" => properties.contains_key("text"),
+            _ => false,
+        }
+}
+
+fn preferred_command_parameter_rank(command_name: &str, name: &str) -> usize {
+    const ORDER: &[&str] = &[
+        "name",
+        "memory_name",
+        "item_name",
+        "old_name",
+        "new_name",
+        "text",
+        "new_text",
+        "question",
+        "query",
+        "item_date",
+        "date",
+        "trigger_time",
+        "trigger_datetime",
+        "trigger_context",
+        "closing_comment",
+        "path",
+        "start_line",
+        "end_line",
+        "n",
+    ];
+
+    if command_name == "get_help" {
+        return usize::MAX;
+    }
+
+    ORDER
+        .iter()
+        .position(|candidate| *candidate == name)
+        .unwrap_or(ORDER.len() + name.bytes().next().unwrap_or_default() as usize)
 }
 
 fn load_snapshot_from_connection(
@@ -7267,6 +7378,7 @@ mod tests {
     use elroy_llm::{ConversationMessage, MessageRole, Provider, StreamEvent};
     use elroy_memory::{create_memory_file, sanitize_filename};
     use elroy_tools::ExecutableToolRegistry;
+    use elroy_tui::TuiSlashCommandAction;
 
     fn seed_competing_memory_record(
         connection: &rusqlite::Connection,
@@ -10764,7 +10876,7 @@ mod tests {
     }
 
     #[test]
-    fn execute_slash_command_runs_help_and_parameterized_commands() {
+    fn handle_slash_command_executes_and_launches_forms() {
         let unique = format!(
             "elroy-rs-app-slash-command-exec-{}",
             std::time::SystemTime::now()
@@ -10786,10 +10898,12 @@ mod tests {
         config.database_path = database_path;
 
         let runtime = AppRuntime::new(config);
-        let help_snapshot = runtime
-            .execute_slash_command("/help")
+        let TuiSlashCommandAction::Execute(help_snapshot) = runtime
+            .handle_slash_command("/help")
             .expect("slash command should execute")
-            .expect("help should execute as zero-arg command");
+        else {
+            panic!("help should execute immediately");
+        };
         assert_eq!(
             help_snapshot.status.as_deref(),
             Some("slash command executed: /help")
@@ -10813,10 +10927,12 @@ mod tests {
         );
         assert!(!create_memory.is_error);
 
-        let shown_snapshot = runtime
-            .execute_slash_command("/show_memory runner")
+        let TuiSlashCommandAction::Execute(shown_snapshot) = runtime
+            .handle_slash_command("/show_memory runner")
             .expect("parameterized slash command should execute")
-            .expect("show_memory should execute when all values are provided");
+        else {
+            panic!("show_memory should execute when all values are provided");
+        };
         assert_eq!(
             shown_snapshot.status.as_deref(),
             Some("slash command executed: /show_memory")
@@ -10828,24 +10944,59 @@ mod tests {
                 .is_some_and(|line| line.contains("Remember the training plan."))
         );
 
-        let missing_value_snapshot = runtime
-            .execute_slash_command("/show_memory")
+        let TuiSlashCommandAction::OpenForm(missing_form) = runtime
+            .handle_slash_command("/show_memory")
             .expect("underspecified slash command should stay local")
-            .expect("underspecified known command should return a failed snapshot");
+        else {
+            panic!("underspecified known command should open a form");
+        };
+        assert_eq!(missing_form.command_name, "show_memory");
+        assert_eq!(missing_form.parameters.len(), 1);
+        assert_eq!(missing_form.parameters[0].name, "memory_name");
+        assert!(missing_form.initial_values.is_empty());
+
+        let TuiSlashCommandAction::OpenForm(prefilled_form) = runtime
+            .handle_slash_command("/create_memory trip")
+            .expect("partially specified slash command should open a form")
+        else {
+            panic!("create_memory with one value should open a form");
+        };
+        assert_eq!(prefilled_form.command_name, "create_memory");
         assert_eq!(
-            missing_value_snapshot.status.as_deref(),
-            Some("slash command failed: /show_memory")
+            prefilled_form.initial_values,
+            vec![("name".to_string(), "trip".to_string())]
         );
         assert!(
-            missing_value_snapshot
-                .conversation_lines
-                .last()
-                .is_some_and(|line| line.contains("tool error: show_memory requires a string name"))
+            prefilled_form
+                .parameters
+                .iter()
+                .map(|parameter| parameter.name.as_str())
+                .eq(["name", "text"])
         );
         assert!(
             runtime
-                .execute_slash_command("/missing_command")
+                .handle_slash_command("/missing_command")
                 .is_err_and(|error| error.to_string() == "Invalid command: missing_command")
+        );
+
+        let submitted_snapshot = runtime
+            .submit_command_form(
+                "create_memory",
+                &[
+                    ("name".to_string(), "trip".to_string()),
+                    ("text".to_string(), "Aisle seats.".to_string()),
+                ],
+            )
+            .expect("command form submit should execute");
+        assert_eq!(
+            submitted_snapshot.status.as_deref(),
+            Some("slash command executed: /create_memory")
+        );
+        assert!(
+            submitted_snapshot
+                .conversation_lines
+                .last()
+                .is_some_and(|line| line.contains("New memory created: trip"))
         );
 
         fs::remove_dir_all(home).expect("home should be removed");

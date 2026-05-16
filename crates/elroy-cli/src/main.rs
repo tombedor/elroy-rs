@@ -263,16 +263,30 @@ impl TuiRuntime for CliTuiRuntime {
             .map_err(|error| error.to_string())
     }
 
-    fn execute_slash_command(
+    fn handle_slash_command(
         &mut self,
         prompt: &str,
-    ) -> Result<Option<elroy_tui::TuiSnapshot>, String> {
+    ) -> Result<elroy_tui::TuiSlashCommandAction, String> {
         self.poll_deferred_context_refresh();
         self.poll_deferred_self_reflection();
         self.clear_deferred_context_refresh_error();
         self.clear_deferred_self_reflection_error();
         self.runtime
-            .execute_slash_command(prompt)
+            .handle_slash_command(prompt)
+            .map_err(|error| error.to_string())
+    }
+
+    fn submit_command_form(
+        &mut self,
+        command_name: &str,
+        values: &[(String, String)],
+    ) -> Result<elroy_tui::TuiSnapshot, String> {
+        self.poll_deferred_context_refresh();
+        self.poll_deferred_self_reflection();
+        self.clear_deferred_context_refresh_error();
+        self.clear_deferred_self_reflection_error();
+        self.runtime
+            .submit_command_form(command_name, values)
             .map_err(|error| error.to_string())
     }
 
