@@ -21,10 +21,9 @@ use elroy_core::{
 use elroy_db::{
     AgendaItemRecord, BootstrapPlan, MemoryRecord, UserPreferenceRecord,
     find_active_agenda_item_by_name, get_or_create_memory_operation_tracker, list_active_due_items,
-    list_active_memories, list_active_plain_agenda_items, list_inactive_due_items,
-    load_context_messages, load_messages_by_ids, load_user_preferences, open_sqlite_connection,
-    replace_context_messages, run_migrations, save_memory_operation_tracker, save_user_preferences,
-    search_active_memories,
+    list_active_plain_agenda_items, list_inactive_due_items, load_context_messages,
+    load_messages_by_ids, load_user_preferences, open_sqlite_connection, replace_context_messages,
+    run_migrations, save_memory_operation_tracker, save_user_preferences, search_active_memories,
 };
 use elroy_feature_requests::{
     FeatureRequestRecord, find_best_feature_request_match, get_feature_request,
@@ -1479,7 +1478,8 @@ fn consolidate_exact_duplicate_memories(
     connection: &mut rusqlite::Connection,
     bootstrap_plan: &BootstrapPlan,
 ) -> Result<(), AppError> {
-    let active_memories = list_active_memories(connection, 500)?;
+    let active_memories =
+        list_active_memories_in_scope(connection, &bootstrap_plan.memory_dir, 500)?;
     let mut groups = HashMap::<String, Vec<MemoryRecord>>::new();
     for memory in active_memories {
         let normalized = normalize_memory_body(&memory.body);
@@ -6771,12 +6771,12 @@ mod tests {
         AppRuntime, LOCAL_USER_TOKEN, PromptExecutionOptions, SYNTHETIC_FIRST_USER_MESSAGE,
         argument_limit, build_live_tool_registry, build_live_tool_registry_with_codex_bin_and_hook,
         build_recall_query, codex_background_status_key, compress_context_messages,
-        context_task_tool_call_id, count_context_tokens, drop_old_context_messages,
-        due_item_context_messages, format_context_summary_message, is_context_refresh_needed,
-        memory_recall_status_updates, parse_recalled_memory_names, prompt_prelude_status_updates,
-        provider_config_from_app_config, recall_due_item_context_messages,
-        recall_memory_context_messages, recalled_memory_names, recent_recall_context,
-        refresh_context_if_needed, run_prompt_with_model_and_registry,
+        consolidate_exact_duplicate_memories, context_task_tool_call_id, count_context_tokens,
+        drop_old_context_messages, due_item_context_messages, format_context_summary_message,
+        is_context_refresh_needed, memory_recall_status_updates, parse_recalled_memory_names,
+        prompt_prelude_status_updates, provider_config_from_app_config,
+        recall_due_item_context_messages, recall_memory_context_messages, recalled_memory_names,
+        recent_recall_context, refresh_context_if_needed, run_prompt_with_model_and_registry,
         run_prompt_with_model_and_registry_stream, select_due_items_by_overlap,
         select_recalled_due_items, select_recalled_memories, should_offer_greeting,
         should_skip_memory_recall, significant_tokens, strip_input_message_for_persistence,
@@ -8221,6 +8221,82 @@ mod tests {
         );
 
         fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
+    fn exact_duplicate_consolidation_scopes_to_current_memory_dir() {
+        let unique = format!(
+            "elroy-rs-app-memory-consolidation-scope-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let root = std::env::temp_dir().join(unique);
+        let current_home = root.join("current-user");
+        let current_memory_dir = current_home.join("memories");
+        let other_memory_dir = root.join("other-user").join("memories");
+        let current_agenda_dir = current_home.join("agenda");
+        let database_path = root.join("shared.db");
+        fs::create_dir_all(&current_memory_dir).expect("current memory dir should be created");
+        fs::create_dir_all(&other_memory_dir).expect("other memory dir should be created");
+        fs::create_dir_all(&current_agenda_dir).expect("current agenda dir should be created");
+        fs::write(
+            current_memory_dir.join("running_progress.md"),
+            "I ran a marathon today\n",
+        )
+        .expect("current memory should be written");
+        fs::write(
+            other_memory_dir.join("other_duplicate.md"),
+            "I ran a marathon today\n",
+        )
+        .expect("other memory should be written");
+
+        let mut config = AppConfig::defaults();
+        config.home_dir = current_home;
+        config.memory_dir = current_memory_dir.clone();
+        config.agenda_dir = current_agenda_dir;
+        config.database_path = database_path.clone();
+        config.memories_between_consolidation = 1;
+        elroy_db::bootstrap_database(&BootstrapPlan::from_config(&config))
+            .expect("current bootstrap should succeed");
+
+        let mut connection = open_sqlite_connection(&database_path).expect("database should open");
+        run_migrations(&mut connection).expect("migrations should run");
+        elroy_db::bootstrap_database(&BootstrapPlan::from_config(&config))
+            .expect("bootstrap should succeed");
+        seed_competing_memory_record(
+            &connection,
+            &other_memory_dir.join("other_duplicate.md"),
+            "Other Duplicate",
+            "I ran a marathon today",
+            9_999,
+        );
+
+        consolidate_exact_duplicate_memories(&mut connection, &BootstrapPlan::from_config(&config))
+            .expect("consolidation should succeed");
+
+        let connection = open_sqlite_connection(&database_path).expect("database should reopen");
+        let active_memories =
+            elroy_db::list_active_memories(&connection, 10).expect("active memories should list");
+        assert_eq!(active_memories.len(), 2);
+        assert!(
+            active_memories
+                .iter()
+                .any(|memory| memory.name == "running progress")
+        );
+        assert!(
+            active_memories
+                .iter()
+                .any(|memory| memory.name == "Other Duplicate")
+        );
+
+        assert!(current_memory_dir.join("running_progress.md").exists());
+        assert!(other_memory_dir.join("other_duplicate.md").exists());
+        assert!(!current_memory_dir.join("archive").exists());
+        assert!(!other_memory_dir.join("archive").exists());
+
+        fs::remove_dir_all(root).expect("root should be removed");
     }
 
     #[test]
