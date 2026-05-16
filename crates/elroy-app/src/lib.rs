@@ -4980,13 +4980,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
         ToolSpec::new(
             "print_active_due_items",
             "List active due items and reminders.",
-            JsonSchema::object(
-                [
-                    ("limit", json!({"type": "integer"})),
-                    ("n", json!({"type": "integer"})),
-                ],
-                [] as [&str; 0],
-            ),
+            JsonSchema::object([("n", json!({"type": "integer"}))], [] as [&str; 0]),
         ),
         move |arguments| {
             let limit = argument_limit(&arguments, 10);
@@ -5037,13 +5031,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
         ToolSpec::new(
             "print_inactive_due_items",
             "List inactive due items and reminders.",
-            JsonSchema::object(
-                [
-                    ("limit", json!({"type": "integer"})),
-                    ("n", json!({"type": "integer"})),
-                ],
-                [] as [&str; 0],
-            ),
+            JsonSchema::object([("n", json!({"type": "integer"}))], [] as [&str; 0]),
         ),
         move |arguments| {
             let limit = argument_limit(&arguments, 10);
@@ -7579,6 +7567,35 @@ mod tests {
         assert_eq!(properties.len(), 1);
         assert!(properties.contains_key("n"));
         assert!(!properties.contains_key("limit"));
+    }
+
+    #[test]
+    fn due_item_print_list_tool_schemas_match_python_surface() {
+        let config = AppConfig::defaults();
+        let registry = build_live_tool_registry(&config);
+
+        for tool_name in ["print_active_due_items", "print_inactive_due_items"] {
+            let spec = registry
+                .specs()
+                .into_iter()
+                .find(|spec| spec.name == tool_name)
+                .unwrap_or_else(|| panic!("{tool_name} tool should exist"));
+
+            let properties = match &spec.parameters {
+                elroy_tools::JsonSchema::Object { properties, .. } => properties,
+            };
+
+            assert_eq!(
+                properties.len(),
+                1,
+                "{tool_name} should expose only one field"
+            );
+            assert!(properties.contains_key("n"), "{tool_name} should expose n");
+            assert!(
+                !properties.contains_key("limit"),
+                "{tool_name} should not expose limit"
+            );
+        }
     }
 
     #[test]
