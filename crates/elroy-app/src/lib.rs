@@ -6895,6 +6895,41 @@ mod tests {
         }
     }
 
+    struct ContextualDueItemModel;
+
+    impl ModelClient for ContextualDueItemModel {
+        fn next_events(
+            &self,
+            request: ConversationRequest<'_>,
+        ) -> Result<Vec<StreamEvent>, elroy_core::ModelClientError> {
+            assert_eq!(request.user_message, "I just got the payroll email.");
+            assert!(request.transcript.iter().any(|message| {
+                message.role == MessageRole::Tool
+                    && message.content.as_deref().is_some_and(|content| {
+                        content.contains("RELEVANT DUE ITEM")
+                            && content.contains("Reply to payroll")
+                            && content.contains("after payroll email")
+                    })
+            }));
+            Ok(vec![StreamEvent::AssistantResponse {
+                content: "You have a relevant reminder: Reply to payroll.".to_string(),
+            }])
+        }
+    }
+
+    impl StreamingModelClient for ContextualDueItemModel {
+        fn stream_events(
+            &self,
+            request: ConversationRequest<'_>,
+        ) -> Result<
+            Box<dyn Iterator<Item = Result<StreamEvent, elroy_core::ModelClientError>>>,
+            elroy_core::ModelClientError,
+        > {
+            let events = self.next_events(request)?;
+            Ok(Box::new(events.into_iter().map(Ok)))
+        }
+    }
+
     #[test]
     fn provider_config_uses_openai_when_model_is_not_claude() {
         let mut config = AppConfig::defaults();
@@ -10727,6 +10762,69 @@ mod tests {
             event,
             StreamEvent::AssistantResponse { content }
                 if content.contains("Hybrid reminder text")
+        )));
+
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
+    fn run_prompt_with_model_and_registry_surfaces_contextual_due_item() {
+        let unique = format!(
+            "elroy-rs-app-contextual-due-item-prompt-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+        fs::write(
+            agenda_dir.join("payroll_follow_up.md"),
+            "---\ndate: unscheduled\ncompleted: false\nstatus: created\ntrigger_context: after payroll email\n---\n\nReply to payroll\n",
+        )
+        .expect("contextual due item file should be written");
+
+        let mut config = AppConfig::defaults();
+        config.home_dir = home.clone();
+        config.memory_dir = memory_dir;
+        config.agenda_dir = agenda_dir;
+        config.database_path = database_path.clone();
+        elroy_db::bootstrap_database(&BootstrapPlan::from_config(&config))
+            .expect("bootstrap should succeed");
+
+        let mut connection = open_sqlite_connection(&database_path).expect("database should open");
+        run_migrations(&mut connection).expect("migrations should run");
+
+        let events = run_prompt_with_model_and_registry(
+            &mut connection,
+            "I just got the payroll email.",
+            &ContextualDueItemModel,
+            build_live_tool_registry(&config),
+            PromptExecutionOptions {
+                role: MessageRole::User,
+                persist_input_message: true,
+                force_tool: None,
+                assistant_name: &config.assistant_name,
+                ensure_alternating_roles: config.llm_provider() == LlmProvider::Anthropic,
+                home_dir: &home,
+                bootstrap_plan: BootstrapPlan::from_config(&config),
+                messages_between_memory: config.messages_between_memory,
+                memories_between_consolidation: config.memories_between_consolidation,
+                messages_between_self_reflection: config.messages_between_self_reflection,
+                memory_recall_classifier_enabled: config.memory_recall_classifier_enabled,
+                memory_recall_classifier_window: config.memory_recall_classifier_window,
+            },
+        )
+        .expect("prompt should succeed");
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::AssistantResponse { content }
+                if content.contains("Reply to payroll")
         )));
 
         fs::remove_dir_all(home).expect("home should be removed");
