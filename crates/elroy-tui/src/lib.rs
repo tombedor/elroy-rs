@@ -407,6 +407,7 @@ fn apply_intent_with_runtime(
                 match pending.stream.cancel() {
                     Ok(snapshot) => {
                         app.apply_snapshot(snapshot);
+                        app.focus = FocusTarget::Input;
                         app.status = "Chat stream cancelled".to_string();
                     }
                     Err(error) => {
@@ -485,6 +486,7 @@ fn advance_prompt_stream(
             match pending.stream.finalize() {
                 Ok(snapshot) => {
                     app.apply_snapshot(snapshot);
+                    app.focus = FocusTarget::Input;
                     let context_messages = runtime.load_context_messages().unwrap_or_default();
                     if let Some(submitted_prompt) = pending.submitted_prompt {
                         app.mark_messages_rendered_after_chat_turn(
@@ -2349,6 +2351,7 @@ mod tests {
         let mut pending = None;
 
         apply_intent_with_runtime(&mut app, UiIntent::SubmitPrompt, &mut runtime, &mut pending);
+        app.focus = FocusTarget::Command(CommandPane::Sidebar);
 
         assert_eq!(
             app.conversation_lines.last().map(String::as_str),
@@ -2371,6 +2374,7 @@ mod tests {
         }
         assert!(finalized);
         assert_eq!(app.status, "submitted prompt: hello runtime");
+        assert_eq!(app.focus, FocusTarget::Input);
     }
 
     #[test]
@@ -2625,11 +2629,13 @@ mod tests {
         let mut pending = None;
 
         apply_intent_with_runtime(&mut app, UiIntent::SubmitPrompt, &mut runtime, &mut pending);
+        app.focus = FocusTarget::Command(CommandPane::Conversation);
         app.input = "draft".to_string();
         apply_intent_with_runtime(&mut app, UiIntent::CancelPrompt, &mut runtime, &mut pending);
 
         assert_eq!(app.input, "draft");
         assert_eq!(app.status, "Chat stream cancelled");
+        assert_eq!(app.focus, FocusTarget::Input);
         assert!(pending.is_none());
         assert!(
             app.conversation_lines
