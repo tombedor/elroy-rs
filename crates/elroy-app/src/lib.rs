@@ -3213,7 +3213,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
             else {
                 return ToolExecutionResult::error("update_due_item_text requires string text");
             };
-            mutate_due_item_file_from_config_with_result(
+            let result = mutate_due_item_file_from_config_with_result(
                 &config_for_due_item_text,
                 name,
                 |due_item_names| {
@@ -3228,7 +3228,17 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                     update_agenda_body(path, text)?;
                     Ok(format!("Due item '{name}' text has been updated."))
                 },
-            )
+            );
+            if result.is_error {
+                return result;
+            }
+            match sync_due_item_context_after_mutation(&config_for_due_item_text, name, Some(name))
+            {
+                Ok(()) => result,
+                Err(error) => ToolExecutionResult::error(format!(
+                    "failed to refresh due item context: {error}"
+                )),
+            }
         },
     );
 
@@ -3297,7 +3307,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
             let Some(new_name) = arguments.get("new_name").and_then(Value::as_str) else {
                 return ToolExecutionResult::error("rename_due_item requires string new_name");
             };
-            mutate_due_item_file_from_config_with_result(
+            let result = mutate_due_item_file_from_config_with_result(
                 &config_for_due_item_rename,
                 name,
                 |due_item_names| {
@@ -3317,7 +3327,20 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                         "Due item '{name}' has been renamed to '{new_name}'."
                     ))
                 },
-            )
+            );
+            if result.is_error {
+                return result;
+            }
+            match sync_due_item_context_after_mutation(
+                &config_for_due_item_rename,
+                name,
+                Some(new_name),
+            ) {
+                Ok(()) => result,
+                Err(error) => ToolExecutionResult::error(format!(
+                    "failed to refresh due item context: {error}"
+                )),
+            }
         },
     );
 
@@ -3389,7 +3412,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                 return ToolExecutionResult::error("complete_due_item requires a string name");
             };
             let closing_comment = arguments.get("closing_comment").and_then(Value::as_str);
-            mutate_due_item_file_from_config_with_result(
+            let result = mutate_due_item_file_from_config_with_result(
                 &config_for_due_item_complete,
                 name,
                 |due_item_names| {
@@ -3407,7 +3430,16 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                         None => format!("Due item '{name}' has been marked as completed."),
                     })
                 },
-            )
+            );
+            if result.is_error {
+                return result;
+            }
+            match sync_due_item_context_after_mutation(&config_for_due_item_complete, name, None) {
+                Ok(()) => result,
+                Err(error) => ToolExecutionResult::error(format!(
+                    "failed to refresh due item context: {error}"
+                )),
+            }
         },
     );
 
@@ -6284,6 +6316,36 @@ fn sync_task_context_after_mutation(
         && !transcript_contains_context_task(&updated_transcript, &task.name)
     {
         updated_transcript.extend(context_task_tool_messages(&task));
+    }
+
+    replace_context_messages(&mut connection, LOCAL_USER_TOKEN, &updated_transcript)?;
+    Ok(())
+}
+
+fn sync_due_item_context_after_mutation(
+    config: &AppConfig,
+    old_name: &str,
+    current_name: Option<&str>,
+) -> Result<(), AppError> {
+    let mut connection = open_sqlite_connection(&config.database_path)?;
+    run_migrations(&mut connection)?;
+    let transcript = load_validated_runtime_transcript(
+        &mut connection,
+        &config.assistant_name,
+        config.llm_provider() == LlmProvider::Anthropic,
+    )?;
+    let old_tool_call_id = context_due_item_tool_call_id(old_name);
+    let mut updated_transcript = transcript
+        .into_iter()
+        .filter(|message| !message_matches_tool_call_id(message, &old_tool_call_id))
+        .collect::<Vec<_>>();
+
+    if let Some(current_name) = current_name
+        && let Some(due_item) = find_active_agenda_item_by_name(&connection, current_name)?
+            .filter(|item| item.trigger_datetime.is_some() || item.trigger_context.is_some())
+        && !transcript_contains_context_due_item(&updated_transcript, &due_item.name)
+    {
+        updated_transcript.extend(context_due_item_tool_messages(&due_item));
     }
 
     replace_context_messages(&mut connection, LOCAL_USER_TOKEN, &updated_transcript)?;
@@ -10791,20 +10853,21 @@ mod tests {
         let database_path = home.join("elroy.db");
         fs::create_dir_all(&memory_dir).expect("memory dir should be created");
         fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
-        fs::write(
-            agenda_dir.join("call_mom.md"),
-            "---\ndate: unscheduled\ncompleted: false\nstatus: created\ntrigger_context: after dinner\n---\n\nCall mom tonight\n",
-        )
-        .expect("due item file should be written");
 
         let mut config = AppConfig::defaults();
         config.memory_dir = memory_dir;
         config.agenda_dir = agenda_dir.clone();
         config.database_path = database_path;
-        elroy_db::bootstrap_database(&elroy_db::BootstrapPlan::from_config(&config))
-            .expect("bootstrap should succeed");
 
         let registry = build_live_tool_registry(&config);
+        let created = registry.invoke(
+            "create_due_item",
+            "{\"name\":\"Call Mom\",\"text\":\"Call mom tonight\",\"trigger_context\":\"after dinner\"}",
+        );
+        assert!(!created.is_error);
+        let seeded_context = registry.invoke("show_context_messages", "{\"limit\":20}");
+        assert!(!seeded_context.is_error);
+        assert!(seeded_context.content.contains("context-due-item:call mom"));
         let updated = registry.invoke(
             "update_due_item_text",
             "{\"name\":\"call mom\",\"new_text\":\"Call mom after dinner\"}",
@@ -10814,6 +10877,14 @@ mod tests {
             updated.content,
             "Due item 'call mom' text has been updated."
         );
+        let updated_context = registry.invoke("show_context_messages", "{\"limit\":20}");
+        assert!(!updated_context.is_error);
+        assert!(
+            updated_context
+                .content
+                .contains("context-due-item:call mom")
+        );
+        assert!(updated_context.content.contains("Call mom after dinner"));
         let missing_updated = registry.invoke(
             "update_due_item_text",
             "{\"name\":\"missing\",\"new_text\":\"No-op\"}",
@@ -10834,6 +10905,18 @@ mod tests {
             "Due item 'call mom' has been renamed to 'Call Parents'."
         );
         assert!(agenda_dir.join("call_parents.md").exists());
+        let renamed_context = registry.invoke("show_context_messages", "{\"limit\":20}");
+        assert!(!renamed_context.is_error);
+        assert!(
+            !renamed_context
+                .content
+                .contains("context-due-item:call mom")
+        );
+        assert!(
+            renamed_context
+                .content
+                .contains("context-due-item:call parents")
+        );
         let missing_renamed = registry.invoke(
             "rename_due_item",
             "{\"old_name\":\"missing\",\"new_name\":\"Call Family\"}",
@@ -10865,6 +10948,13 @@ mod tests {
         let completed_text =
             fs::read_to_string(agenda_dir.join("call_parents.md")).expect("due item should read");
         assert!(completed_text.contains("completed: true"));
+        let completed_context = registry.invoke("show_context_messages", "{\"limit\":20}");
+        assert!(!completed_context.is_error);
+        assert!(
+            !completed_context
+                .content
+                .contains("context-due-item:call parents")
+        );
         let missing_completed = registry.invoke("complete_due_item", "{\"name\":\"missing\"}");
         assert!(missing_completed.is_error);
         assert_eq!(
