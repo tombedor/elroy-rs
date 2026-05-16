@@ -5313,7 +5313,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
             with_tool_connection(&database_path, |connection| {
                 let Some(item) = find_task_by_name(connection, name)? else {
                     return Ok(ToolExecutionResult::error(format!(
-                        "task not found: {name}"
+                        "Active task '{name}' not found."
                     )));
                 };
                 Ok(ToolExecutionResult::success(task_payload(item).to_string()))
@@ -10974,6 +10974,9 @@ mod tests {
         let shown = registry.invoke("show_task", "{\"name\":\"career search\"}");
         assert!(!shown.is_error);
         assert!(shown.content.contains("Reach out to four contacts"));
+        let missing_shown = registry.invoke("show_task", "{\"name\":\"missing\"}");
+        assert!(missing_shown.is_error);
+        assert_eq!(missing_shown.content, "Active task 'missing' not found.");
 
         let completed = registry.invoke(
             "complete_task",
