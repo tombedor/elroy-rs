@@ -4714,13 +4714,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
         ToolSpec::new(
             "print_memories",
             "List active memories available to Elroy.",
-            JsonSchema::object(
-                [
-                    ("limit", json!({"type": "integer"})),
-                    ("n", json!({"type": "integer"})),
-                ],
-                [] as [&str; 0],
-            ),
+            JsonSchema::object([("n", json!({"type": "integer"}))], [] as [&str; 0]),
         ),
         move |arguments| {
             let limit = argument_limit(&arguments, 10);
@@ -7566,6 +7560,25 @@ mod tests {
         assert_eq!(properties.len(), 1);
         assert!(properties.contains_key("memory_name"));
         assert!(!properties.contains_key("name"));
+    }
+
+    #[test]
+    fn print_memories_tool_schema_matches_python_surface() {
+        let config = AppConfig::defaults();
+        let registry = build_live_tool_registry(&config);
+        let spec = registry
+            .specs()
+            .into_iter()
+            .find(|spec| spec.name == "print_memories")
+            .expect("print_memories tool should exist");
+
+        let properties = match &spec.parameters {
+            elroy_tools::JsonSchema::Object { properties, .. } => properties,
+        };
+
+        assert_eq!(properties.len(), 1);
+        assert!(properties.contains_key("n"));
+        assert!(!properties.contains_key("limit"));
     }
 
     #[test]
