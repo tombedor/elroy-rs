@@ -16,11 +16,13 @@ pub struct AppConfig {
     pub chat_model: String,
     pub max_tokens: usize,
     pub assistant_name: String,
+    pub reflect: bool,
     pub enable_assistant_greeting: bool,
     pub min_convo_age_for_greeting_minutes: f64,
     pub max_context_age_minutes: f64,
     pub messages_between_memory: usize,
     pub memories_between_consolidation: usize,
+    pub l2_memory_relevance_distance_threshold: f64,
     pub memory_cluster_similarity_threshold: f64,
     pub max_memory_cluster_size: usize,
     pub min_memory_cluster_size: usize,
@@ -82,11 +84,13 @@ impl AppConfig {
             chat_model: "gpt-5".to_string(),
             max_tokens: 100_000,
             assistant_name: "Elroy".to_string(),
+            reflect: false,
             enable_assistant_greeting: false,
             min_convo_age_for_greeting_minutes: 5.0,
             max_context_age_minutes: 720.0,
             messages_between_memory: 20,
             memories_between_consolidation: 4,
+            l2_memory_relevance_distance_threshold: 1.4,
             memory_cluster_similarity_threshold: 0.21125,
             max_memory_cluster_size: 5,
             min_memory_cluster_size: 3,
@@ -122,6 +126,9 @@ impl AppConfig {
         if let Some(assistant_name) = file_config.default_assistant_name {
             self.assistant_name = assistant_name;
         }
+        if let Some(reflect) = file_config.reflect {
+            self.reflect = reflect;
+        }
         if let Some(enable_assistant_greeting) = file_config.enable_assistant_greeting {
             self.enable_assistant_greeting = enable_assistant_greeting;
         }
@@ -138,6 +145,11 @@ impl AppConfig {
         }
         if let Some(memories_between_consolidation) = file_config.memories_between_consolidation {
             self.memories_between_consolidation = memories_between_consolidation;
+        }
+        if let Some(l2_memory_relevance_distance_threshold) =
+            file_config.l2_memory_relevance_distance_threshold
+        {
+            self.l2_memory_relevance_distance_threshold = l2_memory_relevance_distance_threshold;
         }
         if let Some(memory_cluster_similarity_threshold) =
             file_config.memory_cluster_similarity_threshold
@@ -200,6 +212,9 @@ impl AppConfig {
         if let Some(assistant_name) = env.get("ELROY_DEFAULT_ASSISTANT_NAME") {
             self.assistant_name = assistant_name.clone();
         }
+        if let Some(reflect) = env.get("ELROY_REFLECT") {
+            self.reflect = parse_bool(reflect);
+        }
         if let Some(enable_assistant_greeting) = env.get("ELROY_ENABLE_ASSISTANT_GREETING") {
             self.enable_assistant_greeting = parse_bool(enable_assistant_greeting);
         }
@@ -218,6 +233,12 @@ impl AppConfig {
             env.get("ELROY_MEMORIES_BETWEEN_CONSOLIDATION")
         {
             self.memories_between_consolidation = parse_usize(memories_between_consolidation);
+        }
+        if let Some(l2_memory_relevance_distance_threshold) =
+            env.get("ELROY_L2_MEMORY_RELEVANCE_DISTANCE_THRESHOLD")
+        {
+            self.l2_memory_relevance_distance_threshold =
+                parse_f64(l2_memory_relevance_distance_threshold);
         }
         if let Some(memory_cluster_similarity_threshold) =
             env.get("ELROY_MEMORY_CLUSTER_SIMILARITY_THRESHOLD")
@@ -283,11 +304,13 @@ struct FileConfig {
     chat_model: Option<String>,
     max_tokens: Option<usize>,
     default_assistant_name: Option<String>,
+    reflect: Option<bool>,
     enable_assistant_greeting: Option<bool>,
     min_convo_age_for_greeting_minutes: Option<f64>,
     max_context_age_minutes: Option<f64>,
     messages_between_memory: Option<usize>,
     memories_between_consolidation: Option<usize>,
+    l2_memory_relevance_distance_threshold: Option<f64>,
     memory_cluster_similarity_threshold: Option<f64>,
     max_memory_cluster_size: Option<usize>,
     min_memory_cluster_size: Option<usize>,
@@ -427,11 +450,13 @@ mod tests {
         assert!(config.include_base_tools);
         assert_eq!(config.max_tokens, 100_000);
         assert_eq!(config.context_refresh_target_tokens(), 33_333);
+        assert!(!config.reflect);
         assert!(!config.enable_assistant_greeting);
         assert_eq!(config.min_convo_age_for_greeting_minutes, 5.0);
         assert_eq!(config.max_context_age_minutes, 720.0);
         assert_eq!(config.messages_between_memory, 20);
         assert_eq!(config.memories_between_consolidation, 4);
+        assert_eq!(config.l2_memory_relevance_distance_threshold, 1.4);
         assert_eq!(config.memory_cluster_similarity_threshold, 0.21125);
         assert_eq!(config.max_memory_cluster_size, 5);
         assert_eq!(config.min_memory_cluster_size, 3);
@@ -466,7 +491,7 @@ mod tests {
         let config_path = home_dir.join("elroy.conf.yaml");
         fs::write(
             &config_path,
-            "chat_model: gpt-5-nano\nmax_tokens: 9000\nenable_assistant_greeting: true\nmin_convo_age_for_greeting_minutes: 15.5\nmax_context_age_minutes: 180.0\nmessages_between_memory: 12\nmemories_between_consolidation: 6\nmemory_cluster_similarity_threshold: 0.33\nmax_memory_cluster_size: 7\nmin_memory_cluster_size: 4\nmessages_between_self_reflection: 4\nmemory_recall_classifier_enabled: false\nmemory_recall_classifier_window: 7\nmemory_dir: /tmp/elroy-memories\nagenda_dir: /tmp/elroy-agenda\ndatabase_url: sqlite:////tmp/elroy.db\nirrelevant_key: ignored\n",
+            "chat_model: gpt-5-nano\nmax_tokens: 9000\nreflect: true\nenable_assistant_greeting: true\nmin_convo_age_for_greeting_minutes: 15.5\nmax_context_age_minutes: 180.0\nmessages_between_memory: 12\nmemories_between_consolidation: 6\nl2_memory_relevance_distance_threshold: 1.11\nmemory_cluster_similarity_threshold: 0.33\nmax_memory_cluster_size: 7\nmin_memory_cluster_size: 4\nmessages_between_self_reflection: 4\nmemory_recall_classifier_enabled: false\nmemory_recall_classifier_window: 7\nmemory_dir: /tmp/elroy-memories\nagenda_dir: /tmp/elroy-agenda\ndatabase_url: sqlite:////tmp/elroy.db\nirrelevant_key: ignored\n",
         )
         .expect("config fixture should be written");
 
@@ -481,11 +506,13 @@ mod tests {
         assert_eq!(config.database_path, PathBuf::from("/tmp/elroy.db"));
         assert_eq!(config.config_path, config_path);
         assert_eq!(config.llm_provider(), LlmProvider::OpenAi);
+        assert!(config.reflect);
         assert!(config.enable_assistant_greeting);
         assert_eq!(config.min_convo_age_for_greeting_minutes, 15.5);
         assert_eq!(config.max_context_age_minutes, 180.0);
         assert_eq!(config.messages_between_memory, 12);
         assert_eq!(config.memories_between_consolidation, 6);
+        assert_eq!(config.l2_memory_relevance_distance_threshold, 1.11);
         assert_eq!(config.memory_cluster_similarity_threshold, 0.33);
         assert_eq!(config.max_memory_cluster_size, 7);
         assert_eq!(config.min_memory_cluster_size, 4);
@@ -519,6 +546,7 @@ mod tests {
                 "ELROY_DEFAULT_ASSISTANT_NAME".to_string(),
                 "EnvElroy".to_string(),
             ),
+            ("ELROY_REFLECT".to_string(), "true".to_string()),
             (
                 "ELROY_ENABLE_ASSISTANT_GREETING".to_string(),
                 "true".to_string(),
@@ -539,6 +567,10 @@ mod tests {
             (
                 "ELROY_MEMORIES_BETWEEN_CONSOLIDATION".to_string(),
                 "9".to_string(),
+            ),
+            (
+                "ELROY_L2_MEMORY_RELEVANCE_DISTANCE_THRESHOLD".to_string(),
+                "1.75".to_string(),
             ),
             (
                 "ELROY_MEMORY_CLUSTER_SIMILARITY_THRESHOLD".to_string(),
@@ -592,11 +624,13 @@ mod tests {
         assert_eq!(config.max_tokens, 12_000);
         assert_eq!(config.context_refresh_target_tokens(), 4_000);
         assert_eq!(config.assistant_name, "EnvElroy");
+        assert!(config.reflect);
         assert!(config.enable_assistant_greeting);
         assert_eq!(config.min_convo_age_for_greeting_minutes, 2.5);
         assert_eq!(config.max_context_age_minutes, 45.0);
         assert_eq!(config.messages_between_memory, 8);
         assert_eq!(config.memories_between_consolidation, 9);
+        assert_eq!(config.l2_memory_relevance_distance_threshold, 1.75);
         assert_eq!(config.memory_cluster_similarity_threshold, 0.44);
         assert_eq!(config.max_memory_cluster_size, 8);
         assert_eq!(config.min_memory_cluster_size, 2);

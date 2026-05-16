@@ -1978,6 +1978,11 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                 ],
                 vec![
                     String::new(),
+                    "Reflect".to_string(),
+                    config_for_print_config.reflect.to_string(),
+                ],
+                vec![
+                    String::new(),
                     "Database URL".to_string(),
                     format!(
                         "sqlite:///{}",
@@ -2072,6 +2077,13 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                     "Memory Cluster Similarity".to_string(),
                     config_for_print_config
                         .memory_cluster_similarity_threshold
+                        .to_string(),
+                ],
+                vec![
+                    String::new(),
+                    "L2 Memory Relevance Distance Threshold".to_string(),
+                    config_for_print_config
+                        .l2_memory_relevance_distance_threshold
                         .to_string(),
                 ],
                 vec![
@@ -7152,7 +7164,13 @@ mod tests {
         assert!(printed.content.contains("Chat API Key"));
         assert!(printed.content.contains("********"));
         assert!(printed.content.contains("Anthropic API Key"));
+        assert!(printed.content.contains("Reflect"));
         assert!(printed.content.contains("Memories Between Consolidation"));
+        assert!(
+            printed
+                .content
+                .contains("L2 Memory Relevance Distance Threshold")
+        );
         assert!(printed.content.contains("Memory Cluster Similarity"));
         assert!(printed.content.contains("Max Memory Cluster Size"));
         assert!(printed.content.contains("Min Memory Cluster Size"));
