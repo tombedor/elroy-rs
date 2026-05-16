@@ -2760,6 +2760,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                 [
                     ("name", json!({"type": "string"})),
                     ("text", json!({"type": "string"})),
+                    ("trigger_time", json!({"type": "string"})),
                     ("trigger_datetime", json!({"type": "string"})),
                     ("trigger_context", json!({"type": "string"})),
                     ("date", json!({"type": "string"})),
@@ -2774,11 +2775,14 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
             let Some(text) = arguments.get("text").and_then(Value::as_str) else {
                 return ToolExecutionResult::error("create_due_item requires string text");
             };
-            let trigger_datetime = arguments.get("trigger_datetime").and_then(Value::as_str);
+            let trigger_time = arguments
+                .get("trigger_time")
+                .and_then(Value::as_str)
+                .or_else(|| arguments.get("trigger_datetime").and_then(Value::as_str));
             let trigger_context = arguments.get("trigger_context").and_then(Value::as_str);
-            if trigger_datetime.is_none() && trigger_context.is_none() {
+            if trigger_time.is_none() && trigger_context.is_none() {
                 return ToolExecutionResult::error(
-                    "create_due_item requires trigger_datetime or trigger_context",
+                    "create_due_item requires trigger_time or trigger_context",
                 );
             }
             let date = arguments.get("date").and_then(Value::as_str);
@@ -2787,7 +2791,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                 name,
                 text,
                 date,
-                trigger_datetime,
+                trigger_time,
                 trigger_context,
             )
             .and_then(|path| {
@@ -2797,13 +2801,21 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                 .map_err(|error| std::io::Error::other(error.to_string()))?;
                 Ok(path)
             }) {
-                Ok(path) => ToolExecutionResult::success(
-                    json!({
-                        "created": true,
-                        "file_path": path.display().to_string(),
-                    })
-                    .to_string(),
-                ),
+                Ok(_) => {
+                    let message = match (trigger_time, trigger_context) {
+                        (Some(trigger_time), Some(trigger_context)) => format!(
+                            "Hybrid due item '{name}' has been created for {trigger_time} and context: {trigger_context}."
+                        ),
+                        (Some(trigger_time), None) => {
+                            format!("Timed due item '{name}' has been created for {trigger_time}.")
+                        }
+                        (None, Some(_)) => {
+                            format!("Contextual due item '{name}' has been created.")
+                        }
+                        (None, None) => unreachable!("validated above"),
+                    };
+                    ToolExecutionResult::success(message)
+                }
                 Err(error) => {
                     ToolExecutionResult::error(format!("failed to create due item: {error}"))
                 }
@@ -3168,17 +3180,22 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
         ToolSpec::new(
             "delete_due_item",
             "Mark one active due item deleted.",
-            JsonSchema::object([("name", json!({"type": "string"}))], ["name"]),
+            JsonSchema::object(
+                [
+                    ("name", json!({"type": "string"})),
+                    ("closing_comment", json!({"type": "string"})),
+                ],
+                ["name"],
+            ),
         ),
         move |arguments| {
             let Some(name) = arguments.get("name").and_then(Value::as_str) else {
                 return ToolExecutionResult::error("delete_due_item requires a string name");
             };
-            mutate_agenda_file_from_config(
-                &config_for_due_item_delete,
-                name,
-                mark_agenda_item_deleted,
-            )
+            let closing_comment = arguments.get("closing_comment").and_then(Value::as_str);
+            mutate_agenda_file_from_config(&config_for_due_item_delete, name, |path| {
+                mark_agenda_item_deleted(path, closing_comment)
+            })
         },
     );
 
@@ -3395,11 +3412,9 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
             let Some(name) = arguments.get("name").and_then(Value::as_str) else {
                 return ToolExecutionResult::error("delete_agenda_item requires a string name");
             };
-            mutate_agenda_file_from_config(
-                &config_for_agenda_delete,
-                name,
-                mark_agenda_item_deleted,
-            )
+            mutate_agenda_file_from_config(&config_for_agenda_delete, name, |path| {
+                mark_agenda_item_deleted(path, None)
+            })
         },
     );
 
@@ -7268,12 +7283,27 @@ mod tests {
             "{\"name\":\"call mom\",\"text\":\"Call mom tonight\",\"trigger_context\":\"after dinner\"}",
         );
         assert!(!created.is_error);
+        assert_eq!(
+            created.content,
+            "Contextual due item 'call mom' has been created."
+        );
         assert!(agenda_dir.join("call_mom.md").exists());
+
+        let timed = registry.invoke(
+            "create_due_item",
+            "{\"name\":\"pay rent\",\"text\":\"Pay rent\",\"trigger_time\":\"2026-05-16 09:00\"}",
+        );
+        assert!(!timed.is_error);
+        assert_eq!(
+            timed.content,
+            "Timed due item 'pay rent' has been created for 2026-05-16 09:00."
+        );
 
         let listed = registry.invoke("list_due_items", "{\"limit\":10}");
         assert!(!listed.is_error);
         assert!(listed.content.contains("call mom"));
         assert!(listed.content.contains("after dinner"));
+        assert!(listed.content.contains("pay rent"));
     }
 
     #[test]
@@ -8330,11 +8360,15 @@ mod tests {
         .expect("second due item file should be written");
         elroy_db::bootstrap_database(&elroy_db::BootstrapPlan::from_config(&config))
             .expect("bootstrap should succeed");
-        let deleted = registry.invoke("delete_due_item", "{\"name\":\"pay bill\"}");
+        let deleted = registry.invoke(
+            "delete_due_item",
+            "{\"name\":\"pay bill\",\"closing_comment\":\"paid online\"}",
+        );
         assert!(!deleted.is_error);
         let deleted_text =
             fs::read_to_string(agenda_dir.join("pay_bill.md")).expect("due item should read");
         assert!(deleted_text.contains("status: deleted"));
+        assert!(deleted_text.contains("closing_comment: paid online"));
     }
 
     #[test]

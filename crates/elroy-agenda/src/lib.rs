@@ -87,12 +87,18 @@ pub fn mark_agenda_item_completed(
     })
 }
 
-pub fn mark_agenda_item_deleted(path: &Path) -> std::io::Result<()> {
+pub fn mark_agenda_item_deleted(path: &Path, closing_comment: Option<&str>) -> std::io::Result<()> {
     update_frontmatter_fields(path, |frontmatter| {
         frontmatter.insert(
             YamlValue::String("status".to_string()),
             YamlValue::String("deleted".to_string()),
         );
+        if let Some(closing_comment) = closing_comment {
+            frontmatter.insert(
+                YamlValue::String("closing_comment".to_string()),
+                YamlValue::String(closing_comment.to_string()),
+            );
+        }
     })
 }
 
@@ -360,13 +366,14 @@ mod tests {
         .expect("agenda file should be created");
         append_agenda_update(&path, "called ahead").expect("agenda update should append");
         mark_agenda_item_completed(&path, Some("done")).expect("agenda should complete");
-        mark_agenda_item_deleted(&path).expect("agenda should delete");
+        mark_agenda_item_deleted(&path, Some("no longer needed")).expect("agenda should delete");
 
         let content = std::fs::read_to_string(path).expect("agenda should read");
         assert!(content.contains("## Updates"));
         assert!(content.contains("called ahead"));
         assert!(content.contains("completed: true"));
         assert!(content.contains("status: deleted"));
+        assert!(content.contains("closing_comment: no longer needed"));
 
         std::fs::remove_dir_all(root).expect("root should be removed");
     }

@@ -39,8 +39,7 @@ pub fn complete_task_file(path: &Path, closing_comment: Option<&str>) -> std::io
 }
 
 pub fn delete_task_file(path: &Path, closing_comment: Option<&str>) -> std::io::Result<()> {
-    let _ = closing_comment;
-    mark_agenda_item_deleted(path)
+    mark_agenda_item_deleted(path, closing_comment)
 }
 
 pub fn rename_task_file(path: &Path, new_name: &str) -> std::io::Result<PathBuf> {
