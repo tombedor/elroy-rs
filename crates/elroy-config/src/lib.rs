@@ -17,6 +17,7 @@ pub struct AppConfig {
     pub assistant_name: String,
     pub enable_assistant_greeting: bool,
     pub min_convo_age_for_greeting_minutes: f64,
+    pub max_context_age_minutes: f64,
     pub messages_between_memory: usize,
     pub messages_between_self_reflection: usize,
     pub memory_recall_classifier_enabled: bool,
@@ -77,6 +78,7 @@ impl AppConfig {
             assistant_name: "Elroy".to_string(),
             enable_assistant_greeting: false,
             min_convo_age_for_greeting_minutes: 5.0,
+            max_context_age_minutes: 720.0,
             messages_between_memory: 20,
             messages_between_self_reflection: 10,
             memory_recall_classifier_enabled: true,
@@ -114,6 +116,9 @@ impl AppConfig {
             file_config.min_convo_age_for_greeting_minutes
         {
             self.min_convo_age_for_greeting_minutes = min_convo_age_for_greeting_minutes;
+        }
+        if let Some(max_context_age_minutes) = file_config.max_context_age_minutes {
+            self.max_context_age_minutes = max_context_age_minutes;
         }
         if let Some(messages_between_memory) = file_config.messages_between_memory {
             self.messages_between_memory = messages_between_memory;
@@ -173,6 +178,9 @@ impl AppConfig {
         {
             self.min_convo_age_for_greeting_minutes = parse_f64(min_convo_age_for_greeting_minutes);
         }
+        if let Some(max_context_age_minutes) = env.get("ELROY_MAX_CONTEXT_AGE_MINUTES") {
+            self.max_context_age_minutes = parse_f64(max_context_age_minutes);
+        }
         if let Some(messages_between_memory) = env.get("ELROY_MESSAGES_BETWEEN_MEMORY") {
             self.messages_between_memory = parse_usize(messages_between_memory);
         }
@@ -225,6 +233,7 @@ struct FileConfig {
     default_assistant_name: Option<String>,
     enable_assistant_greeting: Option<bool>,
     min_convo_age_for_greeting_minutes: Option<f64>,
+    max_context_age_minutes: Option<f64>,
     messages_between_memory: Option<usize>,
     messages_between_self_reflection: Option<usize>,
     memory_recall_classifier_enabled: Option<bool>,
@@ -362,6 +371,7 @@ mod tests {
         assert!(config.include_base_tools);
         assert!(!config.enable_assistant_greeting);
         assert_eq!(config.min_convo_age_for_greeting_minutes, 5.0);
+        assert_eq!(config.max_context_age_minutes, 720.0);
         assert_eq!(config.messages_between_memory, 20);
         assert_eq!(config.messages_between_self_reflection, 10);
         assert!(config.memory_recall_classifier_enabled);
@@ -394,7 +404,7 @@ mod tests {
         let config_path = home_dir.join("elroy.conf.yaml");
         fs::write(
             &config_path,
-            "chat_model: gpt-5-nano\nenable_assistant_greeting: true\nmin_convo_age_for_greeting_minutes: 15.5\nmessages_between_memory: 12\nmessages_between_self_reflection: 4\nmemory_recall_classifier_enabled: false\nmemory_recall_classifier_window: 7\nmemory_dir: /tmp/elroy-memories\nagenda_dir: /tmp/elroy-agenda\ndatabase_url: sqlite:////tmp/elroy.db\nirrelevant_key: ignored\n",
+            "chat_model: gpt-5-nano\nenable_assistant_greeting: true\nmin_convo_age_for_greeting_minutes: 15.5\nmax_context_age_minutes: 180.0\nmessages_between_memory: 12\nmessages_between_self_reflection: 4\nmemory_recall_classifier_enabled: false\nmemory_recall_classifier_window: 7\nmemory_dir: /tmp/elroy-memories\nagenda_dir: /tmp/elroy-agenda\ndatabase_url: sqlite:////tmp/elroy.db\nirrelevant_key: ignored\n",
         )
         .expect("config fixture should be written");
 
@@ -409,6 +419,7 @@ mod tests {
         assert_eq!(config.llm_provider(), LlmProvider::OpenAi);
         assert!(config.enable_assistant_greeting);
         assert_eq!(config.min_convo_age_for_greeting_minutes, 15.5);
+        assert_eq!(config.max_context_age_minutes, 180.0);
         assert_eq!(config.messages_between_memory, 12);
         assert_eq!(config.messages_between_self_reflection, 4);
         assert!(!config.memory_recall_classifier_enabled);
@@ -446,6 +457,10 @@ mod tests {
             (
                 "ELROY_MIN_CONVO_AGE_FOR_GREETING_MINUTES".to_string(),
                 "2.5".to_string(),
+            ),
+            (
+                "ELROY_MAX_CONTEXT_AGE_MINUTES".to_string(),
+                "45.0".to_string(),
             ),
             ("ELROY_MESSAGES_BETWEEN_MEMORY".to_string(), "8".to_string()),
             (
@@ -498,6 +513,7 @@ mod tests {
         assert_eq!(config.assistant_name, "EnvElroy");
         assert!(config.enable_assistant_greeting);
         assert_eq!(config.min_convo_age_for_greeting_minutes, 2.5);
+        assert_eq!(config.max_context_age_minutes, 45.0);
         assert_eq!(config.messages_between_memory, 8);
         assert_eq!(config.messages_between_self_reflection, 6);
         assert!(!config.memory_recall_classifier_enabled);

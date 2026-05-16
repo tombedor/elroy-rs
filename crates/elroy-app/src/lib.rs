@@ -583,6 +583,7 @@ impl AppRuntime {
     fn open_connection(&self) -> Result<rusqlite::Connection, AppError> {
         let mut connection = open_sqlite_connection(&self.config.database_path)?;
         run_migrations(&mut connection)?;
+        drop_old_context_messages(&mut connection, self.config.max_context_age_minutes)?;
         Ok(connection)
     }
 
@@ -645,6 +646,37 @@ fn load_snapshot_from_connection(
         model_name: None,
         status: Some("loaded persisted transcript and sidebar data".to_string()),
     })
+}
+
+fn drop_old_context_messages(
+    connection: &mut rusqlite::Connection,
+    max_context_age_minutes: f64,
+) -> Result<(), AppError> {
+    let context_messages = load_context_messages(connection, LOCAL_USER_TOKEN)?;
+    if context_messages.is_empty() {
+        return Ok(());
+    }
+
+    let cutoff_unix = Utc::now().timestamp() - (max_context_age_minutes * 60.0) as i64;
+    let first_message_id = context_messages.first().and_then(|message| message.id);
+    let kept_messages = context_messages
+        .iter()
+        .filter(|message| {
+            message.role == MessageRole::System
+                || message.created_at_unix >= cutoff_unix
+                || first_message_id
+                    .as_ref()
+                    .zip(message.id.as_ref())
+                    .is_some_and(|(first_id, message_id)| first_id == message_id)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+
+    if kept_messages.len() != context_messages.len() {
+        replace_context_messages(connection, LOCAL_USER_TOKEN, &kept_messages)?;
+    }
+
+    Ok(())
 }
 
 fn format_agenda_sidebar_title(item: &AgendaItemRecord, now: NaiveDateTime) -> String {
@@ -3613,8 +3645,8 @@ mod tests {
     use super::{
         AppRuntime, LOCAL_USER_TOKEN, PromptExecutionOptions, argument_limit,
         build_live_tool_registry, build_live_tool_registry_with_codex_bin_and_hook,
-        build_recall_query, due_item_context_messages, memory_recall_status_updates,
-        parse_recalled_memory_names, prompt_prelude_status_updates,
+        build_recall_query, drop_old_context_messages, due_item_context_messages,
+        memory_recall_status_updates, parse_recalled_memory_names, prompt_prelude_status_updates,
         provider_config_from_app_config, recall_memory_context_messages, recalled_memory_names,
         recent_recall_context, run_prompt_with_model_and_registry,
         run_prompt_with_model_and_registry_stream, select_recalled_memories, should_offer_greeting,
@@ -5335,6 +5367,58 @@ mod tests {
     }
 
     #[test]
+    fn drop_old_context_messages_preserves_first_non_system_message() {
+        let unique = format!(
+            "elroy-rs-app-prune-context-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        fs::create_dir_all(&home).expect("home dir should be created");
+        let database_path = home.join("elroy.db");
+        let mut connection = open_sqlite_connection(&database_path).expect("database should open");
+        run_migrations(&mut connection).expect("migrations should run");
+
+        let stale_first_user = ConversationMessage {
+            role: MessageRole::User,
+            content: Some("old opener".to_string()),
+            chat_model: None,
+            id: None,
+            created_at_unix: Utc::now().timestamp() - 100_000,
+            tool_calls: None,
+            tool_call_id: None,
+        };
+        let stale_assistant = ConversationMessage {
+            role: MessageRole::Assistant,
+            content: Some("old reply".to_string()),
+            chat_model: None,
+            id: None,
+            created_at_unix: Utc::now().timestamp() - 100_000,
+            tool_calls: None,
+            tool_call_id: None,
+        };
+        let recent_user = ConversationMessage::new(MessageRole::User, "recent");
+        elroy_db::replace_context_messages(
+            &mut connection,
+            LOCAL_USER_TOKEN,
+            &[stale_first_user, stale_assistant, recent_user.clone()],
+        )
+        .expect("messages should persist");
+
+        drop_old_context_messages(&mut connection, 60.0).expect("prune should succeed");
+
+        let stored =
+            elroy_db::load_context_messages(&mut connection, LOCAL_USER_TOKEN).expect("load ok");
+        assert_eq!(stored.len(), 2);
+        assert_eq!(stored[0].content.as_deref(), Some("old opener"));
+        assert_eq!(stored[1].content.as_deref(), recent_user.content.as_deref());
+
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
     fn startup_prompt_stream_can_run_restart_prompt_without_persisting_input() {
         let unique = format!(
             "elroy-rs-app-startup-restart-{}",
@@ -5474,6 +5558,103 @@ mod tests {
             message.role == MessageRole::Assistant
                 && message.content.as_deref() == Some("Good to see you again.")
         }));
+
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
+    fn load_snapshot_drops_old_context_messages_on_runtime_open() {
+        let unique = format!(
+            "elroy-rs-app-drop-old-context-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        fs::create_dir_all(home.join("memories")).expect("memory dir should be created");
+        fs::create_dir_all(home.join("agenda")).expect("agenda dir should be created");
+
+        let mut config = AppConfig::defaults();
+        config.home_dir = home.clone();
+        config.config_path = home.join("elroy.conf.yaml");
+        config.memory_dir = home.join("memories");
+        config.agenda_dir = home.join("agenda");
+        config.database_path = home.join("elroy.db");
+        config.max_context_age_minutes = 60.0;
+
+        let mut connection =
+            open_sqlite_connection(&config.database_path).expect("database should open");
+        run_migrations(&mut connection).expect("migrations should run");
+        let stale_user = ConversationMessage {
+            role: MessageRole::User,
+            content: Some("stale user".to_string()),
+            chat_model: None,
+            id: None,
+            created_at_unix: Utc::now().timestamp() - 100_000,
+            tool_calls: None,
+            tool_call_id: None,
+        };
+        let recent_assistant = ConversationMessage::new(MessageRole::Assistant, "recent answer");
+        elroy_db::replace_context_messages(
+            &mut connection,
+            LOCAL_USER_TOKEN,
+            &[stale_user, recent_assistant.clone()],
+        )
+        .expect("messages should persist");
+        drop(connection);
+
+        let runtime = AppRuntime::new(config.clone());
+        let snapshot = runtime.load_snapshot().expect("snapshot should load");
+        assert!(
+            snapshot
+                .conversation_lines
+                .iter()
+                .any(|line| line == "user: stale user")
+        );
+        assert!(
+            snapshot
+                .conversation_lines
+                .iter()
+                .any(|line| line == "assistant: recent answer")
+        );
+
+        let mut connection =
+            open_sqlite_connection(&config.database_path).expect("database should reopen");
+        let stored =
+            elroy_db::load_context_messages(&mut connection, LOCAL_USER_TOKEN).expect("load ok");
+        assert_eq!(stored.len(), 2);
+        assert_eq!(stored[0].content.as_deref(), Some("stale user"));
+        assert_eq!(
+            stored[1].content.as_deref(),
+            recent_assistant.content.as_deref()
+        );
+
+        let stale_follow_up = ConversationMessage {
+            role: MessageRole::Assistant,
+            content: Some("stale follow-up".to_string()),
+            chat_model: None,
+            id: None,
+            created_at_unix: Utc::now().timestamp() - 100_000,
+            tool_calls: None,
+            tool_call_id: None,
+        };
+        elroy_db::replace_context_messages(
+            &mut connection,
+            LOCAL_USER_TOKEN,
+            &[stored[0].clone(), stored[1].clone(), stale_follow_up],
+        )
+        .expect("messages should persist");
+        drop(connection);
+
+        let _ = runtime.load_snapshot().expect("snapshot should reload");
+        let mut connection =
+            open_sqlite_connection(&config.database_path).expect("database should reopen");
+        let stored =
+            elroy_db::load_context_messages(&mut connection, LOCAL_USER_TOKEN).expect("load ok");
+        assert_eq!(stored.len(), 2);
+        assert_eq!(stored[0].content.as_deref(), Some("stale user"));
+        assert_eq!(stored[1].content.as_deref(), Some("recent answer"));
 
         fs::remove_dir_all(home).expect("home should be removed");
     }
