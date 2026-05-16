@@ -3743,7 +3743,19 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                 &config_for_agenda_checklist_edit,
                 name,
                 |path| {
-                    let updated = update_checklist_item(path, item_id, Some(text), None)?;
+                    let updated = match update_checklist_item(path, item_id, Some(text), None) {
+                        Ok(updated) => updated,
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                            return Err(std::io::Error::other(format!(
+                                "Agenda item '{}' has no checklist item {}.",
+                                path.file_stem()
+                                    .and_then(|value| value.to_str())
+                                    .unwrap_or(name),
+                                item_id
+                            )));
+                        }
+                        Err(error) => return Err(error),
+                    };
                     Ok(format!(
                         "Checklist item {} on '{}' updated.",
                         updated.id, name
@@ -3791,7 +3803,19 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                 &config_for_agenda_checklist_complete,
                 name,
                 |path| {
-                    let updated = update_checklist_item(path, item_id, None, Some(true))?;
+                    let updated = match update_checklist_item(path, item_id, None, Some(true)) {
+                        Ok(updated) => updated,
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                            return Err(std::io::Error::other(format!(
+                                "Agenda item '{}' has no checklist item {}.",
+                                path.file_stem()
+                                    .and_then(|value| value.to_str())
+                                    .unwrap_or(name),
+                                item_id
+                            )));
+                        }
+                        Err(error) => return Err(error),
+                    };
                     Ok(format!(
                         "Checklist item {} on '{}' marked as completed.",
                         updated.id, name
@@ -5666,6 +5690,9 @@ fn mutate_agenda_file_from_config_with_result(
         Ok(payload)
     }) {
         Ok(payload) => ToolExecutionResult::success(payload),
+        Err(error) if error.to_string().starts_with("Agenda item '") => {
+            ToolExecutionResult::error(error.to_string())
+        }
         Err(error) => ToolExecutionResult::error(format!("agenda mutation failed: {error}")),
     }
 }
@@ -6492,9 +6519,8 @@ mod tests {
         argument_limit, build_live_tool_registry, build_live_tool_registry_with_codex_bin_and_hook,
         build_recall_query, codex_background_status_key, compress_context_messages,
         context_task_tool_call_id, count_context_tokens, drop_old_context_messages,
-        due_item_context_messages,
-        format_context_summary_message, is_context_refresh_needed, memory_recall_status_updates,
-        parse_recalled_memory_names, prompt_prelude_status_updates,
+        due_item_context_messages, format_context_summary_message, is_context_refresh_needed,
+        memory_recall_status_updates, parse_recalled_memory_names, prompt_prelude_status_updates,
         provider_config_from_app_config, recall_due_item_context_messages,
         recall_memory_context_messages, recalled_memory_names, recent_recall_context,
         refresh_context_if_needed, run_prompt_with_model_and_registry,
@@ -7789,6 +7815,15 @@ mod tests {
         );
         assert!(!edited.is_error);
         assert_eq!(edited.content, "Checklist item 1 on 'trip' updated.");
+        let missing_edited = registry.invoke(
+            "edit_agenda_checklist_item",
+            "{\"item_name\":\"trip\",\"checklist_item_id\":99,\"new_text\":\"backup\"}",
+        );
+        assert!(missing_edited.is_error);
+        assert_eq!(
+            missing_edited.content,
+            "Agenda item 'trip' has no checklist item 99."
+        );
 
         let completed = registry.invoke(
             "complete_agenda_checklist_item",
@@ -7798,6 +7833,15 @@ mod tests {
         assert_eq!(
             completed.content,
             "Checklist item 1 on 'trip' marked as completed."
+        );
+        let missing_completed = registry.invoke(
+            "complete_agenda_checklist_item",
+            "{\"item_name\":\"trip\",\"checklist_item_id\":99}",
+        );
+        assert!(missing_completed.is_error);
+        assert_eq!(
+            missing_completed.content,
+            "Agenda item 'trip' has no checklist item 99."
         );
 
         let file_text = fs::read_to_string(agenda_dir.join("trip.md")).expect("agenda should read");
