@@ -1558,6 +1558,15 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
         },
     );
 
+    let get_fast_recall = ExecutableTool::new(
+        ToolSpec::new(
+            "get_fast_recall",
+            "No-op tool used to acknowledge synthetic recall context.",
+            JsonSchema::object(Vec::<(String, Value)>::new(), [] as [&str; 0]),
+        ),
+        move |_| ToolExecutionResult::success("OK".to_string()),
+    );
+
     let config_for_agenda_write = config.clone();
     let add_agenda_item = ExecutableTool::new(
         ToolSpec::new(
@@ -3374,6 +3383,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
 
     ExecutableToolRegistry::new(vec![
         create_memory,
+        get_fast_recall,
         add_agenda_item,
         create_task,
         create_due_item,
@@ -4876,6 +4886,15 @@ mod tests {
         assert!(!stripped.content.contains("get_fast_recall"));
 
         fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
+    fn live_tool_registry_includes_get_fast_recall_ack_tool() {
+        let registry = build_live_tool_registry(&AppConfig::defaults());
+        let result = registry.invoke("get_fast_recall", "{}");
+
+        assert!(!result.is_error);
+        assert_eq!(result.content, "OK");
     }
 
     #[test]
