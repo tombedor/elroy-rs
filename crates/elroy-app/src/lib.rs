@@ -7064,8 +7064,9 @@ fn recall_memory_context_messages(
     }
 
     if reflect {
+        let recent_context = recent_recall_context(transcript, 3);
         let content = serde_json::to_string_pretty(&json!({
-            "content": build_reflective_recall_content(&recalled),
+            "content": build_reflective_recall_content(&recalled, prompt, &recent_context),
             "recall_metadata": recalled
                 .iter()
                 .map(|memory| {
@@ -7265,15 +7266,33 @@ fn recent_recall_context(transcript: &[ConversationMessage], window: usize) -> V
         .collect()
 }
 
-fn build_reflective_recall_content(memories: &[&elroy_db::MemoryRecord]) -> String {
-    let lines = memories
+fn build_reflective_recall_content(
+    memories: &[&elroy_db::MemoryRecord],
+    prompt: &str,
+    recent_context: &[String],
+) -> String {
+    let memory_lines = memories
         .iter()
         .map(|memory| format!("- {}: {}", memory.name, excerpt(&memory.body, 180)))
         .collect::<Vec<_>>();
-    format!(
+    let mut sections = vec![format!(
         "I remember these details may be relevant to the current conversation:\n{}",
-        lines.join("\n")
-    )
+        memory_lines.join("\n")
+    )];
+    if !recent_context.is_empty() {
+        sections.push(format!(
+            "Recent conversation context:\n{}",
+            recent_context.join("\n")
+        ));
+    }
+    sections.push(format!(
+        "The latest user message is: {}",
+        excerpt(prompt.trim(), 160)
+    ));
+    sections.push(
+        "I should use the recalled details only if they help answer the user clearly.".to_string(),
+    );
+    sections.join("\n\n")
 }
 
 fn recalled_memory_names(transcript: &[ConversationMessage]) -> HashSet<String> {
@@ -15213,12 +15232,16 @@ mod tests {
         let mut config = AppConfig::defaults();
         config.memory_recall_classifier_enabled = false;
         config.reflect = true;
+        let transcript = vec![
+            ConversationMessage::new(MessageRole::User, "I am getting ready for practice"),
+            ConversationMessage::new(MessageRole::Assistant, "What part do you want to focus on?"),
+        ];
         let messages = recall_memory_context_messages(
             config.memory_recall_classifier_enabled,
             config.memory_recall_classifier_window,
             config.reflect,
             "I am heading to basketball practice",
-            &[],
+            &transcript,
             &[MemoryRecord {
                 id: 1,
                 legacy_frontmatter_id: None,
@@ -15245,6 +15268,12 @@ mod tests {
         assert!(payload.contains("I remember these details may be relevant"));
         assert!(payload.contains("\"recall_metadata\""));
         assert!(payload.contains("basketball form"));
+        assert!(payload.contains("Recent conversation context"));
+        assert!(payload.contains("user: I am getting ready for practice"));
+        assert!(payload.contains("assistant: What part do you want to focus on?"));
+        assert!(
+            payload.contains("The latest user message is: I am heading to basketball practice")
+        );
     }
 
     #[test]
