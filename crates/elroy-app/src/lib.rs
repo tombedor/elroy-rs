@@ -1651,6 +1651,10 @@ fn format_context_message_source_content(messages: &[ConversationMessage]) -> St
         .join("\n")
 }
 
+fn format_memory_file_source_content(source_name: &str, source_body: &str) -> String {
+    format!("#{source_name}\n{source_body}")
+}
+
 fn format_due_item_detail(item: &AgendaItemRecord) -> String {
     let mut lines = vec![format!("Due item '{}':", item.name)];
     if let Some(trigger_datetime) = &item.trigger_datetime {
@@ -5374,7 +5378,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                         memory.name,
                         index,
                         memory_sources.len() - 1,
-                        source_body
+                        format_memory_file_source_content(source_name, &source_body)
                     )));
                 }
                 if let Some(message_ids) = parse_context_message_source_ids(frontmatter.as_deref())
@@ -8153,12 +8157,19 @@ mod tests {
                 ("Memory".to_string(), "running progress".to_string()),
             ]
         );
+        let running_progress_index =
+            serde_json::from_str::<Vec<(String, String)>>(&source_list.content)
+                .expect("source list should parse")
+                .iter()
+                .position(|entry| entry == &("Memory".to_string(), "running progress".to_string()))
+                .expect("running progress source should be present");
 
         let source_content = registry.invoke(
             "get_source_content_for_memory",
-            "{\"memory_name\":\"running summary\",\"index\":0}",
+            &format!("{{\"memory_name\":\"running summary\",\"index\":{running_progress_index}}}"),
         );
         assert!(!source_content.is_error);
+        assert!(source_content.content.contains("#running progress"));
         assert!(source_content.content.contains("I ran a marathon today"));
 
         assert!(
@@ -8981,6 +8992,7 @@ mod tests {
             "{\"memory_name\":\"runner notes\",\"index\":0}",
         );
         assert!(!source_content.is_error);
+        assert!(source_content.content.contains("#runner notes"));
         assert!(source_content.content.contains("old text"));
         assert!(!source_content.content.contains("new correction"));
 
