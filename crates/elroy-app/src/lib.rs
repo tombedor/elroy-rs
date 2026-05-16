@@ -2836,9 +2836,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                     ("name", json!({"type": "string"})),
                     ("text", json!({"type": "string"})),
                     ("trigger_time", json!({"type": "string"})),
-                    ("trigger_datetime", json!({"type": "string"})),
                     ("trigger_context", json!({"type": "string"})),
-                    ("date", json!({"type": "string"})),
                 ],
                 ["name", "text"],
             ),
@@ -7472,6 +7470,29 @@ mod tests {
         assert!(!properties.contains_key("date"));
         assert!(!properties.contains_key("trigger_datetime"));
         assert!(!properties.contains_key("trigger_context"));
+    }
+
+    #[test]
+    fn create_due_item_tool_schema_matches_python_surface() {
+        let config = AppConfig::defaults();
+        let registry = build_live_tool_registry(&config);
+        let spec = registry
+            .specs()
+            .into_iter()
+            .find(|spec| spec.name == "create_due_item")
+            .expect("create_due_item tool should exist");
+
+        let properties = match &spec.parameters {
+            elroy_tools::JsonSchema::Object { properties, .. } => properties,
+        };
+
+        assert_eq!(properties.len(), 4);
+        assert!(properties.contains_key("name"));
+        assert!(properties.contains_key("text"));
+        assert!(properties.contains_key("trigger_time"));
+        assert!(properties.contains_key("trigger_context"));
+        assert!(!properties.contains_key("trigger_datetime"));
+        assert!(!properties.contains_key("date"));
     }
 
     #[test]
