@@ -2767,6 +2767,9 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
             let Some(text) = arguments.get("text").and_then(Value::as_str) else {
                 return ToolExecutionResult::error("create_task requires string text");
             };
+            if name.trim().is_empty() {
+                return ToolExecutionResult::error("Task name cannot be empty");
+            }
             let date = arguments
                 .get("item_date")
                 .and_then(Value::as_str)
@@ -2850,6 +2853,9 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
             let Some(text) = arguments.get("text").and_then(Value::as_str) else {
                 return ToolExecutionResult::error("create_due_item requires string text");
             };
+            if name.trim().is_empty() {
+                return ToolExecutionResult::error("Due item name cannot be empty");
+            }
             let trigger_time = arguments
                 .get("trigger_time")
                 .and_then(Value::as_str)
@@ -8076,6 +8082,12 @@ mod tests {
             duplicate_contextual.content,
             "Contextual due item 'call mom' already exists"
         );
+        let blank_name = registry.invoke(
+            "create_due_item",
+            "{\"name\":\"   \",\"text\":\"This should fail\",\"trigger_context\":\"later\"}",
+        );
+        assert!(blank_name.is_error);
+        assert_eq!(blank_name.content, "Due item name cannot be empty");
         assert!(agenda_dir.join("call_mom.md").exists());
         let context = registry.invoke("show_context_messages", "{\"limit\":20}");
         assert!(!context.is_error);
@@ -8922,6 +8934,12 @@ mod tests {
             duplicate_created.content,
             "Task 'Job Search' already exists"
         );
+        let blank_name = registry.invoke(
+            "create_task",
+            "{\"name\":\"   \",\"text\":\"This should fail\"}",
+        );
+        assert!(blank_name.is_error);
+        assert_eq!(blank_name.content, "Task name cannot be empty");
         let past_trigger = registry.invoke(
             "create_task",
             "{\"name\":\"Old Reminder\",\"text\":\"This should fail\",\"trigger_datetime\":\"2000-01-01 09:00\"}",
