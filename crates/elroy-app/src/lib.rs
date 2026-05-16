@@ -1665,8 +1665,12 @@ fn format_due_item_listing(items: &[AgendaItemRecord], active: bool) -> String {
         let trigger_time = item
             .trigger_datetime
             .as_deref()
-            .unwrap_or("N/A")
-            .to_string();
+            .map(|value| {
+                parse_sidebar_trigger_datetime(value)
+                    .map(|datetime| datetime.format("%Y-%m-%d %H:%M:%S").to_string())
+                    .unwrap_or_else(|| value.to_string())
+            })
+            .unwrap_or_else(|| "N/A".to_string());
         let context = item.trigger_context.as_deref().unwrap_or("N/A").to_string();
         lines.push(format!(
             "- {} | Type: {} | Trigger Time: {} | Context: {} | Text: {}",
@@ -8227,6 +8231,11 @@ mod tests {
         assert!(printed_active.content.contains("Active Due Items"));
         assert!(printed_active.content.contains("pay bill"));
         assert!(printed_active.content.contains("Type: Timed"));
+        assert!(
+            printed_active
+                .content
+                .contains("Trigger Time: 2026-05-15 09:00:00")
+        );
 
         let printed_inactive = registry.invoke("print_inactive_due_items", "{\"n\":10}");
         assert!(!printed_inactive.is_error);
