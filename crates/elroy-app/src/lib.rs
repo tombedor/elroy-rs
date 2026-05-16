@@ -7363,7 +7363,7 @@ fn recall_memory_context_messages_with_decision(
 
     let recall_query =
         build_recall_query(prompt, context.transcript, memory_recall_classifier_window);
-    let relevance_model = if reflect { None } else { reflective_model };
+    let relevance_model = reflective_model;
     let already_recalled_memories = recalled_item_names_by_type(context.transcript, "Memory");
     let recalled = select_relevant_recall_memories(
         &recall_query,
@@ -7391,7 +7391,7 @@ fn recall_memory_context_messages_with_decision(
             .collect()
     };
     let reflective_due_items = if reflect {
-        select_due_items_by_overlap(&recall_query, context.due_items, 2, None)
+        select_relevant_recall_due_items(&recall_query, context.due_items, 2, relevance_model)
             .into_iter()
             .filter(|item| !already_recalled_agenda_items.contains(&item.name))
             .collect()
@@ -7399,7 +7399,7 @@ fn recall_memory_context_messages_with_decision(
         Vec::new()
     };
     let reflective_agenda_items = if reflect {
-        select_agenda_items_by_overlap(&recall_query, context.agenda_items, 2)
+        select_relevant_recall_agenda_items(&recall_query, context.agenda_items, 2, relevance_model)
             .into_iter()
             .filter(|item| !already_recalled_agenda_items.contains(&item.name))
             .collect()
@@ -16807,9 +16807,19 @@ mod tests {
         let mut config = AppConfig::defaults();
         config.memory_recall_classifier_enabled = false;
         config.reflect = true;
-        let model = FakeModel::new(vec![vec![StreamEvent::AssistantResponse {
-            content: r#"{"is_relevant":true,"content":"I remember that the user should bring the resistance bands to practice."}"#.to_string(),
-        }]]);
+        let model = FakeModel::new(vec![
+            vec![StreamEvent::AssistantResponse {
+                content: r#"{"answers":[true],"reasoning":"The recalled memory is relevant."}"#
+                    .to_string(),
+            }],
+            vec![StreamEvent::AssistantResponse {
+                content: r#"{"answers":[true],"reasoning":"The due item is relevant."}"#
+                    .to_string(),
+            }],
+            vec![StreamEvent::AssistantResponse {
+                content: r#"{"is_relevant":true,"content":"I remember that the user should bring the resistance bands to practice."}"#.to_string(),
+            }],
+        ]);
         let due_items = vec![AgendaItemRecord {
             id: 2,
             legacy_frontmatter_id: None,
@@ -16867,9 +16877,15 @@ mod tests {
         let mut config = AppConfig::defaults();
         config.memory_recall_classifier_enabled = false;
         config.reflect = true;
-        let model = FakeModel::new(vec![vec![StreamEvent::AssistantResponse {
-            content: r#"{"is_relevant":false,"content":null}"#.to_string(),
-        }]]);
+        let model = FakeModel::new(vec![
+            vec![StreamEvent::AssistantResponse {
+                content: r#"{"answers":[true],"reasoning":"The recalled memory is relevant enough to inspect."}"#
+                    .to_string(),
+            }],
+            vec![StreamEvent::AssistantResponse {
+                content: r#"{"is_relevant":false,"content":null}"#.to_string(),
+            }],
+        ]);
 
         let messages = recall_memory_context_messages_with_decision(
             config.memory_recall_classifier_window,
@@ -16894,6 +16910,81 @@ mod tests {
         );
 
         assert!(messages.is_empty());
+    }
+
+    #[test]
+    fn reflective_recall_can_broaden_candidates_beyond_overlap() {
+        let mut config = AppConfig::defaults();
+        config.memory_recall_classifier_enabled = false;
+        config.reflect = true;
+        let model = FakeModel::new(vec![
+            vec![StreamEvent::AssistantResponse {
+                content: r#"{"answers":[true],"reasoning":"This due item is semantically relevant."}"#
+                    .to_string(),
+            }],
+            vec![StreamEvent::AssistantResponse {
+                content:
+                    r#"{"answers":[true],"reasoning":"This agenda item is semantically relevant."}"#
+                        .to_string(),
+            }],
+            vec![StreamEvent::AssistantResponse {
+                content: r#"{"is_relevant":true,"content":"I remember that the user should bring the resistance bands and review the equipment checklist before practice."}"#.to_string(),
+            }],
+        ]);
+        let messages = recall_memory_context_messages_with_decision(
+            config.memory_recall_classifier_window,
+            config.reflect,
+            "What gear should I bring to practice?",
+            true,
+            Some(&model),
+            RecallContext {
+                transcript: &[],
+                memories: &[],
+                due_items: &[AgendaItemRecord {
+                    id: 2,
+                    legacy_frontmatter_id: None,
+                    name: "practice reminder".to_string(),
+                    file_path: "/tmp/practice_reminder.md".to_string(),
+                    agenda_date: Some("unscheduled".to_string()),
+                    is_completed: false,
+                    status: Some("created".to_string()),
+                    closing_comment: None,
+                    checklist_total: 0,
+                    checklist_completed: 0,
+                    body: "Bring the resistance bands".to_string(),
+                    trigger_datetime: Some("2026-05-20T09:00:00".to_string()),
+                    trigger_context: Some("before basketball practice".to_string()),
+                    is_active: true,
+                    updated_at_unix: 11,
+                }],
+                agenda_items: &[AgendaItemRecord {
+                    id: 3,
+                    legacy_frontmatter_id: None,
+                    name: "packing checklist".to_string(),
+                    file_path: "/tmp/packing_checklist.md".to_string(),
+                    agenda_date: Some("2026-05-20".to_string()),
+                    is_completed: false,
+                    status: Some("created".to_string()),
+                    closing_comment: None,
+                    checklist_total: 0,
+                    checklist_completed: 0,
+                    body: "Review the equipment checklist before leaving.".to_string(),
+                    trigger_datetime: None,
+                    trigger_context: None,
+                    is_active: true,
+                    updated_at_unix: 12,
+                }],
+            },
+        );
+
+        assert_eq!(messages.len(), 2);
+        let payload = messages[1]
+            .content
+            .as_deref()
+            .expect("reflective recall payload should exist");
+        assert!(payload.contains("practice reminder"));
+        assert!(payload.contains("packing checklist"));
+        assert!(payload.contains("resistance bands"));
     }
 
     #[test]
