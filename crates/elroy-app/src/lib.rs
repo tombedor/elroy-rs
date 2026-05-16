@@ -2773,19 +2773,31 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                 .or_else(|| arguments.get("date").and_then(Value::as_str));
             let trigger_datetime = arguments.get("trigger_datetime").and_then(Value::as_str);
             let trigger_context = arguments.get("trigger_context").and_then(Value::as_str);
-            match create_task_file_with_schedule(
-                &config_for_task_write.agenda_dir,
-                name,
-                text,
-                date,
-                trigger_datetime,
-                trigger_context,
-            )
-            .and_then(|path| {
+            match (|| -> Result<PathBuf, std::io::Error> {
+                let mut connection = open_sqlite_connection(&config_for_task_write.database_path)
+                    .map_err(|error| std::io::Error::other(error.to_string()))?;
+                run_migrations(&mut connection)
+                    .map_err(|error| std::io::Error::other(error.to_string()))?;
+                if find_active_agenda_item_by_name(&connection, name)
+                    .map_err(|error| std::io::Error::other(error.to_string()))?
+                    .is_some()
+                {
+                    return Err(std::io::Error::other(format!(
+                        "Task '{name}' already exists"
+                    )));
+                }
+                let path = create_task_file_with_schedule(
+                    &config_for_task_write.agenda_dir,
+                    name,
+                    text,
+                    date,
+                    trigger_datetime,
+                    trigger_context,
+                )?;
                 elroy_db::bootstrap_database(&BootstrapPlan::from_config(&config_for_task_write))
                     .map_err(|error| std::io::Error::other(error.to_string()))?;
                 Ok(path)
-            }) {
+            })() {
                 Ok(path) => ToolExecutionResult::success(format!(
                     "Task '{}' has been created.",
                     path.file_stem()
@@ -2793,6 +2805,9 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                         .unwrap_or(name)
                         .replace('_', " ")
                 )),
+                Err(error) if error.to_string().starts_with("Task '") => {
+                    ToolExecutionResult::error(error.to_string())
+                }
                 Err(error) => ToolExecutionResult::error(format!("failed to create task: {error}")),
             }
         },
@@ -2833,24 +2848,37 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                 );
             }
             let date = arguments.get("date").and_then(Value::as_str);
-            match create_agenda_file(
-                &config_for_due_item_write.agenda_dir,
-                name,
-                text,
-                date,
-                trigger_time,
-                trigger_context,
-            )
-            .and_then(|path| {
-                elroy_db::bootstrap_database(&BootstrapPlan::from_config(
-                    &config_for_due_item_write,
-                ))
-                .map_err(|error| std::io::Error::other(error.to_string()))?;
+            match (|| -> Result<PathBuf, std::io::Error> {
                 let mut connection =
                     open_sqlite_connection(&config_for_due_item_write.database_path)
                         .map_err(|error| std::io::Error::other(error.to_string()))?;
                 run_migrations(&mut connection)
                     .map_err(|error| std::io::Error::other(error.to_string()))?;
+                if find_active_agenda_item_by_name(&connection, name)
+                    .map_err(|error| std::io::Error::other(error.to_string()))?
+                    .is_some()
+                {
+                    let item_type = if trigger_time.is_some() {
+                        "Timed"
+                    } else {
+                        "Contextual"
+                    };
+                    return Err(std::io::Error::other(format!(
+                        "{item_type} due item '{name}' already exists"
+                    )));
+                }
+                let path = create_agenda_file(
+                    &config_for_due_item_write.agenda_dir,
+                    name,
+                    text,
+                    date,
+                    trigger_time,
+                    trigger_context,
+                )?;
+                elroy_db::bootstrap_database(&BootstrapPlan::from_config(
+                    &config_for_due_item_write,
+                ))
+                .map_err(|error| std::io::Error::other(error.to_string()))?;
                 let due_item = find_active_agenda_item_by_name(&connection, name)
                     .map_err(|error| std::io::Error::other(error.to_string()))?
                     .filter(|item| {
@@ -2870,7 +2898,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                     }
                 }
                 Ok(path)
-            }) {
+            })() {
                 Ok(_) => {
                     let message = match (trigger_time, trigger_context) {
                         (Some(trigger_time), Some(trigger_context)) => format!(
@@ -2885,6 +2913,12 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                         (None, None) => unreachable!("validated above"),
                     };
                     ToolExecutionResult::success(message)
+                }
+                Err(error)
+                    if error.to_string().contains(" due item '")
+                        && error.to_string().ends_with(" already exists") =>
+                {
+                    ToolExecutionResult::error(error.to_string())
                 }
                 Err(error) => {
                     ToolExecutionResult::error(format!("failed to create due item: {error}"))
@@ -7965,6 +7999,15 @@ mod tests {
             created.content,
             "Contextual due item 'call mom' has been created."
         );
+        let duplicate_contextual = registry.invoke(
+            "create_due_item",
+            "{\"name\":\"call mom\",\"text\":\"Call mom tomorrow\",\"trigger_context\":\"tomorrow morning\"}",
+        );
+        assert!(duplicate_contextual.is_error);
+        assert_eq!(
+            duplicate_contextual.content,
+            "Contextual due item 'call mom' already exists"
+        );
         assert!(agenda_dir.join("call_mom.md").exists());
         let context = registry.invoke("show_context_messages", "{\"limit\":20}");
         assert!(!context.is_error);
@@ -7980,6 +8023,15 @@ mod tests {
         assert_eq!(
             timed.content,
             "Timed due item 'pay rent' has been created for 2026-05-16 09:00."
+        );
+        let duplicate_timed = registry.invoke(
+            "create_due_item",
+            "{\"name\":\"pay rent\",\"text\":\"Pay rent later\",\"trigger_time\":\"2026-05-17 09:00\"}",
+        );
+        assert!(duplicate_timed.is_error);
+        assert_eq!(
+            duplicate_timed.content,
+            "Timed due item 'pay rent' already exists"
         );
         let timed_context = registry.invoke("show_context_messages", "{\"limit\":40}");
         assert!(!timed_context.is_error);
@@ -8782,6 +8834,15 @@ mod tests {
             fs::read_to_string(agenda_dir.join("job_search.md")).expect("task file should read");
         assert!(created_text.contains("date: 2026-05-20"));
         assert!(created_text.contains("trigger_context: after breakfast"));
+        let duplicate_created = registry.invoke(
+            "create_task",
+            "{\"name\":\"Job Search\",\"text\":\"Reach out to one contact\"}",
+        );
+        assert!(duplicate_created.is_error);
+        assert_eq!(
+            duplicate_created.content,
+            "Task 'Job Search' already exists"
+        );
 
         let triggered = registry.invoke("list_triggered_tasks", "{\"limit\":10}");
         assert!(!triggered.is_error);
