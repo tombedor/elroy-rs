@@ -2548,6 +2548,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                 [
                     ("name", json!({"type": "string"})),
                     ("text", json!({"type": "string"})),
+                    ("item_date", json!({"type": "string"})),
                     ("date", json!({"type": "string"})),
                     ("trigger_datetime", json!({"type": "string"})),
                     ("trigger_context", json!({"type": "string"})),
@@ -2705,7 +2706,10 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                 .and_then(Value::as_str)
                 .filter(|name| !name.trim().is_empty())
                 .unwrap_or(&derived_name);
-            let date = arguments.get("date").and_then(Value::as_str);
+            let date = arguments
+                .get("item_date")
+                .and_then(Value::as_str)
+                .or_else(|| arguments.get("date").and_then(Value::as_str));
             let effective_date = date
                 .map(ToOwned::to_owned)
                 .unwrap_or_else(|| Local::now().date_naive().to_string());
@@ -7521,6 +7525,46 @@ mod tests {
         assert!(stored.contains(&format!("date: {today}")));
         assert!(stored.contains("Sprint kickoff planning"));
         assert!(stored.contains("Review owners and milestones."));
+
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
+    fn add_agenda_item_accepts_item_date_alias() {
+        let unique = format!(
+            "elroy-rs-app-agenda-item-date-alias-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+
+        let mut config = AppConfig::defaults();
+        config.memory_dir = memory_dir;
+        config.agenda_dir = agenda_dir.clone();
+        config.database_path = database_path;
+        elroy_db::bootstrap_database(&elroy_db::BootstrapPlan::from_config(&config))
+            .expect("bootstrap should succeed");
+
+        let registry = build_live_tool_registry(&config);
+        let added = registry.invoke(
+            "add_agenda_item",
+            "{\"text\":\"Quarterly planning\",\"item_date\":\"2026-05-22\"}",
+        );
+        assert!(!added.is_error);
+        assert_eq!(
+            added.content,
+            "Agenda item added for 2026-05-22: quarterly_planning"
+        );
+        let stored = fs::read_to_string(agenda_dir.join("quarterly_planning.md"))
+            .expect("agenda file should read");
+        assert!(stored.contains("date: 2026-05-22"));
 
         fs::remove_dir_all(home).expect("home should be removed");
     }
