@@ -77,6 +77,7 @@ pub struct TuiApp {
     pub last_command_pane: CommandPane,
     pub conversation_lines: Vec<String>,
     pub conversation_scroll: usize,
+    pub follow_conversation_output: bool,
     pub memory_titles: Vec<String>,
     pub agenda_titles: Vec<String>,
     pub improvement_titles: Vec<String>,
@@ -532,6 +533,7 @@ fn apply_intent_with_runtime(
             match runtime.start_prompt_stream(&submitted) {
                 Ok(stream) => {
                     app.conversation_lines.push(format!("user: {submitted}"));
+                    app.follow_conversation_output = true;
                     app.record_submitted_prompt(&submitted);
                     app.input.clear();
                     app.status = "thinking...".to_string();
@@ -553,6 +555,7 @@ fn apply_intent_with_runtime(
                     Ok(snapshot) => {
                         app.apply_snapshot(snapshot);
                         app.focus = FocusTarget::Input;
+                        app.follow_conversation_output = true;
                         app.status = "Chat stream cancelled".to_string();
                     }
                     Err(error) => {
@@ -625,6 +628,7 @@ fn start_command_execution(
         Ok(()) => {
             app.command_active = true;
             app.focus = FocusTarget::Input;
+            app.follow_conversation_output = true;
             app.status = format!("running command: /{display_name}");
             Ok(())
         }
@@ -658,6 +662,7 @@ fn maybe_complete_command_execution(
             app.command_active = false;
             app.apply_snapshot(snapshot);
             app.focus = FocusTarget::Input;
+            app.follow_conversation_output = true;
             match runtime.take_restart_request() {
                 Ok(Some(resume_message)) => return Some(resume_message),
                 Ok(None) => {}
@@ -671,6 +676,7 @@ fn maybe_complete_command_execution(
             app.command_active = false;
             app.status = format!("command failed: {error}");
             app.focus = FocusTarget::Input;
+            app.follow_conversation_output = true;
         }
     }
     None
@@ -703,6 +709,7 @@ fn advance_prompt_stream(
                 Ok(snapshot) => {
                     app.apply_snapshot(snapshot);
                     app.focus = FocusTarget::Input;
+                    app.follow_conversation_output = true;
                     let context_messages = runtime.load_context_messages().unwrap_or_default();
                     if let Some(submitted_prompt) = pending.submitted_prompt {
                         app.mark_messages_rendered_after_chat_turn(
@@ -830,6 +837,9 @@ fn apply_prompt_update(app: &mut TuiApp, update: PromptUpdate) {
             } else {
                 app.conversation_lines.push(format!("assistant: {delta}"));
             }
+            if app.focus != FocusTarget::Command(CommandPane::Conversation) {
+                app.follow_conversation_output = true;
+            }
         }
         PromptUpdate::InternalThought(content) => {
             app.status = format!("thinking: {content}");
@@ -840,6 +850,9 @@ fn apply_prompt_update(app: &mut TuiApp, update: PromptUpdate) {
         } => {
             app.conversation_lines
                 .push(format!("tool requested: {name} {arguments_json}"));
+            if app.focus != FocusTarget::Command(CommandPane::Conversation) {
+                app.follow_conversation_output = true;
+            }
         }
         PromptUpdate::ToolResult { content, is_error } => {
             let label = if is_error {
@@ -848,6 +861,9 @@ fn apply_prompt_update(app: &mut TuiApp, update: PromptUpdate) {
                 "tool result"
             };
             app.conversation_lines.push(format!("{label}: {content}"));
+            if app.focus != FocusTarget::Command(CommandPane::Conversation) {
+                app.follow_conversation_output = true;
+            }
         }
         PromptUpdate::Status(content) => {
             app.status = content;
@@ -900,6 +916,7 @@ impl TuiApp {
             last_command_pane: CommandPane::Conversation,
             conversation_lines: vec!["Conversation history and streaming output".to_string()],
             conversation_scroll: 0,
+            follow_conversation_output: true,
             memory_titles: Vec::new(),
             agenda_titles: Vec::new(),
             improvement_titles: Vec::new(),
@@ -947,6 +964,9 @@ impl TuiApp {
         self.conversation_lines
             .extend(unseen_messages.iter().map(format_context_message_line));
         self.mark_context_messages_rendered(unseen_messages);
+        if self.focus != FocusTarget::Command(CommandPane::Conversation) {
+            self.follow_conversation_output = true;
+        }
     }
 
     pub fn mark_messages_rendered_after_bootstrap_stream(
@@ -1012,6 +1032,7 @@ impl TuiApp {
             .direction(Direction::Horizontal)
             .constraints([Constraint::Min(1), Constraint::Length(36)])
             .split(vertical[0]);
+        let conversation_height = body[0].height.saturating_sub(2) as usize;
 
         Paragraph::new(self.conversation_lines.join("\n"))
             .block(
@@ -1019,7 +1040,10 @@ impl TuiApp {
                     .title(self.title.as_str())
                     .borders(Borders::ALL),
             )
-            .scroll((self.conversation_scroll as u16, 0))
+            .scroll((
+                self.effective_conversation_scroll(conversation_height) as u16,
+                0,
+            ))
             .render(body[0], buf);
 
         Paragraph::new(self.sidebar_text())
@@ -1104,6 +1128,18 @@ impl TuiApp {
             SidebarSection::Improvements => &self.improvement_titles,
             SidebarSection::FeatureRequests => &self.feature_request_titles,
             SidebarSection::CodexSessions => &self.codex_session_titles,
+        }
+    }
+
+    fn effective_conversation_scroll(&self, viewport_height: usize) -> usize {
+        let max_scroll = self
+            .conversation_lines
+            .len()
+            .saturating_sub(viewport_height.max(1));
+        if self.follow_conversation_output {
+            max_scroll
+        } else {
+            self.conversation_scroll.min(max_scroll)
         }
     }
 
@@ -1466,6 +1502,7 @@ impl TuiApp {
             }
             UiIntent::MoveUp => {
                 if self.focus == FocusTarget::Command(CommandPane::Conversation) {
+                    self.follow_conversation_output = false;
                     self.conversation_scroll = self.conversation_scroll.saturating_sub(1);
                     self.status = "scrolled conversation up".to_string();
                 } else {
@@ -1478,6 +1515,7 @@ impl TuiApp {
             UiIntent::MoveDown => {
                 if self.focus == FocusTarget::Command(CommandPane::Conversation) {
                     let max_scroll = self.conversation_lines.len().saturating_sub(1);
+                    self.follow_conversation_output = false;
                     self.conversation_scroll =
                         self.conversation_scroll.saturating_add(1).min(max_scroll);
                     self.status = "scrolled conversation down".to_string();
@@ -1513,10 +1551,12 @@ impl TuiApp {
             FocusTarget::Command(pane) => {
                 self.last_command_pane = pane;
                 self.focus = FocusTarget::Input;
+                self.follow_conversation_output = true;
                 UiIntent::Noop
             }
             FocusTarget::Unknown => {
                 self.focus = FocusTarget::Input;
+                self.follow_conversation_output = true;
                 UiIntent::Noop
             }
         }
@@ -2565,6 +2605,7 @@ mod tests {
         let down = app.handle_key("j");
         assert_eq!(down, UiIntent::MoveDown);
         app.apply_intent(down);
+        assert!(!app.follow_conversation_output);
         assert_eq!(app.conversation_scroll, 1);
         assert_eq!(app.selected_sidebar_index, 1);
         assert_eq!(app.status, "scrolled conversation down");
@@ -2575,6 +2616,20 @@ mod tests {
         assert_eq!(app.conversation_scroll, 0);
         assert_eq!(app.selected_sidebar_index, 1);
         assert_eq!(app.status, "scrolled conversation up");
+    }
+
+    #[test]
+    fn escaping_from_conversation_browse_reenables_following_latest_output() {
+        let mut app = TuiApp::bootstrap();
+        app.handle_key("escape");
+        let down = app.handle_key("j");
+        app.apply_intent(down);
+        assert!(!app.follow_conversation_output);
+
+        app.handle_key("escape");
+
+        assert_eq!(app.focus, FocusTarget::Input);
+        assert!(app.follow_conversation_output);
     }
 
     #[test]
@@ -2589,6 +2644,7 @@ mod tests {
             "line 4".to_string(),
         ];
         app.conversation_scroll = 2;
+        app.follow_conversation_output = false;
         let area = Rect::new(0, 0, 80, 8);
         let mut buf = Buffer::empty(area);
         app.render(area, &mut buf);
@@ -2608,6 +2664,37 @@ mod tests {
         assert!(!text.contains("line 0"));
         assert!(!text.contains("line 1"));
         assert!(text.contains("line 2"));
+    }
+
+    #[test]
+    fn render_follows_latest_conversation_output_by_default() {
+        let mut app = TuiApp::bootstrap();
+        app.title = "Elroy".to_string();
+        app.conversation_lines = vec![
+            "line 0".to_string(),
+            "line 1".to_string(),
+            "line 2".to_string(),
+            "line 3".to_string(),
+            "line 4".to_string(),
+        ];
+        let area = Rect::new(0, 0, 80, 8);
+        let mut buf = Buffer::empty(area);
+        app.render(area, &mut buf);
+        let text = buf
+            .content
+            .chunks(area.width as usize)
+            .map(|row| {
+                row.iter()
+                    .map(|cell| cell.symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(!text.contains("line 0"));
+        assert!(text.contains("line 4"));
     }
 
     #[test]
