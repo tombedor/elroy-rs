@@ -3666,8 +3666,8 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                 return ToolExecutionResult::error("add_agenda_item_update requires string note");
             };
             mutate_agenda_file_from_config_with_result(&config_for_agenda_update, name, |path| {
-                append_agenda_update(path, note)?;
-                Ok(format!("Update added to '{name}' at <timestamp>."))
+                let timestamp = append_agenda_update(path, note)?;
+                Ok(format!("Update added to '{name}' at {timestamp}."))
             })
         },
     );
@@ -7786,13 +7786,19 @@ mod tests {
             "{\"item_name\":\"doctor visit\",\"note\":\"called ahead\"}",
         );
         assert!(!update.is_error);
-        assert_eq!(
-            update.content,
-            "Update added to 'doctor visit' at <timestamp>."
+        assert!(
+            update
+                .content
+                .starts_with("Update added to 'doctor visit' at unix-")
         );
         let updated_text =
             fs::read_to_string(agenda_dir.join("doctor_visit.md")).expect("agenda should read");
         assert!(updated_text.contains("## Updates"));
+        let update_timestamp = update
+            .content
+            .trim_start_matches("Update added to 'doctor visit' at ")
+            .trim_end_matches('.');
+        assert!(updated_text.contains(&format!("**{update_timestamp}**")));
         assert!(updated_text.contains("called ahead"));
 
         let complete = registry.invoke(

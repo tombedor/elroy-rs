@@ -33,7 +33,7 @@ pub fn create_agenda_file(
     Ok(path)
 }
 
-pub fn append_agenda_update(path: &Path, note: &str) -> std::io::Result<()> {
+pub fn append_agenda_update(path: &Path, note: &str) -> std::io::Result<String> {
     let (frontmatter, body) = read_markdown_parts(path)?;
     let timestamp = local_timestamp_string();
     let update_line = format!("- **{timestamp}**: {note}");
@@ -57,7 +57,8 @@ pub fn append_agenda_update(path: &Path, note: &str) -> std::io::Result<()> {
     } else {
         format!("{}\n\n## Updates\n\n{update_line}", body.trim())
     };
-    write_markdown_parts(path, frontmatter.as_ref(), &new_body)
+    write_markdown_parts(path, frontmatter.as_ref(), &new_body)?;
+    Ok(timestamp)
 }
 
 pub fn update_agenda_body(path: &Path, text: &str) -> std::io::Result<()> {
@@ -364,12 +365,14 @@ mod tests {
             None,
         )
         .expect("agenda file should be created");
-        append_agenda_update(&path, "called ahead").expect("agenda update should append");
+        let timestamp =
+            append_agenda_update(&path, "called ahead").expect("agenda update should append");
         mark_agenda_item_completed(&path, Some("done")).expect("agenda should complete");
         mark_agenda_item_deleted(&path, Some("no longer needed")).expect("agenda should delete");
 
         let content = std::fs::read_to_string(path).expect("agenda should read");
         assert!(content.contains("## Updates"));
+        assert!(content.contains(&format!("**{timestamp}**")));
         assert!(content.contains("called ahead"));
         assert!(content.contains("completed: true"));
         assert!(content.contains("status: deleted"));
