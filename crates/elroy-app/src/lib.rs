@@ -1674,7 +1674,7 @@ fn format_due_item_listing(items: &[AgendaItemRecord], active: bool) -> String {
 }
 
 fn format_memory_detail(memory: &MemoryRecord) -> String {
-    format!("Memory '{}':\n\n{}", memory.name, memory.body)
+    format!("#{}\n{}", memory.name, memory.body)
 }
 
 fn format_memory_examination(memory: &MemoryRecord) -> String {
@@ -7102,7 +7102,7 @@ mod tests {
         assert!(!memory.is_error);
         assert!(memory.content.contains("remember the hill workout"));
         assert!(!printed_memory.is_error);
-        assert!(printed_memory.content.contains("Memory 'runner notes':"));
+        assert!(printed_memory.content.starts_with("#runner notes\n"));
         assert!(printed_memory.content.contains("remember the hill workout"));
         assert!(!missing_printed_memory.is_error);
         assert_eq!(
