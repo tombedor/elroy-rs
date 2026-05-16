@@ -8,8 +8,8 @@ use elroy_core::{AppSession, TurnContext};
 use elroy_db::{BootstrapInventory, BootstrapPlan, bootstrap_database};
 use elroy_llm::StreamEvent;
 use elroy_tui::{
-    PromptUpdate, SidebarAction, SidebarSection, TuiContextMessage, TuiPromptStream, TuiRuntime,
-    TuiSidebarDetail, run_with_snapshot_and_runtime,
+    PromptUpdate, SidebarAction, SidebarSection, TuiContextMessage, TuiPromptStream, TuiRunResult,
+    TuiRuntime, TuiSidebarDetail, run_with_snapshot_and_runtime,
 };
 
 const RESTART_RESUME_MESSAGE_ENV: &str = "ELROY_RESTART_RESUME_MESSAGE";
@@ -25,10 +25,14 @@ fn main() {
     if args.iter().any(|arg| arg == "--tui") {
         let snapshot = runtime.load_snapshot().unwrap_or_default();
         let mut tui_runtime = CliTuiRuntime::new(runtime);
-        run_with_snapshot_and_runtime(snapshot, &mut tui_runtime).unwrap_or_else(|error| {
-            eprintln!("{error}");
-            std::process::exit(1);
-        });
+        let result =
+            run_with_snapshot_and_runtime(snapshot, &mut tui_runtime).unwrap_or_else(|error| {
+                eprintln!("{error}");
+                std::process::exit(1);
+            });
+        if let TuiRunResult::RestartRequested(resume_message) = result {
+            restart_current_process(&args, &resume_message);
+        }
         return;
     }
 
@@ -106,6 +110,42 @@ fn run_live_prompt(runtime: &AppRuntime, prompt: &str) {
     if let Err(error) = prompt_stream.into_snapshot() {
         eprintln!("{error}");
         std::process::exit(1);
+    }
+}
+
+fn restart_current_process(args: &[String], resume_message: &str) -> ! {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+
+        let current_exe = env::current_exe().unwrap_or_else(|error| {
+            eprintln!("failed to resolve current executable for restart: {error}");
+            std::process::exit(1);
+        });
+
+        let mut command = std::process::Command::new(&current_exe);
+        command.args(args);
+        command.env(RESTART_RESUME_MESSAGE_ENV, resume_message);
+        let error = command.exec();
+        eprintln!("failed to restart elroy-rs process: {error}");
+        std::process::exit(1);
+    }
+
+    #[cfg(not(unix))]
+    {
+        let current_exe = env::current_exe().unwrap_or_else(|error| {
+            eprintln!("failed to resolve current executable for restart: {error}");
+            std::process::exit(1);
+        });
+        let status = std::process::Command::new(&current_exe)
+            .args(args)
+            .env(RESTART_RESUME_MESSAGE_ENV, resume_message)
+            .status()
+            .unwrap_or_else(|error| {
+                eprintln!("failed to restart elroy-rs process: {error}");
+                std::process::exit(1);
+            });
+        std::process::exit(status.code().unwrap_or(1));
     }
 }
 
@@ -410,5 +450,11 @@ mod tests {
             Some("context refresh failed: refresh exploded")
         );
         assert!(runtime.deferred_context_refresh.is_none());
+    }
+
+    #[test]
+    fn prompt_arg_ignores_missing_prompt_flag() {
+        let args = vec!["--tui".to_string()];
+        assert_eq!(prompt_arg(&args), None);
     }
 }

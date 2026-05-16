@@ -82,6 +82,12 @@ pub enum TuiExit {
     Continue,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TuiRunResult {
+    Quit,
+    RestartRequested(String),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SidebarAction {
     Archive,
@@ -161,7 +167,7 @@ pub trait TuiRuntime {
     ) -> Result<TuiSnapshot, String>;
 }
 
-pub fn run() -> io::Result<()> {
+pub fn run() -> io::Result<TuiRunResult> {
     run_with_snapshot(TuiSnapshot::default())
 }
 
@@ -177,14 +183,14 @@ pub struct TuiSnapshot {
     pub status: Option<String>,
 }
 
-pub fn run_with_snapshot(snapshot: TuiSnapshot) -> io::Result<()> {
+pub fn run_with_snapshot(snapshot: TuiSnapshot) -> io::Result<TuiRunResult> {
     run_with_snapshot_and_runtime(snapshot, &mut NoopRuntime)
 }
 
 pub fn run_with_snapshot_and_runtime<R: TuiRuntime>(
     snapshot: TuiSnapshot,
     runtime: &mut R,
-) -> io::Result<()> {
+) -> io::Result<TuiRunResult> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
@@ -210,14 +216,20 @@ fn run_event_loop(
     app: &mut TuiApp,
     runtime: &mut impl TuiRuntime,
     pending_prompt: &mut Option<PendingPrompt>,
-) -> io::Result<()> {
+) -> io::Result<TuiRunResult> {
     let mut context_poll_ready = pending_prompt.is_none();
     let mut last_context_poll = Instant::now();
     let mut deferred_context_refresh_at = None;
 
     loop {
-        if advance_prompt_stream(app, runtime, pending_prompt) {
-            deferred_context_refresh_at = Some(Instant::now() + Duration::from_secs(5));
+        match advance_prompt_stream(app, runtime, pending_prompt) {
+            PromptAdvance::CompletedTurn => {
+                deferred_context_refresh_at = Some(Instant::now() + Duration::from_secs(5));
+            }
+            PromptAdvance::RestartRequested(resume_message) => {
+                return Ok(TuiRunResult::RestartRequested(resume_message));
+            }
+            PromptAdvance::Noop => {}
         }
         app.prompt_active = pending_prompt.is_some();
         app.background_status = runtime.background_status().unwrap_or(None);
@@ -247,7 +259,7 @@ fn run_event_loop(
         match event::read()? {
             Event::Key(key) => {
                 if apply_key_event(app, key, runtime, pending_prompt) == TuiExit::Quit {
-                    return Ok(());
+                    return Ok(TuiRunResult::Quit);
                 }
             }
             Event::Resize(_, _) => {
@@ -256,6 +268,13 @@ fn run_event_loop(
             _ => {}
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PromptAdvance {
+    Noop,
+    CompletedTurn,
+    RestartRequested(String),
 }
 
 fn start_startup_prompt_stream(
@@ -274,27 +293,6 @@ fn start_startup_prompt_stream(
         Ok(None) => None,
         Err(error) => {
             app.status = format!("startup failed: {error}");
-            None
-        }
-    }
-}
-
-fn start_restart_prompt_stream(
-    app: &mut TuiApp,
-    runtime: &mut impl TuiRuntime,
-    resume_message: &str,
-) -> Option<PendingPrompt> {
-    match runtime.start_restart_prompt_stream(resume_message) {
-        Ok(stream) => {
-            app.status = "thinking...".to_string();
-            Some(PendingPrompt {
-                submitted_prompt: None,
-                before_ids: app.rendered_context_message_ids.clone(),
-                stream,
-            })
-        }
-        Err(error) => {
-            app.status = format!("restart failed: {error}");
             None
         }
     }
@@ -453,9 +451,9 @@ fn advance_prompt_stream(
     app: &mut TuiApp,
     runtime: &mut impl TuiRuntime,
     pending_prompt: &mut Option<PendingPrompt>,
-) -> bool {
+) -> PromptAdvance {
     let Some(pending) = pending_prompt.as_mut() else {
-        return false;
+        return PromptAdvance::Noop;
     };
     match pending.stream.next_update() {
         Ok(Some(update)) => apply_prompt_update(app, update),
@@ -480,9 +478,7 @@ fn advance_prompt_stream(
                     }
                     match runtime.take_restart_request() {
                         Ok(Some(resume_message)) => {
-                            *pending_prompt =
-                                start_restart_prompt_stream(app, runtime, &resume_message);
-                            return false;
+                            return PromptAdvance::RestartRequested(resume_message);
                         }
                         Ok(None) => {}
                         Err(error) => {
@@ -494,14 +490,14 @@ fn advance_prompt_stream(
                     app.status = format!("prompt failed: {error}");
                 }
             }
-            return true;
+            return PromptAdvance::CompletedTurn;
         }
         Err(error) => {
             pending_prompt.take();
             app.status = format!("prompt failed: {error}");
         }
     }
-    false
+    PromptAdvance::Noop
 }
 
 fn maybe_run_deferred_context_refresh(
@@ -1306,9 +1302,9 @@ mod tests {
     use ratatui::layout::Rect;
 
     use super::{
-        CommandPane, FocusTarget, PromptUpdate, SidebarAction, SidebarSection, TuiApp,
-        TuiContextMessage, TuiExit, TuiPromptStream, TuiRuntime, TuiSidebarDetail, TuiSnapshot,
-        UiIntent, advance_prompt_stream, apply_intent_with_runtime, apply_key_event,
+        CommandPane, FocusTarget, PromptAdvance, PromptUpdate, SidebarAction, SidebarSection,
+        TuiApp, TuiContextMessage, TuiExit, TuiPromptStream, TuiRuntime, TuiSidebarDetail,
+        TuiSnapshot, UiIntent, advance_prompt_stream, apply_intent_with_runtime, apply_key_event,
         key_event_token, maybe_run_deferred_context_refresh, poll_context_updates,
         start_startup_prompt_stream,
     };
@@ -2070,7 +2066,10 @@ mod tests {
         );
         let mut finalized = false;
         while pending.is_some() {
-            finalized = advance_prompt_stream(&mut app, &mut runtime, &mut pending);
+            finalized = matches!(
+                advance_prompt_stream(&mut app, &mut runtime, &mut pending),
+                PromptAdvance::CompletedTurn
+            );
         }
         assert!(finalized);
         assert_eq!(app.status, "submitted prompt: hello runtime");
@@ -2113,7 +2112,10 @@ mod tests {
         );
         let mut finalized = false;
         while pending.is_some() {
-            finalized = advance_prompt_stream(&mut app, &mut runtime, &mut pending);
+            finalized = matches!(
+                advance_prompt_stream(&mut app, &mut runtime, &mut pending),
+                PromptAdvance::CompletedTurn
+            );
         }
         assert!(finalized);
         assert_eq!(app.status, "loaded startup");
@@ -2126,48 +2128,35 @@ mod tests {
     }
 
     #[test]
-    fn completed_prompt_can_restart_into_hidden_startup_stream() {
+    fn completed_prompt_returns_restart_request() {
         let mut app = TuiApp::bootstrap();
         app.input = "hello runtime".to_string();
         let mut runtime = FakeRuntime {
             pending_restart_request: Some("Restarted successfully. Ready to continue.".to_string()),
-            restart_stream: Some(FakePromptStream {
-                updates: vec![
-                    PromptUpdate::Status("thinking...".to_string()),
-                    PromptUpdate::AssistantDelta("welcome ".to_string()),
-                    PromptUpdate::AssistantDelta("back".to_string()),
-                ],
-                finalized_snapshot: TuiSnapshot {
-                    conversation_lines: vec![
-                        "user: hello runtime".to_string(),
-                        "assistant: runtime response".to_string(),
-                        "assistant: welcome back".to_string(),
-                    ],
-                    status: Some("loaded restart".to_string()),
-                    ..TuiSnapshot::default()
-                },
-                cancelled_snapshot: TuiSnapshot::default(),
-            }),
-            context_messages: vec![TuiContextMessage {
-                id: 22,
-                role: "assistant".to_string(),
-                content: "welcome back".to_string(),
-            }],
             ..FakeRuntime::default()
         };
         let mut pending = None;
 
         apply_intent_with_runtime(&mut app, UiIntent::SubmitPrompt, &mut runtime, &mut pending);
+        let mut restart_request = None;
         while pending.is_some() {
-            advance_prompt_stream(&mut app, &mut runtime, &mut pending);
+            if let PromptAdvance::RestartRequested(resume_message) =
+                advance_prompt_stream(&mut app, &mut runtime, &mut pending)
+            {
+                restart_request = Some(resume_message);
+            }
         }
 
         assert_eq!(
             app.conversation_lines.last().map(String::as_str),
-            Some("assistant: welcome back")
+            Some("assistant: runtime response")
         );
-        assert_eq!(app.status, "loaded restart");
+        assert_eq!(app.status, "submitted prompt: hello runtime");
         assert!(runtime.pending_restart_request.is_none());
+        assert_eq!(
+            restart_request.as_deref(),
+            Some("Restarted successfully. Ready to continue.")
+        );
         assert!(
             !app.conversation_lines
                 .iter()
