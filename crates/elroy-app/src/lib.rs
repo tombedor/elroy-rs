@@ -2742,9 +2742,13 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                     .map_err(|error| std::io::Error::other(error.to_string()))?;
                 Ok(path)
             }) {
-                Ok(path) => ToolExecutionResult::success(
-                    json!({"created": true, "file_path": path.display().to_string()}).to_string(),
-                ),
+                Ok(path) => ToolExecutionResult::success(format!(
+                    "Task '{}' has been created.",
+                    path.file_stem()
+                        .and_then(|value| value.to_str())
+                        .unwrap_or(name)
+                        .replace('_', " ")
+                )),
                 Err(error) => ToolExecutionResult::error(format!("failed to create task: {error}")),
             }
         },
@@ -3060,8 +3064,9 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
             let Some(text) = arguments.get("text").and_then(Value::as_str) else {
                 return ToolExecutionResult::error("update_task_text requires string text");
             };
-            mutate_task_file_from_config(&config_for_task_text, name, |path| {
-                update_task_text_file(path, text)
+            mutate_task_file_from_config_with_result(&config_for_task_text, name, |path| {
+                update_task_text_file(path, text)?;
+                Ok(format!("Task '{name}' text has been updated."))
             })
         },
     );
@@ -3116,11 +3121,8 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                 return ToolExecutionResult::error("rename_task requires string new_name");
             };
             mutate_task_file_from_config_with_result(&config_for_task_rename, name, |path| {
-                let renamed = rename_task_file(path, new_name)?;
-                Ok(
-                    json!({"updated": true, "new_file_path": renamed.display().to_string()})
-                        .to_string(),
-                )
+                let _renamed = rename_task_file(path, new_name)?;
+                Ok(format!("Task '{name}' has been renamed to '{new_name}'."))
             })
         },
     );
@@ -3177,8 +3179,14 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                 return ToolExecutionResult::error("complete_task requires a string name");
             };
             let closing_comment = arguments.get("closing_comment").and_then(Value::as_str);
-            mutate_task_file_from_config(&config_for_task_complete, name, |path| {
-                complete_task_file(path, closing_comment)
+            mutate_task_file_from_config_with_result(&config_for_task_complete, name, |path| {
+                complete_task_file(path, closing_comment)?;
+                Ok(match closing_comment {
+                    Some(closing_comment) => format!(
+                        "Task '{name}' has been marked as completed. Comment: {closing_comment}"
+                    ),
+                    None => format!("Task '{name}' has been marked as completed."),
+                })
             })
         },
     );
@@ -3218,15 +3226,27 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
         ToolSpec::new(
             "delete_task",
             "Mark one active task deleted.",
-            JsonSchema::object([("name", json!({"type": "string"}))], ["name"]),
+            JsonSchema::object(
+                [
+                    ("name", json!({"type": "string"})),
+                    ("closing_comment", json!({"type": "string"})),
+                ],
+                ["name"],
+            ),
         ),
         move |arguments| {
             let Some(name) = arguments.get("name").and_then(Value::as_str) else {
                 return ToolExecutionResult::error("delete_task requires a string name");
             };
             let closing_comment = arguments.get("closing_comment").and_then(Value::as_str);
-            mutate_task_file_from_config(&config_for_task_delete, name, |path| {
-                delete_task_file(path, closing_comment)
+            mutate_task_file_from_config_with_result(&config_for_task_delete, name, |path| {
+                delete_task_file(path, closing_comment)?;
+                Ok(match closing_comment {
+                    Some(closing_comment) => {
+                        format!("Task '{name}' has been deleted. Comment: {closing_comment}")
+                    }
+                    None => format!("Task '{name}' has been deleted."),
+                })
             })
         },
     );
@@ -5153,37 +5173,6 @@ fn mutate_memory_file_from_config(
                 .to_string(),
         ),
         Err(error) => ToolExecutionResult::error(format!("memory mutation failed: {error}")),
-    }
-}
-
-fn mutate_task_file_from_config(
-    config: &AppConfig,
-    name: &str,
-    operation: impl FnOnce(&Path) -> std::io::Result<()>,
-) -> ToolExecutionResult {
-    let mut connection = match open_sqlite_connection(&config.database_path) {
-        Ok(connection) => connection,
-        Err(error) => {
-            return ToolExecutionResult::error(format!("failed to open database: {error}"));
-        }
-    };
-    if let Err(error) = run_migrations(&mut connection) {
-        return ToolExecutionResult::error(format!("failed to run migrations: {error}"));
-    }
-    let task = match find_task_by_name(&connection, name) {
-        Ok(Some(task)) => task,
-        Ok(None) => return ToolExecutionResult::error(format!("task not found: {name}")),
-        Err(error) => return ToolExecutionResult::error(format!("database query failed: {error}")),
-    };
-    match operation(Path::new(&task.file_path)).and_then(|()| {
-        elroy_db::bootstrap_database(&BootstrapPlan::from_config(config))
-            .map_err(|error| std::io::Error::other(error.to_string()))?;
-        Ok(())
-    }) {
-        Ok(()) => ToolExecutionResult::success(
-            json!({"updated": true, "name": task.name, "file_path": task.file_path}).to_string(),
-        ),
-        Err(error) => ToolExecutionResult::error(format!("task mutation failed: {error}")),
     }
 }
 
@@ -8071,6 +8060,7 @@ mod tests {
             "{\"name\":\"Job Search\",\"text\":\"Reach out to three contacts\",\"date\":\"2026-05-20\",\"trigger_context\":\"after breakfast\"}",
         );
         assert!(!created.is_error);
+        assert_eq!(created.content, "Task 'job search' has been created.");
         assert!(agenda_dir.join("job_search.md").exists());
 
         let triggered = registry.invoke("list_triggered_tasks", "{\"limit\":10}");
@@ -8087,12 +8077,17 @@ mod tests {
             "{\"name\":\"job search\",\"text\":\"Reach out to four contacts\"}",
         );
         assert!(!updated.is_error);
+        assert_eq!(updated.content, "Task 'job search' text has been updated.");
 
         let renamed = registry.invoke(
             "rename_task",
             "{\"name\":\"job search\",\"new_name\":\"Career Search\"}",
         );
         assert!(!renamed.is_error);
+        assert_eq!(
+            renamed.content,
+            "Task 'job search' has been renamed to 'Career Search'."
+        );
         assert!(agenda_dir.join("career_search.md").exists());
 
         let listed = registry.invoke("list_tasks", "{\"limit\":10}");
@@ -8103,20 +8098,35 @@ mod tests {
         assert!(!shown.is_error);
         assert!(shown.content.contains("Reach out to four contacts"));
 
-        let completed = registry.invoke("complete_task", "{\"name\":\"career search\"}");
+        let completed = registry.invoke(
+            "complete_task",
+            "{\"name\":\"career search\",\"closing_comment\":\"done\"}",
+        );
         assert!(!completed.is_error);
+        assert_eq!(
+            completed.content,
+            "Task 'career search' has been marked as completed. Comment: done"
+        );
 
         let deleted_created = registry.invoke(
             "create_task",
             "{\"name\":\"Inbox Zero\",\"text\":\"Clear email backlog\"}",
         );
         assert!(!deleted_created.is_error);
-        let deleted = registry.invoke("delete_task", "{\"name\":\"inbox zero\"}");
+        let deleted = registry.invoke(
+            "delete_task",
+            "{\"name\":\"inbox zero\",\"closing_comment\":\"superseded\"}",
+        );
         assert!(!deleted.is_error);
+        assert_eq!(
+            deleted.content,
+            "Task 'inbox zero' has been deleted. Comment: superseded"
+        );
 
         let deleted_text =
             fs::read_to_string(agenda_dir.join("inbox_zero.md")).expect("task file should read");
         assert!(deleted_text.contains("status: deleted"));
+        assert!(deleted_text.contains("closing_comment: superseded"));
 
         fs::remove_dir_all(home).expect("home should be removed");
     }
