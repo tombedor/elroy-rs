@@ -49,8 +49,8 @@ use elroy_tools::{
     ExecutableTool, ExecutableToolRegistry, JsonSchema, ToolExecutionResult, ToolRegistry, ToolSpec,
 };
 use elroy_tui::{
-    SidebarAction, SidebarSection, TuiCommandForm, TuiCommandParameter, TuiSidebarDetail,
-    TuiSlashCommandAction, TuiSnapshot,
+    SidebarAction, SidebarSection, TuiCommandForm, TuiCommandPaletteAction, TuiCommandPaletteEntry,
+    TuiCommandParameter, TuiSidebarDetail, TuiSlashCommandAction, TuiSnapshot,
 };
 use elroy_user::{effective_persona, effective_user_full_name, effective_user_preferred_name};
 use serde_json::{Map, Value, json};
@@ -289,6 +289,48 @@ impl AppRuntime {
             &self.config.assistant_name,
             self.config.llm_provider() == LlmProvider::Anthropic,
         )
+    }
+
+    pub fn load_command_palette_entries(&self) -> Result<Vec<TuiCommandPaletteEntry>, AppError> {
+        let mut entries = build_live_tool_registry(&self.config)
+            .specs()
+            .into_iter()
+            .map(|spec| TuiCommandPaletteEntry {
+                title: format!("/{}", display_command_name(&spec.name)),
+                description: spec.description,
+                action: TuiCommandPaletteAction::ToolCommand(spec.name),
+            })
+            .collect::<Vec<_>>();
+        entries.sort_by(|left, right| left.title.cmp(&right.title));
+        Ok(entries)
+    }
+
+    pub fn launch_named_command(&self, name: &str) -> Result<TuiSlashCommandAction, AppError> {
+        let registry = build_live_tool_registry(&self.config);
+        let Some(spec) = registry.specs().into_iter().find(|spec| spec.name == name) else {
+            return Err(AppError::Runtime(format!("Invalid command: {name}")));
+        };
+        let JsonSchema::Object {
+            properties,
+            required,
+            ..
+        } = &spec.parameters;
+        let parameters = ordered_command_parameters(name, properties, required);
+        let required_count = parameters
+            .iter()
+            .filter(|parameter| !parameter.optional)
+            .count();
+        if required_count == 0 {
+            return self
+                .execute_command_with_values(name, display_command_name(name), &[])
+                .map(TuiSlashCommandAction::Execute);
+        }
+        Ok(TuiSlashCommandAction::OpenForm(TuiCommandForm {
+            command_name: name.to_string(),
+            description: spec.description,
+            parameters,
+            initial_values: vec![],
+        }))
     }
 
     pub fn handle_slash_command(&self, prompt: &str) -> Result<TuiSlashCommandAction, AppError> {
@@ -828,6 +870,10 @@ fn ordered_command_parameters(
             name,
         })
         .collect()
+}
+
+fn display_command_name(name: &str) -> &str {
+    if name == "get_help" { "help" } else { name }
 }
 
 fn drop_legacy_alias(names: &mut Vec<String>, canonical: &str, alias: &str) {
@@ -7378,7 +7424,7 @@ mod tests {
     use elroy_llm::{ConversationMessage, MessageRole, Provider, StreamEvent};
     use elroy_memory::{create_memory_file, sanitize_filename};
     use elroy_tools::ExecutableToolRegistry;
-    use elroy_tui::TuiSlashCommandAction;
+    use elroy_tui::{TuiCommandPaletteAction, TuiSlashCommandAction};
 
     fn seed_competing_memory_record(
         connection: &rusqlite::Connection,
@@ -10997,6 +11043,65 @@ mod tests {
                 .conversation_lines
                 .last()
                 .is_some_and(|line| line.contains("New memory created: trip"))
+        );
+
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
+    fn command_palette_entries_and_launch_path_cover_help_and_forms() {
+        let unique = format!(
+            "elroy-rs-app-command-palette-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+
+        let mut config = AppConfig::defaults();
+        config.home_dir = home.clone();
+        config.memory_dir = memory_dir;
+        config.agenda_dir = agenda_dir;
+        config.database_path = database_path;
+
+        let runtime = AppRuntime::new(config);
+        let entries = runtime
+            .load_command_palette_entries()
+            .expect("command palette entries should load");
+        assert!(entries.iter().any(|entry| {
+            entry.title == "/help"
+                && entry.action == TuiCommandPaletteAction::ToolCommand("get_help".to_string())
+        }));
+
+        let TuiSlashCommandAction::OpenForm(form) = runtime
+            .launch_named_command("create_memory")
+            .expect("parameterized command should launch a form")
+        else {
+            panic!("create_memory should launch a form from the palette path");
+        };
+        assert_eq!(form.command_name, "create_memory");
+        assert!(
+            form.parameters
+                .iter()
+                .map(|parameter| parameter.name.as_str())
+                .eq(["name", "text"])
+        );
+
+        let TuiSlashCommandAction::Execute(snapshot) = runtime
+            .launch_named_command("get_help")
+            .expect("zero-arg command should execute from the palette path")
+        else {
+            panic!("get_help should execute immediately from the palette path");
+        };
+        assert_eq!(
+            snapshot.status.as_deref(),
+            Some("slash command executed: /help")
         );
 
         fs::remove_dir_all(home).expect("home should be removed");

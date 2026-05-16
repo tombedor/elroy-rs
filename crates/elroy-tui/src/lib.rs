@@ -66,6 +66,7 @@ pub struct TuiApp {
     pub input_history: Vec<String>,
     pub history_index: Option<usize>,
     pub history_draft: Option<String>,
+    pub command_palette: Option<CommandPaletteState>,
     pub command_form: Option<CommandFormState>,
     pub detail_modal: Option<DetailModalState>,
     pub sidebar_section: SidebarSection,
@@ -125,6 +126,20 @@ pub struct TuiCommandForm {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TuiCommandPaletteAction {
+    FocusMemories,
+    FocusAgenda,
+    ToolCommand(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TuiCommandPaletteEntry {
+    pub title: String,
+    pub description: String,
+    pub action: TuiCommandPaletteAction,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TuiSlashCommandAction {
     NotHandled,
     Execute(TuiSnapshot),
@@ -158,6 +173,12 @@ pub struct CommandFormState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandPaletteState {
+    pub entries: Vec<TuiCommandPaletteEntry>,
+    pub selected_index: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PromptUpdate {
     AssistantDelta(String),
     InternalThought(String),
@@ -187,6 +208,8 @@ pub trait TuiPromptStream {
 
 pub trait TuiRuntime {
     fn load_snapshot(&mut self) -> Result<TuiSnapshot, String>;
+    fn load_command_palette_entries(&mut self) -> Result<Vec<TuiCommandPaletteEntry>, String>;
+    fn launch_named_command(&mut self, name: &str) -> Result<TuiSlashCommandAction, String>;
     fn handle_slash_command(&mut self, prompt: &str) -> Result<TuiSlashCommandAction, String>;
     fn submit_command_form(
         &mut self,
@@ -377,6 +400,11 @@ fn apply_key_event(
         return TuiExit::Continue;
     }
 
+    if app.command_palette.is_some() {
+        handle_command_palette_key(app, key, runtime);
+        return TuiExit::Continue;
+    }
+
     if app.command_form.is_some() {
         handle_command_form_key(app, key, runtime);
         return TuiExit::Continue;
@@ -386,6 +414,19 @@ fn apply_key_event(
         if let Some(token) = modal_key_token(key) {
             let intent = app.handle_modal_key(token);
             apply_intent_with_runtime(app, intent, runtime, pending_prompt);
+        }
+        return TuiExit::Continue;
+    }
+
+    if key.code == KeyCode::Char('p') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        match runtime.load_command_palette_entries() {
+            Ok(entries) => {
+                app.open_command_palette(entries);
+                app.status = "command palette opened".to_string();
+            }
+            Err(error) => {
+                app.status = format!("command palette failed: {error}");
+            }
         }
         return TuiExit::Continue;
     }
@@ -747,6 +788,7 @@ impl TuiApp {
             input_history: Vec::new(),
             history_index: None,
             history_draft: None,
+            command_palette: None,
             command_form: None,
             detail_modal: None,
             sidebar_section: SidebarSection::Memories,
@@ -893,7 +935,9 @@ impl TuiApp {
         ))
         .render(vertical[2], buf);
 
-        if let Some(command_form) = &self.command_form {
+        if let Some(command_palette) = &self.command_palette {
+            self.render_command_palette_modal(command_palette, area, buf);
+        } else if let Some(command_form) = &self.command_form {
             self.render_command_form_modal(command_form, area, buf);
         } else if let Some(detail_modal) = &self.detail_modal {
             self.render_detail_modal(detail_modal, area, buf);
@@ -1039,6 +1083,39 @@ impl TuiApp {
             .render(sections[1], buf);
     }
 
+    fn render_command_palette_modal(
+        &self,
+        command_palette: &CommandPaletteState,
+        area: Rect,
+        buf: &mut Buffer,
+    ) {
+        let modal_area = centered_rect(area, 72, 60);
+        Clear.render(modal_area, buf);
+        let mut lines = vec!["Commands".to_string(), String::new()];
+        for (index, entry) in command_palette.entries.iter().enumerate() {
+            let marker = if index == command_palette.selected_index {
+                ">"
+            } else {
+                " "
+            };
+            lines.push(format!("{marker} {}  {}", entry.title, entry.description));
+        }
+        let sections = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(1), Constraint::Length(1)])
+            .split(modal_area);
+        Paragraph::new(lines.join("\n"))
+            .block(
+                Block::default()
+                    .title("Command Palette")
+                    .borders(Borders::ALL),
+            )
+            .render(sections[0], buf);
+        Paragraph::new(command_palette.footer_text())
+            .block(Block::default().borders(Borders::LEFT | Borders::RIGHT | Borders::BOTTOM))
+            .render(sections[1], buf);
+    }
+
     pub fn open_detail_modal(&mut self, detail: TuiSidebarDetail) {
         self.detail_modal = Some(DetailModalState {
             title: detail.title,
@@ -1052,6 +1129,29 @@ impl TuiApp {
 
     pub fn open_command_form(&mut self, command_form: TuiCommandForm) {
         self.command_form = Some(CommandFormState::from(command_form));
+    }
+
+    pub fn open_command_palette(&mut self, mut entries: Vec<TuiCommandPaletteEntry>) {
+        entries.insert(
+            0,
+            TuiCommandPaletteEntry {
+                title: "Focus Memories".to_string(),
+                description: "Switch the sidebar to memories".to_string(),
+                action: TuiCommandPaletteAction::FocusMemories,
+            },
+        );
+        entries.insert(
+            1,
+            TuiCommandPaletteEntry {
+                title: "Focus Agenda".to_string(),
+                description: "Switch the sidebar to agenda".to_string(),
+                action: TuiCommandPaletteAction::FocusAgenda,
+            },
+        );
+        self.command_palette = Some(CommandPaletteState {
+            entries,
+            selected_index: 0,
+        });
     }
 
     fn record_submitted_prompt(&mut self, submitted: &str) {
@@ -1480,6 +1580,92 @@ impl CommandFormState {
     }
 }
 
+impl CommandPaletteState {
+    fn footer_text(&self) -> String {
+        "Up/Down move  Enter select  Escape close".to_string()
+    }
+
+    fn move_selection(&mut self, delta: isize) {
+        if self.entries.is_empty() {
+            return;
+        }
+        let len = self.entries.len() as isize;
+        let current = self.selected_index as isize;
+        self.selected_index = (current + delta).rem_euclid(len) as usize;
+    }
+}
+
+fn handle_command_palette_key(app: &mut TuiApp, key: KeyEvent, runtime: &mut impl TuiRuntime) {
+    let Some(command_palette) = app.command_palette.as_mut() else {
+        return;
+    };
+
+    match key.code {
+        KeyCode::Esc => {
+            app.command_palette = None;
+        }
+        KeyCode::Up => {
+            command_palette.move_selection(-1);
+        }
+        KeyCode::Down | KeyCode::Tab => {
+            command_palette.move_selection(1);
+        }
+        KeyCode::BackTab => {
+            command_palette.move_selection(-1);
+        }
+        KeyCode::Enter => {
+            let Some(entry) = command_palette
+                .entries
+                .get(command_palette.selected_index)
+                .cloned()
+            else {
+                app.command_palette = None;
+                return;
+            };
+            app.command_palette = None;
+            match entry.action {
+                TuiCommandPaletteAction::FocusMemories => {
+                    app.sidebar_section = SidebarSection::Memories;
+                    app.focus = FocusTarget::Command(CommandPane::Sidebar);
+                    app.last_command_pane = CommandPane::Sidebar;
+                    app.status = "focused memories".to_string();
+                }
+                TuiCommandPaletteAction::FocusAgenda => {
+                    app.sidebar_section = SidebarSection::Agenda;
+                    app.focus = FocusTarget::Command(CommandPane::Sidebar);
+                    app.last_command_pane = CommandPane::Sidebar;
+                    app.status = "focused agenda".to_string();
+                }
+                TuiCommandPaletteAction::ToolCommand(name) => {
+                    match runtime.launch_named_command(&name) {
+                        Ok(TuiSlashCommandAction::Execute(snapshot)) => {
+                            app.apply_snapshot(snapshot);
+                            app.focus = FocusTarget::Input;
+                        }
+                        Ok(TuiSlashCommandAction::OpenForm(form)) => {
+                            app.open_command_form(form);
+                            app.status = format!(
+                                "editing command: /{}",
+                                app.command_form
+                                    .as_ref()
+                                    .expect("command form should open")
+                                    .command_name
+                            );
+                        }
+                        Ok(TuiSlashCommandAction::NotHandled) => {
+                            app.status = format!("command launch failed: {name}");
+                        }
+                        Err(error) => {
+                            app.status = format!("command launch failed: {error}");
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 fn handle_command_form_key(app: &mut TuiApp, key: KeyEvent, runtime: &mut impl TuiRuntime) {
     let Some(command_form) = app.command_form.as_mut() else {
         return;
@@ -1605,6 +1791,14 @@ impl TuiRuntime for NoopRuntime {
         Ok(TuiSnapshot::default())
     }
 
+    fn load_command_palette_entries(&mut self) -> Result<Vec<TuiCommandPaletteEntry>, String> {
+        Ok(vec![])
+    }
+
+    fn launch_named_command(&mut self, _name: &str) -> Result<TuiSlashCommandAction, String> {
+        Ok(TuiSlashCommandAction::NotHandled)
+    }
+
     fn handle_slash_command(&mut self, _prompt: &str) -> Result<TuiSlashCommandAction, String> {
         Ok(TuiSlashCommandAction::NotHandled)
     }
@@ -1691,16 +1885,19 @@ mod tests {
 
     use super::{
         CommandPane, FocusTarget, PendingPrompt, PromptAdvance, PromptUpdate, SidebarAction,
-        SidebarSection, TuiApp, TuiCommandForm, TuiCommandParameter, TuiContextMessage, TuiExit,
-        TuiPromptStream, TuiRuntime, TuiSidebarDetail, TuiSlashCommandAction, TuiSnapshot,
-        UiIntent, advance_prompt_stream, apply_intent_with_runtime, apply_key_event,
-        key_event_token, maybe_refresh_snapshot_after_background_completion,
-        maybe_run_deferred_context_refresh, poll_context_updates, start_startup_prompt_stream,
+        SidebarSection, TuiApp, TuiCommandForm, TuiCommandPaletteAction, TuiCommandPaletteEntry,
+        TuiCommandParameter, TuiContextMessage, TuiExit, TuiPromptStream, TuiRuntime,
+        TuiSidebarDetail, TuiSlashCommandAction, TuiSnapshot, UiIntent, advance_prompt_stream,
+        apply_intent_with_runtime, apply_key_event, key_event_token,
+        maybe_refresh_snapshot_after_background_completion, maybe_run_deferred_context_refresh,
+        poll_context_updates, start_startup_prompt_stream,
     };
 
     #[derive(Default)]
     struct FakeRuntime {
         snapshot: TuiSnapshot,
+        command_palette_entries: Vec<TuiCommandPaletteEntry>,
+        launch_named_command_action: Option<TuiSlashCommandAction>,
         slash_command_action: Option<TuiSlashCommandAction>,
         slash_command_error: Option<String>,
         submitted_command_forms: Vec<(String, Vec<(String, String)>)>,
@@ -1743,6 +1940,17 @@ mod tests {
     impl TuiRuntime for FakeRuntime {
         fn load_snapshot(&mut self) -> Result<TuiSnapshot, String> {
             Ok(self.snapshot.clone())
+        }
+
+        fn load_command_palette_entries(&mut self) -> Result<Vec<TuiCommandPaletteEntry>, String> {
+            Ok(self.command_palette_entries.clone())
+        }
+
+        fn launch_named_command(&mut self, _name: &str) -> Result<TuiSlashCommandAction, String> {
+            Ok(self
+                .launch_named_command_action
+                .clone()
+                .unwrap_or(TuiSlashCommandAction::NotHandled))
         }
 
         fn handle_slash_command(&mut self, prompt: &str) -> Result<TuiSlashCommandAction, String> {
@@ -2405,6 +2613,77 @@ mod tests {
             Some("tool result: submitted /create_memory")
         );
         assert_eq!(app.status, "slash command executed: /create_memory");
+    }
+
+    #[test]
+    fn ctrl_p_opens_command_palette_from_input() {
+        let mut app = TuiApp::bootstrap();
+        let mut runtime = FakeRuntime {
+            command_palette_entries: vec![TuiCommandPaletteEntry {
+                title: "/create_memory".to_string(),
+                description: "Create a memory".to_string(),
+                action: TuiCommandPaletteAction::ToolCommand("create_memory".to_string()),
+            }],
+            ..FakeRuntime::default()
+        };
+        let mut pending = None;
+
+        let exit = apply_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            &mut runtime,
+            &mut pending,
+        );
+
+        assert_eq!(exit, TuiExit::Continue);
+        assert!(app.command_palette.is_some());
+        assert_eq!(app.status, "command palette opened");
+    }
+
+    #[test]
+    fn command_palette_enter_launches_command_form() {
+        let mut app = TuiApp::bootstrap();
+        app.open_command_palette(vec![TuiCommandPaletteEntry {
+            title: "/create_memory".to_string(),
+            description: "Create a memory".to_string(),
+            action: TuiCommandPaletteAction::ToolCommand("create_memory".to_string()),
+        }]);
+        app.command_palette
+            .as_mut()
+            .expect("command palette should open")
+            .selected_index = 2;
+        let mut runtime = FakeRuntime {
+            launch_named_command_action: Some(TuiSlashCommandAction::OpenForm(TuiCommandForm {
+                command_name: "create_memory".to_string(),
+                description: "Create a memory".to_string(),
+                parameters: vec![
+                    TuiCommandParameter {
+                        name: "name".to_string(),
+                        optional: false,
+                        default_text: String::new(),
+                    },
+                    TuiCommandParameter {
+                        name: "text".to_string(),
+                        optional: false,
+                        default_text: String::new(),
+                    },
+                ],
+                initial_values: vec![],
+            })),
+            ..FakeRuntime::default()
+        };
+        let mut pending = None;
+
+        apply_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut runtime,
+            &mut pending,
+        );
+
+        assert!(app.command_palette.is_none());
+        assert!(app.command_form.is_some());
+        assert_eq!(app.status, "editing command: /create_memory");
     }
 
     #[test]

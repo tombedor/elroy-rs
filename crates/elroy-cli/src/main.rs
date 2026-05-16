@@ -263,6 +263,31 @@ impl TuiRuntime for CliTuiRuntime {
             .map_err(|error| error.to_string())
     }
 
+    fn load_command_palette_entries(
+        &mut self,
+    ) -> Result<Vec<elroy_tui::TuiCommandPaletteEntry>, String> {
+        self.poll_deferred_context_refresh();
+        self.poll_deferred_self_reflection();
+        self.clear_deferred_context_refresh_error();
+        self.clear_deferred_self_reflection_error();
+        self.runtime
+            .load_command_palette_entries()
+            .map_err(|error| error.to_string())
+    }
+
+    fn launch_named_command(
+        &mut self,
+        name: &str,
+    ) -> Result<elroy_tui::TuiSlashCommandAction, String> {
+        self.poll_deferred_context_refresh();
+        self.poll_deferred_self_reflection();
+        self.clear_deferred_context_refresh_error();
+        self.clear_deferred_self_reflection_error();
+        self.runtime
+            .launch_named_command(name)
+            .map_err(|error| error.to_string())
+    }
+
     fn handle_slash_command(
         &mut self,
         prompt: &str,
