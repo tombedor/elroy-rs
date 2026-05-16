@@ -491,12 +491,6 @@ fn advance_prompt_stream(
                             &context_messages,
                         );
                     }
-                    if pending.schedule_self_reflection
-                        && let Err(error) = runtime.run_self_reflection_if_needed()
-                    {
-                        app.status = format!("self reflection failed: {error}");
-                        return PromptAdvance::CompletedTurn;
-                    }
                     match runtime.take_restart_request() {
                         Ok(Some(resume_message)) => {
                             return PromptAdvance::RestartRequested(resume_message);
@@ -504,7 +498,14 @@ fn advance_prompt_stream(
                         Ok(None) => {}
                         Err(error) => {
                             app.status = format!("restart failed: {error}");
+                            return PromptAdvance::CompletedTurn;
                         }
+                    }
+                    if pending.schedule_self_reflection
+                        && let Err(error) = runtime.run_self_reflection_if_needed()
+                    {
+                        app.status = format!("self reflection failed: {error}");
+                        return PromptAdvance::CompletedTurn;
                     }
                 }
                 Err(error) => {
@@ -2288,6 +2289,7 @@ mod tests {
         );
         assert_eq!(app.status, "submitted prompt: hello runtime");
         assert!(runtime.pending_restart_request.is_none());
+        assert_eq!(runtime.self_reflection_runs, 0);
         assert_eq!(
             restart_request.as_deref(),
             Some("Restarted successfully. Ready to continue.")
