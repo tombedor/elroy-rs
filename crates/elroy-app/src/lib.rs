@@ -7418,30 +7418,26 @@ fn recall_memory_context_messages_with_decision(
         );
     }
 
-    let payload = recalled
-        .iter()
-        .map(|memory| {
-            json!({
-                "name": memory.name,
-                "file_path": memory.file_path,
-                "excerpt": excerpt(&memory.body, 180),
-                "updated_at_unix": memory.updated_at_unix,
+    let content = serde_json::to_string_pretty(&json!({
+        "content": recalled
+            .iter()
+            .map(|memory| format_memory_detail(memory))
+            .collect::<Vec<_>>()
+            .join("\n\n"),
+        "recall_metadata": recalled
+            .iter()
+            .map(|memory| {
+                json!({
+                    "memory_type": "Memory",
+                    "memory_id": memory.id,
+                    "name": memory.name,
+                })
             })
-        })
-        .collect::<Vec<_>>();
-    let content =
-        serde_json::to_string_pretty(&payload).expect("memory recall payload should serialize");
+            .collect::<Vec<_>>(),
+    }))
+    .expect("memory recall payload should serialize");
 
-    synthetic_tool_context_messages(
-        "bootstrap-memory-recall",
-        "search_memories",
-        json!({
-            "query": recall_query,
-            "limit": recalled.len(),
-        })
-        .to_string(),
-        content,
-    )
+    synthetic_tool_context_messages("bootstrap-memory-recall", "get_fast_recall", "{}", content)
 }
 
 #[cfg(test)]
@@ -16333,15 +16329,16 @@ mod tests {
                 .tool_calls
                 .as_ref()
                 .map(|calls| calls[0].name.as_str()),
-            Some("search_memories")
+            Some("get_fast_recall")
         );
         assert_eq!(messages[1].role, MessageRole::Tool);
-        assert!(
-            messages[1]
-                .content
-                .as_deref()
-                .is_some_and(|content| content.contains("basketball form"))
-        );
+        let payload = messages[1]
+            .content
+            .as_deref()
+            .expect("tool payload should exist");
+        assert!(payload.contains("basketball form"));
+        assert!(payload.contains("\"recall_metadata\""));
+        assert!(payload.contains("\"memory_type\": \"Memory\""));
     }
 
     #[test]
