@@ -141,6 +141,7 @@ pub trait TuiRuntime {
     fn start_prompt_stream(&mut self, prompt: &str) -> Result<Box<dyn TuiPromptStream>, String>;
     fn start_startup_prompt_stream(&mut self) -> Result<Option<Box<dyn TuiPromptStream>>, String>;
     fn load_context_messages(&mut self) -> Result<Vec<TuiContextMessage>, String>;
+    fn refresh_context_if_needed(&mut self) -> Result<(), String>;
     fn background_status(&mut self) -> Result<Option<String>, String>;
     fn open_sidebar_item(
         &mut self,
@@ -207,15 +208,25 @@ fn run_event_loop(
 ) -> io::Result<()> {
     let mut context_poll_ready = pending_prompt.is_none();
     let mut last_context_poll = Instant::now();
+    let mut deferred_context_refresh_at = None;
 
     loop {
-        advance_prompt_stream(app, runtime, pending_prompt);
+        if advance_prompt_stream(app, runtime, pending_prompt) {
+            deferred_context_refresh_at = Some(Instant::now() + Duration::from_secs(5));
+        }
         app.prompt_active = pending_prompt.is_some();
         app.background_status = runtime.background_status().unwrap_or(None);
         if !context_poll_ready && pending_prompt.is_none() {
             context_poll_ready = true;
             last_context_poll = Instant::now();
         }
+        maybe_run_deferred_context_refresh(
+            app,
+            runtime,
+            pending_prompt.is_some(),
+            Instant::now(),
+            &mut deferred_context_refresh_at,
+        );
         if context_poll_ready && last_context_poll.elapsed() >= Duration::from_secs(1) {
             poll_context_updates(app, runtime);
             last_context_poll = Instant::now();
@@ -416,9 +427,9 @@ fn advance_prompt_stream(
     app: &mut TuiApp,
     runtime: &mut impl TuiRuntime,
     pending_prompt: &mut Option<PendingPrompt>,
-) {
+) -> bool {
     let Some(pending) = pending_prompt.as_mut() else {
-        return;
+        return false;
     };
     match pending.stream.next_update() {
         Ok(Some(update)) => apply_prompt_update(app, update),
@@ -446,12 +457,34 @@ fn advance_prompt_stream(
                     app.status = format!("prompt failed: {error}");
                 }
             }
+            return true;
         }
         Err(error) => {
             pending_prompt.take();
             app.status = format!("prompt failed: {error}");
         }
     }
+    false
+}
+
+fn maybe_run_deferred_context_refresh(
+    app: &mut TuiApp,
+    runtime: &mut impl TuiRuntime,
+    prompt_active: bool,
+    now: Instant,
+    deferred_context_refresh_at: &mut Option<Instant>,
+) {
+    let Some(deadline) = *deferred_context_refresh_at else {
+        return;
+    };
+    if prompt_active || now < deadline {
+        return;
+    }
+
+    if let Err(error) = runtime.refresh_context_if_needed() {
+        app.status = format!("context refresh failed: {error}");
+    }
+    *deferred_context_refresh_at = None;
 }
 
 fn poll_context_updates(app: &mut TuiApp, runtime: &mut impl TuiRuntime) {
@@ -1183,6 +1216,10 @@ impl TuiRuntime for NoopRuntime {
         Ok(vec![])
     }
 
+    fn refresh_context_if_needed(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+
     fn background_status(&mut self) -> Result<Option<String>, String> {
         Ok(None)
     }
@@ -1214,6 +1251,7 @@ impl TuiRuntime for NoopRuntime {
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
+    use std::time::Instant;
 
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::buffer::Buffer;
@@ -1223,7 +1261,8 @@ mod tests {
         CommandPane, FocusTarget, PromptUpdate, SidebarAction, SidebarSection, TuiApp,
         TuiContextMessage, TuiExit, TuiPromptStream, TuiRuntime, TuiSidebarDetail, TuiSnapshot,
         UiIntent, advance_prompt_stream, apply_intent_with_runtime, apply_key_event,
-        key_event_token, poll_context_updates, start_startup_prompt_stream,
+        key_event_token, maybe_run_deferred_context_refresh, poll_context_updates,
+        start_startup_prompt_stream,
     };
 
     #[derive(Default)]
@@ -1234,6 +1273,7 @@ mod tests {
         startup_stream: Option<FakePromptStream>,
         context_messages: Vec<TuiContextMessage>,
         background_status: Option<String>,
+        refresh_context_calls: usize,
     }
 
     struct FakePromptStream {
@@ -1321,6 +1361,11 @@ mod tests {
 
         fn load_context_messages(&mut self) -> Result<Vec<TuiContextMessage>, String> {
             Ok(self.context_messages.clone())
+        }
+
+        fn refresh_context_if_needed(&mut self) -> Result<(), String> {
+            self.refresh_context_calls += 1;
+            Ok(())
         }
 
         fn background_status(&mut self) -> Result<Option<String>, String> {
@@ -1959,9 +2004,11 @@ mod tests {
             app.conversation_lines.last().map(String::as_str),
             Some("assistant: runtime response")
         );
+        let mut finalized = false;
         while pending.is_some() {
-            advance_prompt_stream(&mut app, &mut runtime, &mut pending);
+            finalized = advance_prompt_stream(&mut app, &mut runtime, &mut pending);
         }
+        assert!(finalized);
         assert_eq!(app.status, "submitted prompt: hello runtime");
     }
 
@@ -2000,9 +2047,11 @@ mod tests {
             app.conversation_lines.last().map(String::as_str),
             Some("assistant: welcome back")
         );
+        let mut finalized = false;
         while pending.is_some() {
-            advance_prompt_stream(&mut app, &mut runtime, &mut pending);
+            finalized = advance_prompt_stream(&mut app, &mut runtime, &mut pending);
         }
+        assert!(finalized);
         assert_eq!(app.status, "loaded startup");
         assert_eq!(app.rendered_context_message_ids, HashSet::from([22]));
         assert!(
@@ -2146,6 +2195,24 @@ mod tests {
             app.rendered_context_message_ids,
             HashSet::from([10, 11, 12])
         );
+    }
+
+    #[test]
+    fn deferred_context_refresh_runs_once_after_deadline() {
+        let mut app = TuiApp::bootstrap();
+        let mut runtime = FakeRuntime::default();
+        let mut deferred_context_refresh_at = Some(Instant::now());
+
+        maybe_run_deferred_context_refresh(
+            &mut app,
+            &mut runtime,
+            false,
+            Instant::now(),
+            &mut deferred_context_refresh_at,
+        );
+
+        assert_eq!(runtime.refresh_context_calls, 1);
+        assert!(deferred_context_refresh_at.is_none());
     }
 
     #[test]

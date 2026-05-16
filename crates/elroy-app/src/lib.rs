@@ -16,7 +16,8 @@ use elroy_codex::{
 use elroy_config::{AppConfig, LlmProvider};
 use elroy_core::{
     ConversationOrchestrator, LiveProviderModel, LocalToolExecutor, ModelClient,
-    StreamingModelClient, TurnEventStream, get_background_status, validated_transcript,
+    StreamingModelClient, TurnEventStream, clear_background_status, get_background_status,
+    set_background_status, validated_transcript,
 };
 use elroy_db::{
     AgendaItemRecord, BootstrapPlan, UserPreferenceRecord, find_active_agenda_item_by_name,
@@ -235,6 +236,15 @@ impl AppRuntime {
             &mut connection,
             &self.config.assistant_name,
             self.config.llm_provider() == LlmProvider::Anthropic,
+        )
+    }
+
+    pub fn refresh_context_if_needed(&self) -> Result<bool, AppError> {
+        let mut connection = self.open_connection()?;
+        refresh_context_if_needed(
+            &mut connection,
+            &self.config,
+            &BootstrapPlan::from_config(&self.config),
         )
     }
 
@@ -1222,6 +1232,54 @@ fn run_self_reflection_if_needed(
     })
     .run(home_dir, transcript)?;
     Ok(())
+}
+
+fn refresh_context_if_needed(
+    connection: &mut rusqlite::Connection,
+    config: &AppConfig,
+    bootstrap_plan: &BootstrapPlan,
+) -> Result<bool, AppError> {
+    let transcript = load_validated_runtime_transcript(
+        connection,
+        &config.assistant_name,
+        config.llm_provider() == LlmProvider::Anthropic,
+    )?;
+    if !is_context_refresh_needed(&transcript, config.max_tokens) {
+        return Ok(false);
+    }
+
+    set_background_status("context-refresh", "refreshing context...");
+
+    let result = (|| {
+        let compressed = compress_context_messages(
+            &transcript,
+            config.context_refresh_target_tokens(),
+            config.max_context_age_minutes,
+        );
+
+        if transcript
+            .iter()
+            .any(|message| message.role == MessageRole::User)
+        {
+            let (name, text) = formulate_memory_from_transcript(&transcript);
+            create_memory_file(&bootstrap_plan.memory_dir, &name, &text)?;
+            elroy_db::bootstrap_database(bootstrap_plan)
+                .map_err(|error| AppError::Runtime(error.to_string()))?;
+            *connection = open_sqlite_connection(&bootstrap_plan.database_path)?;
+
+            let mut tracker = get_or_create_memory_operation_tracker(connection, LOCAL_USER_TOKEN)?;
+            tracker.messages_since_memory = 0;
+            tracker.memories_since_consolidation += 1;
+            tracker.updated_at_unix = Utc::now().timestamp();
+            save_memory_operation_tracker(connection, &tracker)?;
+        }
+
+        replace_context_messages(connection, LOCAL_USER_TOKEN, &compressed)?;
+        Ok(true)
+    })();
+
+    clear_background_status("context-refresh");
+    result
 }
 
 fn run_auto_memory_if_needed(
@@ -3759,7 +3817,6 @@ fn significant_tokens(text: &str) -> HashSet<String> {
         .collect()
 }
 
-#[allow(dead_code)]
 fn approximate_message_token_count(message: &ConversationMessage) -> usize {
     let content_tokens = message
         .content
@@ -3788,7 +3845,6 @@ fn approximate_message_token_count(message: &ConversationMessage) -> usize {
     content_tokens + tool_call_tokens + tool_result_tokens
 }
 
-#[allow(dead_code)]
 fn count_context_tokens(context_messages: &[ConversationMessage]) -> usize {
     context_messages
         .iter()
@@ -3796,7 +3852,6 @@ fn count_context_tokens(context_messages: &[ConversationMessage]) -> usize {
         .sum()
 }
 
-#[allow(dead_code)]
 fn is_context_refresh_needed(context_messages: &[ConversationMessage], max_tokens: usize) -> bool {
     if !context_messages
         .iter()
@@ -3808,7 +3863,6 @@ fn is_context_refresh_needed(context_messages: &[ConversationMessage], max_token
     count_context_tokens(context_messages) > max_tokens
 }
 
-#[allow(dead_code)]
 fn compress_context_messages(
     context_messages: &[ConversationMessage],
     context_refresh_target_tokens: usize,
@@ -3954,7 +4008,7 @@ mod tests {
         drop_old_context_messages, due_item_context_messages, is_context_refresh_needed,
         memory_recall_status_updates, parse_recalled_memory_names, prompt_prelude_status_updates,
         provider_config_from_app_config, recall_memory_context_messages, recalled_memory_names,
-        recent_recall_context, run_prompt_with_model_and_registry,
+        recent_recall_context, refresh_context_if_needed, run_prompt_with_model_and_registry,
         run_prompt_with_model_and_registry_stream, select_recalled_memories, should_offer_greeting,
         should_skip_memory_recall, significant_tokens, strip_input_message_for_persistence,
         strip_transient_context_messages,
@@ -5863,6 +5917,127 @@ mod tests {
             .expect("tracker should exist");
         assert_eq!(tracker.messages_since_memory, 0);
         assert_eq!(tracker.memories_since_consolidation, 1);
+
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
+    fn refresh_context_if_needed_compresses_transcript_and_creates_memory() {
+        let unique = format!(
+            "elroy-rs-app-context-refresh-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+
+        let mut connection = open_sqlite_connection(&database_path).expect("database should open");
+        run_migrations(&mut connection).expect("migrations should run");
+
+        let mut transcript = vec![ConversationMessage::new(MessageRole::System, "system")];
+        for index in 0..8 {
+            transcript.push(ConversationMessage::new(
+                MessageRole::User,
+                format!("user {index} words repeated repeated repeated repeated"),
+            ));
+            transcript.push(ConversationMessage::new(
+                MessageRole::Assistant,
+                format!("assistant {index} words repeated repeated repeated repeated"),
+            ));
+        }
+        let original_len = transcript.len();
+        elroy_db::replace_context_messages(&mut connection, LOCAL_USER_TOKEN, &transcript)
+            .expect("messages should persist");
+
+        let mut config = AppConfig::defaults();
+        config.home_dir = home.clone();
+        config.memory_dir = memory_dir.clone();
+        config.agenda_dir = agenda_dir;
+        config.database_path = database_path.clone();
+        config.max_tokens = 40;
+
+        let refreshed = refresh_context_if_needed(
+            &mut connection,
+            &config,
+            &BootstrapPlan::from_config(&config),
+        )
+        .expect("context refresh should succeed");
+
+        assert!(refreshed);
+
+        let stored =
+            elroy_db::load_context_messages(&mut connection, LOCAL_USER_TOKEN).expect("load ok");
+        assert_eq!(stored[0].role, MessageRole::System);
+        assert!(stored.len() < original_len);
+
+        let memories = elroy_db::list_active_memories(&connection, 10).expect("memories load");
+        assert_eq!(memories.len(), 1);
+        assert!(memories[0].body.contains("user"));
+
+        let tracker = load_memory_operation_tracker(&connection, LOCAL_USER_TOKEN)
+            .expect("tracker should load")
+            .expect("tracker should exist");
+        assert_eq!(tracker.messages_since_memory, 0);
+        assert_eq!(tracker.memories_since_consolidation, 1);
+
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
+    fn refresh_context_if_needed_skips_when_transcript_is_under_threshold() {
+        let unique = format!(
+            "elroy-rs-app-context-refresh-skip-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+
+        let mut connection = open_sqlite_connection(&database_path).expect("database should open");
+        run_migrations(&mut connection).expect("migrations should run");
+        elroy_db::replace_context_messages(
+            &mut connection,
+            LOCAL_USER_TOKEN,
+            &[
+                ConversationMessage::new(MessageRole::System, "system"),
+                ConversationMessage::new(MessageRole::User, "hello"),
+                ConversationMessage::new(MessageRole::Assistant, "hi"),
+            ],
+        )
+        .expect("messages should persist");
+
+        let mut config = AppConfig::defaults();
+        config.home_dir = home.clone();
+        config.memory_dir = memory_dir;
+        config.agenda_dir = agenda_dir;
+        config.database_path = database_path;
+        config.max_tokens = 1_000;
+
+        let refreshed = refresh_context_if_needed(
+            &mut connection,
+            &config,
+            &BootstrapPlan::from_config(&config),
+        )
+        .expect("context refresh should succeed");
+
+        assert!(!refreshed);
+        assert!(
+            elroy_db::list_active_memories(&connection, 10)
+                .expect("memories load")
+                .is_empty()
+        );
 
         fs::remove_dir_all(home).expect("home should be removed");
     }

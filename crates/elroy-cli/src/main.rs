@@ -169,6 +169,13 @@ impl TuiRuntime for CliTuiRuntime {
             .map_err(|error| error.to_string())
     }
 
+    fn refresh_context_if_needed(&mut self) -> Result<(), String> {
+        self.runtime
+            .refresh_context_if_needed()
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
     fn background_status(&mut self) -> Result<Option<String>, String> {
         Ok(self.runtime.background_status())
     }
