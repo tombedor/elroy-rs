@@ -1102,7 +1102,8 @@ fn run_prompt_with_model_and_registry(
         &existing_transcript,
         &list_active_memories(connection, 50)?,
     );
-    let due_item_context = due_item_context_messages(&list_active_due_items(connection, 20)?);
+    let now_iso = Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string();
+    let due_item_context = due_item_context_messages(&list_due_tasks(connection, 20, &now_iso)?);
     let mut model_transcript = existing_transcript.clone();
     model_transcript.extend(recall_context.iter().cloned());
     model_transcript.extend(due_item_context.iter().cloned());
@@ -1181,7 +1182,8 @@ fn run_prompt_with_model_and_registry_stream(
         &existing_transcript,
         &list_active_memories(&connection, 50)?,
     );
-    let due_item_context = due_item_context_messages(&list_active_due_items(&connection, 20)?);
+    let now_iso = Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string();
+    let due_item_context = due_item_context_messages(&list_due_tasks(&connection, 20, &now_iso)?);
     let mut model_transcript = existing_transcript.clone();
     model_transcript.extend(recall_context.iter().cloned());
     model_transcript.extend(due_item_context.iter().cloned());
@@ -3600,31 +3602,27 @@ fn due_item_context_messages(items: &[AgendaItemRecord]) -> Vec<ConversationMess
         return Vec::new();
     }
 
-    let payload = items
+    let lines = items
         .iter()
-        .map(|item| {
-            json!({
-                "name": item.name,
-                "agenda_date": item.agenda_date,
-                "trigger_datetime": item.trigger_datetime,
-                "trigger_context": item.trigger_context,
-                "status": item.status,
-                "checklist_total": item.checklist_total,
-                "checklist_completed": item.checklist_completed,
-                "excerpt": excerpt(&item.body, 180),
-            })
+        .filter_map(|item| {
+            let trigger_datetime = item.trigger_datetime.as_deref()?;
+            Some(format!(
+                "DUE ITEM: '{}' - {}\n\nThis item was scheduled for {} and is now due. Please inform the user about it and then use the delete_due_item tool to remove it from active due items.",
+                item.name,
+                item.body,
+                trigger_datetime,
+            ))
         })
         .collect::<Vec<_>>();
-    let arguments_json = serde_json::to_string(&json!({ "limit": items.len() }))
-        .expect("due item args should serialize");
-    let content =
-        serde_json::to_string_pretty(&payload).expect("due item payload should serialize");
+    if lines.is_empty() {
+        return Vec::new();
+    }
 
     synthetic_tool_context_messages(
         "bootstrap-due-items",
-        "list_due_items",
-        arguments_json,
-        content,
+        "get_due_items",
+        "{}",
+        lines.join("\n\n"),
     )
 }
 
@@ -5530,7 +5528,7 @@ mod tests {
             agenda_date: Some("unscheduled".to_string()),
             is_completed: false,
             status: Some("created".to_string()),
-            trigger_datetime: None,
+            trigger_datetime: Some("2000-01-01T09:00:00".to_string()),
             trigger_context: Some("after dinner".to_string()),
             closing_comment: None,
             checklist_total: 0,
@@ -5547,15 +5545,37 @@ mod tests {
                 .tool_calls
                 .as_ref()
                 .map(|calls| calls[0].name.as_str()),
-            Some("list_due_items")
+            Some("get_due_items")
         );
         assert_eq!(messages[1].role, MessageRole::Tool);
-        assert!(
-            messages[1]
-                .content
-                .as_deref()
-                .is_some_and(|content| content.contains("after dinner"))
-        );
+        assert!(messages[1].content.as_deref().is_some_and(|content| {
+            content.contains("Call mom tonight")
+                && content.contains("delete_due_item")
+                && content.contains("2000-01-01T09:00:00")
+        }));
+    }
+
+    #[test]
+    fn due_item_context_messages_skip_context_only_items() {
+        let messages = due_item_context_messages(&[AgendaItemRecord {
+            id: 1,
+            legacy_frontmatter_id: None,
+            name: "call mom".to_string(),
+            file_path: "/tmp/call_mom.md".to_string(),
+            agenda_date: Some("unscheduled".to_string()),
+            is_completed: false,
+            status: Some("created".to_string()),
+            trigger_datetime: None,
+            trigger_context: Some("after dinner".to_string()),
+            closing_comment: None,
+            checklist_total: 0,
+            checklist_completed: 0,
+            body: "Call mom tonight".to_string(),
+            is_active: true,
+            updated_at_unix: 1,
+        }]);
+
+        assert!(messages.is_empty());
     }
 
     #[test]
