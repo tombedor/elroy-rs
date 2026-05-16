@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use chrono::{Local, NaiveDateTime, Utc};
+use chrono::{DateTime, Local, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use elroy_agenda::{
     add_checklist_item, append_agenda_update, create_agenda_file, mark_agenda_item_completed,
     rename_agenda_file, update_agenda_body, update_checklist_item,
@@ -2773,6 +2773,19 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                 .or_else(|| arguments.get("date").and_then(Value::as_str));
             let trigger_datetime = arguments.get("trigger_datetime").and_then(Value::as_str);
             let trigger_context = arguments.get("trigger_context").and_then(Value::as_str);
+            if let Some(trigger_datetime) = trigger_datetime {
+                match parse_trigger_datetime_for_validation(trigger_datetime) {
+                    Ok(parsed) if parsed < Utc::now() => {
+                        return ToolExecutionResult::error(format!(
+                            "Attempted to create a due item for {}, which is in the past. The current time is {}",
+                            parsed,
+                            Utc::now()
+                        ));
+                    }
+                    Ok(_) => {}
+                    Err(error) => return ToolExecutionResult::error(error),
+                }
+            }
             match (|| -> Result<PathBuf, std::io::Error> {
                 let mut connection = open_sqlite_connection(&config_for_task_write.database_path)
                     .map_err(|error| std::io::Error::other(error.to_string()))?;
@@ -2846,6 +2859,19 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                 return ToolExecutionResult::error(
                     "create_due_item requires trigger_time or trigger_context",
                 );
+            }
+            if let Some(trigger_time) = trigger_time {
+                match parse_trigger_datetime_for_validation(trigger_time) {
+                    Ok(parsed) if parsed < Utc::now() => {
+                        return ToolExecutionResult::error(format!(
+                            "Attempted to create a due item for {}, which is in the past. The current time is {}",
+                            parsed,
+                            Utc::now()
+                        ));
+                    }
+                    Ok(_) => {}
+                    Err(error) => return ToolExecutionResult::error(error),
+                }
             }
             let date = arguments.get("date").and_then(Value::as_str);
             match (|| -> Result<PathBuf, std::io::Error> {
@@ -5813,6 +5839,48 @@ fn with_tool_connection(
     }
 }
 
+fn parse_trigger_datetime_for_validation(raw: &str) -> Result<DateTime<Utc>, String> {
+    let raw = raw.trim();
+    if let Ok(parsed) = DateTime::parse_from_rfc3339(raw) {
+        return Ok(parsed.with_timezone(&Utc));
+    }
+    if let Ok(parsed) = NaiveDateTime::parse_from_str(raw, "%Y-%m-%dT%H:%M:%S") {
+        let local = Local
+            .from_local_datetime(&parsed)
+            .single()
+            .ok_or_else(|| format!("Invalid datetime format: '{raw}'"))?;
+        return Ok(local.with_timezone(&Utc));
+    }
+    if let Ok(parsed) = NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S") {
+        let local = Local
+            .from_local_datetime(&parsed)
+            .single()
+            .ok_or_else(|| format!("Invalid datetime format: '{raw}'"))?;
+        return Ok(local.with_timezone(&Utc));
+    }
+    if let Ok(parsed) = NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M") {
+        let local = Local
+            .from_local_datetime(&parsed)
+            .single()
+            .ok_or_else(|| format!("Invalid datetime format: '{raw}'"))?;
+        return Ok(local.with_timezone(&Utc));
+    }
+    if let Ok(parsed) = NaiveDate::parse_from_str(raw, "%Y-%m-%d") {
+        let naive = parsed
+            .and_hms_opt(0, 0, 0)
+            .ok_or_else(|| format!("Invalid datetime format: '{raw}'"))?;
+        let local = Local
+            .from_local_datetime(&naive)
+            .single()
+            .ok_or_else(|| format!("Invalid datetime format: '{raw}'"))?;
+        return Ok(local.with_timezone(&Utc));
+    }
+    Err(format!(
+        "Invalid datetime format: '{}'. Expected formats: 'YYYY-MM-DD HH:MM:SS', 'YYYY-MM-DD HH:MM', 'YYYY-MM-DD', or ISO 8601 format",
+        raw
+    ))
+}
+
 fn excerpt(body: &str, max_chars: usize) -> String {
     let trimmed = body.trim();
     if trimmed.chars().count() <= max_chars {
@@ -8033,6 +8101,17 @@ mod tests {
             duplicate_timed.content,
             "Timed due item 'pay rent' already exists"
         );
+        let past_timed = registry.invoke(
+            "create_due_item",
+            "{\"name\":\"old reminder\",\"text\":\"This should fail\",\"trigger_time\":\"2000-01-01 09:00\"}",
+        );
+        assert!(past_timed.is_error);
+        assert!(
+            past_timed
+                .content
+                .contains("Attempted to create a due item for")
+        );
+        assert!(past_timed.content.contains("which is in the past"));
         let timed_context = registry.invoke("show_context_messages", "{\"limit\":40}");
         assert!(!timed_context.is_error);
         assert!(timed_context.content.contains("context-due-item:pay rent"));
@@ -8843,6 +8922,17 @@ mod tests {
             duplicate_created.content,
             "Task 'Job Search' already exists"
         );
+        let past_trigger = registry.invoke(
+            "create_task",
+            "{\"name\":\"Old Reminder\",\"text\":\"This should fail\",\"trigger_datetime\":\"2000-01-01 09:00\"}",
+        );
+        assert!(past_trigger.is_error);
+        assert!(
+            past_trigger
+                .content
+                .contains("Attempted to create a due item for")
+        );
+        assert!(past_trigger.content.contains("which is in the past"));
 
         let triggered = registry.invoke("list_triggered_tasks", "{\"limit\":10}");
         assert!(!triggered.is_error);
