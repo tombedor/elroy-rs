@@ -230,6 +230,13 @@ impl Drop for CliTuiRuntime {
 }
 
 impl TuiRuntime for CliTuiRuntime {
+    fn load_snapshot(&mut self) -> Result<elroy_tui::TuiSnapshot, String> {
+        self.poll_deferred_context_refresh();
+        self.runtime
+            .load_snapshot()
+            .map_err(|error| error.to_string())
+    }
+
     fn submit_prompt(&mut self, prompt: &str) -> Result<elroy_tui::TuiSnapshot, String> {
         self.poll_deferred_context_refresh();
         self.clear_deferred_context_refresh_error();

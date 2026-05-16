@@ -143,6 +143,7 @@ pub trait TuiPromptStream {
 }
 
 pub trait TuiRuntime {
+    fn load_snapshot(&mut self) -> Result<TuiSnapshot, String>;
     fn submit_prompt(&mut self, prompt: &str) -> Result<TuiSnapshot, String>;
     fn start_prompt_stream(&mut self, prompt: &str) -> Result<Box<dyn TuiPromptStream>, String>;
     fn start_startup_prompt_stream(&mut self) -> Result<Option<Box<dyn TuiPromptStream>>, String>;
@@ -220,6 +221,7 @@ fn run_event_loop(
     let mut context_poll_ready = pending_prompt.is_none();
     let mut last_context_poll = Instant::now();
     let mut deferred_context_refresh_at = None;
+    let mut previous_background_status = None;
 
     loop {
         match advance_prompt_stream(app, runtime, pending_prompt) {
@@ -232,7 +234,16 @@ fn run_event_loop(
             PromptAdvance::Noop => {}
         }
         app.prompt_active = pending_prompt.is_some();
-        app.background_status = runtime.background_status().unwrap_or(None);
+        let current_background_status = runtime.background_status().unwrap_or(None);
+        maybe_refresh_snapshot_after_background_completion(
+            app,
+            runtime,
+            pending_prompt.is_some(),
+            previous_background_status.as_deref(),
+            current_background_status.as_deref(),
+        );
+        app.background_status = current_background_status.clone();
+        previous_background_status = current_background_status;
         if !context_poll_ready && pending_prompt.is_none() {
             context_poll_ready = true;
             last_context_poll = Instant::now();
@@ -518,6 +529,23 @@ fn maybe_run_deferred_context_refresh(
         app.status = format!("context refresh failed: {error}");
     }
     *deferred_context_refresh_at = None;
+}
+
+fn maybe_refresh_snapshot_after_background_completion(
+    app: &mut TuiApp,
+    runtime: &mut impl TuiRuntime,
+    prompt_active: bool,
+    previous_background_status: Option<&str>,
+    current_background_status: Option<&str>,
+) {
+    if prompt_active || previous_background_status.is_none() || current_background_status.is_some()
+    {
+        return;
+    }
+
+    if let Ok(snapshot) = runtime.load_snapshot() {
+        app.apply_snapshot(snapshot);
+    }
 }
 
 fn poll_context_updates(app: &mut TuiApp, runtime: &mut impl TuiRuntime) {
@@ -1233,6 +1261,10 @@ impl TuiPromptStream for NoopPromptStream {
 }
 
 impl TuiRuntime for NoopRuntime {
+    fn load_snapshot(&mut self) -> Result<TuiSnapshot, String> {
+        Ok(TuiSnapshot::default())
+    }
+
     fn submit_prompt(&mut self, _prompt: &str) -> Result<TuiSnapshot, String> {
         Ok(TuiSnapshot::default())
     }
@@ -1305,12 +1337,13 @@ mod tests {
         CommandPane, FocusTarget, PromptAdvance, PromptUpdate, SidebarAction, SidebarSection,
         TuiApp, TuiContextMessage, TuiExit, TuiPromptStream, TuiRuntime, TuiSidebarDetail,
         TuiSnapshot, UiIntent, advance_prompt_stream, apply_intent_with_runtime, apply_key_event,
-        key_event_token, maybe_run_deferred_context_refresh, poll_context_updates,
-        start_startup_prompt_stream,
+        key_event_token, maybe_refresh_snapshot_after_background_completion,
+        maybe_run_deferred_context_refresh, poll_context_updates, start_startup_prompt_stream,
     };
 
     #[derive(Default)]
     struct FakeRuntime {
+        snapshot: TuiSnapshot,
         submitted_prompts: Vec<String>,
         last_opened: Option<(SidebarSection, String)>,
         last_mutation: Option<(SidebarSection, String, SidebarAction)>,
@@ -1347,6 +1380,10 @@ mod tests {
     }
 
     impl TuiRuntime for FakeRuntime {
+        fn load_snapshot(&mut self) -> Result<TuiSnapshot, String> {
+            Ok(self.snapshot.clone())
+        }
+
         fn submit_prompt(&mut self, prompt: &str) -> Result<TuiSnapshot, String> {
             self.submitted_prompts.push(prompt.to_string());
             Ok(TuiSnapshot {
@@ -1935,6 +1972,56 @@ mod tests {
         );
         assert!(app.status.contains("updated selected"));
         assert!(app.detail_modal.is_none());
+    }
+
+    #[test]
+    fn completed_background_status_refreshes_snapshot_data() {
+        let mut app = TuiApp::from_snapshot(TuiSnapshot {
+            memory_titles: vec!["Stale Memory".to_string()],
+            ..TuiSnapshot::default()
+        });
+        let mut runtime = FakeRuntime {
+            snapshot: TuiSnapshot {
+                memory_titles: vec!["Fresh Memory".to_string()],
+                ..TuiSnapshot::default()
+            },
+            ..FakeRuntime::default()
+        };
+
+        maybe_refresh_snapshot_after_background_completion(
+            &mut app,
+            &mut runtime,
+            false,
+            Some("refreshing context..."),
+            None,
+        );
+
+        assert_eq!(app.memory_titles, vec!["Fresh Memory".to_string()]);
+    }
+
+    #[test]
+    fn active_prompt_does_not_refresh_snapshot_from_background_completion() {
+        let mut app = TuiApp::from_snapshot(TuiSnapshot {
+            memory_titles: vec!["Stale Memory".to_string()],
+            ..TuiSnapshot::default()
+        });
+        let mut runtime = FakeRuntime {
+            snapshot: TuiSnapshot {
+                memory_titles: vec!["Fresh Memory".to_string()],
+                ..TuiSnapshot::default()
+            },
+            ..FakeRuntime::default()
+        };
+
+        maybe_refresh_snapshot_after_background_completion(
+            &mut app,
+            &mut runtime,
+            true,
+            Some("refreshing context..."),
+            None,
+        );
+
+        assert_eq!(app.memory_titles, vec!["Stale Memory".to_string()]);
     }
 
     #[test]
