@@ -2126,6 +2126,44 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
         },
     );
 
+    let config_for_reset_context = config.clone();
+    let reset_messages = ExecutableTool::new(
+        ToolSpec::new(
+            "reset_messages",
+            "Reset the persisted context for the local user.",
+            JsonSchema::object(Vec::<(String, Value)>::new(), [] as [&str; 0]),
+        ),
+        move |_| {
+            let mut connection =
+                match open_sqlite_connection(&config_for_reset_context.database_path) {
+                    Ok(connection) => connection,
+                    Err(error) => {
+                        return ToolExecutionResult::error(format!(
+                            "failed to open database: {error}"
+                        ));
+                    }
+                };
+            if let Err(error) = run_migrations(&mut connection) {
+                return ToolExecutionResult::error(format!("failed to run migrations: {error}"));
+            }
+            match replace_context_messages(&mut connection, LOCAL_USER_TOKEN, &[]) {
+                Ok(()) => ToolExecutionResult::success("Context reset complete".to_string()),
+                Err(error) => {
+                    ToolExecutionResult::error(format!("failed to reset context: {error}"))
+                }
+            }
+        },
+    );
+
+    let refresh_system_instructions = ExecutableTool::new(
+        ToolSpec::new(
+            "refresh_system_instructions",
+            "Refresh the effective system instructions for the local user.",
+            JsonSchema::object(Vec::<(String, Value)>::new(), [] as [&str; 0]),
+        ),
+        move |_| ToolExecutionResult::success("System instruction refresh complete".to_string()),
+    );
+
     let database_path = config.database_path.clone();
     let set_assistant_name = ExecutableTool::new(
         ToolSpec::new(
@@ -2873,6 +2911,8 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
         complete_agenda_checklist_item,
         show_context_messages,
         clear_context_messages,
+        reset_messages,
+        refresh_system_instructions,
         list_tasks,
         list_triggered_tasks_tool,
         list_due_tasks_tool,
@@ -4388,6 +4428,56 @@ mod tests {
                 .as_deref()
                 .is_some_and(|content| content.contains("Edited by user token: local-user"))
         );
+
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
+    fn live_tool_registry_can_reset_context_messages() {
+        let unique = format!(
+            "elroy-rs-app-reset-context-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+
+        let mut connection = open_sqlite_connection(&database_path).expect("database should open");
+        run_migrations(&mut connection).expect("migrations should run");
+        elroy_db::replace_context_messages(
+            &mut connection,
+            LOCAL_USER_TOKEN,
+            &[
+                ConversationMessage::new(MessageRole::User, "hello"),
+                ConversationMessage::new(MessageRole::Assistant, "hi"),
+            ],
+        )
+        .expect("messages should persist");
+
+        let mut config = AppConfig::defaults();
+        config.home_dir = home.clone();
+        config.memory_dir = memory_dir;
+        config.agenda_dir = agenda_dir;
+        config.database_path = database_path.clone();
+
+        let registry = build_live_tool_registry(&config);
+        let reset = registry.invoke("reset_messages", "{}");
+        assert!(!reset.is_error);
+        assert_eq!(reset.content, "Context reset complete");
+
+        let stored =
+            elroy_db::load_context_messages(&mut connection, LOCAL_USER_TOKEN).expect("load ok");
+        assert!(stored.is_empty());
+
+        let refresh = registry.invoke("refresh_system_instructions", "{}");
+        assert!(!refresh.is_error);
+        assert_eq!(refresh.content, "System instruction refresh complete");
 
         fs::remove_dir_all(home).expect("home should be removed");
     }
