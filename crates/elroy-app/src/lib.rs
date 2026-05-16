@@ -2834,6 +2834,10 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                 .get("item_date")
                 .and_then(Value::as_str)
                 .or_else(|| arguments.get("date").and_then(Value::as_str));
+            let date = match parse_optional_agenda_item_date(date) {
+                Ok(date) => date,
+                Err(error) => return ToolExecutionResult::error(error),
+            };
             let trigger_datetime = arguments.get("trigger_datetime").and_then(Value::as_str);
             let trigger_context = arguments.get("trigger_context").and_then(Value::as_str);
             if let Some(trigger_datetime) = trigger_datetime {
@@ -2866,7 +2870,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                     &config_for_task_write.agenda_dir,
                     name,
                     text,
-                    date,
+                    date.as_deref(),
                     trigger_datetime,
                     trigger_context,
                 )?;
@@ -6151,6 +6155,13 @@ fn parse_agenda_item_date(raw: Option<&str>) -> Result<String, String> {
             .map(|date| date.format("%Y-%m-%d").to_string())
             .map_err(|_| format!("Invalid date format '{raw}'. Use YYYY-MM-DD.")),
         None => Ok(Local::now().date_naive().format("%Y-%m-%d").to_string()),
+    }
+}
+
+fn parse_optional_agenda_item_date(raw: Option<&str>) -> Result<Option<String>, String> {
+    match raw {
+        Some(raw) => parse_agenda_item_date(Some(raw)).map(Some),
+        None => Ok(None),
     }
 }
 
@@ -10880,6 +10891,15 @@ mod tests {
         );
         assert!(blank_name.is_error);
         assert_eq!(blank_name.content, "Task name cannot be empty");
+        let invalid_date = registry.invoke(
+            "create_task",
+            "{\"name\":\"Bad Date\",\"text\":\"This should fail\",\"item_date\":\"2026/05/20\"}",
+        );
+        assert!(invalid_date.is_error);
+        assert_eq!(
+            invalid_date.content,
+            "Invalid date format '2026/05/20'. Use YYYY-MM-DD."
+        );
         let past_trigger = registry.invoke(
             "create_task",
             "{\"name\":\"Old Reminder\",\"text\":\"This should fail\",\"trigger_datetime\":\"2000-01-01 09:00\"}",
