@@ -5324,6 +5324,9 @@ fn mutate_task_file_from_config_with_result(
         Ok(payload)
     }) {
         Ok(payload) => ToolExecutionResult::success(payload),
+        Err(error) if error.to_string().starts_with("Active task '") => {
+            ToolExecutionResult::error(error.to_string())
+        }
         Err(error) => ToolExecutionResult::error(format!("task mutation failed: {error}")),
     }
 }
@@ -5360,6 +5363,9 @@ fn mutate_due_item_file_from_config_with_result(
         Ok(payload)
     }) {
         Ok(payload) => ToolExecutionResult::success(payload),
+        Err(error) if error.to_string().starts_with("Active due item '") => {
+            ToolExecutionResult::error(error.to_string())
+        }
         Err(error) => ToolExecutionResult::error(format!("due item mutation failed: {error}")),
     }
 }
@@ -8347,7 +8353,7 @@ mod tests {
         assert!(duplicate_renamed.is_error);
         assert_eq!(
             duplicate_renamed.content,
-            "task mutation failed: Active task 'career search' already exists."
+            "Active task 'career search' already exists."
         );
 
         let listed = registry.invoke("list_tasks", "{\"limit\":10}");
@@ -8652,7 +8658,7 @@ mod tests {
         assert!(duplicate_renamed.is_error);
         assert_eq!(
             duplicate_renamed.content,
-            "due item mutation failed: Active due item 'call parents' already exists."
+            "Active due item 'call parents' already exists."
         );
 
         let completed = registry.invoke(
