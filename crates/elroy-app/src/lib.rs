@@ -3974,7 +3974,11 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
             if let Err(error) = run_migrations(&mut connection) {
                 return ToolExecutionResult::error(format!("failed to run migrations: {error}"));
             }
-            let memory = match find_active_memory_by_name(&connection, memory_name) {
+            let memory = match find_active_memory_by_name_in_scope(
+                &connection,
+                memory_name,
+                &config_for_add_memory_to_context.memory_dir,
+            ) {
                 Ok(Some(memory)) => memory,
                 Ok(None) => {
                     return ToolExecutionResult::success(format!(
@@ -5966,6 +5970,19 @@ fn context_due_item_tool_call_id(name: &str) -> String {
 
 fn context_task_tool_call_id(name: &str) -> String {
     format!("context-task:{}", name.to_ascii_lowercase())
+}
+
+fn find_active_memory_by_name_in_scope(
+    connection: &rusqlite::Connection,
+    name: &str,
+    memory_dir: &Path,
+) -> rusqlite::Result<Option<elroy_db::MemoryRecord>> {
+    Ok(elroy_db::list_active_memories(connection, 10_000)?
+        .into_iter()
+        .find(|memory| {
+            memory.name.eq_ignore_ascii_case(name)
+                && Path::new(&memory.file_path).starts_with(memory_dir)
+        }))
 }
 
 fn context_memory_tool_messages(memory: &elroy_db::MemoryRecord) -> Vec<ConversationMessage> {
@@ -8069,6 +8086,137 @@ mod tests {
         assert!(!stripped.content.contains("get_fast_recall"));
 
         fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
+    fn add_memory_to_current_context_scopes_to_current_memory_dir() {
+        let unique = format!(
+            "elroy-rs-app-context-memory-scope-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let root = std::env::temp_dir().join(unique);
+        let current_home = root.join("current-user");
+        let current_memory_dir = current_home.join("memories");
+        let other_memory_dir = root.join("other-user").join("memories");
+        let current_agenda_dir = current_home.join("agenda");
+        let database_path = root.join("shared.db");
+        fs::create_dir_all(&current_memory_dir).expect("current memory dir should be created");
+        fs::create_dir_all(&other_memory_dir).expect("other memory dir should be created");
+        fs::create_dir_all(&current_agenda_dir).expect("current agenda dir should be created");
+        fs::write(
+            current_memory_dir.join("shared_memory_name.md"),
+            "Current user memory\n",
+        )
+        .expect("current memory should be written");
+        fs::write(
+            other_memory_dir.join("shared_memory_name.md"),
+            "Other user memory\n",
+        )
+        .expect("other memory should be written");
+
+        let mut current_config = AppConfig::defaults();
+        current_config.home_dir = current_home;
+        current_config.memory_dir = current_memory_dir.clone();
+        current_config.agenda_dir = current_agenda_dir;
+        current_config.database_path = database_path.clone();
+        elroy_db::bootstrap_database(&BootstrapPlan::from_config(&current_config))
+            .expect("current bootstrap should succeed");
+
+        let mut connection =
+            open_sqlite_connection(&current_config.database_path).expect("database should open");
+        run_migrations(&mut connection).expect("migrations should run");
+        connection
+            .execute(
+                "INSERT INTO bootstrap_documents (
+                    kind,
+                    path,
+                    stem,
+                    frontmatter_id,
+                    agenda_date,
+                    is_completed,
+                    status,
+                    body,
+                    updated_at_unix,
+                    trigger_datetime,
+                    trigger_context,
+                    closing_comment,
+                    checklist_total,
+                    checklist_completed
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                rusqlite::params![
+                    "memory",
+                    other_memory_dir
+                        .join("shared_memory_name.md")
+                        .display()
+                        .to_string(),
+                    "shared_memory_name",
+                    Option::<i64>::None,
+                    Option::<String>::None,
+                    0_i64,
+                    Option::<String>::None,
+                    "Other user memory",
+                    9_999_i64,
+                    Option::<String>::None,
+                    Option::<String>::None,
+                    Option::<String>::None,
+                    0_i64,
+                    0_i64,
+                ],
+            )
+            .expect("other bootstrap document should insert");
+        let bootstrap_document_id: i64 = connection
+            .query_row(
+                "SELECT id FROM bootstrap_documents WHERE path = ?1",
+                [other_memory_dir
+                    .join("shared_memory_name.md")
+                    .display()
+                    .to_string()],
+                |row| row.get(0),
+            )
+            .expect("other bootstrap document should load");
+        connection
+            .execute(
+                "INSERT INTO memories (
+                    bootstrap_document_id,
+                    legacy_frontmatter_id,
+                    name,
+                    file_path,
+                    body,
+                    is_active,
+                    updated_at_unix
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![
+                    bootstrap_document_id,
+                    Option::<i64>::None,
+                    "Shared Memory Name",
+                    other_memory_dir
+                        .join("shared_memory_name.md")
+                        .display()
+                        .to_string(),
+                    "Other user memory",
+                    1_i64,
+                    9_999_i64,
+                ],
+            )
+            .expect("other memory row should insert");
+
+        let registry = build_live_tool_registry(&current_config);
+        let add = registry.invoke(
+            "add_memory_to_current_context",
+            "{\"memory_name\":\"Shared Memory Name\"}",
+        );
+        assert!(!add.is_error);
+        assert_eq!(add.content, "Memory 'shared memory name' added to context.");
+
+        let context = registry.invoke("show_context_messages", "{\"limit\":20}");
+        assert!(!context.is_error);
+        assert!(context.content.contains("Current user memory"));
+        assert!(!context.content.contains("Other user memory"));
+
+        fs::remove_dir_all(root).expect("root should be removed");
     }
 
     #[test]
