@@ -16,3 +16,6 @@ elroy-core = { path = "../elroy-core" }
 elroy-db = { path = "../elroy-db" }
 elroy-llm = { path = "../elroy-llm" }
 elroy-tui = { path = "../elroy-tui" }
+
+[dev-dependencies]
+mockito = "1"
