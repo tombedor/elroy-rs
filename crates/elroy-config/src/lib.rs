@@ -30,6 +30,7 @@ pub struct AppConfig {
     pub memory_recall_classifier_enabled: bool,
     pub memory_recall_classifier_window: usize,
     pub include_base_tools: bool,
+    pub exclude_tools: Vec<String>,
     pub async_runtime_enabled: bool,
     pub openai_api_key: Option<String>,
     pub openai_base_url: String,
@@ -98,6 +99,7 @@ impl AppConfig {
             memory_recall_classifier_enabled: true,
             memory_recall_classifier_window: 3,
             include_base_tools: true,
+            exclude_tools: Vec::new(),
             async_runtime_enabled: true,
             openai_api_key: None,
             openai_base_url: "https://api.openai.com/v1/responses".to_string(),
@@ -175,6 +177,9 @@ impl AppConfig {
         }
         if let Some(include_base_tools) = file_config.include_base_tools {
             self.include_base_tools = include_base_tools;
+        }
+        if let Some(exclude_tools) = file_config.exclude_tools {
+            self.exclude_tools = exclude_tools;
         }
         if let Some(openai_api_key) = file_config.openai_api_key {
             self.openai_api_key = Some(openai_api_key);
@@ -270,6 +275,9 @@ impl AppConfig {
         if let Some(include_base_tools) = env.get("ELROY_INCLUDE_BASE_TOOLS") {
             self.include_base_tools = parse_bool(include_base_tools);
         }
+        if let Some(exclude_tools) = env.get("ELROY_EXCLUDE_TOOLS") {
+            self.exclude_tools = parse_csv_list(exclude_tools);
+        }
         if let Some(async_runtime_enabled) = env.get("ELROY_ASYNC_RUNTIME") {
             self.async_runtime_enabled = parse_bool(async_runtime_enabled);
         }
@@ -318,6 +326,7 @@ struct FileConfig {
     memory_recall_classifier_enabled: Option<bool>,
     memory_recall_classifier_window: Option<usize>,
     include_base_tools: Option<bool>,
+    exclude_tools: Option<Vec<String>>,
     memory_dir: Option<String>,
     agenda_dir: Option<String>,
     database_url: Option<String>,
@@ -422,6 +431,15 @@ fn parse_usize(value: &str) -> usize {
     value.trim().parse::<usize>().unwrap_or(0)
 }
 
+fn parse_csv_list(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -448,6 +466,7 @@ mod tests {
 
         assert!(config.async_runtime_enabled);
         assert!(config.include_base_tools);
+        assert!(config.exclude_tools.is_empty());
         assert_eq!(config.max_tokens, 100_000);
         assert_eq!(config.context_refresh_target_tokens(), 33_333);
         assert!(!config.reflect);
@@ -491,7 +510,7 @@ mod tests {
         let config_path = home_dir.join("elroy.conf.yaml");
         fs::write(
             &config_path,
-            "chat_model: gpt-5-nano\nmax_tokens: 9000\nreflect: true\nenable_assistant_greeting: true\nmin_convo_age_for_greeting_minutes: 15.5\nmax_context_age_minutes: 180.0\nmessages_between_memory: 12\nmemories_between_consolidation: 6\nl2_memory_relevance_distance_threshold: 1.11\nmemory_cluster_similarity_threshold: 0.33\nmax_memory_cluster_size: 7\nmin_memory_cluster_size: 4\nmessages_between_self_reflection: 4\nmemory_recall_classifier_enabled: false\nmemory_recall_classifier_window: 7\nmemory_dir: /tmp/elroy-memories\nagenda_dir: /tmp/elroy-agenda\ndatabase_url: sqlite:////tmp/elroy.db\nirrelevant_key: ignored\n",
+            "chat_model: gpt-5-nano\nmax_tokens: 9000\nreflect: true\nenable_assistant_greeting: true\nmin_convo_age_for_greeting_minutes: 15.5\nmax_context_age_minutes: 180.0\nmessages_between_memory: 12\nmemories_between_consolidation: 6\nl2_memory_relevance_distance_threshold: 1.11\nmemory_cluster_similarity_threshold: 0.33\nmax_memory_cluster_size: 7\nmin_memory_cluster_size: 4\nmessages_between_self_reflection: 4\nmemory_recall_classifier_enabled: false\nmemory_recall_classifier_window: 7\nexclude_tools:\n  - get_user_preferred_name\n  - get_help\nmemory_dir: /tmp/elroy-memories\nagenda_dir: /tmp/elroy-agenda\ndatabase_url: sqlite:////tmp/elroy.db\nirrelevant_key: ignored\n",
         )
         .expect("config fixture should be written");
 
@@ -520,6 +539,13 @@ mod tests {
         assert!(!config.memory_recall_classifier_enabled);
         assert_eq!(config.memory_recall_classifier_window, 7);
         assert!(config.include_base_tools);
+        assert_eq!(
+            config.exclude_tools,
+            vec![
+                "get_user_preferred_name".to_string(),
+                "get_help".to_string()
+            ]
+        );
 
         fs::remove_dir_all(home_dir).expect("temp home dir should be removed");
     }
@@ -599,6 +625,10 @@ mod tests {
                 "sqlite:////tmp/env.db".to_string(),
             ),
             ("ELROY_INCLUDE_BASE_TOOLS".to_string(), "false".to_string()),
+            (
+                "ELROY_EXCLUDE_TOOLS".to_string(),
+                "get_user_preferred_name, get_help".to_string(),
+            ),
             ("ELROY_ASYNC_RUNTIME".to_string(), "false".to_string()),
             ("OPENAI_API_KEY".to_string(), "openai-test-key".to_string()),
             (
@@ -641,6 +671,13 @@ mod tests {
         assert_eq!(config.agenda_dir, PathBuf::from("/tmp/env-agenda"));
         assert_eq!(config.database_path, PathBuf::from("/tmp/env.db"));
         assert!(!config.include_base_tools);
+        assert_eq!(
+            config.exclude_tools,
+            vec![
+                "get_user_preferred_name".to_string(),
+                "get_help".to_string()
+            ]
+        );
         assert!(!config.async_runtime_enabled);
         assert_eq!(config.openai_api_key.as_deref(), Some("openai-test-key"));
         assert_eq!(

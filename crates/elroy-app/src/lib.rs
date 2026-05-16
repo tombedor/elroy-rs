@@ -2375,6 +2375,15 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                 ],
                 vec![
                     String::new(),
+                    "Exclude Tools".to_string(),
+                    if config_for_print_config.exclude_tools.is_empty() {
+                        "(none)".to_string()
+                    } else {
+                        config_for_print_config.exclude_tools.join(", ")
+                    },
+                ],
+                vec![
+                    String::new(),
                     "Async Runtime".to_string(),
                     config_for_print_config.async_runtime_enabled.to_string(),
                 ],
@@ -5628,7 +5637,8 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
         },
     );
 
-    ExecutableToolRegistry::new(vec![
+    let excluded_tools = config.exclude_tools.iter().cloned().collect::<HashSet<_>>();
+    let tools = vec![
         get_current_date,
         pwd,
         ls,
@@ -5703,7 +5713,14 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
         get_source_list_for_memory,
         get_source_content_for_memory,
         show_agenda_item,
-    ])
+    ];
+
+    ExecutableToolRegistry::new(
+        tools
+            .into_iter()
+            .filter(|tool| !excluded_tools.contains(&tool.spec().name))
+            .collect(),
+    )
 }
 
 pub fn argument_limit(arguments: &Value, default_limit: usize) -> usize {
@@ -10502,6 +10519,29 @@ mod tests {
     }
 
     #[test]
+    fn live_tool_registry_can_exclude_specific_tools_from_config() {
+        let mut config = AppConfig::defaults();
+        config.exclude_tools = vec![
+            "get_user_preferred_name".to_string(),
+            "get_help".to_string(),
+        ];
+
+        let registry = build_live_tool_registry(&config);
+
+        assert!(
+            !registry
+                .specs()
+                .iter()
+                .any(|tool| tool.name == "get_user_preferred_name")
+        );
+        assert!(!registry.specs().iter().any(|tool| tool.name == "get_help"));
+
+        let result = registry.invoke("get_user_preferred_name", "{}");
+        assert!(result.is_error);
+        assert!(result.content.contains("unknown tool"));
+    }
+
+    #[test]
     fn live_tool_registry_can_use_filesystem_and_time_base_tools() {
         let unique = format!(
             "elroy-rs-app-base-tools-{}",
@@ -10664,6 +10704,8 @@ mod tests {
         assert!(printed.content.contains("Chat API Key"));
         assert!(printed.content.contains("********"));
         assert!(printed.content.contains("Anthropic API Key"));
+        assert!(printed.content.contains("Exclude Tools"));
+        assert!(printed.content.contains("(none)"));
         assert!(printed.content.contains("Reflect"));
         assert!(printed.content.contains("Memories Between Consolidation"));
         assert!(
