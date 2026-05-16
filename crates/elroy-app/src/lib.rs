@@ -3056,10 +3056,14 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
             let limit = argument_limit(&arguments, 10);
             with_tool_connection(&database_path, |connection| {
                 let memories = search_active_memories(connection, query, limit)?;
-                let payload = memories
+                let due_items = list_active_due_items(connection, limit * 3)?;
+                let relevant_due_items =
+                    select_due_items_by_overlap(query, &due_items, limit, None);
+                let mut payload = memories
                     .into_iter()
                     .map(|memory| {
                         json!({
+                            "type": "memory",
                             "name": memory.name,
                             "file_path": memory.file_path,
                             "excerpt": excerpt(&memory.body, 180),
@@ -3067,6 +3071,17 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                         })
                     })
                     .collect::<Vec<_>>();
+                payload.extend(relevant_due_items.into_iter().map(|item| {
+                    json!({
+                        "type": "due_item",
+                        "name": item.name,
+                        "file_path": item.file_path,
+                        "trigger_datetime": item.trigger_datetime,
+                        "trigger_context": item.trigger_context,
+                        "excerpt": excerpt(&item.body, 180),
+                        "updated_at_unix": item.updated_at_unix,
+                    })
+                }));
                 Ok(ToolExecutionResult::success(
                     serde_json::to_string_pretty(&payload)
                         .expect("memory search payload should serialize"),
@@ -3880,11 +3895,11 @@ fn recalled_memory_names(transcript: &[ConversationMessage]) -> HashSet<String> 
         .collect()
 }
 
-fn select_recalled_due_items<'a>(
+fn select_due_items_by_overlap<'a>(
     prompt: &str,
     due_items: &'a [AgendaItemRecord],
-    now_iso: &str,
     limit: usize,
+    skip_time_due_before: Option<&str>,
 ) -> Vec<&'a AgendaItemRecord> {
     let prompt_tokens = significant_tokens(prompt);
     if prompt_tokens.is_empty() {
@@ -3895,11 +3910,11 @@ fn select_recalled_due_items<'a>(
         .iter()
         .filter_map(|item| {
             let trigger_context = item.trigger_context.as_deref()?;
-            if item
-                .trigger_datetime
-                .as_deref()
-                .is_some_and(|trigger_datetime| trigger_datetime <= now_iso)
-            {
+            if skip_time_due_before.is_some_and(|now_iso| {
+                item.trigger_datetime
+                    .as_deref()
+                    .is_some_and(|trigger_datetime| trigger_datetime <= now_iso)
+            }) {
                 return None;
             }
 
@@ -3929,6 +3944,15 @@ fn select_recalled_due_items<'a>(
         .take(limit)
         .map(|(_, _, item)| item)
         .collect()
+}
+
+fn select_recalled_due_items<'a>(
+    prompt: &str,
+    due_items: &'a [AgendaItemRecord],
+    now_iso: &str,
+    limit: usize,
+) -> Vec<&'a AgendaItemRecord> {
+    select_due_items_by_overlap(prompt, due_items, limit, Some(now_iso))
 }
 
 fn parse_recalled_memory_names(content: &str) -> Vec<String> {
@@ -4199,9 +4223,10 @@ mod tests {
         provider_config_from_app_config, recall_due_item_context_messages,
         recall_memory_context_messages, recalled_memory_names, recent_recall_context,
         refresh_context_if_needed, run_prompt_with_model_and_registry,
-        run_prompt_with_model_and_registry_stream, select_recalled_due_items,
-        select_recalled_memories, should_offer_greeting, should_skip_memory_recall,
-        significant_tokens, strip_input_message_for_persistence, strip_transient_context_messages,
+        run_prompt_with_model_and_registry_stream, select_due_items_by_overlap,
+        select_recalled_due_items, select_recalled_memories, should_offer_greeting,
+        should_skip_memory_recall, significant_tokens, strip_input_message_for_persistence,
+        strip_transient_context_messages,
     };
     use elroy_agenda::create_agenda_file;
     use elroy_codex::{
@@ -5726,6 +5751,33 @@ mod tests {
     }
 
     #[test]
+    fn select_due_items_by_overlap_can_include_not_yet_due_items_for_search() {
+        let due_items = vec![AgendaItemRecord {
+            id: 1,
+            legacy_frontmatter_id: None,
+            name: "Payroll Follow-up".to_string(),
+            file_path: "/tmp/payroll.md".to_string(),
+            agenda_date: Some("unscheduled".to_string()),
+            is_completed: false,
+            status: Some("created".to_string()),
+            trigger_datetime: Some("2099-01-01T09:00:00".to_string()),
+            trigger_context: Some("after payroll email".to_string()),
+            closing_comment: None,
+            checklist_total: 0,
+            checklist_completed: 0,
+            body: "Reply to payroll".to_string(),
+            is_active: true,
+            updated_at_unix: 20,
+        }];
+
+        let recalled =
+            select_due_items_by_overlap("I just got the payroll email", &due_items, 2, None);
+
+        assert_eq!(recalled.len(), 1);
+        assert_eq!(recalled[0].name, "Payroll Follow-up");
+    }
+
+    #[test]
     fn select_recalled_due_items_skips_time_due_items() {
         let due_items = vec![AgendaItemRecord {
             id: 1,
@@ -5799,6 +5851,48 @@ mod tests {
                 && content.contains("after payroll email")
                 && content.contains("Reply to payroll")
         }));
+    }
+
+    #[test]
+    fn live_tool_registry_search_memories_can_return_due_items() {
+        let unique = format!(
+            "elroy-rs-app-search-memories-due-items-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+        fs::write(
+            agenda_dir.join("payroll_follow_up.md"),
+            "---\ndate: unscheduled\ncompleted: false\nstatus: created\ntrigger_context: after payroll email\n---\n\nReply to payroll\n",
+        )
+        .expect("due item should be written");
+
+        let mut config = AppConfig::defaults();
+        config.memory_dir = memory_dir;
+        config.agenda_dir = agenda_dir;
+        config.database_path = database_path;
+        elroy_db::bootstrap_database(&elroy_db::BootstrapPlan::from_config(&config))
+            .expect("bootstrap should succeed");
+
+        let registry = build_live_tool_registry(&config);
+        let search = registry.invoke(
+            "search_memories",
+            "{\"query\":\"payroll email\",\"limit\":5}",
+        );
+
+        assert!(!search.is_error);
+        assert!(search.content.contains("\"type\": \"due_item\""));
+        assert!(search.content.contains("payroll_follow_up.md"));
+        assert!(search.content.contains("after payroll email"));
+
+        fs::remove_dir_all(home).expect("home should be removed");
     }
 
     #[test]
