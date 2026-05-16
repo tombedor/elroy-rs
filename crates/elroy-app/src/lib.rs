@@ -4593,7 +4593,13 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
         ToolSpec::new(
             "print_memories",
             "List active memories available to Elroy.",
-            JsonSchema::object([("limit", json!({"type": "integer"}))], [] as [&str; 0]),
+            JsonSchema::object(
+                [
+                    ("limit", json!({"type": "integer"})),
+                    ("n", json!({"type": "integer"})),
+                ],
+                [] as [&str; 0],
+            ),
         ),
         move |arguments| {
             let limit = argument_limit(&arguments, 10);
@@ -4859,7 +4865,13 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
         ToolSpec::new(
             "print_active_due_items",
             "List active due items and reminders.",
-            JsonSchema::object([("limit", json!({"type": "integer"}))], [] as [&str; 0]),
+            JsonSchema::object(
+                [
+                    ("limit", json!({"type": "integer"})),
+                    ("n", json!({"type": "integer"})),
+                ],
+                [] as [&str; 0],
+            ),
         ),
         move |arguments| {
             let limit = argument_limit(&arguments, 10);
@@ -4910,7 +4922,13 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
         ToolSpec::new(
             "print_inactive_due_items",
             "List inactive due items and reminders.",
-            JsonSchema::object([("limit", json!({"type": "integer"}))], [] as [&str; 0]),
+            JsonSchema::object(
+                [
+                    ("limit", json!({"type": "integer"})),
+                    ("n", json!({"type": "integer"})),
+                ],
+                [] as [&str; 0],
+            ),
         ),
         move |arguments| {
             let limit = argument_limit(&arguments, 10);
@@ -5315,7 +5333,11 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
 }
 
 pub fn argument_limit(arguments: &Value, default_limit: usize) -> usize {
-    match arguments.get("limit").and_then(Value::as_u64) {
+    match arguments
+        .get("limit")
+        .and_then(Value::as_u64)
+        .or_else(|| arguments.get("n").and_then(Value::as_u64))
+    {
         Some(0) | None => default_limit,
         Some(value) => value.clamp(1, 50) as usize,
     }
@@ -6518,8 +6540,10 @@ mod tests {
     fn argument_limit_clamps_values() {
         assert_eq!(argument_limit(&serde_json::json!({}), 10), 10);
         assert_eq!(argument_limit(&serde_json::json!({"limit": 0}), 10), 10);
+        assert_eq!(argument_limit(&serde_json::json!({"n": 0}), 10), 10);
         assert_eq!(argument_limit(&serde_json::json!({"limit": 100}), 10), 50);
         assert_eq!(argument_limit(&serde_json::json!({"limit": 7}), 10), 7);
+        assert_eq!(argument_limit(&serde_json::json!({"n": 7}), 10), 7);
     }
 
     #[test]
@@ -6830,7 +6854,7 @@ mod tests {
         let printed_memory = registry.invoke("print_memory", "{\"name\":\"runner notes\"}");
         let missing_printed_memory = registry.invoke("print_memory", "{\"name\":\"missing\"}");
         let agenda = registry.invoke("show_agenda_item", "{\"name\":\"doctor visit\"}");
-        let printed_memories = registry.invoke("print_memories", "{\"limit\":10}");
+        let printed_memories = registry.invoke("print_memories", "{\"n\":10}");
 
         assert!(!memory.is_error);
         assert!(memory.content.contains("remember the hill workout"));
@@ -7863,13 +7887,13 @@ mod tests {
         assert!(inactive.content.contains("call mom"));
         assert!(inactive.content.contains("done"));
 
-        let printed_active = registry.invoke("print_active_due_items", "{\"limit\":10}");
+        let printed_active = registry.invoke("print_active_due_items", "{\"n\":10}");
         assert!(!printed_active.is_error);
         assert!(printed_active.content.contains("Active Due Items"));
         assert!(printed_active.content.contains("pay bill"));
         assert!(printed_active.content.contains("Type: Timed"));
 
-        let printed_inactive = registry.invoke("print_inactive_due_items", "{\"limit\":10}");
+        let printed_inactive = registry.invoke("print_inactive_due_items", "{\"n\":10}");
         assert!(!printed_inactive.is_error);
         assert!(printed_inactive.content.contains("Inactive Due Items"));
         assert!(printed_inactive.content.contains("call mom"));
