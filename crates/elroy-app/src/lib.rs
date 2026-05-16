@@ -1817,14 +1817,6 @@ fn refresh_context_if_needed(
             config.context_refresh_target_tokens(),
             config.max_context_age_minutes,
         );
-        let removed_prefix_len = transcript.len().saturating_sub(compressed.len());
-        let dropped_messages = transcript
-            .iter()
-            .skip(1)
-            .take(removed_prefix_len)
-            .cloned()
-            .collect::<Vec<_>>();
-
         if transcript
             .iter()
             .any(|message| message.role == MessageRole::User)
@@ -1847,7 +1839,10 @@ fn refresh_context_if_needed(
         }
 
         let mut refreshed_transcript = compressed;
-        if !dropped_messages.is_empty() {
+        if transcript
+            .iter()
+            .any(|message| message.role == MessageRole::User)
+        {
             let tool_call_id = format!(
                 "context-summary-{}",
                 Utc::now()
@@ -1858,7 +1853,7 @@ fn refresh_context_if_needed(
                 tool_call_id,
                 "context_summary",
                 "{}",
-                build_context_summary_message(connection, config, &dropped_messages),
+                build_context_summary_message(connection, config, &transcript),
             ));
         }
 
@@ -15229,12 +15224,13 @@ mod tests {
             Some("context_summary")
         );
         assert_eq!(stored[stored.len() - 1].role, MessageRole::Tool);
-        assert!(
-            stored[stored.len() - 1]
-                .content
-                .as_deref()
-                .is_some_and(|content| content.starts_with("Recent conversation summary:"))
-        );
+        let summary_content = stored[stored.len() - 1]
+            .content
+            .as_deref()
+            .expect("summary tool content should exist");
+        assert!(summary_content.starts_with("Recent conversation summary:"));
+        assert!(summary_content.contains("user 7 words repeated"));
+        assert!(summary_content.contains("assistant 7 words repeated"));
 
         let memories = elroy_db::list_active_memories(&connection, 10).expect("memories load");
         assert_eq!(memories.len(), 1);
