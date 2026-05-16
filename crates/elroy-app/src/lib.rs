@@ -5954,11 +5954,14 @@ fn due_item_context_messages(items: &[AgendaItemRecord]) -> Vec<ConversationMess
         .iter()
         .filter_map(|item| {
             let trigger_datetime = item.trigger_datetime.as_deref()?;
+            let formatted_trigger_datetime = parse_sidebar_trigger_datetime(trigger_datetime)
+                .map(|datetime| datetime.format("%Y-%m-%d %H:%M:%S").to_string())
+                .unwrap_or_else(|| trigger_datetime.to_string());
             Some(format!(
-                "DUE ITEM: '{}' - {}\n\nThis item was scheduled for {} and is now due. Please inform the user about it and then use the delete_due_item tool to remove it from active due items.",
+                "⏰ DUE ITEM: '{}' - {}\n\nThis item was scheduled for {} and is now due. Please inform the user about it and then use the delete_due_item tool to remove it from active due items.",
                 item.name,
                 item.body,
-                trigger_datetime,
+                formatted_trigger_datetime,
             ))
         })
         .collect::<Vec<_>>();
@@ -9416,7 +9419,8 @@ mod tests {
         assert!(messages[1].content.as_deref().is_some_and(|content| {
             content.contains("Call mom tonight")
                 && content.contains("delete_due_item")
-                && content.contains("2000-01-01T09:00:00")
+                && content.contains("⏰ DUE ITEM")
+                && content.contains("2000-01-01 09:00:00")
         }));
     }
 
