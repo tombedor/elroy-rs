@@ -34,6 +34,7 @@ STRONGLY bias towards making updates to due items without confirmation from the 
 
 ### Memory Queries
 - `examine_memories`: Search through memories for the answer to a question. This returns relevant memories that are relevant to the question. If you need more detail, use get_source_content_for_memory to get more detailed information for returned memories.
+- `get_source_list_for_memory`: List what sources a memory is based on before drilling into a specific source.
 - `get_source_content_for_memory`: Retrieve the source content for a specific memory. This is useful when a memory is relevant but lacks detail to answer the question.
 
 ### Proactive management of memories and agenda items

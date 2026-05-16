@@ -1468,6 +1468,18 @@ fn parse_context_message_source_ids(frontmatter: Option<&str>) -> Option<Vec<i64
     serde_json::from_str(message_ids_json?.as_str()).ok()
 }
 
+fn list_memory_sources(frontmatter: Option<&str>, memory_name: &str) -> Vec<(String, String)> {
+    if let Some(message_ids) = parse_context_message_source_ids(frontmatter) {
+        let source_name = message_ids
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        return vec![(CONTEXT_MESSAGE_SOURCE_TYPE.to_string(), source_name)];
+    }
+    vec![("MemoryFile".to_string(), memory_name.to_string())]
+}
+
 fn format_context_message_source_content(messages: &[ConversationMessage]) -> String {
     messages
         .iter()
@@ -4533,6 +4545,54 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
     );
 
     let database_path = config.database_path.clone();
+    let get_source_list_for_memory = ExecutableTool::new(
+        ToolSpec::new(
+            "get_source_list_for_memory",
+            "List available sources for one active memory.",
+            JsonSchema::object(
+                [("memory_name", json!({"type": "string"}))],
+                ["memory_name"],
+            ),
+        ),
+        move |arguments| {
+            let Some(memory_name) = arguments.get("memory_name").and_then(Value::as_str) else {
+                return ToolExecutionResult::error(
+                    "get_source_list_for_memory requires string memory_name",
+                );
+            };
+            with_tool_connection(&database_path, |connection| {
+                let Some(memory) = find_active_memory_by_name(connection, memory_name)? else {
+                    return Ok(ToolExecutionResult::error(format!(
+                        "memory not found: {memory_name}"
+                    )));
+                };
+                let path = Path::new(&memory.file_path);
+                let sources = match read_memory_parts(path) {
+                    Ok((frontmatter, _)) => {
+                        list_memory_sources(frontmatter.as_deref(), &memory.name)
+                    }
+                    Err(_) => Vec::new(),
+                };
+                Ok(ToolExecutionResult::success(
+                    json!({
+                        "memory_name": memory.name,
+                        "sources": sources
+                            .into_iter()
+                            .map(|(source_type, name)| {
+                                json!({
+                                    "source_type": source_type,
+                                    "name": name,
+                                })
+                            })
+                            .collect::<Vec<_>>(),
+                    })
+                    .to_string(),
+                ))
+            })
+        },
+    );
+
+    let database_path = config.database_path.clone();
     let get_source_content_for_memory = ExecutableTool::new(
         ToolSpec::new(
             "get_source_content_for_memory",
@@ -4702,6 +4762,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
         print_due_item,
         show_memory,
         print_memory,
+        get_source_list_for_memory,
         get_source_content_for_memory,
         show_agenda_item,
     ])
@@ -6224,6 +6285,61 @@ mod tests {
         assert!(source.content.contains("with the harder second interval"));
         assert!(out_of_range.is_error);
         assert!(out_of_range.content.contains("Available indices: [0]"));
+
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
+    fn live_tool_registry_can_list_source_metadata_for_memory() {
+        let unique = format!(
+            "elroy-rs-app-memory-source-list-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+
+        let mut config = AppConfig::defaults();
+        config.memory_dir = memory_dir.clone();
+        config.agenda_dir = agenda_dir;
+        config.database_path = database_path.clone();
+
+        let mut connection = open_sqlite_connection(&database_path).expect("database should open");
+        run_migrations(&mut connection).expect("migrations should run");
+        elroy_db::replace_context_messages(
+            &mut connection,
+            LOCAL_USER_TOKEN,
+            &[ConversationMessage::new(
+                MessageRole::User,
+                "Hello, I ran a marathon today!",
+            )],
+        )
+        .expect("context messages should persist");
+
+        let registry = build_live_tool_registry(&config);
+        let created = registry.invoke(
+            "create_memory",
+            "{\"name\":\"Running progress\",\"text\":\"I ran a marathon today\"}",
+        );
+        let source_list = registry.invoke(
+            "get_source_list_for_memory",
+            "{\"memory_name\":\"running progress\"}",
+        );
+
+        assert!(!created.is_error);
+        assert!(!source_list.is_error);
+        assert!(
+            source_list
+                .content
+                .contains("\"source_type\":\"ContextMessageSet\"")
+        );
+        assert!(source_list.content.contains("\"name\":\"1\""));
 
         fs::remove_dir_all(home).expect("home should be removed");
     }
