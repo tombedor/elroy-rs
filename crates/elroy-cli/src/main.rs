@@ -117,7 +117,14 @@ struct CliPromptStream {
 
 impl CliTuiRuntime {
     fn new(runtime: AppRuntime) -> Self {
+        runtime.enable_restart_support();
         Self { runtime }
+    }
+}
+
+impl Drop for CliTuiRuntime {
+    fn drop(&mut self) {
+        self.runtime.disable_restart_support();
     }
 }
 
@@ -144,6 +151,20 @@ impl TuiRuntime for CliTuiRuntime {
                 stream.map(|inner| Box::new(CliPromptStream { inner }) as Box<dyn TuiPromptStream>)
             })
             .map_err(|error| error.to_string())
+    }
+
+    fn start_restart_prompt_stream(
+        &mut self,
+        resume_message: &str,
+    ) -> Result<Box<dyn TuiPromptStream>, String> {
+        self.runtime
+            .restart_prompt_stream(resume_message)
+            .map(|inner| Box::new(CliPromptStream { inner }) as Box<dyn TuiPromptStream>)
+            .map_err(|error| error.to_string())
+    }
+
+    fn take_restart_request(&mut self) -> Result<Option<String>, String> {
+        Ok(self.runtime.consume_restart_request())
     }
 
     fn load_context_messages(&mut self) -> Result<Vec<TuiContextMessage>, String> {

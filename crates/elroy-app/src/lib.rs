@@ -1,6 +1,6 @@
 use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use chrono::{Local, NaiveDateTime, Utc};
 use elroy_agenda::{
@@ -54,6 +54,16 @@ const SYNTHETIC_FIRST_USER_MESSAGE: &str = "The user has begun the conversation"
 const DEFAULT_MAX_LIST_ENTRIES: usize = 50;
 const DEFAULT_MAX_LIST_DEPTH: usize = 2;
 const DEFAULT_READ_LINE_LIMIT: usize = 200;
+const DEFAULT_RESTART_RESUME_PROMPT: &str =
+    "Elroy just restarted. Send a brief message that you are back and ready to continue.";
+
+static RESTART_STATE: OnceLock<Mutex<RestartState>> = OnceLock::new();
+
+#[derive(Debug, Default)]
+struct RestartState {
+    supported: bool,
+    pending_resume_prompt: Option<String>,
+}
 
 #[derive(Debug)]
 pub enum AppError {
@@ -222,6 +232,18 @@ impl AppRuntime {
         Self { config }
     }
 
+    pub fn enable_restart_support(&self) {
+        enable_session_restart_support();
+    }
+
+    pub fn disable_restart_support(&self) {
+        disable_session_restart_support();
+    }
+
+    pub fn consume_restart_request(&self) -> Option<String> {
+        consume_session_restart_request()
+    }
+
     pub fn config(&self) -> &AppConfig {
         &self.config
     }
@@ -381,6 +403,14 @@ impl AppRuntime {
             },
         )
         .map(Some)
+    }
+
+    pub fn restart_prompt_stream(
+        &self,
+        resume_message: &str,
+    ) -> Result<PromptEventStream, AppError> {
+        self.startup_prompt_stream(Some(resume_message))?
+            .ok_or_else(|| AppError::Runtime("restart prompt stream should exist".to_string()))
     }
 
     pub fn open_sidebar_item(
@@ -1486,6 +1516,43 @@ fn codex_background_status_message(session_id: &str) -> String {
     format!("codex session {session_id} running...")
 }
 
+fn restart_state() -> &'static Mutex<RestartState> {
+    RESTART_STATE.get_or_init(|| Mutex::new(RestartState::default()))
+}
+
+fn enable_session_restart_support() {
+    let mut state = restart_state()
+        .lock()
+        .expect("restart state lock should work");
+    state.supported = true;
+}
+
+fn disable_session_restart_support() {
+    let mut state = restart_state()
+        .lock()
+        .expect("restart state lock should work");
+    state.supported = false;
+    state.pending_resume_prompt = None;
+}
+
+fn request_session_restart(resume_prompt: &str) -> Result<(), &'static str> {
+    let mut state = restart_state()
+        .lock()
+        .expect("restart state lock should work");
+    if !state.supported {
+        return Err("Session restart is not available in this Elroy runtime.");
+    }
+    state.pending_resume_prompt = Some(resume_prompt.to_string());
+    Ok(())
+}
+
+fn consume_session_restart_request() -> Option<String> {
+    let mut state = restart_state()
+        .lock()
+        .expect("restart state lock should work");
+    state.pending_resume_prompt.take()
+}
+
 fn filesystem_display_path(target: &Path) -> String {
     let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     target
@@ -1808,6 +1875,30 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                 })
                 .to_string(),
             )
+        },
+    );
+
+    let restart_session = ExecutableTool::new(
+        ToolSpec::new(
+            "restart_session",
+            "Restart the active Elroy session after the current response completes.",
+            JsonSchema::object(
+                [("resume_message", json!({"type": "string"}))],
+                [] as [&str; 0],
+            ),
+        ),
+        move |arguments| {
+            let resume_message = arguments
+                .get("resume_message")
+                .and_then(Value::as_str)
+                .unwrap_or(DEFAULT_RESTART_RESUME_PROMPT);
+            match request_session_restart(resume_message) {
+                Ok(()) => ToolExecutionResult::success(
+                    "Restart scheduled. Elroy will restart after this response completes."
+                        .to_string(),
+                ),
+                Err(error) => ToolExecutionResult::error(error.to_string()),
+            }
         },
     );
 
@@ -4146,6 +4237,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
         pwd,
         ls,
         read_file,
+        restart_session,
         create_memory,
         get_fast_recall,
         add_agenda_item,
@@ -6682,6 +6774,38 @@ mod tests {
         );
 
         fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
+    fn live_tool_registry_can_schedule_restart_when_supported() {
+        crate::disable_session_restart_support();
+        let config = AppConfig::defaults();
+        let registry = build_live_tool_registry(&config);
+
+        let unavailable = registry.invoke("restart_session", "{}");
+        assert!(unavailable.is_error);
+        assert!(
+            unavailable
+                .content
+                .contains("Session restart is not available in this Elroy runtime.")
+        );
+
+        let runtime = AppRuntime::new(config);
+        runtime.enable_restart_support();
+        let scheduled = registry.invoke(
+            "restart_session",
+            "{\"resume_message\":\"Restarted successfully. Ready to continue.\"}",
+        );
+        assert!(!scheduled.is_error);
+        assert_eq!(
+            scheduled.content,
+            "Restart scheduled. Elroy will restart after this response completes."
+        );
+        assert_eq!(
+            runtime.consume_restart_request().as_deref(),
+            Some("Restarted successfully. Ready to continue.")
+        );
+        runtime.disable_restart_support();
     }
 
     #[test]

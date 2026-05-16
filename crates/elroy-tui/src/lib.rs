@@ -140,6 +140,11 @@ pub trait TuiRuntime {
     fn submit_prompt(&mut self, prompt: &str) -> Result<TuiSnapshot, String>;
     fn start_prompt_stream(&mut self, prompt: &str) -> Result<Box<dyn TuiPromptStream>, String>;
     fn start_startup_prompt_stream(&mut self) -> Result<Option<Box<dyn TuiPromptStream>>, String>;
+    fn start_restart_prompt_stream(
+        &mut self,
+        resume_message: &str,
+    ) -> Result<Box<dyn TuiPromptStream>, String>;
+    fn take_restart_request(&mut self) -> Result<Option<String>, String>;
     fn load_context_messages(&mut self) -> Result<Vec<TuiContextMessage>, String>;
     fn refresh_context_if_needed(&mut self) -> Result<(), String>;
     fn background_status(&mut self) -> Result<Option<String>, String>;
@@ -269,6 +274,27 @@ fn start_startup_prompt_stream(
         Ok(None) => None,
         Err(error) => {
             app.status = format!("startup failed: {error}");
+            None
+        }
+    }
+}
+
+fn start_restart_prompt_stream(
+    app: &mut TuiApp,
+    runtime: &mut impl TuiRuntime,
+    resume_message: &str,
+) -> Option<PendingPrompt> {
+    match runtime.start_restart_prompt_stream(resume_message) {
+        Ok(stream) => {
+            app.status = "thinking...".to_string();
+            Some(PendingPrompt {
+                submitted_prompt: None,
+                before_ids: app.rendered_context_message_ids.clone(),
+                stream,
+            })
+        }
+        Err(error) => {
+            app.status = format!("restart failed: {error}");
             None
         }
     }
@@ -451,6 +477,17 @@ fn advance_prompt_stream(
                             &pending.before_ids,
                             &context_messages,
                         );
+                    }
+                    match runtime.take_restart_request() {
+                        Ok(Some(resume_message)) => {
+                            *pending_prompt =
+                                start_restart_prompt_stream(app, runtime, &resume_message);
+                            return false;
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            app.status = format!("restart failed: {error}");
+                        }
                     }
                 }
                 Err(error) => {
@@ -1212,6 +1249,17 @@ impl TuiRuntime for NoopRuntime {
         Ok(None)
     }
 
+    fn start_restart_prompt_stream(
+        &mut self,
+        _resume_message: &str,
+    ) -> Result<Box<dyn TuiPromptStream>, String> {
+        Err("restart not available".to_string())
+    }
+
+    fn take_restart_request(&mut self) -> Result<Option<String>, String> {
+        Ok(None)
+    }
+
     fn load_context_messages(&mut self) -> Result<Vec<TuiContextMessage>, String> {
         Ok(vec![])
     }
@@ -1271,6 +1319,8 @@ mod tests {
         last_opened: Option<(SidebarSection, String)>,
         last_mutation: Option<(SidebarSection, String, SidebarAction)>,
         startup_stream: Option<FakePromptStream>,
+        restart_stream: Option<FakePromptStream>,
+        pending_restart_request: Option<String>,
         context_messages: Vec<TuiContextMessage>,
         background_status: Option<String>,
         refresh_context_calls: usize,
@@ -1357,6 +1407,20 @@ mod tests {
                 .startup_stream
                 .take()
                 .map(|stream| Box::new(stream) as Box<dyn TuiPromptStream>))
+        }
+
+        fn start_restart_prompt_stream(
+            &mut self,
+            _resume_message: &str,
+        ) -> Result<Box<dyn TuiPromptStream>, String> {
+            self.restart_stream
+                .take()
+                .map(|stream| Box::new(stream) as Box<dyn TuiPromptStream>)
+                .ok_or_else(|| "restart stream missing".to_string())
+        }
+
+        fn take_restart_request(&mut self) -> Result<Option<String>, String> {
+            Ok(self.pending_restart_request.take())
         }
 
         fn load_context_messages(&mut self) -> Result<Vec<TuiContextMessage>, String> {
@@ -2058,6 +2122,56 @@ mod tests {
             !app.conversation_lines
                 .iter()
                 .any(|line| line.starts_with("user:"))
+        );
+    }
+
+    #[test]
+    fn completed_prompt_can_restart_into_hidden_startup_stream() {
+        let mut app = TuiApp::bootstrap();
+        app.input = "hello runtime".to_string();
+        let mut runtime = FakeRuntime {
+            pending_restart_request: Some("Restarted successfully. Ready to continue.".to_string()),
+            restart_stream: Some(FakePromptStream {
+                updates: vec![
+                    PromptUpdate::Status("thinking...".to_string()),
+                    PromptUpdate::AssistantDelta("welcome ".to_string()),
+                    PromptUpdate::AssistantDelta("back".to_string()),
+                ],
+                finalized_snapshot: TuiSnapshot {
+                    conversation_lines: vec![
+                        "user: hello runtime".to_string(),
+                        "assistant: runtime response".to_string(),
+                        "assistant: welcome back".to_string(),
+                    ],
+                    status: Some("loaded restart".to_string()),
+                    ..TuiSnapshot::default()
+                },
+                cancelled_snapshot: TuiSnapshot::default(),
+            }),
+            context_messages: vec![TuiContextMessage {
+                id: 22,
+                role: "assistant".to_string(),
+                content: "welcome back".to_string(),
+            }],
+            ..FakeRuntime::default()
+        };
+        let mut pending = None;
+
+        apply_intent_with_runtime(&mut app, UiIntent::SubmitPrompt, &mut runtime, &mut pending);
+        while pending.is_some() {
+            advance_prompt_stream(&mut app, &mut runtime, &mut pending);
+        }
+
+        assert_eq!(
+            app.conversation_lines.last().map(String::as_str),
+            Some("assistant: welcome back")
+        );
+        assert_eq!(app.status, "loaded restart");
+        assert!(runtime.pending_restart_request.is_none());
+        assert!(
+            !app.conversation_lines
+                .iter()
+                .any(|line| line == "user: Restarted successfully. Ready to continue.")
         );
     }
 
