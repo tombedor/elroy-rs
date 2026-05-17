@@ -7905,8 +7905,22 @@ fn select_relevant_contextual_due_items<'a>(
     let candidate_limit = limit.saturating_mul(3).max(limit);
     let overlap_candidates =
         select_due_items_by_overlap(query, due_items, candidate_limit, Some(now_iso));
-    let candidates = if overlap_candidates.is_empty() && relevance_model.is_some() {
-        recent_contextual_due_item_candidates(due_items, candidate_limit, now_iso)
+    let candidates = if relevance_model.is_some() {
+        let mut merged_candidates = overlap_candidates;
+        for candidate in recent_contextual_due_item_candidates(due_items, candidate_limit, now_iso)
+        {
+            if merged_candidates
+                .iter()
+                .any(|existing| existing.id == candidate.id)
+            {
+                continue;
+            }
+            merged_candidates.push(candidate);
+            if merged_candidates.len() >= candidate_limit {
+                break;
+            }
+        }
+        merged_candidates
     } else {
         overlap_candidates
     };
@@ -13981,6 +13995,90 @@ mod tests {
     }
 
     #[test]
+    fn recall_due_item_context_messages_can_prefer_semantic_contextual_match_over_weaker_overlap() {
+        struct SemanticReminderRelevanceModel;
+
+        impl ModelClient for SemanticReminderRelevanceModel {
+            fn next_events(
+                &self,
+                request: ConversationRequest<'_>,
+            ) -> Result<Vec<StreamEvent>, elroy_core::ModelClientError> {
+                let prompt = request.user_message;
+                let answers = if prompt.contains("0. # Practice Reminder") {
+                    vec![true, false]
+                } else {
+                    vec![false, true]
+                };
+                Ok(vec![StreamEvent::AssistantResponse {
+                    content: serde_json::json!({
+                        "answers": answers,
+                        "reasoning": "Only the resistance-bands reminder matches the user's intent."
+                    })
+                    .to_string(),
+                }])
+            }
+        }
+
+        let transcript = vec![ConversationMessage::new(
+            MessageRole::Assistant,
+            "What do you need help with?",
+        )];
+        let due_items = vec![
+            AgendaItemRecord {
+                id: 1,
+                legacy_frontmatter_id: None,
+                name: "Gear Inventory".to_string(),
+                file_path: "/tmp/gear_inventory.md".to_string(),
+                agenda_date: Some("unscheduled".to_string()),
+                is_completed: false,
+                status: Some("created".to_string()),
+                trigger_datetime: None,
+                trigger_context: Some("after equipment handoff".to_string()),
+                closing_comment: None,
+                checklist_total: 0,
+                checklist_completed: 0,
+                body: "Review the storage locker spreadsheet.".to_string(),
+                is_active: true,
+                updated_at_unix: 10,
+            },
+            AgendaItemRecord {
+                id: 2,
+                legacy_frontmatter_id: None,
+                name: "Practice Reminder".to_string(),
+                file_path: "/tmp/practice_reminder.md".to_string(),
+                agenda_date: Some("unscheduled".to_string()),
+                is_completed: false,
+                status: Some("created".to_string()),
+                trigger_datetime: None,
+                trigger_context: Some("before basketball practice".to_string()),
+                closing_comment: None,
+                checklist_total: 0,
+                checklist_completed: 0,
+                body: "Bring the resistance bands".to_string(),
+                is_active: true,
+                updated_at_unix: 20,
+            },
+        ];
+        let messages = recall_due_item_context_messages(
+            "What gear should I bring?",
+            &transcript,
+            &due_items,
+            "2026-05-15T12:00:00",
+            Some(&SemanticReminderRelevanceModel),
+        );
+
+        let joined_tool_content = messages
+            .iter()
+            .filter(|message| message.role == MessageRole::Tool)
+            .filter_map(|message| message.content.as_deref())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined_tool_content.contains("Practice Reminder"));
+        assert!(joined_tool_content.contains("Bring the resistance bands"));
+        assert!(!joined_tool_content.contains("Gear Inventory"));
+    }
+
+    #[test]
     fn live_tool_registry_search_memories_can_return_due_items() {
         let unique = format!(
             "elroy-rs-app-search-memories-due-items-{}",
@@ -15109,6 +15207,128 @@ mod tests {
             "What gear should I bring?",
             &SemanticContextualDueItemModel,
             Some(&SemanticContextualDueItemModel),
+            build_live_tool_registry(&config),
+            PromptExecutionOptions {
+                role: MessageRole::User,
+                persist_input_message: true,
+                force_tool: None,
+                assistant_name: &config.assistant_name,
+                ensure_alternating_roles: config.llm_provider() == LlmProvider::Anthropic,
+                home_dir: &home,
+                bootstrap_plan: BootstrapPlan::from_config(&config),
+                messages_between_memory: config.messages_between_memory,
+                memories_between_consolidation: config.memories_between_consolidation,
+                messages_between_self_reflection: config.messages_between_self_reflection,
+                defer_auto_memory: false,
+                defer_self_reflection: false,
+                memory_recall_classifier_enabled: false,
+                memory_recall_classifier_window: config.memory_recall_classifier_window,
+                reflect: config.reflect,
+            },
+        )
+        .expect("prompt should succeed");
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::AssistantResponse { content }
+                if content.contains("resistance bands")
+        )));
+
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
+    fn run_prompt_with_model_and_registry_can_prefer_semantic_contextual_due_item_over_weaker_overlap()
+     {
+        struct SemanticPriorityContextualDueItemModel;
+        struct SemanticReminderRelevanceModel;
+
+        impl ModelClient for SemanticPriorityContextualDueItemModel {
+            fn next_events(
+                &self,
+                request: ConversationRequest<'_>,
+            ) -> Result<Vec<StreamEvent>, elroy_core::ModelClientError> {
+                assert_eq!(request.user_message, "What gear should I bring?");
+                let tool_content = request
+                    .transcript
+                    .iter()
+                    .filter(|message| message.role == MessageRole::Tool)
+                    .filter_map(|message| message.content.as_deref())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                assert!(
+                    tool_content.contains("practice reminder")
+                        && tool_content.contains("Bring the resistance bands"),
+                    "{tool_content}"
+                );
+                assert!(!tool_content.contains("Gear Inventory"), "{tool_content}");
+                Ok(vec![StreamEvent::AssistantResponse {
+                    content: "You should bring the resistance bands.".to_string(),
+                }])
+            }
+        }
+
+        impl ModelClient for SemanticReminderRelevanceModel {
+            fn next_events(
+                &self,
+                request: ConversationRequest<'_>,
+            ) -> Result<Vec<StreamEvent>, elroy_core::ModelClientError> {
+                let prompt = request.user_message;
+                let answers = if prompt.contains("0. # Practice Reminder") {
+                    vec![true, false]
+                } else {
+                    vec![false, true]
+                };
+                Ok(vec![StreamEvent::AssistantResponse {
+                    content: serde_json::json!({
+                        "answers": answers,
+                        "reasoning": "Only the resistance-bands reminder matches the user's intent."
+                    })
+                    .to_string(),
+                }])
+            }
+        }
+
+        let unique = format!(
+            "elroy-rs-app-contextual-due-item-semantic-priority-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+        fs::write(
+            agenda_dir.join("gear_inventory.md"),
+            "---\ndate: unscheduled\ncompleted: false\nstatus: created\ntrigger_context: after equipment handoff\n---\n\nReview the storage locker spreadsheet.\n",
+        )
+        .expect("overlap due item file should be written");
+        fs::write(
+            agenda_dir.join("practice_reminder.md"),
+            "---\ndate: unscheduled\ncompleted: false\nstatus: created\ntrigger_context: before basketball practice\n---\n\nBring the resistance bands\n",
+        )
+        .expect("semantic due item file should be written");
+
+        let mut config = AppConfig::defaults();
+        config.home_dir = home.clone();
+        config.memory_dir = memory_dir;
+        config.agenda_dir = agenda_dir;
+        config.database_path = database_path.clone();
+        elroy_db::bootstrap_database(&BootstrapPlan::from_config(&config))
+            .expect("bootstrap should succeed");
+
+        let mut connection = open_sqlite_connection(&database_path).expect("database should open");
+        run_migrations(&mut connection).expect("migrations should run");
+
+        let events = run_prompt_with_model_and_registry_internal(
+            &mut connection,
+            "What gear should I bring?",
+            &SemanticPriorityContextualDueItemModel,
+            Some(&SemanticReminderRelevanceModel),
             build_live_tool_registry(&config),
             PromptExecutionOptions {
                 role: MessageRole::User,
