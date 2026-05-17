@@ -4674,4 +4674,19 @@ mod tests {
                 .any(|line| line.contains("assistant: cancelled"))
         );
     }
+
+    #[test]
+    fn cancel_prompt_does_not_run_deferred_self_reflection() {
+        let mut app = TuiApp::bootstrap();
+        app.input = "hello".to_string();
+        let mut runtime = FakeRuntime::default();
+        let mut pending = None;
+
+        apply_intent_with_runtime(&mut app, UiIntent::SubmitPrompt, &mut runtime, &mut pending);
+        apply_intent_with_runtime(&mut app, UiIntent::CancelPrompt, &mut runtime, &mut pending);
+
+        assert!(pending.is_none());
+        assert_eq!(runtime.self_reflection_runs, 0);
+        assert_eq!(app.status, "Chat stream cancelled");
+    }
 }
