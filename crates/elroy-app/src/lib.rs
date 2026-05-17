@@ -9960,6 +9960,7 @@ mod tests {
         ConversationMessage, EmbeddingProviderConfig, MessageRole, Provider, StreamEvent,
     };
     use elroy_memory::{create_memory_file, sanitize_filename};
+    use elroy_tasks::create_task_file_with_schedule;
     use elroy_tools::ExecutableToolRegistry;
     use elroy_tui::{TuiCommandExecution, TuiCommandPaletteAction, TuiSlashCommandAction};
 
@@ -17752,6 +17753,102 @@ User still wants to compare grocery prices after the shopping trip.",
             "---\ndate: unscheduled\ncompleted: false\nstatus: created\ntrigger_datetime: 2000-01-01T09:00:00\n---\n\nTake your daily medicine\n",
         )
         .expect("due item file should be written");
+
+        let mut config = AppConfig::defaults();
+        config.home_dir = home.clone();
+        config.memory_dir = memory_dir;
+        config.agenda_dir = agenda_dir.clone();
+        config.database_path = database_path.clone();
+        elroy_db::bootstrap_database(&BootstrapPlan::from_config(&config))
+            .expect("bootstrap should succeed");
+
+        let mut connection = open_sqlite_connection(&database_path).expect("database should open");
+        run_migrations(&mut connection).expect("migrations should run");
+
+        let registry = build_live_tool_registry(&config);
+        let model = DueItemSurfacingModel::new();
+        let events = run_prompt_with_model_and_registry(
+            &mut connection,
+            "Hi, how are you doing today?",
+            &model,
+            registry,
+            PromptExecutionOptions {
+                role: MessageRole::User,
+                persist_input_message: true,
+                force_tool: None,
+                assistant_name: &config.assistant_name,
+                ensure_alternating_roles: config.llm_provider() == LlmProvider::Anthropic,
+                home_dir: &home,
+                bootstrap_plan: BootstrapPlan::from_config(&config),
+                messages_between_memory: config.messages_between_memory,
+                memories_between_consolidation: config.memories_between_consolidation,
+                memory_consolidation_settings: Some(
+                    crate::memory_consolidation_settings_from_app_config(&config),
+                ),
+                messages_between_self_reflection: config.messages_between_self_reflection,
+                defer_auto_memory: false,
+                defer_self_reflection: false,
+                memory_recall_classifier_enabled: config.memory_recall_classifier_enabled,
+                memory_recall_classifier_window: config.memory_recall_classifier_window,
+                reflect: config.reflect,
+            },
+        )
+        .expect("prompt should succeed");
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::ToolCallRequested(call)
+                if call.name == "delete_due_item"
+                    && call.arguments_json == "{\"name\":\"medicine reminder\"}"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::AssistantToolResult { content, is_error }
+                if !is_error
+                    && content.contains("Due item 'medicine reminder' has been deleted.")
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::AssistantResponse { content }
+                if content.contains("take your daily medicine")
+        )));
+
+        let active_due_items =
+            list_active_due_items(&connection, 10).expect("due items should list");
+        assert!(
+            !active_due_items
+                .iter()
+                .any(|item| item.name == "medicine reminder")
+        );
+        assert!(!agenda_dir.join("medicine_reminder.md").exists());
+
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
+    fn run_prompt_with_model_and_registry_surfaces_and_cleans_up_due_tasks() {
+        let unique = format!(
+            "elroy-rs-app-due-task-prompt-integration-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+        create_task_file_with_schedule(
+            &agenda_dir,
+            "medicine reminder",
+            "Take your daily medicine",
+            None,
+            Some("2000-01-01T09:00:00"),
+            None,
+        )
+        .expect("due task file should be written");
 
         let mut config = AppConfig::defaults();
         config.home_dir = home.clone();
