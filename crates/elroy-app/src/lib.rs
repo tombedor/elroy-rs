@@ -1590,8 +1590,13 @@ fn run_prompt_with_model_and_registry_internal(
     let now_iso = Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string();
     let timed_due_item_context =
         due_item_context_messages(&list_due_tasks(connection, 20, &now_iso)?);
-    let contextual_due_item_context =
-        recall_due_item_context_messages(prompt, &existing_transcript, &all_due_items, &now_iso);
+    let contextual_due_item_context = recall_due_item_context_messages(
+        prompt,
+        &existing_transcript,
+        &all_due_items,
+        &now_iso,
+        classifier_model,
+    );
     let mut model_transcript = existing_transcript.clone();
     model_transcript.extend(contextual_due_item_context.iter().cloned());
     let persisted_transcript_start_len = model_transcript.len();
@@ -1714,8 +1719,13 @@ fn run_prompt_with_model_and_registry_stream_internal(
     let now_iso = Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string();
     let timed_due_item_context =
         due_item_context_messages(&list_due_tasks(&connection, 20, &now_iso)?);
-    let contextual_due_item_context =
-        recall_due_item_context_messages(prompt, &existing_transcript, &all_due_items, &now_iso);
+    let contextual_due_item_context = recall_due_item_context_messages(
+        prompt,
+        &existing_transcript,
+        &all_due_items,
+        &now_iso,
+        classifier_model,
+    );
     let mut model_transcript = existing_transcript.clone();
     model_transcript.extend(contextual_due_item_context.iter().cloned());
     let persisted_transcript_start_len = model_transcript.len();
@@ -7529,9 +7539,11 @@ fn recall_due_item_context_messages(
     transcript: &[ConversationMessage],
     due_items: &[AgendaItemRecord],
     now_iso: &str,
+    relevance_model: Option<&dyn ModelClient>,
 ) -> Vec<ConversationMessage> {
     let recall_query = build_recall_query(prompt, transcript, 6);
-    let recalled = select_recalled_due_items(&recall_query, due_items, now_iso, 2);
+    let recalled =
+        select_relevant_contextual_due_items(&recall_query, due_items, now_iso, 2, relevance_model);
     if recalled.is_empty() {
         return Vec::new();
     }
@@ -7808,6 +7820,36 @@ fn select_relevant_recall_due_items<'a>(
     .collect()
 }
 
+fn select_relevant_contextual_due_items<'a>(
+    query: &str,
+    due_items: &'a [AgendaItemRecord],
+    now_iso: &str,
+    limit: usize,
+    relevance_model: Option<&dyn ModelClient>,
+) -> Vec<&'a AgendaItemRecord> {
+    let candidate_limit = limit.saturating_mul(3).max(limit);
+    let overlap_candidates =
+        select_due_items_by_overlap(query, due_items, candidate_limit, Some(now_iso));
+    let candidates = if overlap_candidates.is_empty() && relevance_model.is_some() {
+        recent_contextual_due_item_candidates(due_items, candidate_limit, now_iso)
+    } else {
+        overlap_candidates
+    };
+    filter_candidates_for_relevance(relevance_model, query, candidates, |item| {
+        let mut text = format!("# {}\n{}", item.name, item.body.trim());
+        if let Some(trigger_datetime) = item.trigger_datetime.as_deref() {
+            text.push_str(&format!("\ntrigger_datetime: {trigger_datetime}"));
+        }
+        if let Some(trigger_context) = item.trigger_context.as_deref() {
+            text.push_str(&format!("\ntrigger_context: {trigger_context}"));
+        }
+        text
+    })
+    .into_iter()
+    .take(limit)
+    .collect()
+}
+
 fn select_relevant_recall_agenda_items<'a>(
     query: &str,
     agenda_items: &'a [AgendaItemRecord],
@@ -7854,6 +7896,29 @@ fn recent_due_item_candidates(
     let mut candidates = due_items
         .iter()
         .filter(|item| item.trigger_datetime.is_some() || item.trigger_context.is_some())
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| {
+        right
+            .updated_at_unix
+            .cmp(&left.updated_at_unix)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    candidates.into_iter().take(limit).collect()
+}
+
+fn recent_contextual_due_item_candidates<'a>(
+    due_items: &'a [AgendaItemRecord],
+    limit: usize,
+    now_iso: &str,
+) -> Vec<&'a AgendaItemRecord> {
+    let mut candidates = due_items
+        .iter()
+        .filter(|item| item.trigger_context.is_some())
+        .filter(|item| {
+            item.trigger_datetime
+                .as_deref()
+                .is_none_or(|trigger_datetime| trigger_datetime > now_iso)
+        })
         .collect::<Vec<_>>();
     candidates.sort_by(|left, right| {
         right
@@ -8271,6 +8336,7 @@ fn select_agenda_items_by_overlap<'a>(
         .collect()
 }
 
+#[cfg(test)]
 fn select_recalled_due_items<'a>(
     prompt: &str,
     due_items: &'a [AgendaItemRecord],
@@ -13618,6 +13684,7 @@ mod tests {
             &transcript,
             &due_items,
             "2026-05-15T12:00:00",
+            None,
         );
 
         assert_eq!(messages.len(), 2);
@@ -13675,9 +13742,52 @@ mod tests {
             &transcript,
             &due_items,
             "2026-05-15T12:00:00",
+            None,
         );
 
         assert!(messages.is_empty());
+    }
+
+    #[test]
+    fn recall_due_item_context_messages_can_broaden_beyond_overlap_via_relevance_model() {
+        let transcript = vec![ConversationMessage::new(
+            MessageRole::Assistant,
+            "Tell me what to bring to practice.",
+        )];
+        let due_items = vec![AgendaItemRecord {
+            id: 1,
+            legacy_frontmatter_id: None,
+            name: "Practice Reminder".to_string(),
+            file_path: "/tmp/practice.md".to_string(),
+            agenda_date: Some("unscheduled".to_string()),
+            is_completed: false,
+            status: Some("created".to_string()),
+            trigger_datetime: None,
+            trigger_context: Some("before basketball practice".to_string()),
+            closing_comment: None,
+            checklist_total: 0,
+            checklist_completed: 0,
+            body: "Bring the resistance bands".to_string(),
+            is_active: true,
+            updated_at_unix: 20,
+        }];
+        let model = FakeModel::new(vec![vec![StreamEvent::AssistantResponse {
+            content: r#"{"answers":[true],"reasoning":"This reminder is semantically relevant."}"#
+                .to_string(),
+        }]]);
+
+        let messages = recall_due_item_context_messages(
+            "What gear should I bring?",
+            &transcript,
+            &due_items,
+            "2026-05-15T12:00:00",
+            Some(&model),
+        );
+
+        assert_eq!(messages.len(), 2);
+        assert!(messages[1].content.as_deref().is_some_and(|content| {
+            content.contains("Practice Reminder") && content.contains("resistance bands")
+        }));
     }
 
     #[test]
@@ -14717,6 +14827,108 @@ mod tests {
                 .count(),
             2
         );
+
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
+    fn run_prompt_with_model_and_registry_can_broaden_contextual_due_item_surfacing() {
+        struct SemanticContextualDueItemModel;
+
+        impl ModelClient for SemanticContextualDueItemModel {
+            fn next_events(
+                &self,
+                request: ConversationRequest<'_>,
+            ) -> Result<Vec<StreamEvent>, elroy_core::ModelClientError> {
+                if request
+                    .transcript
+                    .iter()
+                    .any(|message| message.role == MessageRole::Tool)
+                {
+                    assert_eq!(request.user_message, "What gear should I bring?");
+                    assert!(request.transcript.iter().any(|message| {
+                        message.role == MessageRole::Tool
+                            && message.content.as_deref().is_some_and(|content| {
+                                let normalized = content.to_ascii_lowercase();
+                                normalized.contains("practice reminder")
+                                    && normalized.contains("bring the resistance bands")
+                                    && normalized
+                                        .contains("\"trigger_context\": \"before basketball practice\"")
+                            })
+                    }));
+                    return Ok(vec![StreamEvent::AssistantResponse {
+                        content: "You should bring the resistance bands.".to_string(),
+                    }]);
+                }
+
+                Ok(vec![StreamEvent::AssistantResponse {
+                    content: r#"{"answers":[true],"reasoning":"This reminder is relevant even though the wording differs."}"#
+                        .to_string(),
+                }])
+            }
+        }
+
+        let unique = format!(
+            "elroy-rs-app-contextual-due-item-semantic-prompt-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+        fs::write(
+            agenda_dir.join("practice_reminder.md"),
+            "---\ndate: unscheduled\ncompleted: false\nstatus: created\ntrigger_context: before basketball practice\n---\n\nBring the resistance bands\n",
+        )
+        .expect("contextual due item file should be written");
+
+        let mut config = AppConfig::defaults();
+        config.home_dir = home.clone();
+        config.memory_dir = memory_dir;
+        config.agenda_dir = agenda_dir;
+        config.database_path = database_path.clone();
+        elroy_db::bootstrap_database(&BootstrapPlan::from_config(&config))
+            .expect("bootstrap should succeed");
+
+        let mut connection = open_sqlite_connection(&database_path).expect("database should open");
+        run_migrations(&mut connection).expect("migrations should run");
+
+        let events = run_prompt_with_model_and_registry_internal(
+            &mut connection,
+            "What gear should I bring?",
+            &SemanticContextualDueItemModel,
+            Some(&SemanticContextualDueItemModel),
+            build_live_tool_registry(&config),
+            PromptExecutionOptions {
+                role: MessageRole::User,
+                persist_input_message: true,
+                force_tool: None,
+                assistant_name: &config.assistant_name,
+                ensure_alternating_roles: config.llm_provider() == LlmProvider::Anthropic,
+                home_dir: &home,
+                bootstrap_plan: BootstrapPlan::from_config(&config),
+                messages_between_memory: config.messages_between_memory,
+                memories_between_consolidation: config.memories_between_consolidation,
+                messages_between_self_reflection: config.messages_between_self_reflection,
+                defer_auto_memory: false,
+                defer_self_reflection: false,
+                memory_recall_classifier_enabled: false,
+                memory_recall_classifier_window: config.memory_recall_classifier_window,
+                reflect: config.reflect,
+            },
+        )
+        .expect("prompt should succeed");
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::AssistantResponse { content }
+                if content.contains("resistance bands")
+        )));
 
         fs::remove_dir_all(home).expect("home should be removed");
     }
