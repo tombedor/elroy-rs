@@ -296,6 +296,30 @@ impl CliTuiRuntime {
         self.deferred_self_reflection_error = None;
     }
 
+    fn start_startup_prompt_stream_with_resume_message(
+        &mut self,
+        restart_resume_message: Option<&str>,
+    ) -> Result<Option<Box<dyn TuiPromptStream>>, String> {
+        self.poll_deferred_context_refresh();
+        self.poll_deferred_auto_memory();
+        self.poll_deferred_self_reflection();
+        self.clear_deferred_context_refresh_error();
+        self.clear_deferred_auto_memory_error();
+        self.clear_deferred_self_reflection_error();
+        let deferred_auto_memory_queue = Arc::clone(&self.deferred_auto_memory_queue);
+        self.runtime
+            .startup_prompt_stream(restart_resume_message)
+            .map(|stream| {
+                stream.map(|inner| {
+                    Box::new(CliPromptStream {
+                        inner,
+                        deferred_auto_memory_queue,
+                    }) as Box<dyn TuiPromptStream>
+                })
+            })
+            .map_err(|error| error.to_string())
+    }
+
     fn poll_deferred_command_execution(
         &mut self,
     ) -> Result<Option<elroy_tui::TuiSnapshot>, String> {
@@ -450,25 +474,8 @@ impl TuiRuntime for CliTuiRuntime {
     }
 
     fn start_startup_prompt_stream(&mut self) -> Result<Option<Box<dyn TuiPromptStream>>, String> {
-        self.poll_deferred_context_refresh();
-        self.poll_deferred_auto_memory();
-        self.poll_deferred_self_reflection();
-        self.clear_deferred_context_refresh_error();
-        self.clear_deferred_auto_memory_error();
-        self.clear_deferred_self_reflection_error();
         let restart_resume_message = std::env::var(RESTART_RESUME_MESSAGE_ENV).ok();
-        let deferred_auto_memory_queue = Arc::clone(&self.deferred_auto_memory_queue);
-        self.runtime
-            .startup_prompt_stream(restart_resume_message.as_deref())
-            .map(|stream| {
-                stream.map(|inner| {
-                    Box::new(CliPromptStream {
-                        inner,
-                        deferred_auto_memory_queue,
-                    }) as Box<dyn TuiPromptStream>
-                })
-            })
-            .map_err(|error| error.to_string())
+        self.start_startup_prompt_stream_with_resume_message(restart_resume_message.as_deref())
     }
 
     fn start_restart_prompt_stream(
@@ -867,6 +874,115 @@ mod tests {
                 .expect("memory dir should read")
                 .next()
                 .is_none()
+        );
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            let _ = runtime
+                .load_snapshot()
+                .expect("snapshot reload should poll deferred auto memory");
+            if runtime
+                .deferred_auto_memory_queue
+                .lock()
+                .expect("queue lock should work")
+                .is_empty()
+                && runtime.deferred_auto_memory.is_none()
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        assert!(
+            runtime
+                .deferred_auto_memory_queue
+                .lock()
+                .expect("queue lock should work")
+                .is_empty()
+        );
+        assert!(runtime.deferred_auto_memory.is_none());
+        assert!(
+            fs::read_dir(&memory_dir)
+                .expect("memory dir should read")
+                .next()
+                .is_some()
+        );
+
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
+    fn cli_tui_runtime_startup_resume_stream_runs_deferred_auto_memory() {
+        let unique = format!(
+            "elroy-rs-cli-startup-resume-deferred-auto-memory-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+
+        let mut server = mockito::Server::new();
+        let _mock = server
+            .mock("POST", "/responses")
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_body(concat!(
+                "event: response.output_text.delta\n",
+                "data: {\"delta\":\"Restarted successfully. Ready to continue.\"}\n\n",
+                "data: [DONE]\n\n"
+            ))
+            .create();
+
+        let mut config = AppConfig::defaults();
+        config.home_dir = home.clone();
+        config.config_path = home.join("elroy.conf.yaml");
+        config.memory_dir = memory_dir.clone();
+        config.agenda_dir = agenda_dir;
+        config.database_path = database_path.clone();
+        config.openai_api_key = Some("test-key".to_string());
+        config.openai_base_url = format!("{}/responses", server.url());
+        config.messages_between_memory = 1;
+
+        let mut connection = open_sqlite_connection(&database_path).expect("database should open");
+        run_migrations(&mut connection).expect("migrations should run");
+        replace_context_messages(
+            &mut connection,
+            "local-user",
+            &[ConversationMessage::new(
+                MessageRole::Assistant,
+                "existing transcript",
+            )],
+        )
+        .expect("messages should persist");
+        drop(connection);
+
+        let mut runtime = CliTuiRuntime::new(AppRuntime::new(config));
+        let mut stream = runtime
+            .start_startup_prompt_stream_with_resume_message(Some(
+                "Restarted successfully. Ready to continue.",
+            ))
+            .expect("startup resume stream should load")
+            .expect("startup resume stream should exist");
+        while stream
+            .next_update()
+            .expect("stream should advance")
+            .is_some()
+        {}
+        let _ = stream.finalize().expect("snapshot should finalize");
+
+        assert_eq!(
+            runtime
+                .deferred_auto_memory_queue
+                .lock()
+                .expect("queue lock should work")
+                .len(),
+            1
         );
 
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
