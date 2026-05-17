@@ -7381,6 +7381,11 @@ fn archive_memory_file_from_config(
     match operation(Path::new(&memory.file_path)).and_then(|new_path| {
         elroy_db::bootstrap_database(&BootstrapPlan::from_config(config))
             .map_err(|error| std::io::Error::other(error.to_string()))?;
+        remove_context_memory_messages_by_names_from_database_path(
+            &config.database_path,
+            std::slice::from_ref(&memory.name),
+        )
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
         Ok(new_path)
     }) {
         Ok(new_path) => ToolExecutionResult::success(
@@ -7478,6 +7483,14 @@ fn create_consolidated_memories_from_records(
     }
     elroy_db::bootstrap_database(bootstrap_plan)
         .map_err(|error| std::io::Error::other(error.to_string()))?;
+    remove_context_memory_messages_by_names_from_database_path(
+        &bootstrap_plan.database_path,
+        &source_memories
+            .iter()
+            .map(|memory| memory.name.clone())
+            .collect::<Vec<_>>(),
+    )
+    .map_err(|error| std::io::Error::other(error.to_string()))?;
     Ok(created)
 }
 
@@ -7984,6 +7997,33 @@ fn remove_context_tool_messages_by_id(
     let updated_transcript = transcript
         .into_iter()
         .filter(|message| !message_matches_tool_call_id(message, tool_call_id))
+        .collect::<Vec<_>>();
+    replace_context_messages(&mut connection, LOCAL_USER_TOKEN, &updated_transcript)?;
+    Ok(())
+}
+
+fn remove_context_memory_messages_by_names_from_database_path(
+    database_path: &Path,
+    memory_names: &[String],
+) -> Result<(), AppError> {
+    if memory_names.is_empty() {
+        return Ok(());
+    }
+
+    let tool_call_ids = memory_names
+        .iter()
+        .map(|name| context_memory_tool_call_id(name))
+        .collect::<Vec<_>>();
+    let mut connection = open_sqlite_connection(database_path)?;
+    run_migrations(&mut connection)?;
+    let transcript = load_context_messages(&mut connection, LOCAL_USER_TOKEN)?;
+    let updated_transcript = transcript
+        .into_iter()
+        .filter(|message| {
+            !tool_call_ids
+                .iter()
+                .any(|tool_call_id| message_matches_tool_call_id(message, tool_call_id))
+        })
         .collect::<Vec<_>>();
     replace_context_messages(&mut connection, LOCAL_USER_TOKEN, &updated_transcript)?;
     Ok(())
@@ -12129,6 +12169,69 @@ mod tests {
     }
 
     #[test]
+    fn threshold_consolidation_removes_archived_source_memories_from_current_context() {
+        let unique = format!(
+            "elroy-rs-app-memory-consolidation-drops-context-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+
+        let mut config = AppConfig::defaults();
+        config.memory_dir = memory_dir.clone();
+        config.agenda_dir = agenda_dir;
+        config.database_path = database_path;
+        config.memories_between_consolidation = 3;
+        elroy_db::bootstrap_database(&elroy_db::BootstrapPlan::from_config(&config))
+            .expect("bootstrap should succeed");
+
+        let registry = build_live_tool_registry(&config);
+        for (name, text) in [
+            ("Trip Note One", "I went shopping on New Year's Day."),
+            ("Trip Note Two", "I went shopping on New Year's Day."),
+        ] {
+            let created = registry.invoke(
+                "create_memory",
+                &format!("{{\"name\":\"{name}\",\"text\":\"{text}\"}}"),
+            );
+            assert!(!created.is_error, "{name} should be created");
+            let added = registry.invoke(
+                "add_memory_to_current_context",
+                &format!("{{\"memory_name\":\"{}\"}}", name.to_ascii_lowercase()),
+            );
+            assert!(!added.is_error, "{name} should be pinned");
+        }
+
+        let third = registry.invoke(
+            "create_memory",
+            "{\"name\":\"Trip Note Three\",\"text\":\"I went shopping on New Year's Day.\"}",
+        );
+        assert!(!third.is_error);
+
+        let context = registry.invoke("show_context_messages", "{\"limit\":20}");
+        assert!(!context.is_error);
+        assert!(!context.content.contains("context-memory:trip note one"));
+        assert!(!context.content.contains("context-memory:trip note two"));
+        assert!(!context.content.contains("Trip Note One"));
+        assert!(!context.content.contains("Trip Note Two"));
+
+        let listed = registry.invoke("print_memories", "{\"n\":10}");
+        assert!(!listed.is_error);
+        assert!(listed.content.contains("trip note one"));
+        assert!(!listed.content.contains("trip note two"));
+        assert!(!listed.content.contains("trip note three"));
+
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
     fn consolidate_memory_cluster_uses_python_style_prompt_contract() {
         struct ConsolidationPromptInspectionModel;
 
@@ -12420,6 +12523,58 @@ User still wants to compare grocery prices after the shopping trip.",
                 .contains("context-memory:travel preference")
         );
         assert!(!stripped.content.contains("get_fast_recall"));
+
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
+    fn archive_memory_removes_pinned_memory_from_current_context() {
+        let unique = format!(
+            "elroy-rs-app-archive-memory-drops-context-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+        fs::write(
+            memory_dir.join("travel_preference.md"),
+            "User likes window seats on long flights.\n",
+        )
+        .expect("memory should be written");
+
+        let mut config = AppConfig::defaults();
+        config.memory_dir = memory_dir.clone();
+        config.agenda_dir = agenda_dir;
+        config.database_path = database_path;
+        elroy_db::bootstrap_database(&elroy_db::BootstrapPlan::from_config(&config))
+            .expect("bootstrap should succeed");
+
+        let registry = build_live_tool_registry(&config);
+        let add = registry.invoke(
+            "add_memory_to_current_context",
+            "{\"memory_name\":\"travel preference\"}",
+        );
+        assert!(!add.is_error);
+
+        let archived = registry.invoke("archive_memory", "{\"memory_name\":\"travel preference\"}");
+        assert!(!archived.is_error);
+
+        let context = registry.invoke("show_context_messages", "{\"limit\":20}");
+        assert!(!context.is_error);
+        assert!(!context.content.contains("context-memory:travel preference"));
+        assert!(!context.content.contains("travel preference"));
+        assert!(
+            memory_dir
+                .join("archive")
+                .join("travel_preference.md")
+                .exists()
+        );
 
         fs::remove_dir_all(home).expect("home should be removed");
     }
