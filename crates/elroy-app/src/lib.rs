@@ -18194,6 +18194,73 @@ mod tests {
     }
 
     #[test]
+    fn process_message_surfaces_hybrid_due_item_when_time_due_end_to_end() {
+        let unique = format!(
+            "elroy-rs-app-process-message-hybrid-due-item-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+        fs::write(
+            agenda_dir.join("hybrid_test.md"),
+            "---\ndate: unscheduled\ncompleted: false\nstatus: created\ntrigger_datetime: 2000-01-01T09:00:00\ntrigger_context: when user mentions work\n---\n\nHybrid reminder text\n",
+        )
+        .expect("hybrid due item file should be written");
+
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("POST", "/responses")
+            .match_header("authorization", "Bearer test-key")
+            .match_body(mockito::Matcher::Regex("Hybrid reminder text".to_string()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "output": [{
+                        "type": "message",
+                        "content": [{
+                            "type": "output_text",
+                            "text": "A hybrid reminder is due: Hybrid reminder text."
+                        }]
+                    }]
+                })
+                .to_string(),
+            )
+            .create();
+
+        let mut config = AppConfig::defaults();
+        config.home_dir = home.clone();
+        config.memory_dir = memory_dir;
+        config.agenda_dir = agenda_dir;
+        config.database_path = database_path.clone();
+        config.openai_api_key = Some("test-key".to_string());
+        config.openai_base_url = format!("{}/responses", server.url());
+        elroy_db::bootstrap_database(&BootstrapPlan::from_config(&config))
+            .expect("bootstrap should succeed");
+
+        let runtime = AppRuntime::new(config);
+        let result = runtime
+            .process_message("What's happening?", MessageProcessOptions::default())
+            .expect("prompt should succeed");
+
+        assert!(result.events.iter().any(|event| matches!(
+            event,
+            StreamEvent::AssistantResponse { content }
+                if content.contains("Hybrid reminder text")
+        )));
+
+        mock.assert();
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
     fn format_context_summary_message_creates_bounded_summary_text() {
         let now = Utc::now().timestamp();
         let summary = format_context_summary_message(&[
