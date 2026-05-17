@@ -1593,6 +1593,173 @@ mod tests {
         fs::remove_dir_all(root).expect("root should be removed");
     }
 
+    #[test]
+    fn cli_tui_runtime_surfaces_resumed_codex_background_statuses_through_polling_boundary() {
+        let _guard = cli_runtime_test_lock()
+            .lock()
+            .expect("cli runtime test lock should work");
+        let unique = format!(
+            "elroy-rs-cli-codex-resume-background-status-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let root = std::env::temp_dir().join(unique);
+        let repo_root = root.join("development").join("sample");
+        let bin_dir = root.join("bin");
+        let memory_dir = root.join("memories");
+        let agenda_dir = root.join("agenda");
+        let database_path = root.join("elroy.db");
+        fs::create_dir_all(&bin_dir).expect("bin dir should be created");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+        init_test_repo(&repo_root);
+        write_fake_codex_script(&bin_dir.join("codex"));
+
+        let mut config = AppConfig::defaults();
+        config.home_dir = root.clone();
+        config.config_path = root.join("elroy.conf.yaml");
+        config.memory_dir = memory_dir;
+        config.agenda_dir = agenda_dir;
+        config.database_path = database_path.clone();
+
+        let followup_database_path = database_path.clone();
+        let app_runtime = AppRuntime::new(config)
+            .with_codex_bin_override(bin_dir.join("codex"))
+            .with_codex_completion_hook(Arc::new(move |result| {
+                let mut connection =
+                    open_sqlite_connection(&followup_database_path).expect("database should open");
+                run_migrations(&mut connection).expect("migrations should run");
+                let mut transcript = elroy_db::load_context_messages(&mut connection, "local-user")
+                    .expect("messages should load");
+                transcript.push(ConversationMessage::new(
+                    MessageRole::Assistant,
+                    format!("Background hook for {}", result.session_id),
+                ));
+                elroy_db::replace_context_messages(&mut connection, "local-user", &transcript)
+                    .expect("messages should persist");
+                std::thread::sleep(Duration::from_millis(200));
+            }));
+        let mut runtime = CliTuiRuntime::new(app_runtime);
+
+        runtime
+            .start_command_execution(TuiCommandExecution {
+                command_name: "dispatch_codex_session".to_string(),
+                display_name: "dispatch_codex_session".to_string(),
+                values: vec![
+                    ("prompt".to_string(), "update notes".to_string()),
+                    ("repo_path".to_string(), repo_root.display().to_string()),
+                ],
+            })
+            .expect("codex dispatch command should schedule");
+        while runtime
+            .poll_command_execution()
+            .expect("dispatch polling should succeed")
+            .is_none()
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let _ = wait_for_runtime_background_status(
+            &mut runtime,
+            Some("codex session thread-123 running..."),
+        );
+        let _ = wait_for_runtime_background_status(
+            &mut runtime,
+            Some("processing codex session thread-123 completion..."),
+        );
+        let _ = wait_for_runtime_snapshot_with_codex_session(
+            &mut runtime,
+            "sample (completed) thread-123",
+        );
+        assert_eq!(wait_for_runtime_background_status(&mut runtime, None), None);
+
+        runtime
+            .start_command_execution(TuiCommandExecution {
+                command_name: "resume_codex_session".to_string(),
+                display_name: "resume_codex_session".to_string(),
+                values: vec![
+                    ("session_id".to_string(), "thread-123".to_string()),
+                    ("prompt".to_string(), "follow up".to_string()),
+                ],
+            })
+            .expect("codex resume command should schedule");
+
+        let command_status = loop {
+            let status = runtime
+                .background_status()
+                .expect("background status should load");
+            if status.as_deref() == Some("running command...") {
+                break status;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        assert_eq!(command_status.as_deref(), Some("running command..."));
+
+        let completed_snapshot = loop {
+            if let Some(snapshot) = runtime
+                .poll_command_execution()
+                .expect("command polling should succeed")
+            {
+                break snapshot;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        };
+
+        assert_eq!(
+            completed_snapshot.status.as_deref(),
+            Some("slash command executed: /resume_codex_session")
+        );
+
+        let running_status = wait_for_runtime_background_status(
+            &mut runtime,
+            Some("codex session thread-123 running..."),
+        );
+        assert_eq!(
+            running_status.as_deref(),
+            Some("codex session thread-123 running...")
+        );
+
+        let completion_status = wait_for_runtime_background_status(
+            &mut runtime,
+            Some("processing codex session thread-123 completion..."),
+        );
+        assert_eq!(
+            completion_status.as_deref(),
+            Some("processing codex session thread-123 completion...")
+        );
+
+        let final_snapshot = wait_for_runtime_snapshot_with_codex_session(
+            &mut runtime,
+            "sample (completed) thread-123",
+        );
+        assert!(
+            final_snapshot
+                .codex_session_titles
+                .iter()
+                .any(|title| title == "sample (completed) thread-123")
+        );
+        assert_eq!(wait_for_runtime_background_status(&mut runtime, None), None);
+        assert!(get_background_status().is_none());
+
+        let agent_head = Command::new("git")
+            .args([
+                "-C",
+                &repo_root.display().to_string(),
+                "show",
+                "agent:notes.txt",
+            ])
+            .output()
+            .expect("git show should run");
+        assert!(agent_head.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&agent_head.stdout),
+            "after resume\n"
+        );
+
+        fs::remove_dir_all(root).expect("root should be removed");
+    }
+
     fn wait_for_runtime_background_status(
         runtime: &mut CliTuiRuntime,
         expected_status: Option<&str>,
