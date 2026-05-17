@@ -2533,9 +2533,15 @@ mod tests {
                 }
                 SidebarSection::CodexSessions => (false, None, None),
             };
+            let content = if section == SidebarSection::CodexSessions {
+                "Status: completed\nRepo: /tmp/sample\n\nSummary:\nCodex inspected the parser.\n\nLatest Agent Message:\nParser inspection complete."
+                    .to_string()
+            } else {
+                format!("opened detail for {title}")
+            };
             Ok(TuiSidebarDetail {
                 title: title.to_string(),
-                content: format!("opened detail for {title}"),
+                content,
                 can_complete,
                 destructive_action,
                 destructive_label,
@@ -4271,6 +4277,9 @@ mod tests {
         );
         let detail_modal = app.detail_modal.as_ref().expect("codex modal should open");
         assert_eq!(detail_modal.footer_text(), "Escape/Enter/Q: close");
+        assert!(detail_modal.content.contains("Status: completed"));
+        assert!(detail_modal.content.contains("Summary:"));
+        assert!(detail_modal.content.contains("Latest Agent Message:"));
     }
 
     #[test]

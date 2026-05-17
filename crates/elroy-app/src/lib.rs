@@ -784,32 +784,42 @@ impl AppRuntime {
                 };
 
                 let mut lines = vec![
-                    format!("codex_session: {}", session.thread_id),
-                    format!("repo_path: {}", session.repo_path),
-                    format!("status: {}", session.status),
+                    format!("Status: {}", session.status),
+                    format!(
+                        "Updated: {}",
+                        Utc.timestamp_opt(session.updated_at_unix, 0)
+                            .single()
+                            .unwrap_or_else(Utc::now)
+                            .to_rfc3339()
+                    ),
+                    format!("Repo: {}", session.repo_path),
                 ];
                 if let Some(worktree_path) = session.worktree_path.as_ref() {
-                    lines.push(format!("worktree_path: {worktree_path}"));
+                    lines.push(format!("Worktree: {worktree_path}"));
                 }
                 if let Some(session_branch) = session.session_branch.as_ref() {
-                    lines.push(format!("session_branch: {session_branch}"));
+                    lines.push(format!("Session Branch: {session_branch}"));
                 }
                 if let Some(target_branch) = session.target_branch.as_ref() {
-                    lines.push(format!("target_branch: {target_branch}"));
+                    lines.push(format!("Target Branch: {target_branch}"));
                 }
                 if let Some(session_file_path) = session.session_file_path.as_ref() {
-                    lines.push(format!("session_file_path: {session_file_path}"));
+                    lines.push(format!("Session File: {session_file_path}"));
                 }
-                lines.push(String::new());
-                lines.push(
+                lines.extend([
+                    String::new(),
+                    "Summary:".to_string(),
                     session
                         .latest_summary
                         .clone()
                         .unwrap_or_else(|| "(No summary recorded.)".to_string()),
-                );
+                ]);
                 if let Some(agent_message) = session.latest_agent_message.as_ref() {
-                    lines.push(String::new());
-                    lines.push(agent_message.clone());
+                    lines.extend([
+                        String::new(),
+                        "Latest Agent Message:".to_string(),
+                        agent_message.clone(),
+                    ]);
                 }
                 Ok(TuiSidebarDetail {
                     title: format_codex_session_title(&session),
@@ -9579,11 +9589,15 @@ mod tests {
                 .content
                 .contains("trigger_datetime: 2000-01-01T09:00:00")
         );
+        assert!(codex_detail.content.contains("Status: completed"));
+        assert!(codex_detail.content.contains("Repo: /tmp/sample"));
+        assert!(codex_detail.content.contains("Summary:"));
         assert!(
             codex_detail
                 .content
                 .contains("Codex inspected the parser state.")
         );
+        assert!(codex_detail.content.contains("Latest Agent Message:"));
         assert!(codex_detail.content.contains("Parser inspection complete."));
 
         fs::remove_dir_all(home).expect("home should be removed");
