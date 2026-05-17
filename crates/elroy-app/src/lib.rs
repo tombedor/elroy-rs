@@ -2426,6 +2426,8 @@ fn codex_completion_followup_status_message(session_id: &str) -> String {
     format!("processing codex session {session_id} completion...")
 }
 
+const CONTEXT_REFRESH_SUMMARY_WORD_LIMIT: usize = 300;
+
 fn context_refresh_summary_system_prompt(assistant_name: &str) -> String {
     format!(
         "Your job is to summarize a history of previous messages in a conversation between an AI persona and a human.\nThe conversation you are given is from a fixed context window and may not be complete.\nMessages sent by the AI are marked with the 'assistant' role.\nSummarize what happened in the conversation from the perspective of {} (use the first person).\nNote not only the content of the messages but also the context and relationship between the entities mentioned.\nAlso take note of the overall tone of the conversation.\nOnly output the summary, and keep it concise.",
@@ -2527,12 +2529,17 @@ fn summarize_context_messages_with_model(
     user_name: &str,
     messages: &[ConversationMessage],
 ) -> Result<String, AppError> {
-    let prompt = format_context_messages_for_summary(messages, user_name, assistant_name);
-    if prompt.trim().is_empty() {
+    let base_prompt = format_context_messages_for_summary(messages, user_name, assistant_name);
+    if base_prompt.trim().is_empty() {
         return Err(AppError::Runtime(
             "cannot summarize empty context-refresh transcript".to_string(),
         ));
     }
+
+    let prompt = format!(
+        "{}\n\nYour word limit is {}. DO NOT EXCEED IT.",
+        base_prompt, CONTEXT_REFRESH_SUMMARY_WORD_LIMIT
+    );
 
     let summary = model
         .next_events(ConversationRequest {
@@ -16832,6 +16839,49 @@ mod tests {
         assert_eq!(
             summary,
             "Recent conversation summary: I reminded the user about payroll and the tone stayed focused."
+        );
+    }
+
+    #[test]
+    fn summarize_context_messages_with_model_adds_python_style_word_limit_instruction() {
+        struct SummaryPromptInspectionModel;
+
+        impl ModelClient for SummaryPromptInspectionModel {
+            fn next_events(
+                &self,
+                request: ConversationRequest<'_>,
+            ) -> Result<Vec<StreamEvent>, elroy_core::ModelClientError> {
+                assert!(request.user_message.contains("Conversation Summary"));
+                assert!(
+                    request
+                        .user_message
+                        .contains("Your word limit is 300. DO NOT EXCEED IT."),
+                    "{}",
+                    request.user_message
+                );
+                Ok(vec![StreamEvent::AssistantResponse {
+                    content: "I stayed focused on payroll.".to_string(),
+                }])
+            }
+        }
+
+        let summary = summarize_context_messages_with_model(
+            &SummaryPromptInspectionModel,
+            "Elroy",
+            "User",
+            &[
+                ConversationMessage::new(MessageRole::User, "I need to finish payroll"),
+                ConversationMessage::new(
+                    MessageRole::Assistant,
+                    "You mentioned a payroll deadline.",
+                ),
+            ],
+        )
+        .expect("summary should be generated");
+
+        assert_eq!(
+            summary,
+            "Recent conversation summary: I stayed focused on payroll."
         );
     }
 
