@@ -3669,6 +3669,29 @@ mod tests {
     }
 
     #[test]
+    fn command_palette_can_focus_codex_sessions_section() {
+        let mut app = TuiApp::bootstrap();
+        app.open_command_palette(vec![]);
+        select_command_palette_entry(&mut app, "Focus Codex Sessions");
+        let mut runtime = FakeRuntime::default();
+        let mut pending = None;
+
+        apply_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut runtime,
+            &mut pending,
+        );
+
+        assert!(app.command_palette.is_none());
+        assert_eq!(app.focus, FocusTarget::Command(CommandPane::Sidebar));
+        assert_eq!(app.last_command_pane, CommandPane::Sidebar);
+        assert_eq!(app.sidebar_section, SidebarSection::CodexSessions);
+        assert_eq!(app.status, "focused codex sessions");
+        assert_eq!(app.selected_sidebar_index, 0);
+    }
+
+    #[test]
     fn background_command_completion_can_return_restart_request() {
         let mut app = TuiApp::bootstrap();
         app.command_active = true;
