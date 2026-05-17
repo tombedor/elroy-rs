@@ -17429,6 +17429,7 @@ mod tests {
         let fast_mock = fast_server
             .mock("POST", "/responses")
             .match_header("authorization", "Bearer fast-test-key")
+            .expect(4)
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(
@@ -17940,6 +17941,7 @@ mod tests {
         let fast_mock = fast_server
             .mock("POST", "/responses")
             .match_header("authorization", "Bearer fast-test-key")
+            .expect(4)
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(
@@ -18025,6 +18027,143 @@ mod tests {
                 .content
                 .as_deref()
                 .is_some_and(|content| content.contains("\"recall_metadata\""))
+        }));
+
+        fast_mock.assert();
+        chat_mock.assert();
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
+    fn process_message_can_inject_and_persist_mixed_fast_recall() {
+        let unique = format!(
+            "elroy-rs-app-process-message-mixed-fast-recall-runtime-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+        fs::write(
+            memory_dir.join("basketball_form.md"),
+            "# Basketball Form\n\nRemember to follow through on your shot.\n",
+        )
+        .expect("memory file should be written");
+        fs::write(
+            agenda_dir.join("practice_reminder.md"),
+            "---\ndate: unscheduled\ncompleted: false\nstatus: created\ntrigger_context: before basketball practice\n---\n\nBring the resistance bands\n",
+        )
+        .expect("due item file should be written");
+        fs::write(
+            agenda_dir.join("drill_plan.md"),
+            "---\ndate: 2026-05-20\ncompleted: false\nstatus: created\n---\n\nFocus on basketball practice footwork and follow-through\n",
+        )
+        .expect("agenda item file should be written");
+
+        let mut fast_server = mockito::Server::new();
+        let fast_mock = fast_server
+            .mock("POST", "/responses")
+            .match_header("authorization", "Bearer fast-test-key")
+            .expect(4)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "output": [{
+                        "type": "message",
+                        "content": [{
+                            "type": "output_text",
+                            "text": r#"{"answers":[true,true,true],"reasoning":"All three recalled items are relevant to basketball practice."}"#
+                        }]
+                    }]
+                })
+                .to_string(),
+            )
+            .create();
+
+        let mut chat_server = mockito::Server::new();
+        let chat_mock = chat_server
+            .mock("POST", "/responses")
+            .match_header("authorization", "Bearer test-key")
+            .match_body(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::Regex(
+                    "Remember to follow through on your shot\\.".to_string(),
+                ),
+                mockito::Matcher::Regex("Bring the resistance bands".to_string()),
+                mockito::Matcher::Regex(
+                    "Focus on basketball practice footwork and follow-through".to_string(),
+                ),
+            ]))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "output": [{
+                        "type": "message",
+                        "content": [{
+                            "type": "output_text",
+                            "text": "Remember your follow-through, bring the resistance bands, and review the drill plan."
+                        }]
+                    }]
+                })
+                .to_string(),
+            )
+            .create();
+
+        let mut config = AppConfig::defaults();
+        config.home_dir = home.clone();
+        config.memory_dir = memory_dir;
+        config.agenda_dir = agenda_dir;
+        config.database_path = database_path.clone();
+        config.openai_api_key = Some("test-key".to_string());
+        config.openai_base_url = format!("{}/responses", chat_server.url());
+        config.fast_model = Some("gpt-5.4-mini".to_string());
+        config.fast_model_api_key = Some("fast-test-key".to_string());
+        config.fast_model_api_base = Some(format!("{}/responses", fast_server.url()));
+        config.memory_recall_classifier_enabled = false;
+        elroy_db::bootstrap_database(&BootstrapPlan::from_config(&config))
+            .expect("bootstrap should succeed");
+
+        let runtime = AppRuntime::new(config.clone());
+        let result = runtime
+            .process_message(
+                "What should I remember for basketball practice?",
+                MessageProcessOptions::default(),
+            )
+            .expect("prompt should succeed");
+
+        assert!(result.events.iter().any(|event| matches!(
+            event,
+            StreamEvent::StatusUpdate { content } if content == "fetching memories..."
+        )));
+        assert!(result.events.iter().any(|event| matches!(
+            event,
+            StreamEvent::AssistantResponse { content }
+                if content == "Remember your follow-through, bring the resistance bands, and review the drill plan."
+        )));
+
+        let mut reopened =
+            open_sqlite_connection(&config.database_path).expect("database should reopen");
+        let stored =
+            elroy_db::load_context_messages(&mut reopened, LOCAL_USER_TOKEN).expect("load ok");
+        assert!(
+            stored.iter().any(|message| {
+                message_matches_tool_call_id(message, "bootstrap-memory-recall")
+            })
+        );
+        assert!(stored.iter().any(|message| {
+            message.content.as_deref().is_some_and(|content| {
+                content.contains("basketball form")
+                    && content.contains("practice reminder")
+                    && content.contains("drill plan")
+                    && content.contains("\"memory_type\": \"Memory\"")
+                    && content.contains("\"memory_type\": \"AgendaItem\"")
+            })
         }));
 
         fast_mock.assert();
