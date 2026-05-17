@@ -335,10 +335,12 @@ fn run_event_loop(
         ) {
             return Ok(result);
         }
-        if !context_poll_ready && pending_prompt.is_none() {
-            context_poll_ready = true;
-            last_context_poll = Instant::now();
-        }
+        maybe_enable_context_polling_after_prompt_completion(
+            pending_prompt,
+            &mut context_poll_ready,
+            &mut last_context_poll,
+            Instant::now(),
+        );
         maybe_poll_context_updates(
             app,
             runtime,
@@ -371,6 +373,18 @@ fn run_event_loop(
             }
             _ => {}
         }
+    }
+}
+
+fn maybe_enable_context_polling_after_prompt_completion(
+    pending_prompt: &Option<PendingPrompt>,
+    context_poll_ready: &mut bool,
+    last_context_poll: &mut Instant,
+    now: Instant,
+) {
+    if !*context_poll_ready && pending_prompt.is_none() {
+        *context_poll_ready = true;
+        *last_context_poll = now - Duration::from_secs(1);
     }
 }
 
@@ -2295,8 +2309,9 @@ mod tests {
         TuiSlashCommandAction, TuiSnapshot, UiIntent, advance_prompt_stream,
         apply_intent_with_runtime, apply_key_event, apply_mouse_event, apply_paste_event,
         drive_runtime_tick, key_event_token, maybe_complete_command_execution,
-        maybe_poll_context_updates, maybe_refresh_snapshot_after_background_completion,
-        maybe_run_deferred_context_refresh, poll_context_updates, start_startup_prompt_stream,
+        maybe_enable_context_polling_after_prompt_completion, maybe_poll_context_updates,
+        maybe_refresh_snapshot_after_background_completion, maybe_run_deferred_context_refresh,
+        poll_context_updates, start_startup_prompt_stream,
     };
 
     fn select_command_palette_entry(app: &mut TuiApp, title: &str) {
@@ -5112,6 +5127,59 @@ mod tests {
         );
         assert_eq!(app.rendered_context_message_ids, HashSet::from([1, 2]));
         assert_eq!(last_context_poll, second_poll);
+    }
+
+    #[test]
+    fn prompt_completion_makes_context_polling_immediately_ready() {
+        let mut app = TuiApp::from_snapshot(TuiSnapshot {
+            conversation_lines: vec!["assistant: existing".to_string()],
+            ..TuiSnapshot::default()
+        });
+        app.rendered_context_message_ids = HashSet::from([1]);
+        let mut runtime = FakeRuntime {
+            context_messages: vec![
+                TuiContextMessage {
+                    id: 1,
+                    role: "assistant".to_string(),
+                    content: "existing".to_string(),
+                },
+                TuiContextMessage {
+                    id: 2,
+                    role: "assistant".to_string(),
+                    content: "background update".to_string(),
+                },
+            ],
+            ..FakeRuntime::default()
+        };
+        let pending_prompt = None;
+        let mut context_poll_ready = false;
+        let now = Instant::now();
+        let mut last_context_poll = now;
+
+        maybe_enable_context_polling_after_prompt_completion(
+            &pending_prompt,
+            &mut context_poll_ready,
+            &mut last_context_poll,
+            now,
+        );
+        maybe_poll_context_updates(
+            &mut app,
+            &mut runtime,
+            context_poll_ready,
+            &mut last_context_poll,
+            now,
+        );
+
+        assert!(context_poll_ready);
+        assert_eq!(
+            app.conversation_lines,
+            vec![
+                "assistant: existing".to_string(),
+                "assistant: background update".to_string()
+            ]
+        );
+        assert_eq!(app.rendered_context_message_ids, HashSet::from([1, 2]));
+        assert_eq!(last_context_poll, now);
     }
 
     #[test]
