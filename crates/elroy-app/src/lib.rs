@@ -18292,6 +18292,150 @@ mod tests {
     }
 
     #[test]
+    fn process_message_does_not_duplicate_persisted_prompt_time_fast_recall_on_later_turn() {
+        let unique = format!(
+            "elroy-rs-app-process-message-fast-recall-dedupe-runtime-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+        fs::write(
+            memory_dir.join("practice_gear.md"),
+            "# Practice Gear\n\nPack resistance bands before training.\n",
+        )
+        .expect("memory file should be written");
+
+        let mut fast_server = mockito::Server::new();
+        let fast_mock = fast_server
+            .mock("POST", "/responses")
+            .match_header("authorization", "Bearer fast-test-key")
+            .expect(1)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "output": [{
+                        "type": "message",
+                        "content": [{
+                            "type": "output_text",
+                            "text": r#"{"answers":[true],"reasoning":"The practice gear memory is relevant."}"#
+                        }]
+                    }]
+                })
+                .to_string(),
+            )
+            .create();
+
+        let mut chat_server = mockito::Server::new();
+        let first_chat_mock = chat_server
+            .mock("POST", "/responses")
+            .match_header("authorization", "Bearer test-key")
+            .match_body(mockito::Matcher::Regex(
+                "Pack resistance bands before training\\.".to_string(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "output": [{
+                        "type": "message",
+                        "content": [{
+                            "type": "output_text",
+                            "text": "Bring the resistance bands."
+                        }]
+                    }]
+                })
+                .to_string(),
+            )
+            .create();
+        let second_chat_mock = chat_server
+            .mock("POST", "/responses")
+            .match_header("authorization", "Bearer test-key")
+            .match_body(mockito::Matcher::Regex(
+                "Should I remember the same practice gear again\\?".to_string(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "output": [{
+                        "type": "message",
+                        "content": [{
+                            "type": "output_text",
+                            "text": "The same practice gear reminder is still in context."
+                        }]
+                    }]
+                })
+                .to_string(),
+            )
+            .create();
+
+        let mut config = AppConfig::defaults();
+        config.home_dir = home.clone();
+        config.memory_dir = memory_dir;
+        config.agenda_dir = agenda_dir;
+        config.database_path = database_path.clone();
+        config.openai_api_key = Some("test-key".to_string());
+        config.openai_base_url = format!("{}/responses", chat_server.url());
+        config.fast_model = Some("gpt-5.4-mini".to_string());
+        config.fast_model_api_key = Some("fast-test-key".to_string());
+        config.fast_model_api_base = Some(format!("{}/responses", fast_server.url()));
+        config.memory_recall_classifier_enabled = false;
+        elroy_db::bootstrap_database(&BootstrapPlan::from_config(&config))
+            .expect("bootstrap should succeed");
+
+        let runtime = AppRuntime::new(config.clone());
+        let first_result = runtime
+            .process_message(
+                "What gear should I bring to practice?",
+                MessageProcessOptions::default(),
+            )
+            .expect("first prompt should succeed");
+        assert!(first_result.events.iter().any(|event| matches!(
+            event,
+            StreamEvent::StatusUpdate { content } if content == "fetching memories..."
+        )));
+
+        let second_result = runtime
+            .process_message(
+                "Should I remember the same practice gear again?",
+                MessageProcessOptions::default(),
+            )
+            .expect("second prompt should succeed");
+        assert!(!second_result.events.iter().any(|event| matches!(
+            event,
+            StreamEvent::StatusUpdate { content } if content == "fetching memories..."
+        )));
+        assert!(second_result.events.iter().any(|event| matches!(
+            event,
+            StreamEvent::AssistantResponse { content }
+                if content == "The same practice gear reminder is still in context."
+        )));
+
+        let mut reopened =
+            open_sqlite_connection(&config.database_path).expect("database should reopen");
+        let stored =
+            elroy_db::load_context_messages(&mut reopened, LOCAL_USER_TOKEN).expect("load ok");
+        let bootstrap_recall_messages = stored
+            .iter()
+            .filter(|message| message_matches_tool_call_id(message, "bootstrap-memory-recall"))
+            .count();
+        assert_eq!(bootstrap_recall_messages, 2);
+
+        fast_mock.assert();
+        first_chat_mock.assert();
+        second_chat_mock.assert();
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
     fn process_message_can_inject_and_persist_mixed_fast_recall() {
         let unique = format!(
             "elroy-rs-app-process-message-mixed-fast-recall-runtime-{}",
