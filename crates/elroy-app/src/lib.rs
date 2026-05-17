@@ -11987,6 +11987,148 @@ mod tests {
     }
 
     #[test]
+    fn create_memory_tool_limits_each_semantic_cluster_to_densest_members() {
+        let unique = format!(
+            "elroy-rs-app-semantic-memory-max-cluster-size-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+
+        let mut server = mockito::Server::new();
+        for (text, embedding) in [
+            ("cluster core one", "[1.0, 0.0]"),
+            ("cluster core two", "[0.999, 0.001]"),
+            ("cluster core three", "[0.998, 0.002]"),
+            ("cluster fringe note", "[0.97, 0.243]"),
+        ] {
+            server
+                .mock("POST", "/embeddings")
+                .match_body(mockito::Matcher::Regex(text.to_string()))
+                .with_status(200)
+                .with_header("content-type", "application/json")
+                .with_body(format!(r#"{{"data":[{{"embedding":{embedding}}}]}}"#))
+                .create();
+        }
+
+        let _consolidation_mock = server
+            .mock("POST", "/responses")
+            .match_body(mockito::Matcher::Regex("cluster core one".to_string()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "output": [{
+                        "type": "message",
+                        "content": [{
+                            "type": "output_text",
+                            "text": "# Memory Consolidation Reasoning\nI merged the three densest notes and left the looser fringe note for later.\n\n## cluster consolidated memory\nThe three core notes describe the same trip detail and belong in one memory."
+                        }]
+                    }]
+                })
+                .to_string(),
+            )
+            .create();
+
+        let mut config = AppConfig::defaults();
+        config.memory_dir = memory_dir.clone();
+        config.agenda_dir = agenda_dir;
+        config.database_path = database_path.clone();
+        config.memories_between_consolidation = 4;
+        config.min_memory_cluster_size = 3;
+        config.max_memory_cluster_size = 3;
+        config.memory_cluster_similarity_threshold = 0.05;
+        config.fast_model = Some("gpt-5.4-mini".to_string());
+        config.fast_model_api_key = Some("fast-test-key".to_string());
+        config.fast_model_api_base = Some(format!("{}/responses", server.url()));
+        config.embedding_model = "text-embedding-3-small".to_string();
+        config.embedding_model_api_key = Some("embedding-test-key".to_string());
+        config.embedding_model_api_base = Some(format!("{}/embeddings", server.url()));
+
+        let registry = build_live_tool_registry(&config);
+        for (name, text) in [
+            ("Cluster core one", "cluster core one"),
+            ("Cluster core two", "cluster core two"),
+            ("Cluster core three", "cluster core three"),
+            ("Cluster fringe note", "cluster fringe note"),
+        ] {
+            let result = registry.invoke(
+                "create_memory",
+                &format!("{{\"name\":\"{name}\",\"text\":\"{text}\"}}"),
+            );
+            assert!(!result.is_error, "{name} should be created");
+        }
+
+        let connection = open_sqlite_connection(&database_path).expect("database should reopen");
+        let active_memories =
+            elroy_db::list_active_memories(&connection, 10).expect("active memories should list");
+        assert_eq!(active_memories.len(), 2);
+        assert!(
+            active_memories
+                .iter()
+                .any(|memory| memory.name == "cluster consolidated memory")
+        );
+        assert!(
+            active_memories
+                .iter()
+                .any(|memory| memory.name == "cluster fringe note")
+        );
+
+        let source_list = registry.invoke(
+            "get_source_list_for_memory",
+            "{\"memory_name\":\"cluster consolidated memory\"}",
+        );
+        assert!(!source_list.is_error);
+        let mut source_entries: Vec<(String, String)> =
+            serde_json::from_str::<Vec<(String, String)>>(&source_list.content)
+                .expect("source list should parse");
+        source_entries.sort();
+        assert_eq!(
+            source_entries,
+            vec![
+                ("Memory".to_string(), "cluster core one".to_string()),
+                ("Memory".to_string(), "cluster core three".to_string()),
+                ("Memory".to_string(), "cluster core two".to_string()),
+            ]
+        );
+
+        assert!(
+            memory_dir
+                .join("archive")
+                .join("cluster_core_one.md")
+                .exists()
+        );
+        assert!(
+            memory_dir
+                .join("archive")
+                .join("cluster_core_two.md")
+                .exists()
+        );
+        assert!(
+            memory_dir
+                .join("archive")
+                .join("cluster_core_three.md")
+                .exists()
+        );
+        assert!(
+            !memory_dir
+                .join("archive")
+                .join("cluster_fringe_note.md")
+                .exists()
+        );
+        assert!(memory_dir.join("cluster_fringe_note.md").exists());
+
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
     fn consolidate_memory_cluster_uses_python_style_prompt_contract() {
         struct ConsolidationPromptInspectionModel;
 
