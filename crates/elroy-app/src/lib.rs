@@ -18855,6 +18855,230 @@ mod tests {
     }
 
     #[test]
+    fn run_prompt_with_model_and_registry_can_inject_model_authored_reflective_recall() {
+        struct ReflectiveRuntimePromptModel;
+
+        impl ModelClient for ReflectiveRuntimePromptModel {
+            fn next_events(
+                &self,
+                request: ConversationRequest<'_>,
+            ) -> Result<Vec<StreamEvent>, elroy_core::ModelClientError> {
+                assert_eq!(
+                    request.user_message,
+                    "What should I remember before basketball practice?"
+                );
+                let recall_payload = request
+                    .transcript
+                    .iter()
+                    .find(|message| {
+                        message.role == MessageRole::Tool
+                            && message.tool_call_id.as_deref() == Some("bootstrap-memory-recall")
+                    })
+                    .and_then(|message| message.content.as_deref())
+                    .expect("reflective recall payload should be injected");
+                assert!(
+                    recall_payload.contains(
+                        "I remember that the user should bring the resistance bands to practice."
+                    ),
+                    "{recall_payload}"
+                );
+                assert!(
+                    !recall_payload.contains("I remember these memory details may be relevant"),
+                    "{recall_payload}"
+                );
+                Ok(vec![StreamEvent::AssistantResponse {
+                    content: "Bring the resistance bands to practice.".to_string(),
+                }])
+            }
+        }
+
+        let unique = format!(
+            "elroy-rs-app-reflective-runtime-authored-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+        fs::write(
+            memory_dir.join("basketball_form.md"),
+            "# Basketball Form\n\nBring the resistance bands to practice.\n",
+        )
+        .expect("memory file should be written");
+
+        let mut config = AppConfig::defaults();
+        config.home_dir = home.clone();
+        config.memory_dir = memory_dir;
+        config.agenda_dir = agenda_dir;
+        config.database_path = database_path.clone();
+        config.memory_recall_classifier_enabled = false;
+        config.reflect = true;
+        elroy_db::bootstrap_database(&BootstrapPlan::from_config(&config))
+            .expect("bootstrap should succeed");
+
+        let reflective_model = FakeModel::new(vec![
+            vec![StreamEvent::AssistantResponse {
+                content: r#"{"answers":[true],"reasoning":"The recalled memory is relevant."}"#
+                    .to_string(),
+            }],
+            vec![StreamEvent::AssistantResponse {
+                content: r#"{"is_relevant":true,"content":"I remember that the user should bring the resistance bands to practice."}"#.to_string(),
+            }],
+        ]);
+
+        let mut connection = open_sqlite_connection(&database_path).expect("database should open");
+        run_migrations(&mut connection).expect("migrations should run");
+        let events = run_prompt_with_model_and_registry_internal(
+            &mut connection,
+            "What should I remember before basketball practice?",
+            &ReflectiveRuntimePromptModel,
+            Some(&reflective_model),
+            ExecutableToolRegistry::new(vec![]),
+            PromptExecutionOptions {
+                role: MessageRole::User,
+                persist_input_message: true,
+                force_tool: None,
+                assistant_name: &config.assistant_name,
+                ensure_alternating_roles: config.llm_provider() == LlmProvider::Anthropic,
+                home_dir: &home,
+                bootstrap_plan: BootstrapPlan::from_config(&config),
+                messages_between_memory: config.messages_between_memory,
+                memories_between_consolidation: config.memories_between_consolidation,
+                messages_between_self_reflection: config.messages_between_self_reflection,
+                defer_auto_memory: false,
+                defer_self_reflection: false,
+                memory_recall_classifier_enabled: false,
+                memory_recall_classifier_window: config.memory_recall_classifier_window,
+                reflect: true,
+            },
+        )
+        .expect("prompt should succeed");
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::StatusUpdate { content } if content == "fetching memories..."
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::AssistantResponse { content }
+                if content.contains("resistance bands")
+        )));
+
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
+    fn run_prompt_with_model_and_registry_can_suppress_irrelevant_reflective_recall() {
+        struct ReflectiveSuppressionPromptModel;
+
+        impl ModelClient for ReflectiveSuppressionPromptModel {
+            fn next_events(
+                &self,
+                request: ConversationRequest<'_>,
+            ) -> Result<Vec<StreamEvent>, elroy_core::ModelClientError> {
+                assert_eq!(
+                    request.user_message,
+                    "What should I remember before basketball practice?"
+                );
+                assert!(
+                    request.transcript.iter().all(|message| {
+                        message.tool_call_id.as_deref() != Some("bootstrap-memory-recall")
+                    }),
+                    "{:#?}",
+                    request.transcript
+                );
+                Ok(vec![StreamEvent::AssistantResponse {
+                    content: "No prior reminder looks especially relevant.".to_string(),
+                }])
+            }
+        }
+
+        let unique = format!(
+            "elroy-rs-app-reflective-runtime-suppression-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+        fs::write(
+            memory_dir.join("basketball_form.md"),
+            "# Basketball Form\n\nRemember to follow through on your shot.\n",
+        )
+        .expect("memory file should be written");
+
+        let mut config = AppConfig::defaults();
+        config.home_dir = home.clone();
+        config.memory_dir = memory_dir;
+        config.agenda_dir = agenda_dir;
+        config.database_path = database_path.clone();
+        config.memory_recall_classifier_enabled = false;
+        config.reflect = true;
+        elroy_db::bootstrap_database(&BootstrapPlan::from_config(&config))
+            .expect("bootstrap should succeed");
+
+        let reflective_model = FakeModel::new(vec![
+            vec![StreamEvent::AssistantResponse {
+                content: r#"{"answers":[true],"reasoning":"The recalled memory is relevant enough to inspect."}"#
+                    .to_string(),
+            }],
+            vec![StreamEvent::AssistantResponse {
+                content: r#"{"is_relevant":false,"content":null}"#.to_string(),
+            }],
+        ]);
+
+        let mut connection = open_sqlite_connection(&database_path).expect("database should open");
+        run_migrations(&mut connection).expect("migrations should run");
+        let events = run_prompt_with_model_and_registry_internal(
+            &mut connection,
+            "What should I remember before basketball practice?",
+            &ReflectiveSuppressionPromptModel,
+            Some(&reflective_model),
+            ExecutableToolRegistry::new(vec![]),
+            PromptExecutionOptions {
+                role: MessageRole::User,
+                persist_input_message: true,
+                force_tool: None,
+                assistant_name: &config.assistant_name,
+                ensure_alternating_roles: config.llm_provider() == LlmProvider::Anthropic,
+                home_dir: &home,
+                bootstrap_plan: BootstrapPlan::from_config(&config),
+                messages_between_memory: config.messages_between_memory,
+                memories_between_consolidation: config.memories_between_consolidation,
+                messages_between_self_reflection: config.messages_between_self_reflection,
+                defer_auto_memory: false,
+                defer_self_reflection: false,
+                memory_recall_classifier_enabled: false,
+                memory_recall_classifier_window: config.memory_recall_classifier_window,
+                reflect: true,
+            },
+        )
+        .expect("prompt should succeed");
+
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            StreamEvent::StatusUpdate { content } if content == "fetching memories..."
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::AssistantResponse { content }
+                if content.contains("No prior reminder")
+        )));
+
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
     fn context_refresh_is_not_needed_without_user_messages() {
         let context_messages = vec![
             ConversationMessage::new(MessageRole::System, "system"),
