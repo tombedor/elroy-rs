@@ -3030,6 +3030,21 @@ mod tests {
     }
 
     #[test]
+    fn idle_footer_does_not_duplicate_command_palette_hint() {
+        let mut app = TuiApp::bootstrap();
+        app.model_name = "gpt-test".to_string();
+
+        let footer = app.footer_status_text();
+        let hints = app.footer_hints();
+        let combined = format!("{footer} | {hints}");
+
+        assert!(!footer.contains("Ctrl+P"));
+        assert!(!footer.to_lowercase().contains("commands"));
+        assert!(!combined.contains("Ctrl+P"));
+        assert!(!combined.to_lowercase().contains("commands"));
+    }
+
+    #[test]
     fn footer_status_text_prefers_background_status_when_idle() {
         let mut app = TuiApp::bootstrap();
         app.model_name = "gpt-test".to_string();
