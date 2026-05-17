@@ -16316,6 +16316,113 @@ User still wants to compare grocery prices after the shopping trip.",
     }
 
     #[test]
+    fn select_relevant_contextual_due_items_can_surface_semantic_contextual_task_via_embedding_without_relevance_model()
+     {
+        let due_items = vec![
+            AgendaItemRecord {
+                id: 1,
+                legacy_frontmatter_id: None,
+                name: "Workout Kit Review".to_string(),
+                file_path: "/tmp/workout_kit_review.md".to_string(),
+                agenda_date: Some("2026-05-20".to_string()),
+                is_completed: false,
+                status: Some("created".to_string()),
+                trigger_datetime: None,
+                trigger_context: Some("after equipment handoff".to_string()),
+                closing_comment: None,
+                checklist_total: 0,
+                checklist_completed: 0,
+                body: "Review the workout locker spreadsheet.".to_string(),
+                is_active: true,
+                updated_at_unix: 20,
+            },
+            AgendaItemRecord {
+                id: 2,
+                legacy_frontmatter_id: None,
+                name: "Practice Packing Task".to_string(),
+                file_path: "/tmp/practice_packing_task.md".to_string(),
+                agenda_date: Some("2026-05-21".to_string()),
+                is_completed: false,
+                status: Some("created".to_string()),
+                trigger_datetime: None,
+                trigger_context: Some("before basketball practice".to_string()),
+                closing_comment: None,
+                checklist_total: 0,
+                checklist_completed: 0,
+                body: "Pack resistance bands before drills.".to_string(),
+                is_active: true,
+                updated_at_unix: 10,
+            },
+        ];
+
+        let mut server = mockito::Server::new();
+        let _query_embedding_mock = server
+            .mock("POST", "/embeddings")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "input": "What belongs in my workout kit?"
+            })))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "data": [{"embedding": [1.0, 0.0]}]
+                })
+                .to_string(),
+            )
+            .create();
+        let _semantic_embedding_mock = server
+            .mock("POST", "/embeddings")
+            .match_body(mockito::Matcher::Regex(
+                "Pack resistance bands before drills".to_string(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "data": [{"embedding": [1.0, 0.0]}]
+                })
+                .to_string(),
+            )
+            .create();
+        let _overlap_embedding_mock = server
+            .mock("POST", "/embeddings")
+            .match_body(mockito::Matcher::Regex(
+                "Review the workout locker spreadsheet".to_string(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "data": [{"embedding": [0.0, 1.0]}]
+                })
+                .to_string(),
+            )
+            .create();
+
+        let embedding_client = best_effort_embedding_client(Some(&EmbeddingProviderConfig {
+            model: "text-embedding-3-small".to_string(),
+            api_key: "embedding-test-key".to_string(),
+            base_url: format!("{}/embeddings", server.url()),
+            timeout_seconds: 60,
+        }))
+        .expect("embedding client should build");
+
+        let relevant_due_items = select_relevant_contextual_due_items(
+            "What belongs in my workout kit?",
+            &due_items,
+            "2026-05-15T12:00:00",
+            2,
+            None,
+            Some(&embedding_client),
+            Some(0.5),
+        );
+
+        assert_eq!(relevant_due_items.len(), 1);
+        assert_eq!(relevant_due_items[0].name, "Practice Packing Task");
+        assert!(relevant_due_items[0].body.contains("resistance bands"));
+    }
+
+    #[test]
     fn live_tool_registry_search_memories_can_return_due_items() {
         let unique = format!(
             "elroy-rs-app-search-memories-due-items-{}",
@@ -22894,6 +23001,149 @@ User still wants to compare grocery prices after the shopping trip.",
         relevance_mock.assert();
         first_chat_mock.assert();
         second_chat_mock.assert();
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
+    fn process_message_can_surface_semantic_contextual_task_via_embedding_without_relevance_model()
+    {
+        let unique = format!(
+            "elroy-rs-app-process-message-embedding-contextual-task-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+        let semantic_task_path = agenda_dir.join("practice_packing_task.md");
+        fs::write(
+            agenda_dir.join("workout_kit_review.md"),
+            "---\ndate: 2026-05-20\ncompleted: false\nstatus: created\ntrigger_context: after equipment handoff\n---\n\nReview the workout locker spreadsheet.\n",
+        )
+        .expect("overlap contextual task file should be written");
+        fs::write(
+            &semantic_task_path,
+            "---\ndate: 2026-05-21\ncompleted: false\nstatus: created\ntrigger_context: before basketball practice\n---\n\nPack resistance bands before drills.\n",
+        )
+        .expect("semantic contextual task file should be written");
+
+        let mut embedding_server = mockito::Server::new();
+        let _query_embedding_mock = embedding_server
+            .mock("POST", "/embeddings")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "input": "What belongs in my workout kit?"
+            })))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "data": [{"embedding": [1.0, 0.0]}]
+                })
+                .to_string(),
+            )
+            .create();
+        let _semantic_embedding_mock = embedding_server
+            .mock("POST", "/embeddings")
+            .match_body(mockito::Matcher::Regex(
+                "Pack resistance bands before drills".to_string(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "data": [{"embedding": [1.0, 0.0]}]
+                })
+                .to_string(),
+            )
+            .create();
+        let _overlap_embedding_mock = embedding_server
+            .mock("POST", "/embeddings")
+            .match_body(mockito::Matcher::Regex(
+                "Review the workout locker spreadsheet".to_string(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "data": [{"embedding": [0.0, 1.0]}]
+                })
+                .to_string(),
+            )
+            .create();
+
+        let mut chat_server = mockito::Server::new();
+        let chat_mock = chat_server
+            .mock("POST", "/messages")
+            .match_header("x-api-key", "anthropic-test-key")
+            .match_header("anthropic-version", "2023-06-01")
+            .match_body(mockito::Matcher::Regex(
+                "Pack resistance bands before drills".to_string(),
+            ))
+            .expect_at_least(1)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "content": [{
+                        "type": "text",
+                        "text": "Pack the resistance bands before drills."
+                    }]
+                })
+                .to_string(),
+            )
+            .create();
+
+        let mut config = AppConfig::defaults();
+        config.home_dir = home.clone();
+        config.memory_dir = memory_dir;
+        config.agenda_dir = agenda_dir.clone();
+        config.database_path = database_path.clone();
+        config.chat_model = "claude-sonnet-4-20250514".to_string();
+        config.anthropic_api_key = Some("anthropic-test-key".to_string());
+        config.anthropic_base_url = format!("{}/messages", chat_server.url());
+        config.embedding_model_api_key = Some("embedding-test-key".to_string());
+        config.embedding_model_api_base = Some(format!("{}/embeddings", embedding_server.url()));
+        config.openai_api_key = None;
+        config.fast_model_api_key = None;
+        config.memory_recall_classifier_enabled = false;
+        elroy_db::bootstrap_database(&BootstrapPlan::from_config(&config))
+            .expect("bootstrap should succeed");
+
+        let runtime = AppRuntime::new(config.clone());
+        let result = runtime
+            .process_message(
+                "What belongs in my workout kit?",
+                MessageProcessOptions::default(),
+            )
+            .expect("prompt should succeed");
+
+        assert!(result.events.iter().any(|event| matches!(
+            event,
+            StreamEvent::AssistantResponse { content }
+                if content == "Pack the resistance bands before drills."
+        )));
+
+        let reopened =
+            open_sqlite_connection(&config.database_path).expect("database should reopen");
+        let active_task_count: i64 = reopened
+            .query_row(
+                "SELECT COUNT(*) FROM agenda_items WHERE name = ?1 AND status = 'created' AND is_active = 1",
+                rusqlite::params!["practice packing task"],
+                |row| row.get(0),
+            )
+            .expect("active task rows should query");
+        assert_eq!(active_task_count, 1);
+        assert!(
+            semantic_task_path.exists(),
+            "semantic contextual task file should remain on disk"
+        );
+
+        chat_mock.assert();
         fs::remove_dir_all(home).expect("home should be removed");
     }
 
