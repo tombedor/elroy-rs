@@ -17689,6 +17689,168 @@ mod tests {
     }
 
     #[test]
+    fn run_prompt_with_model_and_registry_can_prefer_semantic_due_and_agenda_recall_candidates_over_weaker_overlap()
+     {
+        struct MixedSemanticRecallPromptModel;
+        struct MixedSemanticRecallRelevanceModel;
+
+        impl ModelClient for MixedSemanticRecallPromptModel {
+            fn next_events(
+                &self,
+                request: ConversationRequest<'_>,
+            ) -> Result<Vec<StreamEvent>, elroy_core::ModelClientError> {
+                assert_eq!(
+                    request.user_message,
+                    "What gear should I bring to practice?"
+                );
+                let recall_payload = request
+                    .transcript
+                    .iter()
+                    .find(|message| {
+                        message.role == MessageRole::Tool
+                            && message.tool_call_id.as_deref() == Some("bootstrap-memory-recall")
+                    })
+                    .and_then(|message| message.content.as_deref())
+                    .expect("fast recall payload should be injected");
+                assert!(
+                    recall_payload.contains("bands reminder"),
+                    "{recall_payload}"
+                );
+                assert!(recall_payload.contains("bands plan"), "{recall_payload}");
+                assert!(
+                    !recall_payload.contains("gear inventory reminder"),
+                    "{recall_payload}"
+                );
+                assert!(
+                    !recall_payload.contains("gear inventory plan"),
+                    "{recall_payload}"
+                );
+                Ok(vec![StreamEvent::AssistantResponse {
+                    content: "Bring the resistance bands and check the bands plan.".to_string(),
+                }])
+            }
+        }
+
+        impl ModelClient for MixedSemanticRecallRelevanceModel {
+            fn next_events(
+                &self,
+                request: ConversationRequest<'_>,
+            ) -> Result<Vec<StreamEvent>, elroy_core::ModelClientError> {
+                let prompt = request.user_message;
+                if prompt.contains("needs_recall") {
+                    return Ok(vec![StreamEvent::AssistantResponse {
+                        content: r#"{"needs_recall":true,"reasoning":"The user is asking about practice gear."}"#
+                            .to_string(),
+                    }]);
+                }
+                let answers = if prompt.contains("bands reminder")
+                    && prompt.contains("gear inventory reminder")
+                {
+                    if prompt.find("bands reminder") < prompt.find("gear inventory reminder") {
+                        vec![true, false]
+                    } else {
+                        vec![false, true]
+                    }
+                } else if prompt.contains("bands plan") && prompt.contains("gear inventory plan") {
+                    if prompt.find("bands plan") < prompt.find("gear inventory plan") {
+                        vec![true, false]
+                    } else {
+                        vec![false, true]
+                    }
+                } else {
+                    vec![true]
+                };
+                Ok(vec![StreamEvent::AssistantResponse {
+                    content: serde_json::json!({
+                        "answers": answers,
+                        "reasoning": "Only the resistance-bands candidates match the user's intent."
+                    })
+                    .to_string(),
+                }])
+            }
+        }
+
+        let unique = format!(
+            "elroy-rs-app-recall-semantic-mixed-priority-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+
+        let mut config = AppConfig::defaults();
+        config.home_dir = home.clone();
+        config.memory_dir = memory_dir;
+        config.agenda_dir = agenda_dir.clone();
+        config.database_path = database_path.clone();
+
+        let mut connection = open_sqlite_connection(&database_path).expect("database should open");
+        run_migrations(&mut connection).expect("migrations should run");
+        fs::write(
+            agenda_dir.join("gear_inventory_reminder.md"),
+            "---\ndate: unscheduled\ncompleted: false\nstatus: created\ntrigger_context: after equipment handoff\n---\n\nReview the storage locker spreadsheet.\n",
+        )
+        .expect("overlap due item should be written");
+        fs::write(
+            agenda_dir.join("bands_reminder.md"),
+            "---\ndate: unscheduled\ncompleted: false\nstatus: created\ntrigger_context: before scrimmage\n---\n\nCarry resistance bands in the trunk.\n",
+        )
+        .expect("semantic due item should be written");
+        fs::write(
+            agenda_dir.join("gear_inventory_plan.md"),
+            "---\ndate: 2026-05-20\ncompleted: false\nstatus: created\n---\n\nReview the storage locker spreadsheet.\n",
+        )
+        .expect("overlap agenda item should be written");
+        fs::write(
+            agenda_dir.join("bands_plan.md"),
+            "---\ndate: 2026-05-21\ncompleted: false\nstatus: created\n---\n\nPack resistance bands before drills.\n",
+        )
+        .expect("semantic agenda item should be written");
+        elroy_db::bootstrap_database(&BootstrapPlan::from_config(&config))
+            .expect("bootstrap should succeed");
+
+        let events = run_prompt_with_model_and_registry_internal(
+            &mut connection,
+            "What gear should I bring to practice?",
+            &MixedSemanticRecallPromptModel,
+            Some(&MixedSemanticRecallRelevanceModel),
+            ExecutableToolRegistry::new(vec![]),
+            PromptExecutionOptions {
+                role: MessageRole::User,
+                persist_input_message: true,
+                force_tool: None,
+                assistant_name: &config.assistant_name,
+                ensure_alternating_roles: config.llm_provider() == LlmProvider::Anthropic,
+                home_dir: &home,
+                bootstrap_plan: BootstrapPlan::from_config(&config),
+                messages_between_memory: config.messages_between_memory,
+                memories_between_consolidation: config.memories_between_consolidation,
+                messages_between_self_reflection: config.messages_between_self_reflection,
+                defer_auto_memory: false,
+                defer_self_reflection: false,
+                memory_recall_classifier_enabled: true,
+                memory_recall_classifier_window: 3,
+                reflect: false,
+            },
+        )
+        .expect("prompt should succeed");
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::AssistantResponse { content }
+                if content.contains("resistance bands")
+        )));
+
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
     fn run_prompt_with_model_and_registry_fast_recall_can_include_due_and_agenda_items() {
         struct MixedFastRecallPromptModel;
 
