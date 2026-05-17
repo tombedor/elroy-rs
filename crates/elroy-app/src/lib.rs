@@ -17404,6 +17404,93 @@ mod tests {
     }
 
     #[test]
+    fn app_runtime_refresh_context_can_use_fast_model_when_chat_model_differs() {
+        let unique = format!(
+            "elroy-rs-app-runtime-context-refresh-fast-model-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+
+        let mut server = mockito::Server::new();
+        let _mock = server
+            .mock("POST", "/responses")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "output": [{
+                        "type": "message",
+                        "content": [{
+                            "type": "output_text",
+                            "text": "I condensed the earlier practice discussion into a short first-person summary."
+                        }]
+                    }]
+                })
+                .to_string(),
+            )
+            .create();
+
+        let mut connection = open_sqlite_connection(&database_path).expect("database should open");
+        run_migrations(&mut connection).expect("migrations should run");
+
+        let mut transcript = vec![ConversationMessage::new(MessageRole::System, "system")];
+        for index in 0..8 {
+            transcript.push(ConversationMessage::new(
+                MessageRole::User,
+                format!("user {index} mentioned practice planning repeated repeated"),
+            ));
+            transcript.push(ConversationMessage::new(
+                MessageRole::Assistant,
+                format!("assistant {index} replied about practice planning repeated repeated"),
+            ));
+        }
+        elroy_db::replace_context_messages(&mut connection, LOCAL_USER_TOKEN, &transcript)
+            .expect("messages should persist");
+        drop(connection);
+
+        let mut config = AppConfig::defaults();
+        config.home_dir = home.clone();
+        config.memory_dir = memory_dir;
+        config.agenda_dir = agenda_dir;
+        config.database_path = database_path.clone();
+        config.max_tokens = 40;
+        config.chat_model = "claude-sonnet-4-20250514".to_string();
+        config.fast_model = Some("gpt-5.4-mini".to_string());
+        config.fast_model_api_key = Some("fast-test-key".to_string());
+        config.fast_model_api_base = Some(format!("{}/responses", server.url()));
+
+        let runtime = AppRuntime::new(config.clone());
+        let refreshed = runtime
+            .refresh_context_if_needed()
+            .expect("context refresh should succeed");
+
+        assert!(refreshed);
+
+        let mut reopened =
+            open_sqlite_connection(&config.database_path).expect("database should reopen");
+        let stored =
+            elroy_db::load_context_messages(&mut reopened, LOCAL_USER_TOKEN).expect("load ok");
+        let summary_content = stored[stored.len() - 1]
+            .content
+            .as_deref()
+            .expect("summary tool content should exist");
+        assert_eq!(
+            summary_content,
+            "Recent conversation summary: I condensed the earlier practice discussion into a short first-person summary."
+        );
+
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
     fn process_message_can_use_fast_model_for_prompt_time_recall_classifier_when_chat_model_differs()
      {
         let unique = format!(
