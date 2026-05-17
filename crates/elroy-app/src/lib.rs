@@ -564,6 +564,9 @@ impl AppRuntime {
         let preferences = load_user_preferences(&connection, LOCAL_USER_TOKEN)?;
         let model = live_provider_model(&self.config, preferences.as_ref())?;
         let classifier_model = live_fast_provider_model(&self.config, preferences.as_ref())?;
+        let embedding_provider_config =
+            embedding_provider_config_from_app_config(&self.config).ok();
+        let embedding_client = best_effort_embedding_client(embedding_provider_config.as_ref());
         let executable_tools = if options.enable_tools {
             self.tool_registry()
         } else {
@@ -596,7 +599,10 @@ impl AppRuntime {
                 reflect: self.config.reflect,
             },
             Box::new(model),
-            Some(&classifier_model),
+            RecallModelClients {
+                classifier_model: Some(&classifier_model),
+                embedding_client: embedding_client.as_ref(),
+            },
             executable_tools,
         )
     }
@@ -610,6 +616,9 @@ impl AppRuntime {
         let preferences = load_user_preferences(&connection, LOCAL_USER_TOKEN)?;
         let model = live_provider_model(&self.config, preferences.as_ref())?;
         let classifier_model = live_fast_provider_model(&self.config, preferences.as_ref())?;
+        let embedding_provider_config =
+            embedding_provider_config_from_app_config(&self.config).ok();
+        let embedding_client = best_effort_embedding_client(embedding_provider_config.as_ref());
         let executable_tools = if options.enable_tools {
             self.tool_registry()
         } else {
@@ -624,7 +633,10 @@ impl AppRuntime {
             &mut connection,
             prompt,
             &model,
-            Some(&classifier_model),
+            RecallModelClients {
+                classifier_model: Some(&classifier_model),
+                embedding_client: embedding_client.as_ref(),
+            },
             executable_tools,
             PromptExecutionOptions {
                 role: options.role,
@@ -1593,11 +1605,24 @@ fn best_effort_provider_model(
     ))
 }
 
+#[derive(Clone, Copy, Default)]
+struct RecallModelClients<'a> {
+    classifier_model: Option<&'a dyn ModelClient>,
+    embedding_client: Option<&'a LiveEmbeddingClient>,
+}
+
+fn recall_model_clients(classifier_model: Option<&dyn ModelClient>) -> RecallModelClients<'_> {
+    RecallModelClients {
+        classifier_model,
+        embedding_client: None,
+    }
+}
+
 fn run_prompt_with_model_and_registry_internal(
     connection: &mut rusqlite::Connection,
     prompt: &str,
     model: &dyn ModelClient,
-    classifier_model: Option<&dyn ModelClient>,
+    recall_models: RecallModelClients<'_>,
     executable_tools: ExecutableToolRegistry,
     options: PromptExecutionOptions<'_>,
 ) -> Result<Vec<StreamEvent>, AppError> {
@@ -1621,9 +1646,10 @@ fn run_prompt_with_model_and_registry_internal(
         options.memory_recall_classifier_window,
         prompt,
         &existing_transcript,
-        classifier_model,
+        recall_models.classifier_model,
     );
-    let recall_source_limit = semantic_recall_source_fetch_limit(20, classifier_model);
+    let recall_source_limit =
+        semantic_recall_source_fetch_limit(20, recall_models.classifier_model);
     let all_due_items = list_active_due_items(connection, recall_source_limit)?;
     let now_iso = Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string();
     let timed_due_items = list_due_tasks(connection, recall_source_limit, &now_iso)?;
@@ -1641,13 +1667,14 @@ fn run_prompt_with_model_and_registry_internal(
         options.reflect,
         prompt,
         memory_recall_decision.needs_recall,
-        classifier_model,
+        recall_models.classifier_model,
+        recall_models.embedding_client,
         RecallContext {
             transcript: &existing_transcript,
             memories: &list_active_memories_in_scope(
                 connection,
                 &options.bootstrap_plan.memory_dir,
-                semantic_recall_source_fetch_limit(50, classifier_model),
+                semantic_recall_source_fetch_limit(50, recall_models.classifier_model),
             )?,
             due_items: &recall_due_items,
             agenda_items: &list_active_plain_agenda_items(connection, recall_source_limit)?,
@@ -1662,7 +1689,8 @@ fn run_prompt_with_model_and_registry_internal(
         &due_item_dedupe_transcript,
         &all_due_items,
         &now_iso,
-        classifier_model,
+        recall_models.classifier_model,
+        recall_models.embedding_client,
     );
     let mut model_transcript = existing_transcript.clone();
     model_transcript.extend(contextual_due_item_context.iter().cloned());
@@ -1728,7 +1756,7 @@ fn run_prompt_with_model_and_registry(
         connection,
         prompt,
         model,
-        None,
+        RecallModelClients::default(),
         executable_tools,
         options,
     )
@@ -1740,7 +1768,7 @@ fn run_prompt_with_model_and_registry_stream_internal(
     prompt: &str,
     options: PromptExecutionOptions<'_>,
     model: Box<dyn StreamingModelClient>,
-    classifier_model: Option<&dyn ModelClient>,
+    recall_models: RecallModelClients<'_>,
     executable_tools: ExecutableToolRegistry,
 ) -> Result<PromptEventStream, AppError> {
     let tools = ToolRegistry::new(executable_tools.specs());
@@ -1763,9 +1791,10 @@ fn run_prompt_with_model_and_registry_stream_internal(
         options.memory_recall_classifier_window,
         prompt,
         &existing_transcript,
-        classifier_model,
+        recall_models.classifier_model,
     );
-    let recall_source_limit = semantic_recall_source_fetch_limit(20, classifier_model);
+    let recall_source_limit =
+        semantic_recall_source_fetch_limit(20, recall_models.classifier_model);
     let all_due_items = list_active_due_items(&connection, recall_source_limit)?;
     let now_iso = Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string();
     let timed_due_items = list_due_tasks(&connection, recall_source_limit, &now_iso)?;
@@ -1783,13 +1812,14 @@ fn run_prompt_with_model_and_registry_stream_internal(
         options.reflect,
         prompt,
         memory_recall_decision.needs_recall,
-        classifier_model,
+        recall_models.classifier_model,
+        recall_models.embedding_client,
         RecallContext {
             transcript: &existing_transcript,
             memories: &list_active_memories_in_scope(
                 &connection,
                 &options.bootstrap_plan.memory_dir,
-                semantic_recall_source_fetch_limit(50, classifier_model),
+                semantic_recall_source_fetch_limit(50, recall_models.classifier_model),
             )?,
             due_items: &recall_due_items,
             agenda_items: &list_active_plain_agenda_items(&connection, recall_source_limit)?,
@@ -1804,7 +1834,8 @@ fn run_prompt_with_model_and_registry_stream_internal(
         &due_item_dedupe_transcript,
         &all_due_items,
         &now_iso,
-        classifier_model,
+        recall_models.classifier_model,
+        recall_models.embedding_client,
     );
     let mut model_transcript = existing_transcript.clone();
     model_transcript.extend(contextual_due_item_context.iter().cloned());
@@ -1865,7 +1896,7 @@ fn run_prompt_with_model_and_registry_stream(
         prompt,
         options,
         model,
-        None,
+        RecallModelClients::default(),
         executable_tools,
     )
 }
@@ -2434,7 +2465,7 @@ fn run_background_codex_completion_followup(
         &mut connection,
         &prompt,
         &model,
-        Some(&model),
+        recall_model_clients(Some(&model)),
         build_live_tool_registry(config),
         PromptExecutionOptions {
             role: MessageRole::User,
@@ -7574,6 +7605,7 @@ fn recall_memory_context_messages_with_decision(
     prompt: &str,
     should_recall: bool,
     reflective_model: Option<&dyn ModelClient>,
+    embedding_client: Option<&LiveEmbeddingClient>,
     context: RecallContext<'_>,
 ) -> Vec<ConversationMessage> {
     if !should_recall {
@@ -7590,19 +7622,23 @@ fn recall_memory_context_messages_with_decision(
         &already_recalled_memories,
         2,
         relevance_model,
-        None,
+        embedding_client,
     );
     let already_recalled_agenda_items =
         recalled_item_refs_by_type(context.transcript, "AgendaItem");
     let fast_due_items = if reflect {
         Vec::new()
     } else {
-        select_relevant_recall_due_items(&recall_query, context.due_items, 2, relevance_model, None)
-            .into_iter()
-            .filter(|item| {
-                !recalled_item_matches(&already_recalled_agenda_items, item.id, &item.name)
-            })
-            .collect()
+        select_relevant_recall_due_items(
+            &recall_query,
+            context.due_items,
+            2,
+            relevance_model,
+            embedding_client,
+        )
+        .into_iter()
+        .filter(|item| !recalled_item_matches(&already_recalled_agenda_items, item.id, &item.name))
+        .collect()
     };
     let fast_agenda_items = if reflect {
         Vec::new()
@@ -7612,19 +7648,23 @@ fn recall_memory_context_messages_with_decision(
             context.agenda_items,
             2,
             relevance_model,
-            None,
+            embedding_client,
         )
         .into_iter()
         .filter(|item| !recalled_item_matches(&already_recalled_agenda_items, item.id, &item.name))
         .collect()
     };
     let reflective_due_items = if reflect {
-        select_relevant_recall_due_items(&recall_query, context.due_items, 2, relevance_model, None)
-            .into_iter()
-            .filter(|item| {
-                !recalled_item_matches(&already_recalled_agenda_items, item.id, &item.name)
-            })
-            .collect()
+        select_relevant_recall_due_items(
+            &recall_query,
+            context.due_items,
+            2,
+            relevance_model,
+            embedding_client,
+        )
+        .into_iter()
+        .filter(|item| !recalled_item_matches(&already_recalled_agenda_items, item.id, &item.name))
+        .collect()
     } else {
         Vec::new()
     };
@@ -7634,7 +7674,7 @@ fn recall_memory_context_messages_with_decision(
             context.agenda_items,
             2,
             relevance_model,
-            None,
+            embedding_client,
         )
         .into_iter()
         .filter(|item| !recalled_item_matches(&already_recalled_agenda_items, item.id, &item.name))
@@ -7756,6 +7796,7 @@ fn recall_memory_context_messages(
         prompt,
         should_recall,
         None,
+        None,
         context,
     )
 }
@@ -7766,6 +7807,7 @@ fn recall_due_item_context_messages(
     due_items: &[AgendaItemRecord],
     now_iso: &str,
     relevance_model: Option<&dyn ModelClient>,
+    embedding_client: Option<&LiveEmbeddingClient>,
 ) -> Vec<ConversationMessage> {
     let recall_query = build_recall_query(prompt, transcript, 6);
     let recalled = select_relevant_contextual_due_items(
@@ -7774,7 +7816,7 @@ fn recall_due_item_context_messages(
         now_iso,
         2,
         relevance_model,
-        None,
+        embedding_client,
     );
     if recalled.is_empty() {
         return Vec::new();
@@ -9200,15 +9242,16 @@ mod tests {
         parse_reflective_recall_model_response, parse_relevance_filter_response,
         prompt_prelude_status_updates, provider_config_from_app_config,
         recall_due_item_context_messages, recall_memory_context_messages,
-        recall_memory_context_messages_with_decision, recalled_item_refs_by_type,
-        recalled_memory_names, recent_recall_context, refresh_context_if_needed,
-        run_prompt_with_model_and_registry, run_prompt_with_model_and_registry_internal,
-        run_prompt_with_model_and_registry_stream, select_due_items_by_overlap,
-        select_recalled_due_items, select_recalled_memories, select_relevant_contextual_due_items,
-        select_relevant_recall_agenda_items, select_relevant_recall_due_items,
-        select_relevant_recall_memories, should_offer_greeting, should_skip_memory_recall,
-        significant_tokens, strip_input_message_for_persistence, strip_transient_context_messages,
-        summarize_context_messages_with_model, synthetic_tool_context_messages,
+        recall_memory_context_messages_with_decision, recall_model_clients,
+        recalled_item_refs_by_type, recalled_memory_names, recent_recall_context,
+        refresh_context_if_needed, run_prompt_with_model_and_registry,
+        run_prompt_with_model_and_registry_internal, run_prompt_with_model_and_registry_stream,
+        select_due_items_by_overlap, select_recalled_due_items, select_recalled_memories,
+        select_relevant_contextual_due_items, select_relevant_recall_agenda_items,
+        select_relevant_recall_due_items, select_relevant_recall_memories, should_offer_greeting,
+        should_skip_memory_recall, significant_tokens, strip_input_message_for_persistence,
+        strip_transient_context_messages, summarize_context_messages_with_model,
+        synthetic_tool_context_messages,
     };
     use elroy_agenda::create_agenda_file;
     use elroy_codex::{
@@ -14312,6 +14355,7 @@ mod tests {
             &due_items,
             "2026-05-15T12:00:00",
             None,
+            None,
         );
 
         assert_eq!(messages.len(), 2);
@@ -14370,6 +14414,7 @@ mod tests {
             &due_items,
             "2026-05-15T12:00:00",
             None,
+            None,
         );
 
         assert!(messages.is_empty());
@@ -14415,6 +14460,7 @@ mod tests {
             &transcript,
             &due_items,
             "2026-05-15T12:00:00",
+            None,
             None,
         );
 
@@ -14462,6 +14508,7 @@ mod tests {
             &due_items,
             "2026-05-15T12:00:00",
             None,
+            None,
         );
 
         assert_eq!(messages.len(), 2);
@@ -14507,6 +14554,7 @@ mod tests {
             &due_items,
             "2026-05-15T12:00:00",
             Some(&model),
+            None,
         );
 
         assert_eq!(messages.len(), 2);
@@ -14586,6 +14634,7 @@ mod tests {
             &due_items,
             "2026-05-15T12:00:00",
             Some(&SemanticReminderRelevanceModel),
+            None,
         );
 
         let joined_tool_content = messages
@@ -16503,7 +16552,7 @@ mod tests {
             &mut connection,
             "I just got the payroll email.",
             &ContextualDueItemModel,
-            Some(&NoRecallClassifierModel),
+            recall_model_clients(Some(&NoRecallClassifierModel)),
             build_live_tool_registry(&config),
             PromptExecutionOptions {
                 role: MessageRole::User,
@@ -16545,7 +16594,7 @@ mod tests {
             &mut connection,
             "I'm following up after that payroll email now.",
             &ContextualDueItemModel,
-            Some(&NoRecallClassifierModel),
+            recall_model_clients(Some(&NoRecallClassifierModel)),
             build_live_tool_registry(&config),
             PromptExecutionOptions {
                 role: MessageRole::User,
@@ -16655,7 +16704,7 @@ mod tests {
             &mut connection,
             "What gear should I bring?",
             &SemanticContextualDueItemModel,
-            Some(&SemanticContextualDueItemModel),
+            recall_model_clients(Some(&SemanticContextualDueItemModel)),
             build_live_tool_registry(&config),
             PromptExecutionOptions {
                 role: MessageRole::User,
@@ -16777,7 +16826,7 @@ mod tests {
             &mut connection,
             "What gear should I bring?",
             &SemanticPriorityContextualDueItemModel,
-            Some(&SemanticReminderRelevanceModel),
+            recall_model_clients(Some(&SemanticReminderRelevanceModel)),
             build_live_tool_registry(&config),
             PromptExecutionOptions {
                 role: MessageRole::User,
@@ -16873,7 +16922,7 @@ mod tests {
             &mut connection,
             "I just got the payroll email",
             &NonDuplicatingDueItemModel,
-            None,
+            recall_model_clients(None),
             build_live_tool_registry(&config),
             PromptExecutionOptions {
                 role: MessageRole::User,
@@ -16993,7 +17042,7 @@ mod tests {
             &mut connection,
             "I just got the payroll email",
             &CurrentContextDueItemModel,
-            Some(&NoRecallClassifierModel),
+            recall_model_clients(Some(&NoRecallClassifierModel)),
             build_live_tool_registry(&config),
             PromptExecutionOptions {
                 role: MessageRole::User,
@@ -18796,6 +18845,205 @@ mod tests {
             StreamEvent::AssistantResponse { content }
                 if content == "Bring the resistance bands."
         )));
+
+        relevance_mock.assert();
+        chat_mock.assert();
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
+    fn process_message_can_surface_older_semantic_memory_via_embedding_candidates() {
+        let unique = format!(
+            "elroy-rs-app-process-message-embedding-recall-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+        for index in 0..120 {
+            fs::write(
+                memory_dir.join(format!("recent_note_{index:03}.md")),
+                format!("Review the storage locker spreadsheet {index}.\n"),
+            )
+            .expect("recent memory should be written");
+        }
+        fs::write(
+            memory_dir.join("old_training_note.md"),
+            "Pack resistance bands before drills.\n",
+        )
+        .expect("older semantic memory should be written");
+
+        let mut fast_server = mockito::Server::new();
+        let mut answers = vec![false; 100];
+        answers[0] = true;
+        let relevance_mock = fast_server
+            .mock("POST", "/responses")
+            .match_header("authorization", "Bearer fast-test-key")
+            .match_body(mockito::Matcher::Regex(
+                "Your job is to determine which candidate recall items are relevant to a query\\."
+                    .to_string(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "output": [{
+                        "type": "message",
+                        "content": [{
+                            "type": "output_text",
+                            "text": serde_json::json!({
+                                "answers": answers,
+                                "reasoning": "Only the older training-kit memory matches the user's intent."
+                            }).to_string()
+                        }]
+                    }]
+                })
+                .to_string(),
+            )
+            .create();
+        let _query_embedding_mock = fast_server
+            .mock("POST", "/embeddings")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "input": "What belongs in my workout kit?"
+            })))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "data": [{"embedding": [1.0, 0.0]}]
+                })
+                .to_string(),
+            )
+            .create();
+        let _semantic_embedding_mock = fast_server
+            .mock("POST", "/embeddings")
+            .match_body(mockito::Matcher::Regex(
+                "Pack resistance bands before drills".to_string(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "data": [{"embedding": [1.0, 0.0]}]
+                })
+                .to_string(),
+            )
+            .create();
+        let _recent_embedding_mock = fast_server
+            .mock("POST", "/embeddings")
+            .match_body(mockito::Matcher::Regex(
+                "Review the storage locker spreadsheet".to_string(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "data": [{"embedding": [0.0, 1.0]}]
+                })
+                .to_string(),
+            )
+            .create();
+
+        let mut chat_server = mockito::Server::new();
+        let chat_mock = chat_server
+            .mock("POST", "/messages")
+            .match_header("x-api-key", "anthropic-test-key")
+            .match_header("anthropic-version", "2023-06-01")
+            .match_body(mockito::Matcher::Regex(
+                "Pack resistance bands before drills\\.".to_string(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "content": [{
+                        "type": "text",
+                        "text": "Bring the resistance bands before drills."
+                    }]
+                })
+                .to_string(),
+            )
+            .create();
+
+        let mut config = AppConfig::defaults();
+        config.home_dir = home.clone();
+        config.memory_dir = memory_dir.clone();
+        config.agenda_dir = agenda_dir;
+        config.database_path = database_path.clone();
+        config.chat_model = "claude-sonnet-4-20250514".to_string();
+        config.anthropic_api_key = Some("anthropic-test-key".to_string());
+        config.anthropic_base_url = format!("{}/messages", chat_server.url());
+        config.fast_model = Some("gpt-5.4-mini".to_string());
+        config.fast_model_api_key = Some("fast-test-key".to_string());
+        config.fast_model_api_base = Some(format!("{}/responses", fast_server.url()));
+        config.embedding_model_api_key = Some("fast-test-key".to_string());
+        config.embedding_model_api_base = Some(format!("{}/embeddings", fast_server.url()));
+        config.memory_recall_classifier_enabled = false;
+        elroy_db::bootstrap_database(&BootstrapPlan::from_config(&config))
+            .expect("bootstrap should succeed");
+
+        let connection = open_sqlite_connection(&database_path).expect("database should open");
+        for index in 0..120 {
+            connection
+                .execute(
+                    "UPDATE memories SET updated_at_unix = ?1 WHERE file_path = ?2",
+                    rusqlite::params![
+                        10_000_i64 - index as i64,
+                        memory_dir
+                            .join(format!("recent_note_{index:03}.md"))
+                            .display()
+                            .to_string(),
+                    ],
+                )
+                .expect("recent memory timestamp should update");
+        }
+        connection
+            .execute(
+                "UPDATE memories SET updated_at_unix = 1 WHERE file_path = ?1",
+                rusqlite::params![
+                    memory_dir
+                        .join("old_training_note.md")
+                        .display()
+                        .to_string(),
+                ],
+            )
+            .expect("older memory timestamp should update");
+
+        let runtime = AppRuntime::new(config.clone());
+        let result = runtime
+            .process_message(
+                "What belongs in my workout kit?",
+                MessageProcessOptions::default(),
+            )
+            .expect("prompt should succeed");
+
+        assert!(result.events.iter().any(|event| matches!(
+            event,
+            StreamEvent::StatusUpdate { content } if content == "fetching memories..."
+        )));
+        assert!(result.events.iter().any(|event| matches!(
+            event,
+            StreamEvent::AssistantResponse { content }
+                if content == "Bring the resistance bands before drills."
+        )));
+
+        let mut reopened =
+            open_sqlite_connection(&config.database_path).expect("database should reopen");
+        let stored =
+            elroy_db::load_context_messages(&mut reopened, LOCAL_USER_TOKEN).expect("load ok");
+        assert!(stored.iter().any(|message| {
+            message_matches_tool_call_id(message, "bootstrap-memory-recall")
+                && message.content.as_deref().is_some_and(|content| {
+                    content.contains("old training note")
+                        && content.contains("Pack resistance bands before drills.")
+                })
+        }));
 
         relevance_mock.assert();
         chat_mock.assert();
@@ -20787,7 +21035,7 @@ mod tests {
             &mut connection,
             "What was that library you mentioned?",
             &NoRecallPromptModel,
-            Some(&classifier),
+            recall_model_clients(Some(&classifier)),
             ExecutableToolRegistry::new(vec![]),
             PromptExecutionOptions {
                 role: MessageRole::User,
@@ -20885,7 +21133,7 @@ mod tests {
             &mut connection,
             "What workout gear should I bring?",
             &NoRecallContextPromptModel,
-            Some(&classifier_and_filter),
+            recall_model_clients(Some(&classifier_and_filter)),
             ExecutableToolRegistry::new(vec![]),
             PromptExecutionOptions {
                 role: MessageRole::User,
@@ -20992,7 +21240,7 @@ mod tests {
             &mut connection,
             "What gear should I bring to practice?",
             &RecallContextPromptModel,
-            Some(&classifier_and_filter),
+            recall_model_clients(Some(&classifier_and_filter)),
             ExecutableToolRegistry::new(vec![]),
             PromptExecutionOptions {
                 role: MessageRole::User,
@@ -21122,7 +21370,7 @@ mod tests {
             &mut connection,
             "What gear should I bring to practice?",
             &SemanticRecallPromptModel,
-            Some(&SemanticRecallRelevanceModel),
+            recall_model_clients(Some(&SemanticRecallRelevanceModel)),
             ExecutableToolRegistry::new(vec![]),
             PromptExecutionOptions {
                 role: MessageRole::User,
@@ -21286,7 +21534,7 @@ mod tests {
             &mut connection,
             "What belongs in my workout kit?",
             &OlderSemanticRecallPromptModel,
-            Some(&OlderSemanticRecallRelevanceModel),
+            recall_model_clients(Some(&OlderSemanticRecallRelevanceModel)),
             ExecutableToolRegistry::new(vec![]),
             PromptExecutionOptions {
                 role: MessageRole::User,
@@ -21448,7 +21696,7 @@ mod tests {
             &mut connection,
             "What gear should I bring to practice?",
             &MixedSemanticRecallPromptModel,
-            Some(&MixedSemanticRecallRelevanceModel),
+            recall_model_clients(Some(&MixedSemanticRecallRelevanceModel)),
             ExecutableToolRegistry::new(vec![]),
             PromptExecutionOptions {
                 role: MessageRole::User,
@@ -21669,7 +21917,7 @@ mod tests {
             &mut connection,
             "What should I remember before basketball practice?",
             &ReflectiveRuntimePromptModel,
-            Some(&reflective_model),
+            recall_model_clients(Some(&reflective_model)),
             ExecutableToolRegistry::new(vec![]),
             PromptExecutionOptions {
                 role: MessageRole::User,
@@ -21775,7 +22023,7 @@ mod tests {
             &mut connection,
             "What should I remember before basketball practice?",
             &ReflectiveSuppressionPromptModel,
-            Some(&reflective_model),
+            recall_model_clients(Some(&reflective_model)),
             ExecutableToolRegistry::new(vec![]),
             PromptExecutionOptions {
                 role: MessageRole::User,
@@ -22143,6 +22391,7 @@ mod tests {
             "I am heading to basketball practice",
             true,
             Some(&model),
+            None,
             RecallContext {
                 transcript: &[],
                 memories: &[MemoryRecord {
@@ -22192,6 +22441,7 @@ mod tests {
             "I am heading to basketball practice",
             true,
             Some(&model),
+            None,
             RecallContext {
                 transcript: &[],
                 memories: &[MemoryRecord {
@@ -22236,6 +22486,7 @@ mod tests {
             "What gear should I bring to practice?",
             true,
             Some(&model),
+            None,
             RecallContext {
                 transcript: &[],
                 memories: &[],
@@ -23315,6 +23566,7 @@ mod tests {
             "What gear should I bring to practice?",
             true,
             Some(&model),
+            None,
             RecallContext {
                 transcript: &transcript,
                 memories: &memories,
