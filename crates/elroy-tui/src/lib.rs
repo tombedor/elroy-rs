@@ -3355,6 +3355,27 @@ mod tests {
     }
 
     #[test]
+    fn background_command_runtime_failure_returns_focus_and_surfaces_status() {
+        let mut app = TuiApp::bootstrap();
+        app.command_active = true;
+        app.focus = FocusTarget::Command(CommandPane::Conversation);
+        app.status = "running command: /create_memory".to_string();
+        app.follow_conversation_output = false;
+        let mut runtime = FakeRuntime {
+            command_execution_error: Some("background worker exploded".to_string()),
+            ..FakeRuntime::default()
+        };
+
+        let restart = maybe_complete_command_execution(&mut app, &mut runtime);
+
+        assert_eq!(restart, None);
+        assert!(!app.command_active);
+        assert_eq!(app.focus, FocusTarget::Input);
+        assert_eq!(app.status, "command failed: background worker exploded");
+        assert!(app.follow_conversation_output);
+    }
+
+    #[test]
     fn command_form_submit_keeps_form_open_when_command_is_already_running() {
         let mut app = TuiApp::bootstrap();
         app.command_active = true;
