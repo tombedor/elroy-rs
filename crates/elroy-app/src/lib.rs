@@ -1570,6 +1570,17 @@ fn run_prompt_with_model_and_registry_internal(
         classifier_model,
     );
     let all_due_items = list_active_due_items(connection, 20)?;
+    let now_iso = Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string();
+    let timed_due_items = list_due_tasks(connection, 20, &now_iso)?;
+    let timed_due_item_ids = timed_due_items
+        .iter()
+        .map(|item| item.id)
+        .collect::<HashSet<_>>();
+    let recall_due_items = all_due_items
+        .iter()
+        .filter(|item| !timed_due_item_ids.contains(&item.id))
+        .cloned()
+        .collect::<Vec<_>>();
     let recall_context = recall_memory_context_messages_with_decision(
         options.memory_recall_classifier_window,
         options.reflect,
@@ -1583,15 +1594,14 @@ fn run_prompt_with_model_and_registry_internal(
                 &options.bootstrap_plan.memory_dir,
                 50,
             )?,
-            due_items: &all_due_items,
+            due_items: &recall_due_items,
             agenda_items: &list_active_plain_agenda_items(connection, 20)?,
         },
     );
-    let now_iso = Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string();
-    let timed_due_item_context =
-        due_item_context_messages(&list_due_tasks(connection, 20, &now_iso)?);
+    let timed_due_item_context = due_item_context_messages(&timed_due_items);
     let mut due_item_dedupe_transcript = existing_transcript.clone();
     due_item_dedupe_transcript.extend(recall_context.iter().cloned());
+    due_item_dedupe_transcript.extend(timed_due_item_context.iter().cloned());
     let contextual_due_item_context = recall_due_item_context_messages(
         prompt,
         &due_item_dedupe_transcript,
@@ -1701,6 +1711,17 @@ fn run_prompt_with_model_and_registry_stream_internal(
         classifier_model,
     );
     let all_due_items = list_active_due_items(&connection, 20)?;
+    let now_iso = Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string();
+    let timed_due_items = list_due_tasks(&connection, 20, &now_iso)?;
+    let timed_due_item_ids = timed_due_items
+        .iter()
+        .map(|item| item.id)
+        .collect::<HashSet<_>>();
+    let recall_due_items = all_due_items
+        .iter()
+        .filter(|item| !timed_due_item_ids.contains(&item.id))
+        .cloned()
+        .collect::<Vec<_>>();
     let recall_context = recall_memory_context_messages_with_decision(
         options.memory_recall_classifier_window,
         options.reflect,
@@ -1714,15 +1735,14 @@ fn run_prompt_with_model_and_registry_stream_internal(
                 &options.bootstrap_plan.memory_dir,
                 50,
             )?,
-            due_items: &all_due_items,
+            due_items: &recall_due_items,
             agenda_items: &list_active_plain_agenda_items(&connection, 20)?,
         },
     );
-    let now_iso = Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string();
-    let timed_due_item_context =
-        due_item_context_messages(&list_due_tasks(&connection, 20, &now_iso)?);
+    let timed_due_item_context = due_item_context_messages(&timed_due_items);
     let mut due_item_dedupe_transcript = existing_transcript.clone();
     due_item_dedupe_transcript.extend(recall_context.iter().cloned());
+    due_item_dedupe_transcript.extend(timed_due_item_context.iter().cloned());
     let contextual_due_item_context = recall_due_item_context_messages(
         prompt,
         &due_item_dedupe_transcript,
@@ -15465,6 +15485,100 @@ mod tests {
             &mut connection,
             "What's happening?",
             &HybridDueItemModel,
+            build_live_tool_registry(&config),
+            PromptExecutionOptions {
+                role: MessageRole::User,
+                persist_input_message: true,
+                force_tool: None,
+                assistant_name: &config.assistant_name,
+                ensure_alternating_roles: config.llm_provider() == LlmProvider::Anthropic,
+                home_dir: &home,
+                bootstrap_plan: BootstrapPlan::from_config(&config),
+                messages_between_memory: config.messages_between_memory,
+                memories_between_consolidation: config.memories_between_consolidation,
+                messages_between_self_reflection: config.messages_between_self_reflection,
+                defer_auto_memory: false,
+                defer_self_reflection: false,
+                memory_recall_classifier_enabled: config.memory_recall_classifier_enabled,
+                memory_recall_classifier_window: config.memory_recall_classifier_window,
+                reflect: config.reflect,
+            },
+        )
+        .expect("prompt should succeed");
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::AssistantResponse { content }
+                if content.contains("Hybrid reminder text")
+        )));
+
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
+    fn run_prompt_with_model_and_registry_does_not_duplicate_hybrid_due_item_via_contextual_path() {
+        struct HybridDueItemDedupModel;
+
+        impl ModelClient for HybridDueItemDedupModel {
+            fn next_events(
+                &self,
+                request: ConversationRequest<'_>,
+            ) -> Result<Vec<StreamEvent>, elroy_core::ModelClientError> {
+                assert_eq!(request.user_message, "Can we talk about work?");
+                let tool_messages = request
+                    .transcript
+                    .iter()
+                    .filter_map(|message| {
+                        (message.role == MessageRole::Tool)
+                            .then_some(message.content.as_deref())
+                            .flatten()
+                    })
+                    .collect::<Vec<_>>();
+                let hybrid_mentions = tool_messages
+                    .iter()
+                    .filter(|content| content.contains("Hybrid reminder text"))
+                    .count();
+                assert_eq!(hybrid_mentions, 1, "{tool_messages:#?}");
+                Ok(vec![StreamEvent::AssistantResponse {
+                    content: "A hybrid reminder is due: Hybrid reminder text.".to_string(),
+                }])
+            }
+        }
+
+        let unique = format!(
+            "elroy-rs-app-hybrid-due-item-dedup-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+        fs::write(
+            agenda_dir.join("hybrid_test.md"),
+            "---\ndate: unscheduled\ncompleted: false\nstatus: created\ntrigger_datetime: 2000-01-01T09:00:00\ntrigger_context: when user mentions work\n---\n\nHybrid reminder text\n",
+        )
+        .expect("hybrid due item file should be written");
+
+        let mut config = AppConfig::defaults();
+        config.home_dir = home.clone();
+        config.memory_dir = memory_dir;
+        config.agenda_dir = agenda_dir;
+        config.database_path = database_path.clone();
+        elroy_db::bootstrap_database(&BootstrapPlan::from_config(&config))
+            .expect("bootstrap should succeed");
+
+        let mut connection = open_sqlite_connection(&database_path).expect("database should open");
+        run_migrations(&mut connection).expect("migrations should run");
+
+        let events = run_prompt_with_model_and_registry(
+            &mut connection,
+            "Can we talk about work?",
+            &HybridDueItemDedupModel,
             build_live_tool_registry(&config),
             PromptExecutionOptions {
                 role: MessageRole::User,
