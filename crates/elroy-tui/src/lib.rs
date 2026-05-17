@@ -4910,6 +4910,56 @@ mod tests {
     }
 
     #[test]
+    fn runtime_tick_defers_context_refresh_until_prompt_stream_finishes() {
+        let mut app = TuiApp::bootstrap();
+        let mut runtime = FakeRuntime::default();
+        let mut pending = Some(PendingPrompt {
+            submitted_prompt: Some("hello runtime".to_string()),
+            schedule_self_reflection: false,
+            before_ids: HashSet::new(),
+            stream: Box::new(FakePromptStream {
+                updates: vec![PromptUpdate::Status("thinking...".to_string())],
+                finalized_snapshot: TuiSnapshot::default(),
+                cancelled_snapshot: TuiSnapshot::default(),
+            }),
+        });
+        let scheduled_at = Instant::now();
+        let mut deferred_context_refresh_at = Some(scheduled_at);
+        let mut previous_background_status = None;
+
+        let result = drive_runtime_tick(
+            &mut app,
+            &mut runtime,
+            &mut pending,
+            scheduled_at,
+            &mut deferred_context_refresh_at,
+            &mut previous_background_status,
+        );
+
+        assert_eq!(result, None);
+        assert!(pending.is_some());
+        assert!(app.prompt_active);
+        assert_eq!(runtime.refresh_context_calls, 0);
+        assert_eq!(deferred_context_refresh_at, Some(scheduled_at));
+
+        pending = None;
+        app.prompt_active = false;
+        let after_prompt = Instant::now();
+        let result = drive_runtime_tick(
+            &mut app,
+            &mut runtime,
+            &mut pending,
+            after_prompt,
+            &mut deferred_context_refresh_at,
+            &mut previous_background_status,
+        );
+
+        assert_eq!(result, None);
+        assert_eq!(runtime.refresh_context_calls, 1);
+        assert!(deferred_context_refresh_at.is_none());
+    }
+
+    #[test]
     fn cancel_prompt_preserves_draft_text_and_refreshes_snapshot() {
         let mut app = TuiApp::bootstrap();
         app.input = "hello".to_string();
