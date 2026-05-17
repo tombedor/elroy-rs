@@ -17296,6 +17296,138 @@ User still wants to compare grocery prices after the shopping trip.",
     }
 
     #[test]
+    fn live_tool_registry_examine_memories_can_surface_older_semantic_due_item_via_embedding_without_relevance_model()
+     {
+        let unique = format!(
+            "elroy-rs-app-examine-memories-older-semantic-due-item-embedding-only-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+
+        for index in 0..120 {
+            fs::write(
+                agenda_dir.join(format!("recent_reminder_{index:03}.md")),
+                format!(
+                    "---\ndate: unscheduled\ncompleted: false\nstatus: created\ntrigger_context: after equipment handoff\n---\n\nReview the storage locker spreadsheet {index}.\n"
+                ),
+            )
+            .expect("recent due item should be written");
+        }
+        fs::write(
+            agenda_dir.join("old_training_reminder.md"),
+            "---\ndate: unscheduled\ncompleted: false\nstatus: created\ntrigger_context: before basketball practice\n---\n\nPack resistance bands before drills.\n",
+        )
+        .expect("older semantic due item should be written");
+
+        let mut embedding_server = mockito::Server::new();
+        let _query_embedding_mock = embedding_server
+            .mock("POST", "/embeddings")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "input": "What belongs in my workout kit?"
+            })))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "data": [{"embedding": [1.0, 0.0]}]
+                })
+                .to_string(),
+            )
+            .create();
+        let _semantic_embedding_mock = embedding_server
+            .mock("POST", "/embeddings")
+            .match_body(mockito::Matcher::Regex(
+                "Pack resistance bands before drills".to_string(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "data": [{"embedding": [1.0, 0.0]}]
+                })
+                .to_string(),
+            )
+            .create();
+        let _recent_embedding_mock = embedding_server
+            .mock("POST", "/embeddings")
+            .match_body(mockito::Matcher::Regex(
+                "Review the storage locker spreadsheet".to_string(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "data": [{"embedding": [0.0, 1.0]}]
+                })
+                .to_string(),
+            )
+            .create();
+
+        let mut config = AppConfig::defaults();
+        config.memory_dir = memory_dir;
+        config.agenda_dir = agenda_dir.clone();
+        config.database_path = database_path.clone();
+        config.embedding_model_api_key = Some("embedding-test-key".to_string());
+        config.embedding_model_api_base = Some(format!("{}/embeddings", embedding_server.url()));
+        config.openai_api_key = None;
+        config.fast_model_api_key = None;
+        elroy_db::bootstrap_database(&BootstrapPlan::from_config(&config))
+            .expect("bootstrap should succeed");
+
+        let connection = open_sqlite_connection(&database_path).expect("database should open");
+        for index in 0..120 {
+            connection
+                .execute(
+                    "UPDATE agenda_items SET updated_at_unix = ?1 WHERE file_path = ?2",
+                    rusqlite::params![
+                        10_000_i64 - index as i64,
+                        agenda_dir
+                            .join(format!("recent_reminder_{index:03}.md"))
+                            .display()
+                            .to_string(),
+                    ],
+                )
+                .expect("recent due item timestamp should update");
+        }
+        connection
+            .execute(
+                "UPDATE agenda_items SET updated_at_unix = 1 WHERE file_path = ?1",
+                rusqlite::params![
+                    agenda_dir
+                        .join("old_training_reminder.md")
+                        .display()
+                        .to_string(),
+                ],
+            )
+            .expect("older due item timestamp should update");
+
+        let registry = build_live_tool_registry(&config);
+        let result = registry.invoke(
+            "examine_memories",
+            "{\"question\":\"What belongs in my workout kit?\",\"limit\":5}",
+        );
+
+        assert!(!result.is_error);
+        assert!(result.content.contains("# Due Item: old training reminder"));
+        assert!(
+            result
+                .content
+                .contains("Pack resistance bands before drills.")
+        );
+        assert!(!result.content.contains("# Due Item: recent reminder 000"));
+
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
     fn live_tool_registry_examine_memories_can_prefer_semantic_agenda_item_over_weaker_overlap() {
         let unique = format!(
             "elroy-rs-app-examine-memories-semantic-agenda-item-{}",
