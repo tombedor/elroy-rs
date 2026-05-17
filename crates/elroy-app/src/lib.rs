@@ -7854,8 +7854,21 @@ fn select_relevant_recall_memories<'a>(
     let candidate_limit = limit.saturating_mul(3).max(limit);
     let overlap_candidates =
         select_recalled_memories(query, memories, already_recalled, candidate_limit);
-    let candidates = if overlap_candidates.is_empty() && relevance_model.is_some() {
-        recent_memory_candidates(memories, already_recalled, candidate_limit)
+    let candidates = if relevance_model.is_some() {
+        let mut merged_candidates = overlap_candidates;
+        for candidate in recent_memory_candidates(memories, already_recalled, candidate_limit) {
+            if merged_candidates
+                .iter()
+                .any(|existing| existing.id == candidate.id)
+            {
+                continue;
+            }
+            merged_candidates.push(candidate);
+            if merged_candidates.len() >= candidate_limit {
+                break;
+            }
+        }
+        merged_candidates
     } else {
         overlap_candidates
     };
@@ -7875,8 +7888,21 @@ fn select_relevant_recall_due_items<'a>(
 ) -> Vec<&'a AgendaItemRecord> {
     let candidate_limit = limit.saturating_mul(3).max(limit);
     let overlap_candidates = select_due_items_by_overlap(query, due_items, candidate_limit, None);
-    let candidates = if overlap_candidates.is_empty() && relevance_model.is_some() {
-        recent_due_item_candidates(due_items, candidate_limit)
+    let candidates = if relevance_model.is_some() {
+        let mut merged_candidates = overlap_candidates;
+        for candidate in recent_due_item_candidates(due_items, candidate_limit) {
+            if merged_candidates
+                .iter()
+                .any(|existing| existing.id == candidate.id)
+            {
+                continue;
+            }
+            merged_candidates.push(candidate);
+            if merged_candidates.len() >= candidate_limit {
+                break;
+            }
+        }
+        merged_candidates
     } else {
         overlap_candidates
     };
@@ -7947,8 +7973,21 @@ fn select_relevant_recall_agenda_items<'a>(
 ) -> Vec<&'a AgendaItemRecord> {
     let candidate_limit = limit.saturating_mul(3).max(limit);
     let overlap_candidates = select_agenda_items_by_overlap(query, agenda_items, candidate_limit);
-    let candidates = if overlap_candidates.is_empty() && relevance_model.is_some() {
-        recent_agenda_item_candidates(agenda_items, candidate_limit)
+    let candidates = if relevance_model.is_some() {
+        let mut merged_candidates = overlap_candidates;
+        for candidate in recent_agenda_item_candidates(agenda_items, candidate_limit) {
+            if merged_candidates
+                .iter()
+                .any(|existing| existing.id == candidate.id)
+            {
+                continue;
+            }
+            merged_candidates.push(candidate);
+            if merged_candidates.len() >= candidate_limit {
+                break;
+            }
+        }
+        merged_candidates
     } else {
         overlap_candidates
     };
@@ -17142,6 +17181,137 @@ mod tests {
     }
 
     #[test]
+    fn run_prompt_with_model_and_registry_can_prefer_semantic_recall_candidate_over_weaker_overlap()
+    {
+        struct SemanticRecallPromptModel;
+        struct SemanticRecallRelevanceModel;
+
+        impl ModelClient for SemanticRecallPromptModel {
+            fn next_events(
+                &self,
+                request: ConversationRequest<'_>,
+            ) -> Result<Vec<StreamEvent>, elroy_core::ModelClientError> {
+                assert_eq!(
+                    request.user_message,
+                    "What gear should I bring to practice?"
+                );
+                let recall_payload = request
+                    .transcript
+                    .iter()
+                    .find(|message| {
+                        message.role == MessageRole::Tool
+                            && message.tool_call_id.as_deref() == Some("bootstrap-memory-recall")
+                    })
+                    .and_then(|message| message.content.as_deref())
+                    .expect("fast recall payload should be injected");
+                assert!(
+                    recall_payload.contains("resistance bands"),
+                    "{recall_payload}"
+                );
+                assert!(
+                    !recall_payload.contains("Gear Inventory"),
+                    "{recall_payload}"
+                );
+                Ok(vec![StreamEvent::AssistantResponse {
+                    content: "Bring the resistance bands.".to_string(),
+                }])
+            }
+        }
+
+        impl ModelClient for SemanticRecallRelevanceModel {
+            fn next_events(
+                &self,
+                request: ConversationRequest<'_>,
+            ) -> Result<Vec<StreamEvent>, elroy_core::ModelClientError> {
+                let prompt = request.user_message;
+                let answers = if prompt.find("resistance bands")
+                    < prompt.find("storage locker spreadsheet")
+                {
+                    vec![true, false]
+                } else {
+                    vec![false, true]
+                };
+                Ok(vec![StreamEvent::AssistantResponse {
+                    content: serde_json::json!({
+                        "answers": answers,
+                        "reasoning": "Only the resistance-bands memory matches the user's intent."
+                    })
+                    .to_string(),
+                }])
+            }
+        }
+
+        let unique = format!(
+            "elroy-rs-app-recall-semantic-priority-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+
+        let mut config = AppConfig::defaults();
+        config.home_dir = home.clone();
+        config.memory_dir = memory_dir.clone();
+        config.agenda_dir = agenda_dir;
+        config.database_path = database_path.clone();
+
+        let mut connection = open_sqlite_connection(&database_path).expect("database should open");
+        run_migrations(&mut connection).expect("migrations should run");
+        fs::write(
+            memory_dir.join("gear_inventory.md"),
+            "# Gear Inventory\n\nReview the storage locker spreadsheet.\n",
+        )
+        .expect("overlap memory file should be written");
+        fs::write(
+            memory_dir.join("bands_note.md"),
+            "# Training Kit\n\nPack resistance bands before drills.\n",
+        )
+        .expect("semantic memory file should be written");
+        elroy_db::bootstrap_database(&BootstrapPlan::from_config(&config))
+            .expect("bootstrap should succeed");
+
+        let events = run_prompt_with_model_and_registry_internal(
+            &mut connection,
+            "What gear should I bring to practice?",
+            &SemanticRecallPromptModel,
+            Some(&SemanticRecallRelevanceModel),
+            ExecutableToolRegistry::new(vec![]),
+            PromptExecutionOptions {
+                role: MessageRole::User,
+                persist_input_message: true,
+                force_tool: None,
+                assistant_name: &config.assistant_name,
+                ensure_alternating_roles: config.llm_provider() == LlmProvider::Anthropic,
+                home_dir: &home,
+                bootstrap_plan: BootstrapPlan::from_config(&config),
+                messages_between_memory: config.messages_between_memory,
+                memories_between_consolidation: config.memories_between_consolidation,
+                messages_between_self_reflection: config.messages_between_self_reflection,
+                defer_auto_memory: false,
+                defer_self_reflection: false,
+                memory_recall_classifier_enabled: true,
+                memory_recall_classifier_window: 3,
+                reflect: false,
+            },
+        )
+        .expect("prompt should succeed");
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::AssistantResponse { content }
+                if content.contains("resistance bands")
+        )));
+
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
     fn run_prompt_with_model_and_registry_fast_recall_can_include_due_and_agenda_items() {
         struct MixedFastRecallPromptModel;
 
@@ -18527,6 +18697,178 @@ mod tests {
         assert_eq!(relevant_due_items[0].name, "bring backup cleats");
         assert_eq!(relevant_agenda_items.len(), 1);
         assert_eq!(relevant_agenda_items[0].name, "practice packing list");
+    }
+
+    #[test]
+    fn select_relevant_recall_helpers_can_prefer_semantic_matches_over_weaker_overlap_candidates() {
+        struct SemanticPriorityRelevanceModel;
+
+        impl ModelClient for SemanticPriorityRelevanceModel {
+            fn next_events(
+                &self,
+                request: ConversationRequest<'_>,
+            ) -> Result<Vec<StreamEvent>, elroy_core::ModelClientError> {
+                let prompt = request.user_message;
+                let answers = if prompt.contains("resistance bands")
+                    && prompt.contains("storage locker spreadsheet")
+                {
+                    if prompt.find("resistance bands") < prompt.find("storage locker spreadsheet") {
+                        vec![true, false]
+                    } else {
+                        vec![false, true]
+                    }
+                } else if prompt.contains("Carry resistance bands in the trunk.")
+                    && prompt.contains("Review the storage locker spreadsheet.")
+                {
+                    if prompt.find("Carry resistance bands in the trunk.")
+                        < prompt.find("Review the storage locker spreadsheet.")
+                    {
+                        vec![true, false]
+                    } else {
+                        vec![false, true]
+                    }
+                } else if prompt.contains("Pack resistance bands before drills.")
+                    && prompt.contains("Review the storage locker spreadsheet.")
+                {
+                    if prompt.find("Pack resistance bands before drills.")
+                        < prompt.find("Review the storage locker spreadsheet.")
+                    {
+                        vec![true, false]
+                    } else {
+                        vec![false, true]
+                    }
+                } else {
+                    panic!("unexpected relevance prompt: {prompt}");
+                };
+                Ok(vec![StreamEvent::AssistantResponse {
+                    content: serde_json::json!({
+                        "answers": answers,
+                        "reasoning": "Only the semantic candidate matches the user's intent."
+                    })
+                    .to_string(),
+                }])
+            }
+        }
+
+        let memories = vec![
+            MemoryRecord {
+                id: 1,
+                legacy_frontmatter_id: None,
+                name: "Gear Inventory".to_string(),
+                file_path: "/tmp/gear_inventory.md".to_string(),
+                body: "Review the storage locker spreadsheet.".to_string(),
+                is_active: true,
+                updated_at_unix: 10,
+            },
+            MemoryRecord {
+                id: 2,
+                legacy_frontmatter_id: None,
+                name: "Training Kit".to_string(),
+                file_path: "/tmp/practice_gear.md".to_string(),
+                body: "Pack resistance bands before drills.".to_string(),
+                is_active: true,
+                updated_at_unix: 20,
+            },
+        ];
+        let due_items = vec![
+            AgendaItemRecord {
+                id: 3,
+                legacy_frontmatter_id: None,
+                name: "Gear Inventory Reminder".to_string(),
+                file_path: "/tmp/gear_inventory_reminder.md".to_string(),
+                agenda_date: Some("unscheduled".to_string()),
+                is_completed: false,
+                status: Some("created".to_string()),
+                closing_comment: None,
+                checklist_total: 0,
+                checklist_completed: 0,
+                body: "Review the storage locker spreadsheet.".to_string(),
+                trigger_datetime: None,
+                trigger_context: Some("after equipment handoff".to_string()),
+                is_active: true,
+                updated_at_unix: 11,
+            },
+            AgendaItemRecord {
+                id: 4,
+                legacy_frontmatter_id: None,
+                name: "Locker Reminder".to_string(),
+                file_path: "/tmp/practice_reminder.md".to_string(),
+                agenda_date: Some("unscheduled".to_string()),
+                is_completed: false,
+                status: Some("created".to_string()),
+                closing_comment: None,
+                checklist_total: 0,
+                checklist_completed: 0,
+                body: "Carry resistance bands in the trunk.".to_string(),
+                trigger_datetime: None,
+                trigger_context: Some("before scrimmage".to_string()),
+                is_active: true,
+                updated_at_unix: 21,
+            },
+        ];
+        let agenda_items = vec![
+            AgendaItemRecord {
+                id: 5,
+                legacy_frontmatter_id: None,
+                name: "Gear Inventory Agenda".to_string(),
+                file_path: "/tmp/gear_inventory_agenda.md".to_string(),
+                agenda_date: Some("2026-05-21".to_string()),
+                is_completed: false,
+                status: Some("created".to_string()),
+                closing_comment: None,
+                checklist_total: 0,
+                checklist_completed: 0,
+                body: "Review the storage locker spreadsheet.".to_string(),
+                trigger_datetime: None,
+                trigger_context: None,
+                is_active: true,
+                updated_at_unix: 12,
+            },
+            AgendaItemRecord {
+                id: 6,
+                legacy_frontmatter_id: None,
+                name: "Training Kit List".to_string(),
+                file_path: "/tmp/practice_packing_list.md".to_string(),
+                agenda_date: Some("2026-05-22".to_string()),
+                is_completed: false,
+                status: Some("created".to_string()),
+                closing_comment: None,
+                checklist_total: 0,
+                checklist_completed: 0,
+                body: "Pack resistance bands before drills.".to_string(),
+                trigger_datetime: None,
+                trigger_context: None,
+                is_active: true,
+                updated_at_unix: 22,
+            },
+        ];
+
+        let relevant_memories = select_relevant_recall_memories(
+            "What gear should I bring to practice?",
+            &memories,
+            &[],
+            2,
+            Some(&SemanticPriorityRelevanceModel),
+        );
+        let relevant_due_items = select_relevant_recall_due_items(
+            "What gear should I bring to practice?",
+            &due_items,
+            2,
+            Some(&SemanticPriorityRelevanceModel),
+        );
+        let relevant_agenda_items = select_relevant_recall_agenda_items(
+            "What gear should I bring to practice?",
+            &agenda_items,
+            2,
+            Some(&SemanticPriorityRelevanceModel),
+        );
+
+        assert_eq!(relevant_memories.len(), 1);
+        assert_eq!(relevant_memories[0].name, "Training Kit");
+        assert_eq!(relevant_due_items.len(), 1);
+        assert_eq!(relevant_due_items[0].name, "Locker Reminder");
+        assert_eq!(relevant_agenda_items.len(), 1);
+        assert_eq!(relevant_agenda_items[0].name, "Training Kit List");
     }
 
     fn init_test_repo(repo_root: &Path) {
