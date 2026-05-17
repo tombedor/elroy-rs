@@ -1477,6 +1477,83 @@ mod tests {
     }
 
     #[test]
+    fn cli_tui_runtime_preserves_background_command_tool_failures_in_snapshot() {
+        let _guard = cli_runtime_test_lock()
+            .lock()
+            .expect("cli runtime test lock should work");
+        let unique = format!(
+            "elroy-rs-cli-background-command-tool-failure-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+
+        let mut config = AppConfig::defaults();
+        config.home_dir = home.clone();
+        config.config_path = home.join("elroy.conf.yaml");
+        config.memory_dir = memory_dir;
+        config.agenda_dir = agenda_dir;
+        config.database_path = database_path;
+
+        let mut runtime = CliTuiRuntime::new(AppRuntime::new(config));
+        runtime
+            .start_command_execution(TuiCommandExecution {
+                command_name: "show_memory".to_string(),
+                display_name: "show_memory".to_string(),
+                values: vec![],
+            })
+            .expect("background command should schedule");
+
+        let background_status = loop {
+            let status = runtime
+                .background_status()
+                .expect("background status should load");
+            if status.as_deref() == Some("running command...") {
+                break status;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        assert_eq!(background_status.as_deref(), Some("running command..."));
+
+        let completed_snapshot = loop {
+            if let Some(snapshot) = runtime
+                .poll_command_execution()
+                .expect("command polling should succeed")
+            {
+                break snapshot;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        };
+
+        assert_eq!(
+            completed_snapshot.status.as_deref(),
+            Some("slash command failed: /show_memory")
+        );
+        assert!(
+            completed_snapshot
+                .conversation_lines
+                .last()
+                .is_some_and(|line| line == "tool error: show_memory requires a string name")
+        );
+        assert!(runtime.deferred_command_execution.is_none());
+        assert_eq!(
+            runtime
+                .background_status()
+                .expect("background status should load"),
+            None
+        );
+
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
     fn cli_tui_runtime_background_command_can_return_restart_request() {
         let _guard = cli_runtime_test_lock()
             .lock()
