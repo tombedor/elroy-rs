@@ -64,6 +64,7 @@ const DEFAULT_READ_LINE_LIMIT: usize = 200;
 const CONTEXT_MESSAGE_SOURCE_TYPE: &str = "ContextMessageSet";
 const MEMORY_SOURCE_TYPE: &str = "Memory";
 const MEMORY_WORD_COUNT_LIMIT: usize = 300;
+const MEMORY_CONSOLIDATION_CLUSTER_LIMIT: usize = 3;
 const DEFAULT_RESTART_RESUME_PROMPT: &str =
     "Elroy just restarted. Send a brief message that you are back and ready to continue.";
 
@@ -2235,7 +2236,10 @@ fn consolidate_semantic_memory_clusters(
         settings.max_memory_cluster_size,
     );
 
-    for cluster in clusters {
+    for cluster in clusters
+        .into_iter()
+        .take(MEMORY_CONSOLIDATION_CLUSTER_LIMIT)
+    {
         let cluster_memories = cluster
             .into_iter()
             .filter_map(|index| memories.get(index).cloned())
@@ -11747,6 +11751,165 @@ mod tests {
                 .iter()
                 .any(|memory| memory.name == "user s grocery price comparison follow up")
         );
+
+        let tracker = load_memory_operation_tracker(&connection, LOCAL_USER_TOKEN)
+            .expect("tracker should load")
+            .expect("tracker should exist");
+        assert_eq!(tracker.memories_since_consolidation, 0);
+
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
+    fn create_memory_tool_limits_semantic_consolidation_to_top_three_clusters_per_run() {
+        let unique = format!(
+            "elroy-rs-app-semantic-memory-cluster-limit-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+
+        let mut server = mockito::Server::new();
+        for (text, embedding) in [
+            ("alpha trip detail one", "[1.0, 0.0]"),
+            ("alpha trip detail two", "[0.999, 0.001]"),
+            ("alpha trip detail three", "[0.998, 0.002]"),
+            ("beta recipe detail one", "[0.0, 1.0]"),
+            ("beta recipe detail two", "[0.001, 0.999]"),
+            ("beta recipe detail three", "[0.002, 0.998]"),
+            ("gamma project detail one", "[-1.0, 0.0]"),
+            ("gamma project detail two", "[-0.999, 0.001]"),
+            ("gamma project detail three", "[-0.998, 0.002]"),
+            ("delta pricing detail one", "[0.0, -1.0]"),
+            ("delta pricing detail two", "[0.12, -0.993]"),
+            ("delta pricing detail three", "[0.24, -0.971]"),
+        ] {
+            server
+                .mock("POST", "/embeddings")
+                .match_body(mockito::Matcher::Regex(text.to_string()))
+                .with_status(200)
+                .with_header("content-type", "application/json")
+                .with_body(format!(r#"{{"data":[{{"embedding":{embedding}}}]}}"#))
+                .create();
+        }
+
+        let _alpha_consolidation = server
+            .mock("POST", "/responses")
+            .match_body(mockito::Matcher::Regex("alpha trip one".to_string()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "output": [{
+                        "type": "message",
+                        "content": [{
+                            "type": "output_text",
+                            "text": "# Memory Consolidation Reasoning\nMerged the alpha trip notes.\n\n## alpha consolidated memory\nThe alpha trip details belong in one memory."
+                        }]
+                    }]
+                })
+                .to_string(),
+            )
+            .create();
+        let _beta_consolidation = server
+            .mock("POST", "/responses")
+            .match_body(mockito::Matcher::Regex("beta recipe one".to_string()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "output": [{
+                        "type": "message",
+                        "content": [{
+                            "type": "output_text",
+                            "text": "# Memory Consolidation Reasoning\nMerged the beta recipe notes.\n\n## beta consolidated memory\nThe beta recipe details belong in one memory."
+                        }]
+                    }]
+                })
+                .to_string(),
+            )
+            .create();
+        let _gamma_consolidation = server
+            .mock("POST", "/responses")
+            .match_body(mockito::Matcher::Regex("gamma project one".to_string()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "output": [{
+                        "type": "message",
+                        "content": [{
+                            "type": "output_text",
+                            "text": "# Memory Consolidation Reasoning\nMerged the gamma project notes.\n\n## gamma consolidated memory\nThe gamma project details belong in one memory."
+                        }]
+                    }]
+                })
+                .to_string(),
+            )
+            .create();
+
+        let mut config = AppConfig::defaults();
+        config.memory_dir = memory_dir.clone();
+        config.agenda_dir = agenda_dir;
+        config.database_path = database_path.clone();
+        config.memories_between_consolidation = 12;
+        config.min_memory_cluster_size = 3;
+        config.max_memory_cluster_size = 5;
+        config.memory_cluster_similarity_threshold = 0.05;
+        config.fast_model = Some("gpt-5.4-mini".to_string());
+        config.fast_model_api_key = Some("fast-test-key".to_string());
+        config.fast_model_api_base = Some(format!("{}/responses", server.url()));
+        config.embedding_model = "text-embedding-3-small".to_string();
+        config.embedding_model_api_key = Some("embedding-test-key".to_string());
+        config.embedding_model_api_base = Some(format!("{}/embeddings", server.url()));
+
+        let registry = build_live_tool_registry(&config);
+        for (name, text) in [
+            ("alpha trip one", "alpha trip detail one"),
+            ("alpha trip two", "alpha trip detail two"),
+            ("alpha trip three", "alpha trip detail three"),
+            ("beta recipe one", "beta recipe detail one"),
+            ("beta recipe two", "beta recipe detail two"),
+            ("beta recipe three", "beta recipe detail three"),
+            ("gamma project one", "gamma project detail one"),
+            ("gamma project two", "gamma project detail two"),
+            ("gamma project three", "gamma project detail three"),
+            ("delta pricing one", "delta pricing detail one"),
+            ("delta pricing two", "delta pricing detail two"),
+            ("delta pricing three", "delta pricing detail three"),
+        ] {
+            let result = registry.invoke(
+                "create_memory",
+                &format!("{{\"name\":\"{name}\",\"text\":\"{text}\"}}"),
+            );
+            assert!(!result.is_error, "{name} should be created");
+        }
+
+        let connection = open_sqlite_connection(&database_path).expect("database should reopen");
+        let active_memories =
+            elroy_db::list_active_memories(&connection, 20).expect("active memories should list");
+        let active_names = active_memories
+            .iter()
+            .map(|memory| memory.name.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(active_memories.len(), 6);
+        assert!(active_names.contains(&"alpha consolidated memory"));
+        assert!(active_names.contains(&"beta consolidated memory"));
+        assert!(active_names.contains(&"gamma consolidated memory"));
+        assert!(active_names.contains(&"delta pricing one"));
+        assert!(active_names.contains(&"delta pricing two"));
+        assert!(active_names.contains(&"delta pricing three"));
+        assert!(!active_names.contains(&"alpha trip one"));
+        assert!(!active_names.contains(&"beta recipe one"));
+        assert!(!active_names.contains(&"gamma project one"));
 
         let tracker = load_memory_operation_tracker(&connection, LOCAL_USER_TOKEN)
             .expect("tracker should load")
