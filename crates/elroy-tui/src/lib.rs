@@ -3621,6 +3621,18 @@ mod tests {
             command_palette
                 .all_entries
                 .iter()
+                .any(|entry| entry.title == "Focus Memories")
+        );
+        assert!(
+            command_palette
+                .all_entries
+                .iter()
+                .any(|entry| entry.title == "Focus Agenda")
+        );
+        assert!(
+            command_palette
+                .all_entries
+                .iter()
                 .any(|entry| entry.title == "Focus Improvements")
         );
         assert!(
