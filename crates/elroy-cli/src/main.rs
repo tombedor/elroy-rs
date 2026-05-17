@@ -905,6 +905,96 @@ mod tests {
     }
 
     #[test]
+    fn cli_tui_runtime_runs_deferred_context_refresh_through_polling_boundary() {
+        let unique = format!(
+            "elroy-rs-cli-deferred-context-refresh-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+
+        let mut connection = open_sqlite_connection(&database_path).expect("database should open");
+        run_migrations(&mut connection).expect("migrations should run");
+
+        let mut transcript = vec![ConversationMessage::new(MessageRole::System, "system")];
+        for index in 0..8 {
+            transcript.push(ConversationMessage::new(
+                MessageRole::User,
+                format!("user {index} words repeated repeated repeated repeated"),
+            ));
+            transcript.push(ConversationMessage::new(
+                MessageRole::Assistant,
+                format!("assistant {index} words repeated repeated repeated repeated"),
+            ));
+        }
+        let original_len = transcript.len();
+        replace_context_messages(&mut connection, "local-user", &transcript)
+            .expect("messages should persist");
+        drop(connection);
+
+        let mut config = AppConfig::defaults();
+        config.home_dir = home.clone();
+        config.config_path = home.join("elroy.conf.yaml");
+        config.memory_dir = memory_dir.clone();
+        config.agenda_dir = agenda_dir;
+        config.database_path = database_path.clone();
+        config.max_tokens = 40;
+
+        let mut runtime = CliTuiRuntime::new(AppRuntime::new(config.clone()));
+        runtime
+            .refresh_context_if_needed()
+            .expect("deferred context refresh should schedule");
+
+        assert!(runtime.deferred_context_refresh.is_some());
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            let _ = runtime
+                .load_snapshot()
+                .expect("snapshot reload should poll deferred refresh");
+            if runtime.deferred_context_refresh.is_none() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        assert!(runtime.deferred_context_refresh.is_none());
+        assert!(runtime.deferred_context_refresh_error.is_none());
+
+        let mut reopened =
+            open_sqlite_connection(&config.database_path).expect("database should reopen");
+        let stored = elroy_db::load_context_messages(&mut reopened, "local-user").expect("load ok");
+        assert!(stored.len() < original_len);
+        assert_eq!(stored[0].role, MessageRole::System);
+        assert_eq!(
+            stored[stored.len() - 2]
+                .tool_calls
+                .as_ref()
+                .and_then(|calls| calls.first())
+                .map(|call| call.name.as_str()),
+            Some("context_summary")
+        );
+        assert_eq!(stored[stored.len() - 1].role, MessageRole::Tool);
+        let summary_content = stored[stored.len() - 1]
+            .content
+            .as_deref()
+            .expect("summary tool content should exist");
+        assert!(summary_content.starts_with("Recent conversation summary:"));
+
+        let memories = elroy_db::list_active_memories(&reopened, 10).expect("memories should list");
+        assert_eq!(memories.len(), 1);
+
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
     fn prompt_arg_ignores_missing_prompt_flag() {
         let args = vec!["--tui".to_string()];
         assert_eq!(prompt_arg(&args), None);
