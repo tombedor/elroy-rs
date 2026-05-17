@@ -7872,6 +7872,8 @@ Query: {query}\nResponses:\n{responses}"
         .collect()
 }
 
+const SEMANTIC_RECALL_CANDIDATE_LIMIT: usize = 25;
+
 fn select_relevant_recall_memories<'a>(
     query: &str,
     memories: &'a [MemoryRecord],
@@ -7879,7 +7881,11 @@ fn select_relevant_recall_memories<'a>(
     limit: usize,
     relevance_model: Option<&dyn ModelClient>,
 ) -> Vec<&'a MemoryRecord> {
-    let candidate_limit = limit.saturating_mul(3).max(limit);
+    let candidate_limit = if relevance_model.is_some() {
+        limit.saturating_mul(3).max(SEMANTIC_RECALL_CANDIDATE_LIMIT)
+    } else {
+        limit.saturating_mul(3).max(limit)
+    };
     let overlap_candidates =
         select_recalled_memories(query, memories, already_recalled, candidate_limit);
     let candidates = if relevance_model.is_some() {
@@ -7914,7 +7920,11 @@ fn select_relevant_recall_due_items<'a>(
     limit: usize,
     relevance_model: Option<&dyn ModelClient>,
 ) -> Vec<&'a AgendaItemRecord> {
-    let candidate_limit = limit.saturating_mul(3).max(limit);
+    let candidate_limit = if relevance_model.is_some() {
+        limit.saturating_mul(3).max(SEMANTIC_RECALL_CANDIDATE_LIMIT)
+    } else {
+        limit.saturating_mul(3).max(limit)
+    };
     let overlap_candidates = select_due_items_by_overlap(query, due_items, candidate_limit, None);
     let candidates = if relevance_model.is_some() {
         let mut merged_candidates = overlap_candidates;
@@ -7956,7 +7966,11 @@ fn select_relevant_contextual_due_items<'a>(
     limit: usize,
     relevance_model: Option<&dyn ModelClient>,
 ) -> Vec<&'a AgendaItemRecord> {
-    let candidate_limit = limit.saturating_mul(3).max(limit);
+    let candidate_limit = if relevance_model.is_some() {
+        limit.saturating_mul(3).max(SEMANTIC_RECALL_CANDIDATE_LIMIT)
+    } else {
+        limit.saturating_mul(3).max(limit)
+    };
     let overlap_candidates =
         select_due_items_by_overlap(query, due_items, candidate_limit, Some(now_iso));
     let candidates = if relevance_model.is_some() {
@@ -7999,7 +8013,11 @@ fn select_relevant_recall_agenda_items<'a>(
     limit: usize,
     relevance_model: Option<&dyn ModelClient>,
 ) -> Vec<&'a AgendaItemRecord> {
-    let candidate_limit = limit.saturating_mul(3).max(limit);
+    let candidate_limit = if relevance_model.is_some() {
+        limit.saturating_mul(3).max(SEMANTIC_RECALL_CANDIDATE_LIMIT)
+    } else {
+        limit.saturating_mul(3).max(limit)
+    };
     let overlap_candidates = select_agenda_items_by_overlap(query, agenda_items, candidate_limit);
     let candidates = if relevance_model.is_some() {
         let mut merged_candidates = overlap_candidates;
@@ -8821,11 +8839,11 @@ mod tests {
         recalled_memory_names, recent_recall_context, refresh_context_if_needed,
         run_prompt_with_model_and_registry, run_prompt_with_model_and_registry_internal,
         run_prompt_with_model_and_registry_stream, select_due_items_by_overlap,
-        select_recalled_due_items, select_recalled_memories, select_relevant_recall_agenda_items,
-        select_relevant_recall_due_items, select_relevant_recall_memories, should_offer_greeting,
-        should_skip_memory_recall, significant_tokens, strip_input_message_for_persistence,
-        strip_transient_context_messages, summarize_context_messages_with_model,
-        synthetic_tool_context_messages,
+        select_recalled_due_items, select_recalled_memories, select_relevant_contextual_due_items,
+        select_relevant_recall_agenda_items, select_relevant_recall_due_items,
+        select_relevant_recall_memories, should_offer_greeting, should_skip_memory_recall,
+        significant_tokens, strip_input_message_for_persistence, strip_transient_context_messages,
+        summarize_context_messages_with_model, synthetic_tool_context_messages,
     };
     use elroy_agenda::create_agenda_file;
     use elroy_codex::{
@@ -14143,6 +14161,62 @@ mod tests {
         assert!(joined_tool_content.contains("Practice Reminder"));
         assert!(joined_tool_content.contains("Bring the resistance bands"));
         assert!(!joined_tool_content.contains("Gear Inventory"));
+    }
+
+    #[test]
+    fn select_relevant_contextual_due_items_can_surface_older_semantic_candidate() {
+        let mut due_items = (0..7)
+            .map(|index| AgendaItemRecord {
+                id: index + 1,
+                legacy_frontmatter_id: None,
+                name: format!("Recent Reminder {index}"),
+                file_path: format!("/tmp/recent_reminder_{index}.md"),
+                agenda_date: Some("unscheduled".to_string()),
+                is_completed: false,
+                status: Some("created".to_string()),
+                trigger_datetime: None,
+                trigger_context: Some("after equipment handoff".to_string()),
+                closing_comment: None,
+                checklist_total: 0,
+                checklist_completed: 0,
+                body: format!("Review the storage locker spreadsheet {index}."),
+                is_active: true,
+                updated_at_unix: 100 - index,
+            })
+            .collect::<Vec<_>>();
+        due_items.push(AgendaItemRecord {
+            id: 99,
+            legacy_frontmatter_id: None,
+            name: "Old Training Reminder".to_string(),
+            file_path: "/tmp/old_training_reminder.md".to_string(),
+            agenda_date: Some("unscheduled".to_string()),
+            is_completed: false,
+            status: Some("created".to_string()),
+            trigger_datetime: None,
+            trigger_context: Some("before basketball practice".to_string()),
+            closing_comment: None,
+            checklist_total: 0,
+            checklist_completed: 0,
+            body: "Pack resistance bands before drills.".to_string(),
+            is_active: true,
+            updated_at_unix: 1,
+        });
+        let model = FakeModel::new(vec![vec![StreamEvent::AssistantResponse {
+            content: r#"{"answers":[false,false,false,false,false,false,false,true],"reasoning":"Only the older practice reminder is semantically relevant."}"#
+                .to_string(),
+        }]]);
+
+        let relevant_due_items = select_relevant_contextual_due_items(
+            "What belongs in my workout kit?",
+            &due_items,
+            "2026-05-15T12:00:00",
+            2,
+            Some(&model),
+        );
+
+        assert_eq!(relevant_due_items.len(), 1);
+        assert_eq!(relevant_due_items[0].name, "Old Training Reminder");
+        assert!(relevant_due_items[0].body.contains("resistance bands"));
     }
 
     #[test]
@@ -19598,6 +19672,62 @@ mod tests {
         assert_eq!(relevant_due_items[0].name, "Locker Reminder");
         assert_eq!(relevant_agenda_items.len(), 1);
         assert_eq!(relevant_agenda_items[0].name, "Training Kit List");
+    }
+
+    #[test]
+    fn recall_memory_context_messages_can_surface_older_semantic_memory_candidate() {
+        let transcript = vec![ConversationMessage::new(
+            MessageRole::Assistant,
+            "What should I remember for practice?",
+        )];
+        let mut memories = (0..7)
+            .map(|index| MemoryRecord {
+                id: index + 1,
+                legacy_frontmatter_id: None,
+                name: format!("Recent Memory {index}"),
+                file_path: format!("/tmp/recent_memory_{index}.md"),
+                body: format!("Review the storage locker spreadsheet {index}."),
+                is_active: true,
+                updated_at_unix: 100 - index,
+            })
+            .collect::<Vec<_>>();
+        memories.push(MemoryRecord {
+            id: 99,
+            legacy_frontmatter_id: None,
+            name: "Old Training Kit".to_string(),
+            file_path: "/tmp/old_training_kit.md".to_string(),
+            body: "Pack resistance bands before drills.".to_string(),
+            is_active: true,
+            updated_at_unix: 1,
+        });
+        let model = FakeModel::new(vec![vec![StreamEvent::AssistantResponse {
+            content: r#"{"answers":[false,false,false,false,false,false,false,true],"reasoning":"Only the older training-kit memory is semantically relevant."}"#
+                .to_string(),
+        }]]);
+
+        let messages = recall_memory_context_messages_with_decision(
+            3,
+            false,
+            "What gear should I bring to practice?",
+            true,
+            Some(&model),
+            RecallContext {
+                transcript: &transcript,
+                memories: &memories,
+                due_items: &[],
+                agenda_items: &[],
+            },
+        );
+
+        let joined_tool_content = messages
+            .iter()
+            .filter(|message| message.role == MessageRole::Tool)
+            .filter_map(|message| message.content.as_deref())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined_tool_content.contains("Old Training Kit"));
+        assert!(joined_tool_content.contains("resistance bands"));
+        assert!(!joined_tool_content.contains("Recent Memory 0"));
     }
 
     fn init_test_repo(repo_root: &Path) {
