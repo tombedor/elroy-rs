@@ -16978,6 +16978,174 @@ mod tests {
     }
 
     #[test]
+    fn refresh_context_if_needed_persists_model_authored_summary_when_provider_available() {
+        let unique = format!(
+            "elroy-rs-app-context-refresh-model-summary-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+
+        let mut server = mockito::Server::new();
+        let _mock = server
+            .mock("POST", "/responses")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "output": [{
+                        "type": "message",
+                        "content": [{
+                            "type": "output_text",
+                            "text": "I reminded the user about payroll and kept the conversation focused."
+                        }]
+                    }]
+                })
+                .to_string(),
+            )
+            .create();
+
+        let mut connection = open_sqlite_connection(&database_path).expect("database should open");
+        run_migrations(&mut connection).expect("migrations should run");
+
+        let mut transcript = vec![ConversationMessage::new(MessageRole::System, "system")];
+        for index in 0..8 {
+            transcript.push(ConversationMessage::new(
+                MessageRole::User,
+                format!("user {index} mentioned payroll and planning repeated repeated"),
+            ));
+            transcript.push(ConversationMessage::new(
+                MessageRole::Assistant,
+                format!("assistant {index} replied about payroll and planning repeated repeated"),
+            ));
+        }
+        elroy_db::replace_context_messages(&mut connection, LOCAL_USER_TOKEN, &transcript)
+            .expect("messages should persist");
+
+        let mut config = AppConfig::defaults();
+        config.home_dir = home.clone();
+        config.memory_dir = memory_dir;
+        config.agenda_dir = agenda_dir;
+        config.database_path = database_path.clone();
+        config.max_tokens = 40;
+        config.openai_api_key = Some("test-key".to_string());
+        config.openai_base_url = format!("{}/responses", server.url());
+
+        let refreshed = refresh_context_if_needed(
+            &mut connection,
+            &config,
+            &BootstrapPlan::from_config(&config),
+        )
+        .expect("context refresh should succeed");
+
+        assert!(refreshed);
+
+        let stored =
+            elroy_db::load_context_messages(&mut connection, LOCAL_USER_TOKEN).expect("load ok");
+        let summary_content = stored[stored.len() - 1]
+            .content
+            .as_deref()
+            .expect("summary tool content should exist");
+        assert_eq!(
+            summary_content,
+            "Recent conversation summary: I reminded the user about payroll and kept the conversation focused."
+        );
+
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
+    fn refresh_context_if_needed_falls_back_to_deterministic_summary_when_model_returns_empty_text()
+    {
+        let unique = format!(
+            "elroy-rs-app-context-refresh-summary-fallback-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+
+        let mut server = mockito::Server::new();
+        let _mock = server
+            .mock("POST", "/responses")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "output": [{
+                        "type": "message",
+                        "content": [{
+                            "type": "output_text",
+                            "text": ""
+                        }]
+                    }]
+                })
+                .to_string(),
+            )
+            .create();
+
+        let mut connection = open_sqlite_connection(&database_path).expect("database should open");
+        run_migrations(&mut connection).expect("migrations should run");
+
+        let mut transcript = vec![ConversationMessage::new(MessageRole::System, "system")];
+        for index in 0..8 {
+            transcript.push(ConversationMessage::new(
+                MessageRole::User,
+                format!("user {index} words repeated repeated repeated repeated"),
+            ));
+            transcript.push(ConversationMessage::new(
+                MessageRole::Assistant,
+                format!("assistant {index} words repeated repeated repeated repeated"),
+            ));
+        }
+        elroy_db::replace_context_messages(&mut connection, LOCAL_USER_TOKEN, &transcript)
+            .expect("messages should persist");
+
+        let mut config = AppConfig::defaults();
+        config.home_dir = home.clone();
+        config.memory_dir = memory_dir;
+        config.agenda_dir = agenda_dir;
+        config.database_path = database_path.clone();
+        config.max_tokens = 40;
+        config.openai_api_key = Some("test-key".to_string());
+        config.openai_base_url = format!("{}/responses", server.url());
+
+        let refreshed = refresh_context_if_needed(
+            &mut connection,
+            &config,
+            &BootstrapPlan::from_config(&config),
+        )
+        .expect("context refresh should succeed");
+
+        assert!(refreshed);
+
+        let stored =
+            elroy_db::load_context_messages(&mut connection, LOCAL_USER_TOKEN).expect("load ok");
+        let summary_content = stored[stored.len() - 1]
+            .content
+            .as_deref()
+            .expect("summary tool content should exist");
+        assert!(summary_content.starts_with("Recent conversation summary:"));
+        assert!(summary_content.contains("user 7 words repeated"));
+        assert!(summary_content.contains("assistant 7 words repeated"));
+
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
     fn format_context_summary_message_creates_bounded_summary_text() {
         let now = Utc::now().timestamp();
         let summary = format_context_summary_message(&[
