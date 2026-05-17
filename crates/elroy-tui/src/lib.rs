@@ -343,6 +343,7 @@ fn run_event_loop(
             app,
             runtime,
             pending_prompt.is_some(),
+            app.command_active,
             previous_background_status.as_deref(),
             current_background_status.as_deref(),
         );
@@ -826,10 +827,14 @@ fn maybe_refresh_snapshot_after_background_completion(
     app: &mut TuiApp,
     runtime: &mut impl TuiRuntime,
     prompt_active: bool,
+    command_active: bool,
     previous_background_status: Option<&str>,
     current_background_status: Option<&str>,
 ) {
-    if prompt_active || previous_background_status.is_none() || current_background_status.is_some()
+    if prompt_active
+        || command_active
+        || previous_background_status.is_none()
+        || current_background_status.is_some()
     {
         return;
     }
@@ -4134,6 +4139,7 @@ mod tests {
             &mut app,
             &mut runtime,
             false,
+            false,
             Some("refreshing context..."),
             None,
         );
@@ -4161,6 +4167,7 @@ mod tests {
             &mut app,
             &mut runtime,
             false,
+            false,
             Some("refreshing context..."),
             None,
         );
@@ -4186,6 +4193,33 @@ mod tests {
         maybe_refresh_snapshot_after_background_completion(
             &mut app,
             &mut runtime,
+            true,
+            false,
+            Some("refreshing context..."),
+            None,
+        );
+
+        assert_eq!(app.memory_titles, vec!["Stale Memory".to_string()]);
+    }
+
+    #[test]
+    fn active_command_does_not_refresh_snapshot_from_background_completion() {
+        let mut app = TuiApp::from_snapshot(TuiSnapshot {
+            memory_titles: vec!["Stale Memory".to_string()],
+            ..TuiSnapshot::default()
+        });
+        let mut runtime = FakeRuntime {
+            snapshot: TuiSnapshot {
+                memory_titles: vec!["Fresh Memory".to_string()],
+                ..TuiSnapshot::default()
+            },
+            ..FakeRuntime::default()
+        };
+
+        maybe_refresh_snapshot_after_background_completion(
+            &mut app,
+            &mut runtime,
+            false,
             true,
             Some("refreshing context..."),
             None,
