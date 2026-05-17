@@ -5133,6 +5133,13 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
             ) {
                 return ToolExecutionResult::error(format!("memory mutation failed: {error}"));
             }
+            if let Err(error) = sync_memory_context_after_mutation(
+                &config_for_outdated_memory_update,
+                &memory.name,
+                Some(&memory.name),
+            ) {
+                return ToolExecutionResult::error(format!("memory mutation failed: {error}"));
+            }
             ToolExecutionResult::success(format!("Memory '{memory_name}' has been updated"))
         },
     );
@@ -7273,6 +7280,8 @@ fn mutate_memory_file_from_config(
     match operation(Path::new(&memory.file_path)).and_then(|()| {
         elroy_db::bootstrap_database(&BootstrapPlan::from_config(config))
             .map_err(|error| std::io::Error::other(error.to_string()))?;
+        sync_memory_context_after_mutation(config, &memory.name, Some(&memory.name))
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
         Ok(())
     }) {
         Ok(()) => ToolExecutionResult::success(
@@ -8025,6 +8034,36 @@ fn remove_context_memory_messages_by_names_from_database_path(
                 .any(|tool_call_id| message_matches_tool_call_id(message, tool_call_id))
         })
         .collect::<Vec<_>>();
+    replace_context_messages(&mut connection, LOCAL_USER_TOKEN, &updated_transcript)?;
+    Ok(())
+}
+
+fn sync_memory_context_after_mutation(
+    config: &AppConfig,
+    old_name: &str,
+    current_name: Option<&str>,
+) -> Result<(), AppError> {
+    let mut connection = open_sqlite_connection(&config.database_path)?;
+    run_migrations(&mut connection)?;
+    let transcript = load_validated_runtime_transcript(
+        &mut connection,
+        &config.assistant_name,
+        config.llm_provider() == LlmProvider::Anthropic,
+    )?;
+    let old_tool_call_id = context_memory_tool_call_id(old_name);
+    let mut updated_transcript = transcript
+        .into_iter()
+        .filter(|message| !message_matches_tool_call_id(message, &old_tool_call_id))
+        .collect::<Vec<_>>();
+
+    if let Some(current_name) = current_name
+        && let Some(memory) =
+            find_active_memory_by_name_in_scope(&connection, current_name, &config.memory_dir)?
+        && !transcript_contains_context_memory(&updated_transcript, &memory.name)
+    {
+        updated_transcript.extend(context_memory_tool_messages(&memory));
+    }
+
     replace_context_messages(&mut connection, LOCAL_USER_TOKEN, &updated_transcript)?;
     Ok(())
 }
@@ -13131,6 +13170,59 @@ User still wants to compare grocery prices after the shopping trip.",
     }
 
     #[test]
+    fn update_memory_refreshes_pinned_current_context() {
+        let unique = format!(
+            "elroy-rs-app-update-memory-refreshes-context-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+        fs::write(memory_dir.join("runner_notes.md"), "old text\n")
+            .expect("memory file should be written");
+
+        let mut config = AppConfig::defaults();
+        config.memory_dir = memory_dir.clone();
+        config.agenda_dir = agenda_dir;
+        config.database_path = database_path;
+        elroy_db::bootstrap_database(&elroy_db::BootstrapPlan::from_config(&config))
+            .expect("bootstrap should succeed");
+
+        let registry = build_live_tool_registry(&config);
+        let add = registry.invoke(
+            "add_memory_to_current_context",
+            "{\"memory_name\":\"runner notes\"}",
+        );
+        assert!(!add.is_error);
+
+        let update = registry.invoke(
+            "update_memory",
+            "{\"memory_name\":\"runner notes\",\"text\":\"new text\"}",
+        );
+        assert!(!update.is_error);
+
+        let context = registry.invoke("show_context_messages", "{\"limit\":20}");
+        assert!(!context.is_error);
+        assert!(context.content.contains("new text"));
+        assert!(!context.content.contains("old text"));
+        assert_eq!(
+            context
+                .content
+                .matches("\"tool_call_id\": \"context-memory:runner notes\"")
+                .count(),
+            1
+        );
+
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
     fn live_tool_registry_can_append_outdated_memory_update() {
         let unique = format!(
             "elroy-rs-app-outdated-memory-update-{}",
@@ -13238,6 +13330,27 @@ User still wants to compare grocery prices after the shopping trip.",
         assert!(!historical_rows[1].1);
         assert!(historical_rows[1].2.contains("old text"));
         assert!(!historical_rows[1].2.contains("new correction"));
+
+        let add = registry.invoke(
+            "add_memory_to_current_context",
+            "{\"memory_name\":\"runner notes\"}",
+        );
+        assert!(!add.is_error);
+        let refreshed = registry.invoke(
+            "update_outdated_or_incorrect_memory",
+            "{\"memory_name\":\"runner notes\",\"update_text\":\"second correction\"}",
+        );
+        assert!(!refreshed.is_error);
+        let context = registry.invoke("show_context_messages", "{\"limit\":20}");
+        assert!(!context.is_error);
+        assert!(context.content.contains("second correction"));
+        assert_eq!(
+            context
+                .content
+                .matches("\"tool_call_id\": \"context-memory:runner notes\"")
+                .count(),
+            1
+        );
 
         fs::remove_dir_all(home).expect("home should be removed");
     }
