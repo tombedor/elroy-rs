@@ -1458,6 +1458,13 @@ impl TuiApp {
         self.command_palette = Some(command_palette);
     }
 
+    fn focus_sidebar_section(&mut self, section: SidebarSection) {
+        self.sidebar_section = section;
+        self.selected_sidebar_index = 0;
+        self.focus = FocusTarget::Command(CommandPane::Sidebar);
+        self.last_command_pane = CommandPane::Sidebar;
+    }
+
     fn record_submitted_prompt(&mut self, submitted: &str) {
         self.reset_prompt_history_navigation();
         self.input_history.retain(|entry| entry != submitted);
@@ -1572,33 +1579,23 @@ impl TuiApp {
 
         match key {
             "ctrl+m" => {
-                self.sidebar_section = SidebarSection::Memories;
-                self.focus = FocusTarget::Command(CommandPane::Sidebar);
-                self.last_command_pane = CommandPane::Sidebar;
+                self.focus_sidebar_section(SidebarSection::Memories);
                 UiIntent::Noop
             }
             "ctrl+a" => {
-                self.sidebar_section = SidebarSection::Agenda;
-                self.focus = FocusTarget::Command(CommandPane::Sidebar);
-                self.last_command_pane = CommandPane::Sidebar;
+                self.focus_sidebar_section(SidebarSection::Agenda);
                 UiIntent::Noop
             }
             "r" => {
-                self.sidebar_section = SidebarSection::Improvements;
-                self.focus = FocusTarget::Command(CommandPane::Sidebar);
-                self.last_command_pane = CommandPane::Sidebar;
+                self.focus_sidebar_section(SidebarSection::Improvements);
                 UiIntent::Noop
             }
             "f" => {
-                self.sidebar_section = SidebarSection::FeatureRequests;
-                self.focus = FocusTarget::Command(CommandPane::Sidebar);
-                self.last_command_pane = CommandPane::Sidebar;
+                self.focus_sidebar_section(SidebarSection::FeatureRequests);
                 UiIntent::Noop
             }
             "s" => {
-                self.sidebar_section = SidebarSection::CodexSessions;
-                self.focus = FocusTarget::Command(CommandPane::Sidebar);
-                self.last_command_pane = CommandPane::Sidebar;
+                self.focus_sidebar_section(SidebarSection::CodexSessions);
                 UiIntent::Noop
             }
             "escape" => self.handle_escape(),
@@ -1708,33 +1705,23 @@ impl TuiApp {
                 UiIntent::Noop
             }
             "m" => {
-                self.sidebar_section = SidebarSection::Memories;
-                self.focus = FocusTarget::Command(CommandPane::Sidebar);
-                self.last_command_pane = CommandPane::Sidebar;
+                self.focus_sidebar_section(SidebarSection::Memories);
                 UiIntent::Noop
             }
             "g" => {
-                self.sidebar_section = SidebarSection::Agenda;
-                self.focus = FocusTarget::Command(CommandPane::Sidebar);
-                self.last_command_pane = CommandPane::Sidebar;
+                self.focus_sidebar_section(SidebarSection::Agenda);
                 UiIntent::Noop
             }
             "r" => {
-                self.sidebar_section = SidebarSection::Improvements;
-                self.focus = FocusTarget::Command(CommandPane::Sidebar);
-                self.last_command_pane = CommandPane::Sidebar;
+                self.focus_sidebar_section(SidebarSection::Improvements);
                 UiIntent::Noop
             }
             "f" => {
-                self.sidebar_section = SidebarSection::FeatureRequests;
-                self.focus = FocusTarget::Command(CommandPane::Sidebar);
-                self.last_command_pane = CommandPane::Sidebar;
+                self.focus_sidebar_section(SidebarSection::FeatureRequests);
                 UiIntent::Noop
             }
             "s" => {
-                self.sidebar_section = SidebarSection::CodexSessions;
-                self.focus = FocusTarget::Command(CommandPane::Sidebar);
-                self.last_command_pane = CommandPane::Sidebar;
+                self.focus_sidebar_section(SidebarSection::CodexSessions);
                 UiIntent::Noop
             }
             "left" => {
@@ -1820,9 +1807,7 @@ impl TuiApp {
             .position(|section| *section == self.sidebar_section)
             .unwrap_or(0) as isize;
         let next_index = (current_index + delta).rem_euclid(ORDER.len() as isize) as usize;
-        self.sidebar_section = ORDER[next_index];
-        self.focus = FocusTarget::Command(CommandPane::Sidebar);
-        self.last_command_pane = CommandPane::Sidebar;
+        self.focus_sidebar_section(ORDER[next_index]);
     }
 
     fn can_mouse_scroll_conversation(&self) -> bool {
@@ -2011,37 +1996,27 @@ fn handle_command_palette_key(app: &mut TuiApp, key: KeyEvent, runtime: &mut imp
             match entry.action {
                 TuiCommandPaletteAction::FocusMemories => {
                     app.command_palette = None;
-                    app.sidebar_section = SidebarSection::Memories;
-                    app.focus = FocusTarget::Command(CommandPane::Sidebar);
-                    app.last_command_pane = CommandPane::Sidebar;
+                    app.focus_sidebar_section(SidebarSection::Memories);
                     app.status = "focused memories".to_string();
                 }
                 TuiCommandPaletteAction::FocusAgenda => {
                     app.command_palette = None;
-                    app.sidebar_section = SidebarSection::Agenda;
-                    app.focus = FocusTarget::Command(CommandPane::Sidebar);
-                    app.last_command_pane = CommandPane::Sidebar;
+                    app.focus_sidebar_section(SidebarSection::Agenda);
                     app.status = "focused agenda".to_string();
                 }
                 TuiCommandPaletteAction::FocusImprovements => {
                     app.command_palette = None;
-                    app.sidebar_section = SidebarSection::Improvements;
-                    app.focus = FocusTarget::Command(CommandPane::Sidebar);
-                    app.last_command_pane = CommandPane::Sidebar;
+                    app.focus_sidebar_section(SidebarSection::Improvements);
                     app.status = "focused improvements".to_string();
                 }
                 TuiCommandPaletteAction::FocusFeatureRequests => {
                     app.command_palette = None;
-                    app.sidebar_section = SidebarSection::FeatureRequests;
-                    app.focus = FocusTarget::Command(CommandPane::Sidebar);
-                    app.last_command_pane = CommandPane::Sidebar;
+                    app.focus_sidebar_section(SidebarSection::FeatureRequests);
                     app.status = "focused feature requests".to_string();
                 }
                 TuiCommandPaletteAction::FocusCodexSessions => {
                     app.command_palette = None;
-                    app.sidebar_section = SidebarSection::CodexSessions;
-                    app.focus = FocusTarget::Command(CommandPane::Sidebar);
-                    app.last_command_pane = CommandPane::Sidebar;
+                    app.focus_sidebar_section(SidebarSection::CodexSessions);
                     app.status = "focused codex sessions".to_string();
                 }
                 TuiCommandPaletteAction::ToolCommand(name) => {
@@ -2747,6 +2722,24 @@ mod tests {
         assert_eq!(app.sidebar_section, SidebarSection::CodexSessions);
         app.handle_key("left");
         assert_eq!(app.sidebar_section, SidebarSection::FeatureRequests);
+    }
+
+    #[test]
+    fn sidebar_section_switches_reset_selection_to_first_item() {
+        let mut app = TuiApp::bootstrap();
+        app.memory_titles = vec!["Memory A".to_string(), "Memory B".to_string()];
+        app.agenda_titles = vec!["Agenda A".to_string(), "Agenda B".to_string()];
+        app.improvement_titles = vec!["Improvement A".to_string()];
+        app.selected_sidebar_index = 1;
+
+        app.handle_key("ctrl+a");
+        assert_eq!(app.sidebar_section, SidebarSection::Agenda);
+        assert_eq!(app.selected_sidebar_index, 0);
+
+        app.selected_sidebar_index = 1;
+        app.handle_key("right");
+        assert_eq!(app.sidebar_section, SidebarSection::Improvements);
+        assert_eq!(app.selected_sidebar_index, 0);
     }
 
     #[test]
@@ -3672,6 +3665,7 @@ mod tests {
         assert_eq!(app.last_command_pane, CommandPane::Sidebar);
         assert_eq!(app.sidebar_section, SidebarSection::FeatureRequests);
         assert_eq!(app.status, "focused feature requests");
+        assert_eq!(app.selected_sidebar_index, 0);
     }
 
     #[test]
