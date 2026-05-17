@@ -21,6 +21,7 @@ Source of truth for status remains [PARITY_MATRIX.md](/Users/tombedor/developmen
    - protect existing data or workflow correctness
 4. Keep Rust behavior aligned with Python unless an intentional delta is documented in the parity matrix.
 5. Every phase should leave the product in a better standalone state, not just a more complete matrix.
+6. Tests accompany new behavior; coverage-only commits are Phase 5 work. Writing a test for already-implemented behavior does not advance the current phase. A commit that only adds tests — with no behavioral change — belongs in Phase 5 regardless of which phase you are in. During Phases 1–4, write tests when they verify a behavior change in the same commit. If several consecutive commits are coverage-only, treat that as a signal to stop and redirect toward the phase exit criteria.
 
 ## Current Read Of The Product
 
@@ -56,6 +57,7 @@ Do not spend primary effort on these until the current phase says they matter:
 - additional schema narrowing for already-usable tools
 - isolated print/report formatting differences
 - extra direct parity tests for behavior that is already well-covered through larger flows
+- coverage-only commits for already-working behavior while Phase 1 exit criteria remain unmet — this is the single most common way to consume velocity without advancing the product
 
 Those are acceptable as opportunistic cleanup inside a broader slice, but they should not drive roadmap order.
 
@@ -66,6 +68,8 @@ Those are acceptable as opportunistic cleanup inside a broader slice, but they s
 Goal:
 
 - make the Rust app reliably usable for the main day-to-day local assistant workflow even if some deep parity remains missing
+
+**Daily-driver check:** Before starting a work session, answer this question: "Could I use the Rust TUI as my *only* interface for a full day of Elroy work right now, and would I trust it?" If no, the honest description of *why not* is the Phase 1 priority list. If yes, Phase 1 is done — move to Phase 2.
 
 Why this comes first:
 
@@ -80,6 +84,13 @@ Primary parity rows to advance:
 - `elroy/repository/context_messages/`
 - `Streaming status semantics`
 - `TUI keyboard behavior`
+
+Remaining gap checklist (derived from parity matrix "still missing" notes; resolve each as implemented or intentional delta before declaring Phase 1 complete):
+
+- [ ] Broader session workflows in the TUI — enumerate what this means concretely before starting: multi-session history, session switching, greeting on fresh start, full restart/session transitions
+- [ ] Deeper command-form validation parity — forms validate inputs before submit, not only on failure
+- [ ] Fuller Textual-style command-palette system-command behavior — audit which Python palette commands are not yet surfaced
+- [ ] Broader background-status producers — audit which background operations (beyond context-refresh/self-reflection/auto-memory) don't yet surface in the footer
 
 Focus areas:
 
@@ -283,6 +294,9 @@ A weak PR pattern for now is:
 
 - adjusts one tool string or schema detail without moving a phase exit criterion
 - adds isolated helper coverage without advancing a broader workflow
+- adds coverage-only tests for already-working behavior outside of Phase 5
+
+**Phase self-check:** Before starting a commit, ask "does this directly close a gap on the current phase checklist or advance a phase exit criterion?" If the honest answer is no — and the work is coverage-only for already-working behavior — stop and pick a different task.
 
 ## Definition Of Roadmap Success
 
