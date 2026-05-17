@@ -17650,6 +17650,23 @@ mod tests {
                 if content == "Bring the resistance bands to practice."
         )));
 
+        let mut reopened =
+            open_sqlite_connection(&config.database_path).expect("database should reopen");
+        let stored =
+            elroy_db::load_context_messages(&mut reopened, LOCAL_USER_TOKEN).expect("load ok");
+        assert!(
+            stored.iter().any(|message| {
+                message_matches_tool_call_id(message, "bootstrap-memory-recall")
+            })
+        );
+        assert!(stored.iter().any(|message| {
+            message.content.as_deref().is_some_and(|content| {
+                content.contains(
+                    "I remember that the user should bring the resistance bands to practice.",
+                ) && content.contains("\"recall_metadata\"")
+            })
+        }));
+
         relevance_mock.assert();
         reflective_mock.assert();
         chat_mock.assert();
