@@ -1569,9 +1569,10 @@ fn run_prompt_with_model_and_registry_internal(
         &existing_transcript,
         classifier_model,
     );
-    let all_due_items = list_active_due_items(connection, 20)?;
+    let recall_source_limit = semantic_recall_source_fetch_limit(20, classifier_model);
+    let all_due_items = list_active_due_items(connection, recall_source_limit)?;
     let now_iso = Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string();
-    let timed_due_items = list_due_tasks(connection, 20, &now_iso)?;
+    let timed_due_items = list_due_tasks(connection, recall_source_limit, &now_iso)?;
     let timed_due_item_ids = timed_due_items
         .iter()
         .map(|item| item.id)
@@ -1592,10 +1593,10 @@ fn run_prompt_with_model_and_registry_internal(
             memories: &list_active_memories_in_scope(
                 connection,
                 &options.bootstrap_plan.memory_dir,
-                50,
+                semantic_recall_source_fetch_limit(50, classifier_model),
             )?,
             due_items: &recall_due_items,
-            agenda_items: &list_active_plain_agenda_items(connection, 20)?,
+            agenda_items: &list_active_plain_agenda_items(connection, recall_source_limit)?,
         },
     );
     let timed_due_item_context = due_item_context_messages(&timed_due_items);
@@ -1710,9 +1711,10 @@ fn run_prompt_with_model_and_registry_stream_internal(
         &existing_transcript,
         classifier_model,
     );
-    let all_due_items = list_active_due_items(&connection, 20)?;
+    let recall_source_limit = semantic_recall_source_fetch_limit(20, classifier_model);
+    let all_due_items = list_active_due_items(&connection, recall_source_limit)?;
     let now_iso = Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string();
-    let timed_due_items = list_due_tasks(&connection, 20, &now_iso)?;
+    let timed_due_items = list_due_tasks(&connection, recall_source_limit, &now_iso)?;
     let timed_due_item_ids = timed_due_items
         .iter()
         .map(|item| item.id)
@@ -1733,10 +1735,10 @@ fn run_prompt_with_model_and_registry_stream_internal(
             memories: &list_active_memories_in_scope(
                 &connection,
                 &options.bootstrap_plan.memory_dir,
-                50,
+                semantic_recall_source_fetch_limit(50, classifier_model),
             )?,
             due_items: &recall_due_items,
-            agenda_items: &list_active_plain_agenda_items(&connection, 20)?,
+            agenda_items: &list_active_plain_agenda_items(&connection, recall_source_limit)?,
         },
     );
     let timed_due_item_context = due_item_context_messages(&timed_due_items);
@@ -5731,22 +5733,28 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                 &assistant_name_for_search_memories,
             );
             with_tool_connection(&database_path, |connection| {
+                let source_fetch_limit = semantic_recall_source_fetch_limit(
+                    recall_limit * 3,
+                    relevance_model
+                        .as_ref()
+                        .map(|model| model as &dyn ModelClient),
+                );
                 let memories = if relevance_model.is_some() {
                     list_active_memories_in_scope(
                         connection,
                         &memory_dir_for_search_memories,
-                        recall_limit * 3,
+                        source_fetch_limit,
                     )?
                 } else {
                     search_active_memories_in_scope(
                         connection,
                         &memory_dir_for_search_memories,
                         query,
-                        recall_limit * 3,
+                        source_fetch_limit,
                     )?
                 };
-                let due_items = list_active_due_items(connection, recall_limit * 3)?;
-                let agenda_items = list_active_plain_agenda_items(connection, recall_limit * 3)?;
+                let due_items = list_active_due_items(connection, source_fetch_limit)?;
+                let agenda_items = list_active_plain_agenda_items(connection, source_fetch_limit)?;
                 let relevant_memories = select_relevant_recall_memories(
                     query,
                     &memories,
@@ -5801,13 +5809,19 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                 &assistant_name_for_examine_memories,
             );
             with_tool_connection(&database_path, |connection| {
+                let source_fetch_limit = semantic_recall_source_fetch_limit(
+                    recall_limit * 3,
+                    relevance_model
+                        .as_ref()
+                        .map(|model| model as &dyn ModelClient),
+                );
                 let memories = list_active_memories_in_scope(
                     connection,
                     &memory_dir_for_examine_memories,
-                    recall_limit * 3,
+                    source_fetch_limit,
                 )?;
-                let due_items = list_active_due_items(connection, recall_limit * 3)?;
-                let agenda_items = list_active_plain_agenda_items(connection, recall_limit * 3)?;
+                let due_items = list_active_due_items(connection, source_fetch_limit)?;
+                let agenda_items = list_active_plain_agenda_items(connection, source_fetch_limit)?;
                 let relevant_memories = select_relevant_recall_memories(
                     question,
                     &memories,
@@ -7880,6 +7894,18 @@ Query: {query}\nResponses:\n{responses}"
 }
 
 const SEMANTIC_RECALL_CANDIDATE_LIMIT: usize = 25;
+const SEMANTIC_RECALL_SOURCE_FETCH_LIMIT: usize = 1_000;
+
+fn semantic_recall_source_fetch_limit(
+    base_limit: usize,
+    relevance_model: Option<&dyn ModelClient>,
+) -> usize {
+    if relevance_model.is_some() {
+        base_limit.max(SEMANTIC_RECALL_SOURCE_FETCH_LIMIT)
+    } else {
+        base_limit
+    }
+}
 
 fn select_relevant_recall_memories<'a>(
     query: &str,
@@ -14541,6 +14567,110 @@ mod tests {
     }
 
     #[test]
+    fn live_tool_registry_search_memories_can_surface_older_semantic_due_item_beyond_old_fetch_cap()
+    {
+        let unique = format!(
+            "elroy-rs-app-search-memories-older-semantic-due-item-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+
+        for index in 0..7 {
+            fs::write(
+                agenda_dir.join(format!("recent_reminder_{index}.md")),
+                format!(
+                    "---\ndate: unscheduled\ncompleted: false\nstatus: created\ntrigger_context: after equipment handoff\n---\n\nReview the storage locker spreadsheet {index}.\n"
+                ),
+            )
+            .expect("recent due item should be written");
+        }
+        fs::write(
+            agenda_dir.join("old_training_reminder.md"),
+            "---\ndate: unscheduled\ncompleted: false\nstatus: created\ntrigger_context: before basketball practice\n---\n\nPack resistance bands before drills.\n",
+        )
+        .expect("older semantic due item should be written");
+
+        let mut server = mockito::Server::new();
+        let _mock = server
+            .mock("POST", "/responses")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "output": [{
+                        "type": "message",
+                        "content": [{
+                            "type": "output_text",
+                            "text": r#"{"answers":[false,false,false,false,false,false,false,true],"reasoning":"Only the older training reminder matches the user's intent."}"#
+                        }]
+                    }]
+                })
+                .to_string(),
+            )
+            .create();
+
+        let mut config = AppConfig::defaults();
+        config.memory_dir = memory_dir;
+        config.agenda_dir = agenda_dir.clone();
+        config.database_path = database_path.clone();
+        config.openai_api_key = Some("test-key".to_string());
+        config.openai_base_url = format!("{}/responses", server.url());
+        elroy_db::bootstrap_database(&BootstrapPlan::from_config(&config))
+            .expect("bootstrap should succeed");
+
+        let connection = open_sqlite_connection(&database_path).expect("database should open");
+        for index in 0..7 {
+            connection
+                .execute(
+                    "UPDATE agenda_items SET updated_at_unix = ?1 WHERE file_path = ?2",
+                    rusqlite::params![
+                        10_000_i64 - index as i64,
+                        agenda_dir
+                            .join(format!("recent_reminder_{index}.md"))
+                            .display()
+                            .to_string(),
+                    ],
+                )
+                .expect("recent due item timestamp should update");
+        }
+        connection
+            .execute(
+                "UPDATE agenda_items SET updated_at_unix = 1 WHERE file_path = ?1",
+                rusqlite::params![
+                    agenda_dir
+                        .join("old_training_reminder.md")
+                        .display()
+                        .to_string(),
+                ],
+            )
+            .expect("older due item timestamp should update");
+
+        let registry = build_live_tool_registry(&config);
+        let search = registry.invoke(
+            "search_memories",
+            "{\"query\":\"What belongs in my workout kit?\",\"limit\":5}",
+        );
+
+        assert!(!search.is_error);
+        assert!(
+            search
+                .content
+                .contains("DueItem | old training reminder | Pack resistance bands before drills.")
+        );
+        assert!(!search.content.contains("DueItem | recent reminder 0 |"));
+
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
     fn live_tool_registry_search_memories_can_prefer_semantic_agenda_item_over_weaker_overlap() {
         let unique = format!(
             "elroy-rs-app-search-memories-semantic-agenda-item-{}",
@@ -17972,6 +18102,169 @@ mod tests {
             "What gear should I bring to practice?",
             &SemanticRecallPromptModel,
             Some(&SemanticRecallRelevanceModel),
+            ExecutableToolRegistry::new(vec![]),
+            PromptExecutionOptions {
+                role: MessageRole::User,
+                persist_input_message: true,
+                force_tool: None,
+                assistant_name: &config.assistant_name,
+                ensure_alternating_roles: config.llm_provider() == LlmProvider::Anthropic,
+                home_dir: &home,
+                bootstrap_plan: BootstrapPlan::from_config(&config),
+                messages_between_memory: config.messages_between_memory,
+                memories_between_consolidation: config.memories_between_consolidation,
+                messages_between_self_reflection: config.messages_between_self_reflection,
+                defer_auto_memory: false,
+                defer_self_reflection: false,
+                memory_recall_classifier_enabled: true,
+                memory_recall_classifier_window: 3,
+                reflect: false,
+            },
+        )
+        .expect("prompt should succeed");
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::AssistantResponse { content }
+                if content.contains("resistance bands")
+        )));
+
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
+    fn run_prompt_with_model_and_registry_can_surface_older_semantic_memory_beyond_old_fetch_cap() {
+        struct OlderSemanticRecallPromptModel;
+        struct OlderSemanticRecallRelevanceModel;
+
+        impl ModelClient for OlderSemanticRecallPromptModel {
+            fn next_events(
+                &self,
+                request: ConversationRequest<'_>,
+            ) -> Result<Vec<StreamEvent>, elroy_core::ModelClientError> {
+                assert_eq!(request.user_message, "What belongs in my training kit?");
+                let recall_payload = request
+                    .transcript
+                    .iter()
+                    .find(|message| {
+                        message.role == MessageRole::Tool
+                            && message.tool_call_id.as_deref() == Some("bootstrap-memory-recall")
+                    })
+                    .and_then(|message| message.content.as_deref())
+                    .expect("fast recall payload should be injected");
+                assert!(
+                    recall_payload.contains("Old Training Kit"),
+                    "{recall_payload}"
+                );
+                assert!(
+                    !recall_payload.contains("Recent Memory 00"),
+                    "{recall_payload}"
+                );
+                Ok(vec![StreamEvent::AssistantResponse {
+                    content: "Pack the resistance bands.".to_string(),
+                }])
+            }
+        }
+
+        impl ModelClient for OlderSemanticRecallRelevanceModel {
+            fn next_events(
+                &self,
+                request: ConversationRequest<'_>,
+            ) -> Result<Vec<StreamEvent>, elroy_core::ModelClientError> {
+                let prompt = request.user_message;
+                if prompt.contains("needs_recall") {
+                    return Ok(vec![StreamEvent::AssistantResponse {
+                        content: r#"{"needs_recall":true,"reasoning":"The user is asking what belongs in the training kit."}"#
+                            .to_string(),
+                    }]);
+                }
+                assert!(prompt.contains("Old Training Kit"), "{prompt}");
+                let answers = prompt
+                    .lines()
+                    .filter_map(|line| {
+                        let (index, candidate) = line.split_once(". ")?;
+                        index
+                            .chars()
+                            .all(|character| character.is_ascii_digit())
+                            .then_some(candidate.contains("old training kit"))
+                    })
+                    .collect::<Vec<_>>();
+                assert!(answers.iter().any(|answer| *answer), "{prompt}");
+                Ok(vec![StreamEvent::AssistantResponse {
+                    content: serde_json::json!({
+                        "answers": answers,
+                        "reasoning": "Only the older training-kit memory matches the user's intent."
+                    })
+                    .to_string(),
+                }])
+            }
+        }
+
+        let unique = format!(
+            "elroy-rs-app-recall-older-semantic-memory-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+
+        for index in 0..60 {
+            fs::write(
+                memory_dir.join(format!("recent_memory_{index:02}.md")),
+                format!(
+                    "# Recent Memory {index:02}\n\nReview the storage locker spreadsheet {index}.\n"
+                ),
+            )
+            .expect("recent memory should be written");
+        }
+        fs::write(
+            memory_dir.join("old_training_kit.md"),
+            "# Old Training Kit\n\nPack resistance bands before drills.\n",
+        )
+        .expect("older semantic memory should be written");
+
+        let mut config = AppConfig::defaults();
+        config.home_dir = home.clone();
+        config.memory_dir = memory_dir.clone();
+        config.agenda_dir = agenda_dir;
+        config.database_path = database_path.clone();
+
+        elroy_db::bootstrap_database(&BootstrapPlan::from_config(&config))
+            .expect("bootstrap should succeed");
+
+        let mut connection = open_sqlite_connection(&database_path).expect("database should open");
+        for index in 0..60 {
+            connection
+                .execute(
+                    "UPDATE memories SET updated_at_unix = ?1 WHERE file_path = ?2",
+                    rusqlite::params![
+                        10_000_i64 - index as i64,
+                        memory_dir
+                            .join(format!("recent_memory_{index:02}.md"))
+                            .display()
+                            .to_string(),
+                    ],
+                )
+                .expect("recent memory timestamp should update");
+        }
+        connection
+            .execute(
+                "UPDATE memories SET updated_at_unix = 1 WHERE file_path = ?1",
+                rusqlite::params![memory_dir.join("old_training_kit.md").display().to_string(),],
+            )
+            .expect("older memory timestamp should update");
+
+        let events = run_prompt_with_model_and_registry_internal(
+            &mut connection,
+            "What belongs in my training kit?",
+            &OlderSemanticRecallPromptModel,
+            Some(&OlderSemanticRecallRelevanceModel),
             ExecutableToolRegistry::new(vec![]),
             PromptExecutionOptions {
                 role: MessageRole::User,
