@@ -32,8 +32,8 @@ use elroy_feature_requests::{
     update_feature_request, write_new_feature_request,
 };
 use elroy_llm::{
-    ConversationMessage, LiveModelClient, MessageRole, Provider, ProviderConfig, StreamEvent,
-    ToolCall,
+    ConversationMessage, EmbeddingProviderConfig, LiveEmbeddingClient, LiveModelClient,
+    MessageRole, Provider, ProviderConfig, StreamEvent, ToolCall,
 };
 use elroy_memory::{
     archive_memory_file, create_memory_file_with_frontmatter, read_memory_parts, sanitize_filename,
@@ -3161,6 +3161,16 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                 ],
                 vec![
                     String::new(),
+                    "Embedding Model".to_string(),
+                    config_for_print_config.embedding_model.clone(),
+                ],
+                vec![
+                    String::new(),
+                    "Embedding Model Size".to_string(),
+                    config_for_print_config.embedding_model_size.to_string(),
+                ],
+                vec![
+                    String::new(),
                     "Max Tokens".to_string(),
                     config_for_print_config.max_tokens.to_string(),
                 ],
@@ -3178,8 +3188,21 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                 ],
                 vec![
                     String::new(),
+                    "Embedding API Base".to_string(),
+                    config_for_print_config
+                        .embedding_model_api_base
+                        .clone()
+                        .unwrap_or_else(|| "https://api.openai.com/v1/embeddings".to_string()),
+                ],
+                vec![
+                    String::new(),
                     "Chat API Key".to_string(),
                     redact_secret(config_for_print_config.openai_api_key.as_deref()),
+                ],
+                vec![
+                    String::new(),
+                    "Embedding API Key".to_string(),
+                    redact_secret(config_for_print_config.embedding_model_api_key.as_deref()),
                 ],
                 vec![
                     String::new(),
@@ -5770,6 +5793,8 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
     let database_path = config.database_path.clone();
     let memory_dir_for_search_memories = config.memory_dir.clone();
     let provider_config_for_search_memories = fast_provider_config_from_app_config(config).ok();
+    let embedding_provider_config_for_search_memories =
+        embedding_provider_config_from_app_config(config).ok();
     let assistant_name_for_search_memories = config.assistant_name.clone();
     let search_memories = ExecutableTool::new(
         ToolSpec::new(
@@ -5785,6 +5810,9 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
             let relevance_model = best_effort_provider_model(
                 provider_config_for_search_memories.as_ref(),
                 &assistant_name_for_search_memories,
+            );
+            let embedding_client = best_effort_embedding_client(
+                embedding_provider_config_for_search_memories.as_ref(),
             );
             with_tool_connection(&database_path, |connection| {
                 let source_fetch_limit = semantic_recall_source_fetch_limit(
@@ -5817,6 +5845,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                     relevance_model
                         .as_ref()
                         .map(|model| model as &dyn ModelClient),
+                    embedding_client.as_ref(),
                 );
                 let relevant_due_items = select_relevant_recall_due_items(
                     query,
@@ -5825,6 +5854,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                     relevance_model
                         .as_ref()
                         .map(|model| model as &dyn ModelClient),
+                    embedding_client.as_ref(),
                 );
                 let relevant_agenda_items = select_relevant_recall_agenda_items(
                     query,
@@ -5833,6 +5863,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                     relevance_model
                         .as_ref()
                         .map(|model| model as &dyn ModelClient),
+                    embedding_client.as_ref(),
                 );
                 Ok(ToolExecutionResult::success(format_memory_search_results(
                     &relevant_memories,
@@ -5846,6 +5877,8 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
     let database_path = config.database_path.clone();
     let memory_dir_for_examine_memories = config.memory_dir.clone();
     let provider_config_for_examine_memories = fast_provider_config_from_app_config(config).ok();
+    let embedding_provider_config_for_examine_memories =
+        embedding_provider_config_from_app_config(config).ok();
     let assistant_name_for_examine_memories = config.assistant_name.clone();
     let examine_memories = ExecutableTool::new(
         ToolSpec::new(
@@ -5861,6 +5894,9 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
             let relevance_model = best_effort_provider_model(
                 provider_config_for_examine_memories.as_ref(),
                 &assistant_name_for_examine_memories,
+            );
+            let embedding_client = best_effort_embedding_client(
+                embedding_provider_config_for_examine_memories.as_ref(),
             );
             with_tool_connection(&database_path, |connection| {
                 let source_fetch_limit = semantic_recall_source_fetch_limit(
@@ -5884,6 +5920,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                     relevance_model
                         .as_ref()
                         .map(|model| model as &dyn ModelClient),
+                    embedding_client.as_ref(),
                 );
                 let relevant_due_items = select_relevant_recall_due_items(
                     question,
@@ -5892,6 +5929,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                     relevance_model
                         .as_ref()
                         .map(|model| model as &dyn ModelClient),
+                    embedding_client.as_ref(),
                 );
                 let relevant_agenda_items = select_relevant_recall_agenda_items(
                     question,
@@ -5900,6 +5938,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                     relevance_model
                         .as_ref()
                         .map(|model| model as &dyn ModelClient),
+                    embedding_client.as_ref(),
                 );
 
                 let mut sections = relevant_memories
@@ -7551,13 +7590,14 @@ fn recall_memory_context_messages_with_decision(
         &already_recalled_memories,
         2,
         relevance_model,
+        None,
     );
     let already_recalled_agenda_items =
         recalled_item_refs_by_type(context.transcript, "AgendaItem");
     let fast_due_items = if reflect {
         Vec::new()
     } else {
-        select_relevant_recall_due_items(&recall_query, context.due_items, 2, relevance_model)
+        select_relevant_recall_due_items(&recall_query, context.due_items, 2, relevance_model, None)
             .into_iter()
             .filter(|item| {
                 !recalled_item_matches(&already_recalled_agenda_items, item.id, &item.name)
@@ -7567,15 +7607,19 @@ fn recall_memory_context_messages_with_decision(
     let fast_agenda_items = if reflect {
         Vec::new()
     } else {
-        select_relevant_recall_agenda_items(&recall_query, context.agenda_items, 2, relevance_model)
-            .into_iter()
-            .filter(|item| {
-                !recalled_item_matches(&already_recalled_agenda_items, item.id, &item.name)
-            })
-            .collect()
+        select_relevant_recall_agenda_items(
+            &recall_query,
+            context.agenda_items,
+            2,
+            relevance_model,
+            None,
+        )
+        .into_iter()
+        .filter(|item| !recalled_item_matches(&already_recalled_agenda_items, item.id, &item.name))
+        .collect()
     };
     let reflective_due_items = if reflect {
-        select_relevant_recall_due_items(&recall_query, context.due_items, 2, relevance_model)
+        select_relevant_recall_due_items(&recall_query, context.due_items, 2, relevance_model, None)
             .into_iter()
             .filter(|item| {
                 !recalled_item_matches(&already_recalled_agenda_items, item.id, &item.name)
@@ -7585,12 +7629,16 @@ fn recall_memory_context_messages_with_decision(
         Vec::new()
     };
     let reflective_agenda_items = if reflect {
-        select_relevant_recall_agenda_items(&recall_query, context.agenda_items, 2, relevance_model)
-            .into_iter()
-            .filter(|item| {
-                !recalled_item_matches(&already_recalled_agenda_items, item.id, &item.name)
-            })
-            .collect()
+        select_relevant_recall_agenda_items(
+            &recall_query,
+            context.agenda_items,
+            2,
+            relevance_model,
+            None,
+        )
+        .into_iter()
+        .filter(|item| !recalled_item_matches(&already_recalled_agenda_items, item.id, &item.name))
+        .collect()
     } else {
         Vec::new()
     };
@@ -7720,8 +7768,14 @@ fn recall_due_item_context_messages(
     relevance_model: Option<&dyn ModelClient>,
 ) -> Vec<ConversationMessage> {
     let recall_query = build_recall_query(prompt, transcript, 6);
-    let recalled =
-        select_relevant_contextual_due_items(&recall_query, due_items, now_iso, 2, relevance_model);
+    let recalled = select_relevant_contextual_due_items(
+        &recall_query,
+        due_items,
+        now_iso,
+        2,
+        relevance_model,
+        None,
+    );
     if recalled.is_empty() {
         return Vec::new();
     }
@@ -7972,18 +8026,85 @@ fn semantic_recall_candidate_limit(
     }
 }
 
+fn l2_distance(left: &[f32], right: &[f32]) -> Option<f32> {
+    if left.len() != right.len() {
+        return None;
+    }
+    Some(
+        left.iter()
+            .zip(right.iter())
+            .map(|(lhs, rhs)| {
+                let delta = lhs - rhs;
+                delta * delta
+            })
+            .sum(),
+    )
+}
+
+fn embedding_rank_candidates<'a, T>(
+    embedding_client: Option<&LiveEmbeddingClient>,
+    query: &str,
+    candidates: impl IntoIterator<Item = &'a T>,
+    extraction_fn: impl Fn(&T) -> String,
+    limit: usize,
+) -> Vec<&'a T> {
+    let Some(embedding_client) = embedding_client else {
+        return Vec::new();
+    };
+    let Ok(query_embedding) = embedding_client.embed(query) else {
+        return Vec::new();
+    };
+
+    let mut ranked = candidates
+        .into_iter()
+        .filter_map(|candidate| {
+            let embedding = embedding_client.embed(&extraction_fn(candidate)).ok()?;
+            let distance = l2_distance(&query_embedding, &embedding)?;
+            Some((distance, candidate))
+        })
+        .collect::<Vec<_>>();
+    ranked
+        .sort_by(|(left_distance, _), (right_distance, _)| left_distance.total_cmp(right_distance));
+    ranked
+        .into_iter()
+        .map(|(_, candidate)| candidate)
+        .take(limit)
+        .collect()
+}
+
 fn select_relevant_recall_memories<'a>(
     query: &str,
     memories: &'a [MemoryRecord],
     already_recalled: &[RecalledItemRef],
     limit: usize,
     relevance_model: Option<&dyn ModelClient>,
+    embedding_client: Option<&LiveEmbeddingClient>,
 ) -> Vec<&'a MemoryRecord> {
     let candidate_limit = semantic_recall_candidate_limit(limit, relevance_model);
     let overlap_candidates =
         select_recalled_memories(query, memories, already_recalled, candidate_limit);
     let candidates = if relevance_model.is_some() {
         let mut merged_candidates = overlap_candidates;
+        for candidate in embedding_rank_candidates(
+            embedding_client,
+            query,
+            memories
+                .iter()
+                .filter(|memory| !recalled_item_matches(already_recalled, memory.id, &memory.name)),
+            |memory| format!("# {}\n{}", memory.name, memory.body.trim()),
+            candidate_limit,
+        ) {
+            if merged_candidates
+                .iter()
+                .any(|existing| existing.id == candidate.id)
+            {
+                continue;
+            }
+            merged_candidates.push(candidate);
+            if merged_candidates.len() >= candidate_limit {
+                break;
+            }
+        }
         for candidate in recent_memory_candidates(memories, already_recalled, candidate_limit) {
             if merged_candidates
                 .iter()
@@ -8013,11 +8134,39 @@ fn select_relevant_recall_due_items<'a>(
     due_items: &'a [AgendaItemRecord],
     limit: usize,
     relevance_model: Option<&dyn ModelClient>,
+    embedding_client: Option<&LiveEmbeddingClient>,
 ) -> Vec<&'a AgendaItemRecord> {
     let candidate_limit = semantic_recall_candidate_limit(limit, relevance_model);
     let overlap_candidates = select_due_items_by_overlap(query, due_items, candidate_limit, None);
     let candidates = if relevance_model.is_some() {
         let mut merged_candidates = overlap_candidates;
+        for candidate in embedding_rank_candidates(
+            embedding_client,
+            query,
+            due_items.iter(),
+            |item| {
+                let mut text = format!("# {}\n{}", item.name, item.body.trim());
+                if let Some(trigger_datetime) = item.trigger_datetime.as_deref() {
+                    text.push_str(&format!("\ntrigger_datetime: {trigger_datetime}"));
+                }
+                if let Some(trigger_context) = item.trigger_context.as_deref() {
+                    text.push_str(&format!("\ntrigger_context: {trigger_context}"));
+                }
+                text
+            },
+            candidate_limit,
+        ) {
+            if merged_candidates
+                .iter()
+                .any(|existing| existing.id == candidate.id)
+            {
+                continue;
+            }
+            merged_candidates.push(candidate);
+            if merged_candidates.len() >= candidate_limit {
+                break;
+            }
+        }
         for candidate in recent_due_item_candidates(due_items, candidate_limit) {
             if merged_candidates
                 .iter()
@@ -8055,12 +8204,46 @@ fn select_relevant_contextual_due_items<'a>(
     now_iso: &str,
     limit: usize,
     relevance_model: Option<&dyn ModelClient>,
+    embedding_client: Option<&LiveEmbeddingClient>,
 ) -> Vec<&'a AgendaItemRecord> {
     let candidate_limit = semantic_recall_candidate_limit(limit, relevance_model);
     let overlap_candidates =
         select_due_items_by_overlap(query, due_items, candidate_limit, Some(now_iso));
     let candidates = if relevance_model.is_some() {
         let mut merged_candidates = overlap_candidates;
+        for candidate in embedding_rank_candidates(
+            embedding_client,
+            query,
+            due_items.iter().filter(|item| {
+                item.trigger_context.is_some()
+                    && item
+                        .trigger_datetime
+                        .as_deref()
+                        .is_none_or(|trigger| trigger <= now_iso)
+            }),
+            |item| {
+                let mut text = format!("# {}\n{}", item.name, item.body.trim());
+                if let Some(trigger_datetime) = item.trigger_datetime.as_deref() {
+                    text.push_str(&format!("\ntrigger_datetime: {trigger_datetime}"));
+                }
+                if let Some(trigger_context) = item.trigger_context.as_deref() {
+                    text.push_str(&format!("\ntrigger_context: {trigger_context}"));
+                }
+                text
+            },
+            candidate_limit,
+        ) {
+            if merged_candidates
+                .iter()
+                .any(|existing| existing.id == candidate.id)
+            {
+                continue;
+            }
+            merged_candidates.push(candidate);
+            if merged_candidates.len() >= candidate_limit {
+                break;
+            }
+        }
         for candidate in recent_contextual_due_item_candidates(due_items, candidate_limit, now_iso)
         {
             if merged_candidates
@@ -8098,11 +8281,32 @@ fn select_relevant_recall_agenda_items<'a>(
     agenda_items: &'a [AgendaItemRecord],
     limit: usize,
     relevance_model: Option<&dyn ModelClient>,
+    embedding_client: Option<&LiveEmbeddingClient>,
 ) -> Vec<&'a AgendaItemRecord> {
     let candidate_limit = semantic_recall_candidate_limit(limit, relevance_model);
     let overlap_candidates = select_agenda_items_by_overlap(query, agenda_items, candidate_limit);
     let candidates = if relevance_model.is_some() {
         let mut merged_candidates = overlap_candidates;
+        for candidate in embedding_rank_candidates(
+            embedding_client,
+            query,
+            agenda_items
+                .iter()
+                .filter(|item| item.trigger_datetime.is_none() && item.trigger_context.is_none()),
+            |item| format!("# {}\n{}", item.name, item.body.trim()),
+            candidate_limit,
+        ) {
+            if merged_candidates
+                .iter()
+                .any(|existing| existing.id == candidate.id)
+            {
+                continue;
+            }
+            merged_candidates.push(candidate);
+            if merged_candidates.len() >= candidate_limit {
+                break;
+            }
+        }
         for candidate in recent_agenda_item_candidates(agenda_items, candidate_limit) {
             if merged_candidates
                 .iter()
@@ -8893,6 +9097,32 @@ fn fast_provider_config_from_app_config(config: &AppConfig) -> Result<ProviderCo
     )
 }
 
+fn embedding_provider_config_from_app_config(
+    config: &AppConfig,
+) -> Result<EmbeddingProviderConfig, String> {
+    let api_key = config
+        .embedding_model_api_key
+        .as_deref()
+        .or(config.openai_api_key.as_deref())
+        .ok_or_else(|| "missing OPENAI_API_KEY for embedding model".to_string())?;
+    Ok(EmbeddingProviderConfig {
+        model: config.embedding_model.clone(),
+        api_key: api_key.to_string(),
+        base_url: config
+            .embedding_model_api_base
+            .as_deref()
+            .unwrap_or("https://api.openai.com/v1/embeddings")
+            .to_string(),
+        timeout_seconds: 60,
+    })
+}
+
+fn best_effort_embedding_client(
+    provider_config: Option<&EmbeddingProviderConfig>,
+) -> Option<LiveEmbeddingClient> {
+    provider_config.and_then(|config| LiveEmbeddingClient::new(config.clone()).ok())
+}
+
 fn provider_config_for_model(
     provider: LlmProvider,
     model_name: &str,
@@ -8963,10 +9193,10 @@ mod tests {
         consolidate_exact_duplicate_memories, context_due_item_tool_call_id,
         context_due_item_tool_messages, context_memory_tool_messages, context_task_tool_messages,
         count_context_tokens, determine_memory_recall_decision, drop_old_context_messages,
-        due_item_context_messages, fast_provider_config_from_app_config,
-        format_context_messages_for_summary, format_context_summary_message,
-        is_context_refresh_needed, memory_recall_status_updates, message_matches_tool_call_id,
-        parse_memory_recall_decision, parse_recalled_item_refs,
+        due_item_context_messages, embedding_provider_config_from_app_config,
+        fast_provider_config_from_app_config, format_context_messages_for_summary,
+        format_context_summary_message, is_context_refresh_needed, memory_recall_status_updates,
+        message_matches_tool_call_id, parse_memory_recall_decision, parse_recalled_item_refs,
         parse_reflective_recall_model_response, parse_relevance_filter_response,
         prompt_prelude_status_updates, provider_config_from_app_config,
         recall_due_item_context_messages, recall_memory_context_messages,
@@ -9417,6 +9647,35 @@ mod tests {
         assert_eq!(provider.model, "gpt-5.4-mini");
         assert_eq!(provider.api_key, "fast-key");
         assert_eq!(provider.base_url, "http://localhost:4321/fast");
+    }
+
+    #[test]
+    fn embedding_provider_config_falls_back_to_openai_defaults() {
+        let mut config = AppConfig::defaults();
+        config.openai_api_key = Some("openai-key".to_string());
+
+        let provider =
+            embedding_provider_config_from_app_config(&config).expect("config should build");
+
+        assert_eq!(provider.model, "text-embedding-3-small");
+        assert_eq!(provider.api_key, "openai-key");
+        assert_eq!(provider.base_url, "https://api.openai.com/v1/embeddings");
+    }
+
+    #[test]
+    fn embedding_provider_config_uses_embedding_overrides_when_configured() {
+        let mut config = AppConfig::defaults();
+        config.openai_api_key = Some("openai-key".to_string());
+        config.embedding_model = "text-embedding-3-large".to_string();
+        config.embedding_model_api_key = Some("embed-key".to_string());
+        config.embedding_model_api_base = Some("http://localhost:4321/embeddings".to_string());
+
+        let provider =
+            embedding_provider_config_from_app_config(&config).expect("config should build");
+
+        assert_eq!(provider.model, "text-embedding-3-large");
+        assert_eq!(provider.api_key, "embed-key");
+        assert_eq!(provider.base_url, "http://localhost:4321/embeddings");
     }
 
     #[test]
@@ -14395,6 +14654,7 @@ mod tests {
             "2026-05-15T12:00:00",
             2,
             Some(&model),
+            None,
         );
 
         assert_eq!(relevant_due_items.len(), 1);
@@ -14889,6 +15149,155 @@ mod tests {
                 .contains("DueItem | old training reminder | Pack resistance bands before drills.")
         );
         assert!(!search.content.contains("DueItem | recent reminder 0 |"));
+
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
+    fn live_tool_registry_search_memories_can_surface_older_semantic_memory_via_embedding_candidates()
+     {
+        let unique = format!(
+            "elroy-rs-app-search-memories-older-semantic-memory-embedding-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+
+        for index in 0..120 {
+            fs::write(
+                memory_dir.join(format!("recent_note_{index:03}.md")),
+                format!("Review the storage locker spreadsheet {index}.\n"),
+            )
+            .expect("recent memory should be written");
+        }
+        fs::write(
+            memory_dir.join("old_training_note.md"),
+            "Pack resistance bands before drills.\n",
+        )
+        .expect("older semantic memory should be written");
+
+        let mut server = mockito::Server::new();
+        let mut answers = vec![false; 100];
+        answers[0] = true;
+        let _relevance_mock = server
+            .mock("POST", "/responses")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "output": [{
+                        "type": "message",
+                        "content": [{
+                            "type": "output_text",
+                            "text": serde_json::json!({
+                                "answers": answers,
+                                "reasoning": "Only the older training-kit memory matches the user's intent."
+                            }).to_string()
+                        }]
+                    }]
+                })
+                .to_string(),
+            )
+            .create();
+        let _query_embedding_mock = server
+            .mock("POST", "/embeddings")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "input": "What belongs in my workout kit?"
+            })))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "data": [{"embedding": [1.0, 0.0]}]
+                })
+                .to_string(),
+            )
+            .create();
+        let _semantic_embedding_mock = server
+            .mock("POST", "/embeddings")
+            .match_body(mockito::Matcher::Regex(
+                "Pack resistance bands before drills".to_string(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "data": [{"embedding": [1.0, 0.0]}]
+                })
+                .to_string(),
+            )
+            .create();
+        let _recent_embedding_mock = server
+            .mock("POST", "/embeddings")
+            .match_body(mockito::Matcher::Regex(
+                "Review the storage locker spreadsheet".to_string(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "data": [{"embedding": [0.0, 1.0]}]
+                })
+                .to_string(),
+            )
+            .create();
+
+        let mut config = AppConfig::defaults();
+        config.memory_dir = memory_dir.clone();
+        config.agenda_dir = agenda_dir;
+        config.database_path = database_path.clone();
+        config.openai_api_key = Some("test-key".to_string());
+        config.openai_base_url = format!("{}/responses", server.url());
+        config.embedding_model_api_base = Some(format!("{}/embeddings", server.url()));
+        elroy_db::bootstrap_database(&BootstrapPlan::from_config(&config))
+            .expect("bootstrap should succeed");
+
+        let connection = open_sqlite_connection(&database_path).expect("database should open");
+        for index in 0..120 {
+            connection
+                .execute(
+                    "UPDATE memories SET updated_at_unix = ?1 WHERE file_path = ?2",
+                    rusqlite::params![
+                        10_000_i64 - index as i64,
+                        memory_dir
+                            .join(format!("recent_note_{index:03}.md"))
+                            .display()
+                            .to_string(),
+                    ],
+                )
+                .expect("recent memory timestamp should update");
+        }
+        connection
+            .execute(
+                "UPDATE memories SET updated_at_unix = 1 WHERE file_path = ?1",
+                rusqlite::params![
+                    memory_dir
+                        .join("old_training_note.md")
+                        .display()
+                        .to_string(),
+                ],
+            )
+            .expect("older memory timestamp should update");
+
+        let registry = build_live_tool_registry(&config);
+        let search = registry.invoke(
+            "search_memories",
+            "{\"query\":\"What belongs in my workout kit?\",\"limit\":5}",
+        );
+
+        assert!(!search.is_error);
+        assert!(
+            search
+                .content
+                .contains("Memory | old training note | Pack resistance bands before drills.")
+        );
 
         fs::remove_dir_all(home).expect("home should be removed");
     }
@@ -22574,18 +22983,21 @@ mod tests {
             &[],
             2,
             Some(&model),
+            None,
         );
         let relevant_due_items = select_relevant_recall_due_items(
             "What workout gear should I bring?",
             &due_items,
             2,
             Some(&model),
+            None,
         );
         let relevant_agenda_items = select_relevant_recall_agenda_items(
             "What workout gear should I bring?",
             &agenda_items,
             2,
             Some(&model),
+            None,
         );
 
         assert!(relevant_memories.is_empty());
@@ -22660,18 +23072,21 @@ mod tests {
             &[],
             2,
             Some(&model),
+            None,
         );
         let relevant_due_items = select_relevant_recall_due_items(
             "What gear should I bring to practice?",
             &due_items,
             2,
             Some(&model),
+            None,
         );
         let relevant_agenda_items = select_relevant_recall_agenda_items(
             "What gear should I bring to practice?",
             &agenda_items,
             2,
             Some(&model),
+            None,
         );
 
         assert_eq!(relevant_memories.len(), 1);
@@ -22832,18 +23247,21 @@ mod tests {
             &[],
             2,
             Some(&SemanticPriorityRelevanceModel),
+            None,
         );
         let relevant_due_items = select_relevant_recall_due_items(
             "What gear should I bring to practice?",
             &due_items,
             2,
             Some(&SemanticPriorityRelevanceModel),
+            None,
         );
         let relevant_agenda_items = select_relevant_recall_agenda_items(
             "What gear should I bring to practice?",
             &agenda_items,
             2,
             Some(&SemanticPriorityRelevanceModel),
+            None,
         );
 
         assert_eq!(relevant_memories.len(), 1);

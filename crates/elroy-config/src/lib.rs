@@ -15,6 +15,8 @@ pub struct AppConfig {
     pub database_path: PathBuf,
     pub chat_model: String,
     pub fast_model: Option<String>,
+    pub embedding_model: String,
+    pub embedding_model_size: usize,
     pub max_tokens: usize,
     pub assistant_name: String,
     pub reflect: bool,
@@ -37,6 +39,8 @@ pub struct AppConfig {
     pub openai_base_url: String,
     pub fast_model_api_key: Option<String>,
     pub fast_model_api_base: Option<String>,
+    pub embedding_model_api_key: Option<String>,
+    pub embedding_model_api_base: Option<String>,
     pub anthropic_api_key: Option<String>,
     pub anthropic_base_url: String,
     pub anthropic_api_version: String,
@@ -87,6 +91,8 @@ impl AppConfig {
             database_path,
             chat_model: "gpt-5".to_string(),
             fast_model: None,
+            embedding_model: "text-embedding-3-small".to_string(),
+            embedding_model_size: 1536,
             max_tokens: 100_000,
             assistant_name: "Elroy".to_string(),
             reflect: false,
@@ -109,6 +115,8 @@ impl AppConfig {
             openai_base_url: "https://api.openai.com/v1/responses".to_string(),
             fast_model_api_key: None,
             fast_model_api_base: None,
+            embedding_model_api_key: None,
+            embedding_model_api_base: None,
             anthropic_api_key: None,
             anthropic_base_url: "https://api.anthropic.com/v1/messages".to_string(),
             anthropic_api_version: "2023-06-01".to_string(),
@@ -130,6 +138,12 @@ impl AppConfig {
         }
         if let Some(fast_model) = file_config.fast_model {
             self.fast_model = Some(fast_model);
+        }
+        if let Some(embedding_model) = file_config.embedding_model {
+            self.embedding_model = embedding_model;
+        }
+        if let Some(embedding_model_size) = file_config.embedding_model_size {
+            self.embedding_model_size = embedding_model_size;
         }
         if let Some(max_tokens) = file_config.max_tokens {
             self.max_tokens = max_tokens;
@@ -202,6 +216,12 @@ impl AppConfig {
         if let Some(fast_model_api_base) = file_config.fast_model_api_base {
             self.fast_model_api_base = Some(fast_model_api_base);
         }
+        if let Some(embedding_model_api_key) = file_config.embedding_model_api_key {
+            self.embedding_model_api_key = Some(embedding_model_api_key);
+        }
+        if let Some(embedding_model_api_base) = file_config.embedding_model_api_base {
+            self.embedding_model_api_base = Some(embedding_model_api_base);
+        }
         if let Some(anthropic_api_key) = file_config.anthropic_api_key {
             self.anthropic_api_key = Some(anthropic_api_key);
         }
@@ -228,6 +248,12 @@ impl AppConfig {
         }
         if let Some(fast_model) = env.get("ELROY_FAST_MODEL") {
             self.fast_model = Some(fast_model.clone());
+        }
+        if let Some(embedding_model) = env.get("ELROY_EMBEDDING_MODEL") {
+            self.embedding_model = embedding_model.clone();
+        }
+        if let Some(embedding_model_size) = env.get("ELROY_EMBEDDING_MODEL_SIZE") {
+            self.embedding_model_size = parse_usize(embedding_model_size);
         }
         if let Some(max_tokens) = env.get("ELROY_MAX_TOKENS") {
             self.max_tokens = parse_usize(max_tokens);
@@ -311,6 +337,15 @@ impl AppConfig {
         if let Some(fast_model_api_base) = env.get("ELROY_FAST_MODEL_API_BASE") {
             self.fast_model_api_base = Some(fast_model_api_base.clone());
         }
+        if let Some(embedding_model_api_key) = env
+            .get("ELROY_EMBEDDING_MODEL_API_KEY")
+            .or(env.get("OPENAI_API_KEY"))
+        {
+            self.embedding_model_api_key = Some(embedding_model_api_key.clone());
+        }
+        if let Some(embedding_model_api_base) = env.get("ELROY_EMBEDDING_MODEL_API_BASE") {
+            self.embedding_model_api_base = Some(embedding_model_api_base.clone());
+        }
         if let Some(anthropic_api_key) = env.get("ANTHROPIC_API_KEY") {
             self.anthropic_api_key = Some(anthropic_api_key.clone());
         }
@@ -345,6 +380,8 @@ impl AppConfig {
 struct FileConfig {
     chat_model: Option<String>,
     fast_model: Option<String>,
+    embedding_model: Option<String>,
+    embedding_model_size: Option<usize>,
     max_tokens: Option<usize>,
     default_assistant_name: Option<String>,
     reflect: Option<bool>,
@@ -369,6 +406,8 @@ struct FileConfig {
     openai_base_url: Option<String>,
     fast_model_api_key: Option<String>,
     fast_model_api_base: Option<String>,
+    embedding_model_api_key: Option<String>,
+    embedding_model_api_base: Option<String>,
     anthropic_api_key: Option<String>,
     anthropic_base_url: Option<String>,
     anthropic_api_version: Option<String>,
@@ -504,6 +543,8 @@ mod tests {
         assert!(config.async_runtime_enabled);
         assert!(config.include_base_tools);
         assert!(config.exclude_tools.is_empty());
+        assert_eq!(config.embedding_model, "text-embedding-3-small");
+        assert_eq!(config.embedding_model_size, 1536);
         assert_eq!(config.max_tokens, 100_000);
         assert_eq!(config.context_refresh_target_tokens(), 33_333);
         assert!(!config.reflect);
@@ -536,6 +577,8 @@ mod tests {
         assert_eq!(config.fast_model, None);
         assert_eq!(config.fast_model_api_key, None);
         assert_eq!(config.fast_model_api_base, None);
+        assert_eq!(config.embedding_model_api_key, None);
+        assert_eq!(config.embedding_model_api_base, None);
         assert_eq!(
             config.anthropic_base_url,
             "https://api.anthropic.com/v1/messages"
@@ -550,7 +593,7 @@ mod tests {
         let config_path = home_dir.join("elroy.conf.yaml");
         fs::write(
             &config_path,
-            "chat_model: gpt-5-nano\nfast_model: gpt-5.4-mini\nmax_tokens: 9000\nreflect: true\nenable_assistant_greeting: true\nmin_convo_age_for_greeting_minutes: 15.5\nmax_context_age_minutes: 180.0\nmessages_between_memory: 12\nmemories_between_consolidation: 6\nl2_memory_relevance_distance_threshold: 1.11\nmemory_cluster_similarity_threshold: 0.33\nmax_memory_cluster_size: 7\nmin_memory_cluster_size: 4\nmessages_between_self_reflection: 4\nmemory_recall_classifier_enabled: false\nmemory_recall_classifier_window: 7\nexclude_tools:\n  - get_user_preferred_name\n  - get_help\nmemory_dir: /tmp/elroy-memories\nagenda_dir: /tmp/elroy-agenda\ndatabase_url: sqlite:////tmp/elroy.db\nfast_model_api_key: fast-key\nfast_model_api_base: http://localhost:1234/fast\nirrelevant_key: ignored\n",
+            "chat_model: gpt-5-nano\nfast_model: gpt-5.4-mini\nembedding_model: text-embedding-3-large\nembedding_model_size: 3072\nmax_tokens: 9000\nreflect: true\nenable_assistant_greeting: true\nmin_convo_age_for_greeting_minutes: 15.5\nmax_context_age_minutes: 180.0\nmessages_between_memory: 12\nmemories_between_consolidation: 6\nl2_memory_relevance_distance_threshold: 1.11\nmemory_cluster_similarity_threshold: 0.33\nmax_memory_cluster_size: 7\nmin_memory_cluster_size: 4\nmessages_between_self_reflection: 4\nmemory_recall_classifier_enabled: false\nmemory_recall_classifier_window: 7\nexclude_tools:\n  - get_user_preferred_name\n  - get_help\nmemory_dir: /tmp/elroy-memories\nagenda_dir: /tmp/elroy-agenda\ndatabase_url: sqlite:////tmp/elroy.db\nfast_model_api_key: fast-key\nfast_model_api_base: http://localhost:1234/fast\nembedding_model_api_key: embed-key\nembedding_model_api_base: http://localhost:1234/embeddings\nirrelevant_key: ignored\n",
         )
         .expect("config fixture should be written");
 
@@ -559,6 +602,8 @@ mod tests {
 
         assert_eq!(config.chat_model, "gpt-5-nano");
         assert_eq!(config.fast_model.as_deref(), Some("gpt-5.4-mini"));
+        assert_eq!(config.embedding_model, "text-embedding-3-large");
+        assert_eq!(config.embedding_model_size, 3072);
         assert_eq!(config.max_tokens, 9000);
         assert_eq!(config.context_refresh_target_tokens(), 3000);
         assert_eq!(config.memory_dir, PathBuf::from("/tmp/elroy-memories"));
@@ -583,6 +628,11 @@ mod tests {
         assert_eq!(
             config.fast_model_api_base.as_deref(),
             Some("http://localhost:1234/fast")
+        );
+        assert_eq!(config.embedding_model_api_key.as_deref(), Some("embed-key"));
+        assert_eq!(
+            config.embedding_model_api_base.as_deref(),
+            Some("http://localhost:1234/embeddings")
         );
         assert!(config.include_base_tools);
         assert_eq!(
@@ -614,6 +664,11 @@ mod tests {
                 "claude-sonnet-4-5-20250929".to_string(),
             ),
             ("ELROY_FAST_MODEL".to_string(), "gpt-5.4-mini".to_string()),
+            (
+                "ELROY_EMBEDDING_MODEL".to_string(),
+                "text-embedding-3-large".to_string(),
+            ),
+            ("ELROY_EMBEDDING_MODEL_SIZE".to_string(), "3072".to_string()),
             ("ELROY_MAX_TOKENS".to_string(), "12000".to_string()),
             (
                 "ELROY_DEFAULT_ASSISTANT_NAME".to_string(),
@@ -695,6 +750,10 @@ mod tests {
                 "http://localhost:1234/fast".to_string(),
             ),
             (
+                "ELROY_EMBEDDING_MODEL_API_BASE".to_string(),
+                "http://localhost:1234/embeddings".to_string(),
+            ),
+            (
                 "ELROY_ANTHROPIC_BASE_URL".to_string(),
                 "http://localhost:1234/anthropic".to_string(),
             ),
@@ -707,6 +766,8 @@ mod tests {
 
         assert_eq!(config.chat_model, "claude-sonnet-4-5-20250929");
         assert_eq!(config.fast_model.as_deref(), Some("gpt-5.4-mini"));
+        assert_eq!(config.embedding_model, "text-embedding-3-large");
+        assert_eq!(config.embedding_model_size, 3072);
         assert_eq!(config.max_tokens, 12_000);
         assert_eq!(config.context_refresh_target_tokens(), 4_000);
         assert_eq!(config.assistant_name, "EnvElroy");
@@ -740,6 +801,14 @@ mod tests {
         assert_eq!(
             config.fast_model_api_base.as_deref(),
             Some("http://localhost:1234/fast")
+        );
+        assert_eq!(
+            config.embedding_model_api_key.as_deref(),
+            Some("openai-test-key")
+        );
+        assert_eq!(
+            config.embedding_model_api_base.as_deref(),
+            Some("http://localhost:1234/embeddings")
         );
         assert_eq!(
             config.anthropic_api_key.as_deref(),

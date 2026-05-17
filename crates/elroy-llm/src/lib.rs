@@ -271,6 +271,14 @@ impl ProviderConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmbeddingProviderConfig {
+    pub model: String,
+    pub api_key: String,
+    pub base_url: String,
+    pub timeout_seconds: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompletionRequest<'a> {
     pub system_prompt: &'a str,
     pub messages: &'a [ConversationMessage],
@@ -282,6 +290,12 @@ pub struct CompletionRequest<'a> {
 pub struct LiveModelClient {
     http: Client,
     config: ProviderConfig,
+}
+
+#[derive(Debug)]
+pub struct LiveEmbeddingClient {
+    http: Client,
+    config: EmbeddingProviderConfig,
 }
 
 impl LiveModelClient {
@@ -415,6 +429,42 @@ impl LiveModelClient {
     }
 }
 
+impl LiveEmbeddingClient {
+    pub fn new(config: EmbeddingProviderConfig) -> Result<Self, LlmError> {
+        let http = Client::builder()
+            .timeout(Duration::from_secs(config.timeout_seconds))
+            .build()
+            .map_err(LlmError::HttpClient)?;
+        Ok(Self { http, config })
+    }
+
+    pub fn embed(&self, text: &str) -> Result<Vec<f32>, LlmError> {
+        let response = self
+            .http
+            .post(&self.config.base_url)
+            .bearer_auth(&self.config.api_key)
+            .json(&json!({
+                "model": self.config.model,
+                "input": text,
+            }))
+            .send()
+            .map_err(LlmError::HttpRequest)?;
+
+        let status = response.status();
+        let body = response.text().map_err(LlmError::ReadResponse)?;
+        if !status.is_success() {
+            return Err(LlmError::Api {
+                provider: Provider::OpenAi,
+                status,
+                body,
+            });
+        }
+
+        let payload = serde_json::from_str::<Value>(&body).map_err(LlmError::ParseResponse)?;
+        parse_openai_embedding_response(&payload)
+    }
+}
+
 #[derive(Debug)]
 pub enum LlmError {
     HttpClient(reqwest::Error),
@@ -459,6 +509,33 @@ fn trim_error_body(body: &str) -> String {
     } else {
         format!("{}...", &body[..LIMIT])
     }
+}
+
+fn parse_openai_embedding_response(payload: &Value) -> Result<Vec<f32>, LlmError> {
+    let embedding = payload
+        .get("data")
+        .and_then(Value::as_array)
+        .and_then(|items| items.first())
+        .and_then(|item| item.get("embedding"))
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            LlmError::ParseResponse(serde_json::Error::io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "missing embedding array",
+            )))
+        })?;
+
+    embedding
+        .iter()
+        .map(|value| {
+            value.as_f64().map(|number| number as f32).ok_or_else(|| {
+                LlmError::ParseResponse(serde_json::Error::io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "embedding value was not numeric",
+                )))
+            })
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1104,10 +1181,11 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        CompletionRequest, ConversationMessage, LiveModelClient, LlmError, MessageRole,
-        PartialToolCall, Provider, ProviderConfig, StreamEvent, ToolCall,
-        build_anthropic_messages_request, build_anthropic_request, build_openai_request,
-        build_openai_responses_request, parse_anthropic_response, parse_openai_response,
+        CompletionRequest, ConversationMessage, EmbeddingProviderConfig, LiveEmbeddingClient,
+        LiveModelClient, LlmError, MessageRole, PartialToolCall, Provider, ProviderConfig,
+        StreamEvent, ToolCall, build_anthropic_messages_request, build_anthropic_request,
+        build_openai_request, build_openai_responses_request, parse_anthropic_response,
+        parse_openai_response,
     };
 
     fn weather_registry() -> ToolRegistry {
@@ -1420,6 +1498,40 @@ mod tests {
                 content: "Hello from OpenAI.".to_string()
             }]
         );
+    }
+
+    #[test]
+    fn live_openai_embedding_client_sends_authorization_header_and_parses_embedding() {
+        let mut server = Server::new();
+        let mock = server
+            .mock("POST", "/embeddings")
+            .match_header("authorization", "Bearer openai-key")
+            .match_header("content-type", "application/json")
+            .with_status(200)
+            .with_body(
+                json!({
+                    "data": [{
+                        "embedding": [0.1, 0.2, 0.3]
+                    }]
+                })
+                .to_string(),
+            )
+            .create();
+
+        let client = LiveEmbeddingClient::new(EmbeddingProviderConfig {
+            model: "text-embedding-3-small".to_string(),
+            api_key: "openai-key".to_string(),
+            base_url: format!("{}/embeddings", server.url()),
+            timeout_seconds: 5,
+        })
+        .expect("client should construct");
+
+        let embedding = client
+            .embed("What belongs in my workout kit?")
+            .expect("embed ok");
+
+        mock.assert();
+        assert_eq!(embedding, vec![0.1_f32, 0.2_f32, 0.3_f32]);
     }
 
     #[test]
