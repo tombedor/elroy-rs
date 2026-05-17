@@ -14,6 +14,7 @@ pub struct AppConfig {
     pub agenda_dir: PathBuf,
     pub database_path: PathBuf,
     pub chat_model: String,
+    pub fast_model: Option<String>,
     pub max_tokens: usize,
     pub assistant_name: String,
     pub reflect: bool,
@@ -34,6 +35,8 @@ pub struct AppConfig {
     pub async_runtime_enabled: bool,
     pub openai_api_key: Option<String>,
     pub openai_base_url: String,
+    pub fast_model_api_key: Option<String>,
+    pub fast_model_api_base: Option<String>,
     pub anthropic_api_key: Option<String>,
     pub anthropic_base_url: String,
     pub anthropic_api_version: String,
@@ -83,6 +86,7 @@ impl AppConfig {
             agenda_dir,
             database_path,
             chat_model: "gpt-5".to_string(),
+            fast_model: None,
             max_tokens: 100_000,
             assistant_name: "Elroy".to_string(),
             reflect: false,
@@ -103,6 +107,8 @@ impl AppConfig {
             async_runtime_enabled: true,
             openai_api_key: None,
             openai_base_url: "https://api.openai.com/v1/responses".to_string(),
+            fast_model_api_key: None,
+            fast_model_api_base: None,
             anthropic_api_key: None,
             anthropic_base_url: "https://api.anthropic.com/v1/messages".to_string(),
             anthropic_api_version: "2023-06-01".to_string(),
@@ -121,6 +127,9 @@ impl AppConfig {
         }
         if let Some(chat_model) = file_config.chat_model {
             self.chat_model = chat_model;
+        }
+        if let Some(fast_model) = file_config.fast_model {
+            self.fast_model = Some(fast_model);
         }
         if let Some(max_tokens) = file_config.max_tokens {
             self.max_tokens = max_tokens;
@@ -187,6 +196,12 @@ impl AppConfig {
         if let Some(openai_base_url) = file_config.openai_base_url {
             self.openai_base_url = openai_base_url;
         }
+        if let Some(fast_model_api_key) = file_config.fast_model_api_key {
+            self.fast_model_api_key = Some(fast_model_api_key);
+        }
+        if let Some(fast_model_api_base) = file_config.fast_model_api_base {
+            self.fast_model_api_base = Some(fast_model_api_base);
+        }
         if let Some(anthropic_api_key) = file_config.anthropic_api_key {
             self.anthropic_api_key = Some(anthropic_api_key);
         }
@@ -210,6 +225,9 @@ impl AppConfig {
         }
         if let Some(chat_model) = env.get("ELROY_CHAT_MODEL") {
             self.chat_model = chat_model.clone();
+        }
+        if let Some(fast_model) = env.get("ELROY_FAST_MODEL") {
+            self.fast_model = Some(fast_model.clone());
         }
         if let Some(max_tokens) = env.get("ELROY_MAX_TOKENS") {
             self.max_tokens = parse_usize(max_tokens);
@@ -287,6 +305,12 @@ impl AppConfig {
         if let Some(openai_base_url) = env.get("ELROY_OPENAI_BASE_URL") {
             self.openai_base_url = openai_base_url.clone();
         }
+        if let Some(fast_model_api_key) = env.get("ELROY_FAST_MODEL_API_KEY") {
+            self.fast_model_api_key = Some(fast_model_api_key.clone());
+        }
+        if let Some(fast_model_api_base) = env.get("ELROY_FAST_MODEL_API_BASE") {
+            self.fast_model_api_base = Some(fast_model_api_base.clone());
+        }
         if let Some(anthropic_api_key) = env.get("ANTHROPIC_API_KEY") {
             self.anthropic_api_key = Some(anthropic_api_key.clone());
         }
@@ -302,6 +326,16 @@ impl AppConfig {
         LlmProvider::for_model(&self.chat_model)
     }
 
+    pub fn fast_model_name(&self) -> &str {
+        self.fast_model
+            .as_deref()
+            .unwrap_or(self.chat_model.as_str())
+    }
+
+    pub fn fast_llm_provider(&self) -> LlmProvider {
+        LlmProvider::for_model(self.fast_model_name())
+    }
+
     pub fn context_refresh_target_tokens(&self) -> usize {
         self.max_tokens / 3
     }
@@ -310,6 +344,7 @@ impl AppConfig {
 #[derive(Debug, Default, Deserialize)]
 struct FileConfig {
     chat_model: Option<String>,
+    fast_model: Option<String>,
     max_tokens: Option<usize>,
     default_assistant_name: Option<String>,
     reflect: Option<bool>,
@@ -332,6 +367,8 @@ struct FileConfig {
     database_url: Option<String>,
     openai_api_key: Option<String>,
     openai_base_url: Option<String>,
+    fast_model_api_key: Option<String>,
+    fast_model_api_base: Option<String>,
     anthropic_api_key: Option<String>,
     anthropic_base_url: Option<String>,
     anthropic_api_version: Option<String>,
@@ -496,6 +533,9 @@ mod tests {
             config.openai_base_url,
             "https://api.openai.com/v1/responses"
         );
+        assert_eq!(config.fast_model, None);
+        assert_eq!(config.fast_model_api_key, None);
+        assert_eq!(config.fast_model_api_base, None);
         assert_eq!(
             config.anthropic_base_url,
             "https://api.anthropic.com/v1/messages"
@@ -510,7 +550,7 @@ mod tests {
         let config_path = home_dir.join("elroy.conf.yaml");
         fs::write(
             &config_path,
-            "chat_model: gpt-5-nano\nmax_tokens: 9000\nreflect: true\nenable_assistant_greeting: true\nmin_convo_age_for_greeting_minutes: 15.5\nmax_context_age_minutes: 180.0\nmessages_between_memory: 12\nmemories_between_consolidation: 6\nl2_memory_relevance_distance_threshold: 1.11\nmemory_cluster_similarity_threshold: 0.33\nmax_memory_cluster_size: 7\nmin_memory_cluster_size: 4\nmessages_between_self_reflection: 4\nmemory_recall_classifier_enabled: false\nmemory_recall_classifier_window: 7\nexclude_tools:\n  - get_user_preferred_name\n  - get_help\nmemory_dir: /tmp/elroy-memories\nagenda_dir: /tmp/elroy-agenda\ndatabase_url: sqlite:////tmp/elroy.db\nirrelevant_key: ignored\n",
+            "chat_model: gpt-5-nano\nfast_model: gpt-5.4-mini\nmax_tokens: 9000\nreflect: true\nenable_assistant_greeting: true\nmin_convo_age_for_greeting_minutes: 15.5\nmax_context_age_minutes: 180.0\nmessages_between_memory: 12\nmemories_between_consolidation: 6\nl2_memory_relevance_distance_threshold: 1.11\nmemory_cluster_similarity_threshold: 0.33\nmax_memory_cluster_size: 7\nmin_memory_cluster_size: 4\nmessages_between_self_reflection: 4\nmemory_recall_classifier_enabled: false\nmemory_recall_classifier_window: 7\nexclude_tools:\n  - get_user_preferred_name\n  - get_help\nmemory_dir: /tmp/elroy-memories\nagenda_dir: /tmp/elroy-agenda\ndatabase_url: sqlite:////tmp/elroy.db\nfast_model_api_key: fast-key\nfast_model_api_base: http://localhost:1234/fast\nirrelevant_key: ignored\n",
         )
         .expect("config fixture should be written");
 
@@ -518,6 +558,7 @@ mod tests {
         let config = AppConfig::from_env(&env).expect("config should load");
 
         assert_eq!(config.chat_model, "gpt-5-nano");
+        assert_eq!(config.fast_model.as_deref(), Some("gpt-5.4-mini"));
         assert_eq!(config.max_tokens, 9000);
         assert_eq!(config.context_refresh_target_tokens(), 3000);
         assert_eq!(config.memory_dir, PathBuf::from("/tmp/elroy-memories"));
@@ -538,6 +579,11 @@ mod tests {
         assert_eq!(config.messages_between_self_reflection, 4);
         assert!(!config.memory_recall_classifier_enabled);
         assert_eq!(config.memory_recall_classifier_window, 7);
+        assert_eq!(config.fast_model_api_key.as_deref(), Some("fast-key"));
+        assert_eq!(
+            config.fast_model_api_base.as_deref(),
+            Some("http://localhost:1234/fast")
+        );
         assert!(config.include_base_tools);
         assert_eq!(
             config.exclude_tools,
@@ -567,6 +613,7 @@ mod tests {
                 "ELROY_CHAT_MODEL".to_string(),
                 "claude-sonnet-4-5-20250929".to_string(),
             ),
+            ("ELROY_FAST_MODEL".to_string(), "gpt-5.4-mini".to_string()),
             ("ELROY_MAX_TOKENS".to_string(), "12000".to_string()),
             (
                 "ELROY_DEFAULT_ASSISTANT_NAME".to_string(),
@@ -640,6 +687,14 @@ mod tests {
                 "http://localhost:1234/openai".to_string(),
             ),
             (
+                "ELROY_FAST_MODEL_API_KEY".to_string(),
+                "fast-test-key".to_string(),
+            ),
+            (
+                "ELROY_FAST_MODEL_API_BASE".to_string(),
+                "http://localhost:1234/fast".to_string(),
+            ),
+            (
                 "ELROY_ANTHROPIC_BASE_URL".to_string(),
                 "http://localhost:1234/anthropic".to_string(),
             ),
@@ -651,6 +706,7 @@ mod tests {
         let config = AppConfig::from_env(&env).expect("config should load");
 
         assert_eq!(config.chat_model, "claude-sonnet-4-5-20250929");
+        assert_eq!(config.fast_model.as_deref(), Some("gpt-5.4-mini"));
         assert_eq!(config.max_tokens, 12_000);
         assert_eq!(config.context_refresh_target_tokens(), 4_000);
         assert_eq!(config.assistant_name, "EnvElroy");
@@ -680,6 +736,11 @@ mod tests {
         );
         assert!(!config.async_runtime_enabled);
         assert_eq!(config.openai_api_key.as_deref(), Some("openai-test-key"));
+        assert_eq!(config.fast_model_api_key.as_deref(), Some("fast-test-key"));
+        assert_eq!(
+            config.fast_model_api_base.as_deref(),
+            Some("http://localhost:1234/fast")
+        );
         assert_eq!(
             config.anthropic_api_key.as_deref(),
             Some("anthropic-test-key")
@@ -688,6 +749,7 @@ mod tests {
         assert_eq!(config.anthropic_base_url, "http://localhost:1234/anthropic");
         assert_eq!(config.anthropic_api_version, "2099-01-01");
         assert_eq!(config.llm_provider(), LlmProvider::Anthropic);
+        assert_eq!(config.fast_llm_provider(), LlmProvider::OpenAi);
 
         fs::remove_dir_all(home_dir).expect("temp home dir should be removed");
     }

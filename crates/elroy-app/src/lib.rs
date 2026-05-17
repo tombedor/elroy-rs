@@ -534,7 +534,7 @@ impl AppRuntime {
         let connection = self.open_connection()?;
         let preferences = load_user_preferences(&connection, LOCAL_USER_TOKEN)?;
         let model = live_provider_model(&self.config, preferences.as_ref())?;
-        let classifier_model = live_provider_model(&self.config, preferences.as_ref())?;
+        let classifier_model = live_fast_provider_model(&self.config, preferences.as_ref())?;
         let executable_tools = if options.enable_tools {
             build_live_tool_registry(&self.config)
         } else {
@@ -580,6 +580,7 @@ impl AppRuntime {
         let mut connection = self.open_connection()?;
         let preferences = load_user_preferences(&connection, LOCAL_USER_TOKEN)?;
         let model = live_provider_model(&self.config, preferences.as_ref())?;
+        let classifier_model = live_fast_provider_model(&self.config, preferences.as_ref())?;
         let executable_tools = if options.enable_tools {
             build_live_tool_registry(&self.config)
         } else {
@@ -594,7 +595,7 @@ impl AppRuntime {
             &mut connection,
             prompt,
             &model,
-            Some(&model),
+            Some(&classifier_model),
             executable_tools,
             PromptExecutionOptions {
                 role: options.role,
@@ -1519,6 +1520,20 @@ fn live_provider_model(
 ) -> Result<LiveProviderModel, AppError> {
     let provider_config =
         provider_config_from_app_config(config).map_err(AppError::ProviderConfig)?;
+    let client = LiveModelClient::new(provider_config)
+        .map_err(|error| AppError::Runtime(error.to_string()))?;
+    Ok(LiveProviderModel::new(
+        client,
+        effective_persona(preferences, &config.assistant_name),
+    ))
+}
+
+fn live_fast_provider_model(
+    config: &AppConfig,
+    preferences: Option<&UserPreferenceRecord>,
+) -> Result<LiveProviderModel, AppError> {
+    let provider_config =
+        fast_provider_config_from_app_config(config).map_err(AppError::ProviderConfig)?;
     let client = LiveModelClient::new(provider_config)
         .map_err(|error| AppError::Runtime(error.to_string()))?;
     Ok(LiveProviderModel::new(
@@ -2581,7 +2596,7 @@ fn build_context_summary_message(
     let Ok(preferences) = load_user_preferences(connection, LOCAL_USER_TOKEN) else {
         return deterministic;
     };
-    let Ok(provider_config) = provider_config_from_app_config(config) else {
+    let Ok(provider_config) = fast_provider_config_from_app_config(config) else {
         return deterministic;
     };
     let Ok(client) = LiveModelClient::new(provider_config) else {
@@ -5715,7 +5730,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
 
     let database_path = config.database_path.clone();
     let memory_dir_for_search_memories = config.memory_dir.clone();
-    let provider_config_for_search_memories = provider_config_from_app_config(config).ok();
+    let provider_config_for_search_memories = fast_provider_config_from_app_config(config).ok();
     let assistant_name_for_search_memories = config.assistant_name.clone();
     let search_memories = ExecutableTool::new(
         ToolSpec::new(
@@ -5791,7 +5806,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
 
     let database_path = config.database_path.clone();
     let memory_dir_for_examine_memories = config.memory_dir.clone();
-    let provider_config_for_examine_memories = provider_config_from_app_config(config).ok();
+    let provider_config_for_examine_memories = fast_provider_config_from_app_config(config).ok();
     let assistant_name_for_examine_memories = config.assistant_name.clone();
     let examine_memories = ExecutableTool::new(
         ToolSpec::new(
@@ -8800,33 +8815,85 @@ fn strip_input_message_for_persistence(
 }
 
 pub fn provider_config_from_app_config(config: &AppConfig) -> Result<ProviderConfig, String> {
-    match config.llm_provider() {
+    provider_config_for_model(
+        config.llm_provider(),
+        &config.chat_model,
+        config.openai_api_key.as_deref(),
+        Some(config.openai_base_url.as_str()),
+        config.anthropic_api_key.as_deref(),
+        Some(config.anthropic_base_url.as_str()),
+        Some(config.anthropic_api_version.as_str()),
+    )
+}
+
+fn fast_provider_config_from_app_config(config: &AppConfig) -> Result<ProviderConfig, String> {
+    if config.fast_model.is_none() {
+        return provider_config_from_app_config(config);
+    }
+
+    provider_config_for_model(
+        config.fast_llm_provider(),
+        config.fast_model_name(),
+        config
+            .fast_model_api_key
+            .as_deref()
+            .or(config.openai_api_key.as_deref()),
+        config
+            .fast_model_api_base
+            .as_deref()
+            .or(Some(config.openai_base_url.as_str())),
+        config
+            .fast_model_api_key
+            .as_deref()
+            .or(config.anthropic_api_key.as_deref()),
+        config
+            .fast_model_api_base
+            .as_deref()
+            .or(Some(config.anthropic_base_url.as_str())),
+        Some(config.anthropic_api_version.as_str()),
+    )
+}
+
+fn provider_config_for_model(
+    provider: LlmProvider,
+    model_name: &str,
+    openai_api_key: Option<&str>,
+    openai_base_url: Option<&str>,
+    anthropic_api_key: Option<&str>,
+    anthropic_base_url: Option<&str>,
+    anthropic_api_version: Option<&str>,
+) -> Result<ProviderConfig, String> {
+    match provider {
         LlmProvider::OpenAi => {
-            let api_key = config
-                .openai_api_key
-                .clone()
+            let api_key = openai_api_key
+                .map(ToOwned::to_owned)
                 .ok_or_else(|| "missing OPENAI_API_KEY for OpenAI model".to_string())?;
             Ok(ProviderConfig {
                 provider: Provider::OpenAi,
-                model: config.chat_model.clone(),
+                model: model_name.to_string(),
                 api_key,
-                base_url: config.openai_base_url.clone(),
+                base_url: openai_base_url
+                    .unwrap_or("https://api.openai.com/v1/responses")
+                    .to_string(),
                 anthropic_api_version: None,
                 timeout_seconds: 60,
                 max_output_tokens: 2048,
             })
         }
         LlmProvider::Anthropic => {
-            let api_key = config
-                .anthropic_api_key
-                .clone()
+            let api_key = anthropic_api_key
+                .map(ToOwned::to_owned)
                 .ok_or_else(|| "missing ANTHROPIC_API_KEY for Anthropic model".to_string())?;
             Ok(ProviderConfig {
                 provider: Provider::Anthropic,
-                model: config.chat_model.clone(),
+                model: model_name.to_string(),
                 api_key,
-                base_url: config.anthropic_base_url.clone(),
-                anthropic_api_version: Some(config.anthropic_api_version.clone()),
+                base_url: anthropic_base_url
+                    .unwrap_or("https://api.anthropic.com/v1/messages")
+                    .to_string(),
+                anthropic_api_version: Some(
+                    anthropic_api_version.unwrap_or("2023-06-01").to_string(),
+                ),
                 timeout_seconds: 60,
                 max_output_tokens: 2048,
             })
@@ -8857,9 +8924,9 @@ mod tests {
         context_due_item_tool_call_id, context_due_item_tool_messages,
         context_memory_tool_messages, context_task_tool_messages, count_context_tokens,
         determine_memory_recall_decision, drop_old_context_messages, due_item_context_messages,
-        format_context_messages_for_summary, format_context_summary_message,
-        is_context_refresh_needed, memory_recall_status_updates, message_matches_tool_call_id,
-        parse_memory_recall_decision, parse_recalled_item_refs,
+        fast_provider_config_from_app_config, format_context_messages_for_summary,
+        format_context_summary_message, is_context_refresh_needed, memory_recall_status_updates,
+        message_matches_tool_call_id, parse_memory_recall_decision, parse_recalled_item_refs,
         parse_reflective_recall_model_response, parse_relevance_filter_response,
         prompt_prelude_status_updates, provider_config_from_app_config,
         recall_due_item_context_messages, recall_memory_context_messages,
@@ -9279,6 +9346,37 @@ mod tests {
         assert_eq!(config.llm_provider(), LlmProvider::Anthropic);
         assert_eq!(provider.provider, Provider::Anthropic);
         assert_eq!(provider.api_key, "anthropic-key");
+    }
+
+    #[test]
+    fn fast_provider_config_falls_back_to_chat_model_when_fast_model_is_unset() {
+        let mut config = AppConfig::defaults();
+        config.chat_model = "gpt-5.4".to_string();
+        config.openai_api_key = Some("openai-key".to_string());
+
+        let provider = fast_provider_config_from_app_config(&config).expect("config should build");
+
+        assert_eq!(provider.provider, Provider::OpenAi);
+        assert_eq!(provider.model, "gpt-5.4");
+        assert_eq!(provider.api_key, "openai-key");
+        assert_eq!(provider.base_url, config.openai_base_url);
+    }
+
+    #[test]
+    fn fast_provider_config_uses_fast_model_and_overrides_when_configured() {
+        let mut config = AppConfig::defaults();
+        config.chat_model = "claude-sonnet-4-20250514".to_string();
+        config.anthropic_api_key = Some("anthropic-key".to_string());
+        config.fast_model = Some("gpt-5.4-mini".to_string());
+        config.fast_model_api_key = Some("fast-key".to_string());
+        config.fast_model_api_base = Some("http://localhost:4321/fast".to_string());
+
+        let provider = fast_provider_config_from_app_config(&config).expect("config should build");
+
+        assert_eq!(provider.provider, Provider::OpenAi);
+        assert_eq!(provider.model, "gpt-5.4-mini");
+        assert_eq!(provider.api_key, "fast-key");
+        assert_eq!(provider.base_url, "http://localhost:4321/fast");
     }
 
     #[test]
@@ -14472,6 +14570,79 @@ mod tests {
         config.database_path = database_path;
         config.openai_api_key = Some("test-key".to_string());
         config.openai_base_url = format!("{}/responses", server.url());
+        elroy_db::bootstrap_database(&BootstrapPlan::from_config(&config))
+            .expect("bootstrap should succeed");
+
+        let registry = build_live_tool_registry(&config);
+        let search = registry.invoke(
+            "search_memories",
+            "{\"query\":\"What gear should I bring?\",\"limit\":5}",
+        );
+
+        assert!(!search.is_error);
+        assert!(
+            search
+                .content
+                .contains("Memory | bands note | Pack resistance bands before drills.")
+        );
+        assert!(!search.content.contains("Memory | gear inventory |"));
+
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
+    fn live_tool_registry_search_memories_can_use_fast_model_config_when_chat_model_differs() {
+        let unique = format!(
+            "elroy-rs-app-search-memories-fast-model-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+        fs::write(
+            memory_dir.join("gear_inventory.md"),
+            "Review the storage locker spreadsheet.\n",
+        )
+        .expect("overlap memory should be written");
+        fs::write(
+            memory_dir.join("bands_note.md"),
+            "Pack resistance bands before drills.\n",
+        )
+        .expect("semantic memory should be written");
+
+        let mut server = mockito::Server::new();
+        let _mock = server
+            .mock("POST", "/responses")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "output": [{
+                        "type": "message",
+                        "content": [{
+                            "type": "output_text",
+                            "text": r#"{"answers":[false,true],"reasoning":"Only the resistance-bands memory matches the user's intent."}"#
+                        }]
+                    }]
+                })
+                .to_string(),
+            )
+            .create();
+
+        let mut config = AppConfig::defaults();
+        config.chat_model = "claude-sonnet-4-20250514".to_string();
+        config.memory_dir = memory_dir;
+        config.agenda_dir = agenda_dir;
+        config.database_path = database_path;
+        config.fast_model = Some("gpt-5.4-mini".to_string());
+        config.fast_model_api_key = Some("fast-test-key".to_string());
+        config.fast_model_api_base = Some(format!("{}/responses", server.url()));
         elroy_db::bootstrap_database(&BootstrapPlan::from_config(&config))
             .expect("bootstrap should succeed");
 
