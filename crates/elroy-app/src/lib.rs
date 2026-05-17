@@ -5671,7 +5671,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                 let relevant_memories = select_relevant_recall_memories(
                     query,
                     &memories,
-                    &HashSet::new(),
+                    &[],
                     recall_limit,
                     relevance_model
                         .as_ref()
@@ -5732,7 +5732,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                 let relevant_memories = select_relevant_recall_memories(
                     question,
                     &memories,
-                    &HashSet::new(),
+                    &[],
                     recall_limit,
                     relevance_model
                         .as_ref()
@@ -7171,10 +7171,15 @@ fn transcript_contains_context_task(transcript: &[ConversationMessage], task_nam
 
 fn transcript_contains_recalled_agenda_item(
     transcript: &[ConversationMessage],
+    agenda_item_id: i64,
     agenda_item_name: &str,
 ) -> bool {
     transcript_contains_context_due_item(transcript, agenda_item_name)
-        || recalled_item_names_by_type(transcript, "AgendaItem").contains(agenda_item_name)
+        || recalled_item_matches(
+            &recalled_item_refs_by_type(transcript, "AgendaItem"),
+            agenda_item_id,
+            agenda_item_name,
+        )
 }
 
 fn message_matches_context_memory(message: &ConversationMessage, tool_call_id: &str) -> bool {
@@ -7371,6 +7376,12 @@ struct MemoryRecallDecision {
     used_llm: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct RecalledItemRef {
+    id: Option<i64>,
+    name: String,
+}
+
 fn recall_memory_context_messages_with_decision(
     memory_recall_classifier_window: usize,
     reflect: bool,
@@ -7386,7 +7397,7 @@ fn recall_memory_context_messages_with_decision(
     let recall_query =
         build_recall_query(prompt, context.transcript, memory_recall_classifier_window);
     let relevance_model = reflective_model;
-    let already_recalled_memories = recalled_item_names_by_type(context.transcript, "Memory");
+    let already_recalled_memories = recalled_item_refs_by_type(context.transcript, "Memory");
     let recalled = select_relevant_recall_memories(
         &recall_query,
         context.memories,
@@ -7395,13 +7406,15 @@ fn recall_memory_context_messages_with_decision(
         relevance_model,
     );
     let already_recalled_agenda_items =
-        recalled_item_names_by_type(context.transcript, "AgendaItem");
+        recalled_item_refs_by_type(context.transcript, "AgendaItem");
     let fast_due_items = if reflect {
         Vec::new()
     } else {
         select_relevant_recall_due_items(&recall_query, context.due_items, 2, relevance_model)
             .into_iter()
-            .filter(|item| !already_recalled_agenda_items.contains(&item.name))
+            .filter(|item| {
+                !recalled_item_matches(&already_recalled_agenda_items, item.id, &item.name)
+            })
             .collect()
     };
     let fast_agenda_items = if reflect {
@@ -7409,13 +7422,17 @@ fn recall_memory_context_messages_with_decision(
     } else {
         select_relevant_recall_agenda_items(&recall_query, context.agenda_items, 2, relevance_model)
             .into_iter()
-            .filter(|item| !already_recalled_agenda_items.contains(&item.name))
+            .filter(|item| {
+                !recalled_item_matches(&already_recalled_agenda_items, item.id, &item.name)
+            })
             .collect()
     };
     let reflective_due_items = if reflect {
         select_relevant_recall_due_items(&recall_query, context.due_items, 2, relevance_model)
             .into_iter()
-            .filter(|item| !already_recalled_agenda_items.contains(&item.name))
+            .filter(|item| {
+                !recalled_item_matches(&already_recalled_agenda_items, item.id, &item.name)
+            })
             .collect()
     } else {
         Vec::new()
@@ -7423,7 +7440,9 @@ fn recall_memory_context_messages_with_decision(
     let reflective_agenda_items = if reflect {
         select_relevant_recall_agenda_items(&recall_query, context.agenda_items, 2, relevance_model)
             .into_iter()
-            .filter(|item| !already_recalled_agenda_items.contains(&item.name))
+            .filter(|item| {
+                !recalled_item_matches(&already_recalled_agenda_items, item.id, &item.name)
+            })
             .collect()
     } else {
         Vec::new()
@@ -7561,7 +7580,7 @@ fn recall_due_item_context_messages(
     }
     recalled
         .into_iter()
-        .filter(|item| !transcript_contains_recalled_agenda_item(transcript, &item.name))
+        .filter(|item| !transcript_contains_recalled_agenda_item(transcript, item.id, &item.name))
         .flat_map(context_due_item_tool_messages)
         .collect()
 }
@@ -7784,7 +7803,7 @@ Query: {query}\nResponses:\n{responses}"
 fn select_relevant_recall_memories<'a>(
     query: &str,
     memories: &'a [MemoryRecord],
-    already_recalled: &HashSet<String>,
+    already_recalled: &[RecalledItemRef],
     limit: usize,
     relevance_model: Option<&dyn ModelClient>,
 ) -> Vec<&'a MemoryRecord> {
@@ -7885,12 +7904,12 @@ fn select_relevant_recall_agenda_items<'a>(
 
 fn recent_memory_candidates<'a>(
     memories: &'a [MemoryRecord],
-    already_recalled: &HashSet<String>,
+    already_recalled: &[RecalledItemRef],
     limit: usize,
 ) -> Vec<&'a MemoryRecord> {
     let mut candidates = memories
         .iter()
-        .filter(|memory| !already_recalled.contains(&memory.name.to_ascii_lowercase()))
+        .filter(|memory| !recalled_item_matches(already_recalled, memory.id, &memory.name))
         .collect::<Vec<_>>();
     candidates.sort_by(|left, right| {
         right
@@ -8236,18 +8255,21 @@ fn build_reflective_recall_content_with_model(
 
 #[cfg(test)]
 fn recalled_memory_names(transcript: &[ConversationMessage]) -> HashSet<String> {
-    recalled_item_names_by_type(transcript, "Memory")
+    recalled_item_refs_by_type(transcript, "Memory")
+        .into_iter()
+        .map(|item| item.name)
+        .collect()
 }
 
-fn recalled_item_names_by_type(
+fn recalled_item_refs_by_type(
     transcript: &[ConversationMessage],
     memory_type: &str,
-) -> HashSet<String> {
+) -> Vec<RecalledItemRef> {
     transcript
         .iter()
         .filter(|message| message.role == MessageRole::Tool)
         .filter_map(|message| message.content.as_deref())
-        .flat_map(|content| parse_recalled_item_names(content, memory_type))
+        .flat_map(|content| parse_recalled_item_refs(content, memory_type))
         .collect()
 }
 
@@ -8358,12 +8380,7 @@ fn select_recalled_due_items<'a>(
     select_due_items_by_overlap(prompt, due_items, limit, Some(now_iso))
 }
 
-#[cfg(test)]
-fn parse_recalled_memory_names(content: &str) -> Vec<String> {
-    parse_recalled_item_names(content, "Memory")
-}
-
-fn parse_recalled_item_names(content: &str, desired_memory_type: &str) -> Vec<String> {
+fn parse_recalled_item_refs(content: &str, desired_memory_type: &str) -> Vec<RecalledItemRef> {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(content) else {
         return Vec::new();
     };
@@ -8374,7 +8391,10 @@ fn parse_recalled_item_names(content: &str, desired_memory_type: &str) -> Vec<St
             .filter_map(|item| {
                 item.get("name")
                     .and_then(serde_json::Value::as_str)
-                    .map(|name| name.to_ascii_lowercase())
+                    .map(|name| RecalledItemRef {
+                        id: item.get("memory_id").and_then(serde_json::Value::as_i64),
+                        name: name.to_ascii_lowercase(),
+                    })
             })
             .collect();
     }
@@ -8393,16 +8413,30 @@ fn parse_recalled_item_names(content: &str, desired_memory_type: &str) -> Vec<St
             (memory_type == desired_memory_type).then(|| {
                 item.get("name")
                     .and_then(serde_json::Value::as_str)
-                    .map(|name| name.to_ascii_lowercase())
+                    .map(|name| RecalledItemRef {
+                        id: item.get("memory_id").and_then(serde_json::Value::as_i64),
+                        name: name.to_ascii_lowercase(),
+                    })
             })?
         })
         .collect()
 }
 
+fn recalled_item_matches(
+    recalled_items: &[RecalledItemRef],
+    item_id: i64,
+    item_name: &str,
+) -> bool {
+    let normalized_name = item_name.to_ascii_lowercase();
+    recalled_items.iter().any(|recalled| {
+        recalled.id == Some(item_id) || (recalled.id.is_none() && recalled.name == normalized_name)
+    })
+}
+
 fn select_recalled_memories<'a>(
     prompt: &str,
     memories: &'a [elroy_db::MemoryRecord],
-    already_recalled: &HashSet<String>,
+    already_recalled: &[RecalledItemRef],
     limit: usize,
 ) -> Vec<&'a elroy_db::MemoryRecord> {
     let prompt_tokens = significant_tokens(prompt);
@@ -8413,7 +8447,7 @@ fn select_recalled_memories<'a>(
     let mut scored = memories
         .iter()
         .filter_map(|memory| {
-            if already_recalled.contains(&memory.name.to_ascii_lowercase()) {
+            if recalled_item_matches(already_recalled, memory.id, &memory.name) {
                 return None;
             }
             let mut haystack = String::with_capacity(memory.name.len() + memory.body.len() + 1);
@@ -8631,7 +8665,7 @@ pub fn provider_config_from_app_config(config: &AppConfig) -> Result<ProviderCon
 
 #[cfg(test)]
 mod tests {
-    use crate::RecallContext;
+    use crate::{RecallContext, RecalledItemRef};
     use chrono::{Local, Utc};
     use std::{
         cell::RefCell,
@@ -8654,11 +8688,11 @@ mod tests {
         determine_memory_recall_decision, drop_old_context_messages, due_item_context_messages,
         format_context_messages_for_summary, format_context_summary_message,
         is_context_refresh_needed, memory_recall_status_updates, message_matches_tool_call_id,
-        parse_memory_recall_decision, parse_recalled_item_names, parse_recalled_memory_names,
+        parse_memory_recall_decision, parse_recalled_item_refs,
         parse_reflective_recall_model_response, parse_relevance_filter_response,
         prompt_prelude_status_updates, provider_config_from_app_config,
         recall_due_item_context_messages, recall_memory_context_messages,
-        recall_memory_context_messages_with_decision, recalled_item_names_by_type,
+        recall_memory_context_messages_with_decision, recalled_item_refs_by_type,
         recalled_memory_names, recent_recall_context, refresh_context_if_needed,
         run_prompt_with_model_and_registry, run_prompt_with_model_and_registry_internal,
         run_prompt_with_model_and_registry_stream, select_due_items_by_overlap,
@@ -13809,6 +13843,58 @@ mod tests {
     }
 
     #[test]
+    fn recall_due_item_context_messages_do_not_skip_same_name_due_item_with_different_id() {
+        let transcript = synthetic_tool_context_messages(
+            "bootstrap-memory-recall",
+            "get_fast_recall",
+            "{}",
+            r##"{
+  "content": "# payroll follow up\nOld payroll reminder",
+  "recall_metadata": [
+    {
+      "memory_type": "AgendaItem",
+      "memory_id": 1,
+      "name": "payroll follow up"
+    }
+  ]
+}"##,
+        );
+        let due_items = vec![AgendaItemRecord {
+            id: 2,
+            legacy_frontmatter_id: None,
+            name: "payroll follow up".to_string(),
+            file_path: "/tmp/payroll.md".to_string(),
+            agenda_date: Some("unscheduled".to_string()),
+            is_completed: false,
+            status: Some("created".to_string()),
+            trigger_datetime: None,
+            trigger_context: Some("after payroll email".to_string()),
+            closing_comment: None,
+            checklist_total: 0,
+            checklist_completed: 0,
+            body: "Reply to payroll".to_string(),
+            is_active: true,
+            updated_at_unix: 20,
+        }];
+
+        let messages = recall_due_item_context_messages(
+            "I just got the payroll email",
+            &transcript,
+            &due_items,
+            "2026-05-15T12:00:00",
+            None,
+        );
+
+        assert_eq!(messages.len(), 2);
+        assert!(
+            messages[1]
+                .content
+                .as_deref()
+                .is_some_and(|content| content.contains("Reply to payroll"))
+        );
+    }
+
+    #[test]
     fn recall_due_item_context_messages_can_broaden_beyond_overlap_via_relevance_model() {
         let transcript = vec![ConversationMessage::new(
             MessageRole::Assistant,
@@ -17004,12 +17090,8 @@ mod tests {
             },
         ];
 
-        let recalled = select_recalled_memories(
-            "I am heading to basketball practice",
-            &memories,
-            &HashSet::new(),
-            3,
-        );
+        let recalled =
+            select_recalled_memories("I am heading to basketball practice", &memories, &[], 3);
 
         assert_eq!(recalled.len(), 1);
         assert_eq!(recalled[0].name, "basketball form");
@@ -17587,6 +17669,54 @@ mod tests {
     }
 
     #[test]
+    fn recall_memory_context_messages_do_not_skip_same_name_memory_with_different_id() {
+        let transcript = synthetic_tool_context_messages(
+            "bootstrap-memory-recall",
+            "get_fast_recall",
+            "{}",
+            r##"{
+  "content": "# practice plan\nOld warmup advice",
+  "recall_metadata": [
+    {
+      "memory_type": "Memory",
+      "memory_id": 1,
+      "name": "practice plan"
+    }
+  ]
+}"##,
+        );
+
+        let messages = recall_memory_context_messages(
+            false,
+            3,
+            false,
+            "What should I do before basketball drills?",
+            RecallContext {
+                transcript: &transcript,
+                memories: &[MemoryRecord {
+                    id: 2,
+                    legacy_frontmatter_id: None,
+                    name: "practice plan".to_string(),
+                    file_path: "/tmp/practice.md".to_string(),
+                    body: "Warm up before basketball drills".to_string(),
+                    is_active: true,
+                    updated_at_unix: 10,
+                }],
+                due_items: &[],
+                agenda_items: &[],
+            },
+        );
+
+        assert_eq!(messages.len(), 2);
+        assert!(
+            messages[1]
+                .content
+                .as_deref()
+                .is_some_and(|content| content.contains("Warm up before basketball drills"))
+        );
+    }
+
+    #[test]
     fn memory_recall_status_updates_classify_before_fetch_when_enabled() {
         let events = memory_recall_status_updates(true, "What should I focus on?", true);
 
@@ -17687,11 +17817,14 @@ mod tests {
             r#"[{"name":"Basketball Form"},{"name":"Sleep Routine"}]"#,
         )];
 
-        let parsed =
-            parse_recalled_memory_names(r#"[{"name":"Basketball Form"},{"name":"Sleep Routine"}]"#);
+        let parsed = parse_recalled_item_refs(
+            r#"[{"name":"Basketball Form"},{"name":"Sleep Routine"}]"#,
+            "Memory",
+        );
         let names = recalled_memory_names(&transcript);
 
         assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].id, None);
         assert!(names.contains("basketball form"));
         assert!(names.contains("sleep routine"));
     }
@@ -17703,12 +17836,15 @@ mod tests {
             r#"{"content":"I remember these details may be relevant.","recall_metadata":[{"memory_type":"Memory","memory_id":1,"name":"Basketball Form"},{"memory_type":"AgendaItem","memory_id":9,"name":"Payroll Followup"},{"memory_type":"Memory","memory_id":2,"name":"Sleep Routine"}]}"#,
         )];
 
-        let parsed = parse_recalled_memory_names(
+        let parsed = parse_recalled_item_refs(
             r#"{"content":"I remember these details may be relevant.","recall_metadata":[{"memory_type":"Memory","memory_id":1,"name":"Basketball Form"},{"memory_type":"AgendaItem","memory_id":9,"name":"Payroll Followup"},{"memory_type":"Memory","memory_id":2,"name":"Sleep Routine"}]}"#,
+            "Memory",
         );
         let names = recalled_memory_names(&transcript);
 
         assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].id, Some(1));
+        assert_eq!(parsed[1].id, Some(2));
         assert!(names.contains("basketball form"));
         assert!(names.contains("sleep routine"));
         assert!(!names.contains("payroll followup"));
@@ -17721,13 +17857,18 @@ mod tests {
             r#"{"content":"I remember these details may be relevant.","recall_metadata":[{"memory_type":"Memory","memory_id":1,"name":"Basketball Form"},{"memory_type":"AgendaItem","memory_id":9,"name":"Payroll Followup"},{"memory_type":"AgendaItem","memory_id":10,"name":"Drill Plan"}]}"#,
         )];
 
-        let parsed = parse_recalled_item_names(
+        let parsed = parse_recalled_item_refs(
             r#"{"content":"I remember these details may be relevant.","recall_metadata":[{"memory_type":"Memory","memory_id":1,"name":"Basketball Form"},{"memory_type":"AgendaItem","memory_id":9,"name":"Payroll Followup"},{"memory_type":"AgendaItem","memory_id":10,"name":"Drill Plan"}]}"#,
             "AgendaItem",
         );
-        let names = recalled_item_names_by_type(&transcript, "AgendaItem");
+        let names = recalled_item_refs_by_type(&transcript, "AgendaItem")
+            .into_iter()
+            .map(|item| item.name)
+            .collect::<HashSet<_>>();
 
         assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].id, Some(9));
+        assert_eq!(parsed[1].id, Some(10));
         assert!(names.contains("payroll followup"));
         assert!(names.contains("drill plan"));
         assert!(!names.contains("basketball form"));
@@ -17930,7 +18071,10 @@ mod tests {
                 updated_at_unix: 9,
             },
         ];
-        let already_recalled = HashSet::from([String::from("basketball form")]);
+        let already_recalled = vec![RecalledItemRef {
+            id: None,
+            name: "basketball form".to_string(),
+        }];
 
         let recalled = select_recalled_memories(
             "I am heading to basketball practice",
@@ -18003,7 +18147,7 @@ mod tests {
         let relevant_memories = select_relevant_recall_memories(
             "What workout gear should I bring?",
             &memories,
-            &HashSet::new(),
+            &[],
             2,
             Some(&model),
         );
@@ -18089,7 +18233,7 @@ mod tests {
         let relevant_memories = select_relevant_recall_memories(
             "What gear should I bring to practice?",
             &memories,
-            &HashSet::new(),
+            &[],
             2,
             Some(&model),
         );
