@@ -339,10 +339,13 @@ fn run_event_loop(
             context_poll_ready = true;
             last_context_poll = Instant::now();
         }
-        if context_poll_ready && last_context_poll.elapsed() >= Duration::from_secs(1) {
-            poll_context_updates(app, runtime);
-            last_context_poll = Instant::now();
-        }
+        maybe_poll_context_updates(
+            app,
+            runtime,
+            context_poll_ready,
+            &mut last_context_poll,
+            Instant::now(),
+        );
         terminal.draw(|frame| {
             app.render(frame.area(), frame.buffer_mut());
         })?;
@@ -898,6 +901,24 @@ fn poll_context_updates(app: &mut TuiApp, runtime: &mut impl TuiRuntime) {
         app.render_new_context_messages(&trailing_unseen);
     }
     app.mark_context_messages_rendered(&context_messages[..trailing_start]);
+}
+
+fn maybe_poll_context_updates(
+    app: &mut TuiApp,
+    runtime: &mut impl TuiRuntime,
+    context_poll_ready: bool,
+    last_context_poll: &mut Instant,
+    now: Instant,
+) {
+    if !context_poll_ready || app.prompt_active || app.command_active {
+        return;
+    }
+    if now.duration_since(*last_context_poll) < Duration::from_secs(1) {
+        return;
+    }
+
+    poll_context_updates(app, runtime);
+    *last_context_poll = now;
 }
 
 fn apply_prompt_update(app: &mut TuiApp, update: PromptUpdate) {
@@ -2280,7 +2301,7 @@ impl TuiRuntime for NoopRuntime {
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
     use ratatui::buffer::Buffer;
@@ -2294,8 +2315,8 @@ mod tests {
         TuiSlashCommandAction, TuiSnapshot, UiIntent, advance_prompt_stream,
         apply_intent_with_runtime, apply_key_event, apply_mouse_event, apply_paste_event,
         drive_runtime_tick, key_event_token, maybe_complete_command_execution,
-        maybe_refresh_snapshot_after_background_completion, maybe_run_deferred_context_refresh,
-        poll_context_updates, start_startup_prompt_stream,
+        maybe_poll_context_updates, maybe_refresh_snapshot_after_background_completion,
+        maybe_run_deferred_context_refresh, poll_context_updates, start_startup_prompt_stream,
     };
 
     fn select_command_palette_entry(app: &mut TuiApp, title: &str) {
@@ -4726,6 +4747,68 @@ mod tests {
             app.rendered_context_message_ids,
             HashSet::from([10, 11, 12, 13])
         );
+    }
+
+    #[test]
+    fn maybe_poll_context_updates_waits_for_command_action_to_finish() {
+        let mut app = TuiApp::from_snapshot(TuiSnapshot {
+            conversation_lines: vec!["assistant: existing".to_string()],
+            ..TuiSnapshot::default()
+        });
+        app.command_active = true;
+        app.rendered_context_message_ids = HashSet::from([1]);
+        let mut runtime = FakeRuntime {
+            context_messages: vec![
+                TuiContextMessage {
+                    id: 1,
+                    role: "assistant".to_string(),
+                    content: "existing".to_string(),
+                },
+                TuiContextMessage {
+                    id: 2,
+                    role: "assistant".to_string(),
+                    content: "background update".to_string(),
+                },
+            ],
+            ..FakeRuntime::default()
+        };
+        let mut last_context_poll = Instant::now() - Duration::from_secs(2);
+        let first_poll = last_context_poll;
+
+        maybe_poll_context_updates(
+            &mut app,
+            &mut runtime,
+            true,
+            &mut last_context_poll,
+            Instant::now(),
+        );
+
+        assert_eq!(
+            app.conversation_lines,
+            vec!["assistant: existing".to_string()]
+        );
+        assert_eq!(app.rendered_context_message_ids, HashSet::from([1]));
+        assert_eq!(last_context_poll, first_poll);
+
+        app.command_active = false;
+        let second_poll = Instant::now();
+        maybe_poll_context_updates(
+            &mut app,
+            &mut runtime,
+            true,
+            &mut last_context_poll,
+            second_poll,
+        );
+
+        assert_eq!(
+            app.conversation_lines,
+            vec![
+                "assistant: existing".to_string(),
+                "assistant: background update".to_string()
+            ]
+        );
+        assert_eq!(app.rendered_context_message_ids, HashSet::from([1, 2]));
+        assert_eq!(last_context_poll, second_poll);
     }
 
     #[test]
