@@ -4972,6 +4972,68 @@ mod tests {
     }
 
     #[test]
+    fn maybe_poll_context_updates_waits_for_prompt_stream_to_finish() {
+        let mut app = TuiApp::from_snapshot(TuiSnapshot {
+            conversation_lines: vec!["assistant: existing".to_string()],
+            ..TuiSnapshot::default()
+        });
+        app.prompt_active = true;
+        app.rendered_context_message_ids = HashSet::from([1]);
+        let mut runtime = FakeRuntime {
+            context_messages: vec![
+                TuiContextMessage {
+                    id: 1,
+                    role: "assistant".to_string(),
+                    content: "existing".to_string(),
+                },
+                TuiContextMessage {
+                    id: 2,
+                    role: "assistant".to_string(),
+                    content: "background update".to_string(),
+                },
+            ],
+            ..FakeRuntime::default()
+        };
+        let mut last_context_poll = Instant::now() - Duration::from_secs(2);
+        let first_poll = last_context_poll;
+
+        maybe_poll_context_updates(
+            &mut app,
+            &mut runtime,
+            true,
+            &mut last_context_poll,
+            Instant::now(),
+        );
+
+        assert_eq!(
+            app.conversation_lines,
+            vec!["assistant: existing".to_string()]
+        );
+        assert_eq!(app.rendered_context_message_ids, HashSet::from([1]));
+        assert_eq!(last_context_poll, first_poll);
+
+        app.prompt_active = false;
+        let second_poll = Instant::now();
+        maybe_poll_context_updates(
+            &mut app,
+            &mut runtime,
+            true,
+            &mut last_context_poll,
+            second_poll,
+        );
+
+        assert_eq!(
+            app.conversation_lines,
+            vec![
+                "assistant: existing".to_string(),
+                "assistant: background update".to_string()
+            ]
+        );
+        assert_eq!(app.rendered_context_message_ids, HashSet::from([1, 2]));
+        assert_eq!(last_context_poll, second_poll);
+    }
+
+    #[test]
     fn deferred_context_refresh_runs_once_after_deadline() {
         let mut app = TuiApp::bootstrap();
         let mut runtime = FakeRuntime::default();
