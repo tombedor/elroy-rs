@@ -2455,8 +2455,32 @@ The memories being consolidated can be from any time in the past. Note that the 
 Use ISO 8601 format for dates and times to ensure references remain unambiguous in future retrievals.\n\n\
 ## Style Guidelines\n\n\
 - Limit each new memory excerpt to {} words.\n\n\
+## Memory Title Guidelines\n\n\
+Examples of effective and ineffective memory titles are provided:\n\n\
+**Ineffective:**\n\
+- UserFoo's project progress and personal goals: 'Personal goals' is too vague; two topics are referenced.\n\n\
+**Effective:**\n\
+- UserFoo's project on building a treehouse: Specific and topic-focused.\n\
+- UserFoo's goal to be more thoughtful in conversation: Specifies a clear goal.\n\n\
+**Ineffective:**\n\
+- UserFoo's weekend plans: 'Weekend plans' lacks specificity, and dates should be in ISO 8601 format.\n\n\
+**Effective:**\n\
+- UserFoo's plan to attend a concert on 2022-02-11: Specific with a defined date.\n\n\
+**Ineffective:**\n\
+- UserFoo's preferred name and well-being: Covers two distinct topics; 'well-being' is generic.\n\n\
+**Effective:**\n\
+- UserFoo's preferred name: Focused on a single topic.\n\
+- UserFoo's feeling of rejuvenation after rest: Clarifies the topic.\n\n\
 ## Formatting\n\n\
-Return exactly one JSON object with key `memories`, whose value is an array of objects with string fields `name` and `text`.\n\
+Respond in Markdown format using this structure:\n\n\
+```markdown\n\
+# Memory Consolidation Reasoning\n\
+Provide a clear explanation of the consolidation or reorganization choices. Justify which information was included or omitted, and detail organizational strategies and considerations.\n\n\
+## Memory Title 1\n\
+Include all pertinent content from the original memories for the specified topic. Optionally, add reflections on how the assistant should respond to this information, along with any open questions the memory poses.\n\n\
+## Memory Title 2  (If necessary)\n\
+Detail the content for a second memory, should distinct topics require individual consolidation. Repeat as needed.\n\
+```\n\n\
 If the excerpts are about the same topic, usually return a single consolidated memory. If they are distinct, return multiple reorganized memories.\n\n\
 # Memory Consolidation Input\n{}",
         Local::now().to_rfc3339(),
@@ -2467,18 +2491,11 @@ If the excerpts are about the same topic, usually return a single consolidated m
 }
 
 fn parse_consolidated_memory_response(response: &str) -> Option<Vec<ConsolidatedMemoryOutput>> {
-    let trimmed = response.trim();
-    let json_text = if trimmed.starts_with("```") {
-        trimmed
-            .lines()
-            .skip(1)
-            .take_while(|line| !line.trim_start().starts_with("```"))
-            .collect::<Vec<_>>()
-            .join("\n")
-    } else {
-        trimmed.to_string()
-    };
-    let value = serde_json::from_str::<Value>(json_text.trim()).ok()?;
+    let normalized = strip_outer_code_fence(response.trim());
+    if let Some(outputs) = parse_markdown_consolidated_memory_response(&normalized) {
+        return Some(outputs);
+    }
+    let value = serde_json::from_str::<Value>(normalized.trim()).ok()?;
     let memories = value.get("memories")?.as_array()?;
     Some(
         memories
@@ -2496,6 +2513,68 @@ fn parse_consolidated_memory_response(response: &str) -> Option<Vec<Consolidated
             })
             .collect(),
     )
+}
+
+fn strip_outer_code_fence(text: &str) -> String {
+    let trimmed = text.trim();
+    if !trimmed.starts_with("```") {
+        return trimmed.to_string();
+    }
+    let mut lines = trimmed.lines();
+    let _opening = lines.next();
+    let remainder = lines.collect::<Vec<_>>();
+    let mut end = remainder.len();
+    while end > 0 && remainder[end - 1].trim().is_empty() {
+        end -= 1;
+    }
+    if end > 0 && remainder[end - 1].trim_start().starts_with("```") {
+        end -= 1;
+    }
+    remainder[..end].join("\n")
+}
+
+fn parse_markdown_consolidated_memory_response(
+    response: &str,
+) -> Option<Vec<ConsolidatedMemoryOutput>> {
+    let mut outputs = Vec::new();
+    let mut current_name: Option<String> = None;
+    let mut current_body = Vec::new();
+
+    let flush_current = |outputs: &mut Vec<ConsolidatedMemoryOutput>,
+                         current_name: &mut Option<String>,
+                         current_body: &mut Vec<String>| {
+        let Some(name) = current_name.take() else {
+            return;
+        };
+        let text = current_body.join("\n").trim().to_string();
+        current_body.clear();
+        if text.is_empty() {
+            return;
+        }
+        outputs.push(ConsolidatedMemoryOutput { name, text });
+    };
+
+    for line in response.lines() {
+        let trimmed = line.trim_end();
+        if let Some(heading) = trimmed.strip_prefix("## ") {
+            flush_current(&mut outputs, &mut current_name, &mut current_body);
+            let title = heading.trim();
+            if !title.is_empty() {
+                current_name = Some(title.to_string());
+            }
+            continue;
+        }
+        if current_name.is_some() {
+            current_body.push(trimmed.to_string());
+        }
+    }
+    flush_current(&mut outputs, &mut current_name, &mut current_body);
+
+    if outputs.is_empty() {
+        None
+    } else {
+        Some(outputs)
+    }
 }
 
 fn fallback_consolidated_memory_outputs(
@@ -11546,6 +11625,138 @@ mod tests {
     }
 
     #[test]
+    fn create_memory_tool_triggers_semantic_consolidation_with_python_style_markdown_outputs() {
+        let unique = format!(
+            "elroy-rs-app-markdown-memory-consolidation-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+
+        let mut server = mockito::Server::new();
+        let _first_embedding = server
+            .mock("POST", "/embeddings")
+            .match_body(mockito::Matcher::Regex(
+                "I went to the store today, January 1".to_string(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "data": [{"embedding": [1.0, 0.0]}]
+                })
+                .to_string(),
+            )
+            .create();
+        let _second_embedding = server
+            .mock("POST", "/embeddings")
+            .match_body(mockito::Matcher::Regex(
+                "I bought milk and bread while shopping".to_string(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "data": [{"embedding": [0.98, 0.02]}]
+                })
+                .to_string(),
+            )
+            .create();
+        let _third_embedding = server
+            .mock("POST", "/embeddings")
+            .match_body(mockito::Matcher::Regex(
+                "I still need to compare grocery prices later".to_string(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "data": [{"embedding": [0.97, 0.03]}]
+                })
+                .to_string(),
+            )
+            .create();
+        let _consolidation_mock = server
+            .mock("POST", "/responses")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "output": [{
+                        "type": "message",
+                        "content": [{
+                            "type": "output_text",
+                            "text": "# Memory Consolidation Reasoning\nI split the shopping memories into a factual trip summary and a follow-up pricing reminder.\n\n## Shopping trip on 2024-01-01\nUser went to the store on New Year's Day and bought milk and bread.\n\n## User's grocery price comparison follow-up\nUser still wants to compare grocery prices after the New Year's Day shopping trip."
+                        }]
+                    }]
+                })
+                .to_string(),
+            )
+            .create();
+
+        let mut config = AppConfig::defaults();
+        config.memory_dir = memory_dir.clone();
+        config.agenda_dir = agenda_dir;
+        config.database_path = database_path.clone();
+        config.memories_between_consolidation = 3;
+        config.min_memory_cluster_size = 3;
+        config.max_memory_cluster_size = 5;
+        config.memory_cluster_similarity_threshold = 0.1;
+        config.fast_model = Some("gpt-5.4-mini".to_string());
+        config.fast_model_api_key = Some("fast-test-key".to_string());
+        config.fast_model_api_base = Some(format!("{}/responses", server.url()));
+        config.embedding_model = "text-embedding-3-small".to_string();
+        config.embedding_model_api_key = Some("embedding-test-key".to_string());
+        config.embedding_model_api_base = Some(format!("{}/embeddings", server.url()));
+
+        let registry = build_live_tool_registry(&config);
+        let first = registry.invoke(
+            "create_memory",
+            "{\"name\":\"Shopping trip note\",\"text\":\"I went to the store today, January 1\"}",
+        );
+        let second = registry.invoke(
+            "create_memory",
+            "{\"name\":\"Grocery purchases\",\"text\":\"I bought milk and bread while shopping\"}",
+        );
+        let third = registry.invoke(
+            "create_memory",
+            "{\"name\":\"Price comparison follow-up\",\"text\":\"I still need to compare grocery prices later\"}",
+        );
+        assert!(!first.is_error);
+        assert!(!second.is_error);
+        assert!(!third.is_error);
+
+        let connection = open_sqlite_connection(&database_path).expect("database should reopen");
+        let active_memories =
+            elroy_db::list_active_memories(&connection, 10).expect("active memories should list");
+        assert_eq!(active_memories.len(), 2);
+        assert!(
+            active_memories
+                .iter()
+                .any(|memory| memory.name == "shopping trip on 2024 01 01")
+        );
+        assert!(
+            active_memories
+                .iter()
+                .any(|memory| memory.name == "user s grocery price comparison follow up")
+        );
+
+        let tracker = load_memory_operation_tracker(&connection, LOCAL_USER_TOKEN)
+            .expect("tracker should load")
+            .expect("tracker should exist");
+        assert_eq!(tracker.memories_since_consolidation, 0);
+
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
     fn consolidate_memory_cluster_uses_python_style_prompt_contract() {
         struct ConsolidationPromptInspectionModel;
 
@@ -11562,6 +11773,11 @@ mod tests {
                     prompt.contains("Limit each new memory excerpt to 300 words."),
                     "{prompt}"
                 );
+                assert!(prompt.contains("## Memory Title Guidelines"), "{prompt}");
+                assert!(
+                    prompt.contains("# Memory Consolidation Reasoning"),
+                    "{prompt}"
+                );
                 assert!(prompt.contains("# Memory Consolidation Input"), "{prompt}");
                 assert!(prompt.contains("## shopping trip note"), "{prompt}");
                 assert!(
@@ -11569,7 +11785,7 @@ mod tests {
                     "{prompt}"
                 );
                 Ok(vec![StreamEvent::AssistantResponse {
-                    content: r#"{"memories":[{"name":"Shopping trip on 2024-01-01","text":"User went to the store on New Year's Day and bought some items."}]}"#
+                    content: "# Memory Consolidation Reasoning\nI merged the two memories because they describe the same shopping trip.\n\n## Shopping trip on 2024-01-01\nUser went to the store on New Year's Day and bought some items."
                         .to_string(),
                 }])
             }
@@ -11606,6 +11822,35 @@ mod tests {
                 name: "Shopping trip on 2024-01-01".to_string(),
                 text: "User went to the store on New Year's Day and bought some items.".to_string(),
             }]
+        );
+    }
+
+    #[test]
+    fn parse_consolidated_memory_response_accepts_python_style_markdown_multiple_outputs() {
+        let outputs = crate::parse_consolidated_memory_response(
+            "# Memory Consolidation Reasoning\n\
+I split the overlapping memories into two focused follow-ups.\n\n\
+## Shopping trip on 2024-01-01\n\
+User went to the store on New Year's Day and bought some items.\n\n\
+## User's grocery price comparison follow-up\n\
+User still wants to compare grocery prices after the shopping trip.",
+        )
+        .expect("markdown response should parse");
+
+        assert_eq!(
+            outputs,
+            vec![
+                crate::ConsolidatedMemoryOutput {
+                    name: "Shopping trip on 2024-01-01".to_string(),
+                    text: "User went to the store on New Year's Day and bought some items."
+                        .to_string(),
+                },
+                crate::ConsolidatedMemoryOutput {
+                    name: "User's grocery price comparison follow-up".to_string(),
+                    text: "User still wants to compare grocery prices after the shopping trip."
+                        .to_string(),
+                },
+            ]
         );
     }
 
