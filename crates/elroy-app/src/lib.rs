@@ -18871,6 +18871,186 @@ mod tests {
     }
 
     #[test]
+    fn process_message_does_not_duplicate_persisted_contextual_due_item_on_later_turn() {
+        let unique = format!(
+            "elroy-rs-app-process-message-contextual-due-item-dedupe-runtime-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+        fs::write(
+            agenda_dir.join("payroll_follow_up.md"),
+            "---\ndate: unscheduled\ncompleted: false\nstatus: created\ntrigger_context: after payroll email\n---\n\nReply to payroll\n",
+        )
+        .expect("contextual due item file should be written");
+
+        let mut fast_server = mockito::Server::new();
+        let classifier_mock = fast_server
+            .mock("POST", "/responses")
+            .match_header("authorization", "Bearer fast-test-key")
+            .match_body(mockito::Matcher::Regex(
+                "Analyze if this message requires recalling information from long-term memory"
+                    .to_string(),
+            ))
+            .expect(2)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "output": [{
+                        "type": "message",
+                        "content": [{
+                            "type": "output_text",
+                            "text": r#"{"needs_recall":false,"reasoning":"This should come from contextual reminder surfacing instead of memory recall."}"#
+                        }]
+                    }]
+                })
+                .to_string(),
+            )
+            .create();
+        let relevance_mock = fast_server
+            .mock("POST", "/responses")
+            .match_header("authorization", "Bearer fast-test-key")
+            .match_body(mockito::Matcher::Regex(
+                "Your job is to determine which candidate recall items are relevant to a query\\."
+                    .to_string(),
+            ))
+            .expect(2)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "output": [{
+                        "type": "message",
+                        "content": [{
+                            "type": "output_text",
+                            "text": r#"{"answers":[true],"reasoning":"This reminder is relevant."}"#
+                        }]
+                    }]
+                })
+                .to_string(),
+            )
+            .create();
+
+        let mut chat_server = mockito::Server::new();
+        let first_chat_mock = chat_server
+            .mock("POST", "/messages")
+            .match_header("x-api-key", "anthropic-test-key")
+            .match_header("anthropic-version", "2023-06-01")
+            .match_body(mockito::Matcher::Regex("Reply to payroll".to_string()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "content": [{
+                        "type": "text",
+                        "text": "You should reply to payroll."
+                    }]
+                })
+                .to_string(),
+            )
+            .create();
+        let second_chat_mock = chat_server
+            .mock("POST", "/messages")
+            .match_header("x-api-key", "anthropic-test-key")
+            .match_header("anthropic-version", "2023-06-01")
+            .match_body(mockito::Matcher::Regex(
+                "I just got another payroll email".to_string(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "content": [{
+                        "type": "text",
+                        "text": "That payroll reminder is already in context."
+                    }]
+                })
+                .to_string(),
+            )
+            .create();
+
+        let mut config = AppConfig::defaults();
+        config.home_dir = home.clone();
+        config.memory_dir = memory_dir;
+        config.agenda_dir = agenda_dir;
+        config.database_path = database_path.clone();
+        config.chat_model = "claude-sonnet-4-20250514".to_string();
+        config.anthropic_api_key = Some("anthropic-test-key".to_string());
+        config.anthropic_base_url = format!("{}/messages", chat_server.url());
+        config.fast_model = Some("gpt-5.4-mini".to_string());
+        config.fast_model_api_key = Some("fast-test-key".to_string());
+        config.fast_model_api_base = Some(format!("{}/responses", fast_server.url()));
+        config.memory_recall_classifier_enabled = true;
+        elroy_db::bootstrap_database(&BootstrapPlan::from_config(&config))
+            .expect("bootstrap should succeed");
+
+        let runtime = AppRuntime::new(config.clone());
+        let first_result = runtime
+            .process_message(
+                "I just got the payroll email",
+                MessageProcessOptions::default(),
+            )
+            .expect("first prompt should succeed");
+        assert!(first_result.events.iter().any(|event| matches!(
+            event,
+            StreamEvent::StatusUpdate { content } if content == "classifying recall..."
+        )));
+        assert!(first_result.events.iter().any(|event| matches!(
+            event,
+            StreamEvent::AssistantResponse { content }
+                if content == "You should reply to payroll."
+        )));
+
+        let second_result = runtime
+            .process_message(
+                "I just got another payroll email",
+                MessageProcessOptions::default(),
+            )
+            .expect("second prompt should succeed");
+        assert!(second_result.events.iter().any(|event| matches!(
+            event,
+            StreamEvent::StatusUpdate { content } if content == "classifying recall..."
+        )));
+        assert!(second_result.events.iter().any(|event| matches!(
+            event,
+            StreamEvent::AssistantResponse { content }
+                if content == "That payroll reminder is already in context."
+        )));
+
+        let mut reopened =
+            open_sqlite_connection(&config.database_path).expect("database should reopen");
+        let stored =
+            elroy_db::load_context_messages(&mut reopened, LOCAL_USER_TOKEN).expect("load ok");
+        let contextual_due_item_messages = stored
+            .iter()
+            .filter(|message| {
+                message_matches_tool_call_id(
+                    message,
+                    &context_due_item_tool_call_id("payroll follow up"),
+                )
+            })
+            .count();
+        assert_eq!(
+            contextual_due_item_messages, 2,
+            "the contextual due item tool-call/result pair should only be persisted once across turns"
+        );
+
+        classifier_mock.assert();
+        relevance_mock.assert();
+        first_chat_mock.assert();
+        second_chat_mock.assert();
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
     fn process_message_surfaces_and_cleans_up_due_items_end_to_end() {
         let unique = format!(
             "elroy-rs-app-process-message-due-item-cleanup-{}",
