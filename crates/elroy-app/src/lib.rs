@@ -211,6 +211,7 @@ struct PromptEventStreamState {
     persist_input_message: bool,
     messages_between_memory: usize,
     memories_between_consolidation: usize,
+    memory_consolidation_settings: Option<MemoryConsolidationSettings>,
     messages_between_self_reflection: usize,
     defer_auto_memory: bool,
     defer_self_reflection: bool,
@@ -251,12 +252,28 @@ struct PromptExecutionOptions<'a> {
     bootstrap_plan: BootstrapPlan,
     messages_between_memory: usize,
     memories_between_consolidation: usize,
+    memory_consolidation_settings: Option<MemoryConsolidationSettings>,
     messages_between_self_reflection: usize,
     defer_auto_memory: bool,
     defer_self_reflection: bool,
     memory_recall_classifier_enabled: bool,
     memory_recall_classifier_window: usize,
     reflect: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct MemoryConsolidationSettings {
+    memory_cluster_similarity_threshold: f64,
+    max_memory_cluster_size: usize,
+    min_memory_cluster_size: usize,
+    fast_provider_config: Option<ProviderConfig>,
+    embedding_provider_config: Option<EmbeddingProviderConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ConsolidatedMemoryOutput {
+    name: String,
+    text: String,
 }
 
 #[derive(Clone)]
@@ -538,6 +555,7 @@ impl AppRuntime {
                 &mut connection,
                 &BootstrapPlan::from_config(&self.config),
                 self.config.memories_between_consolidation,
+                Some(&memory_consolidation_settings_from_app_config(&self.config)),
                 existing_transcript_len,
                 transcript.as_slice(),
                 self.config.messages_between_memory,
@@ -591,6 +609,9 @@ impl AppRuntime {
                 bootstrap_plan: BootstrapPlan::from_config(&self.config),
                 messages_between_memory: self.config.messages_between_memory,
                 memories_between_consolidation: self.config.memories_between_consolidation,
+                memory_consolidation_settings: Some(memory_consolidation_settings_from_app_config(
+                    &self.config,
+                )),
                 messages_between_self_reflection: self.config.messages_between_self_reflection,
                 defer_auto_memory: options.defer_auto_memory,
                 defer_self_reflection: options.defer_self_reflection,
@@ -654,6 +675,9 @@ impl AppRuntime {
                 bootstrap_plan: BootstrapPlan::from_config(&self.config),
                 messages_between_memory: self.config.messages_between_memory,
                 memories_between_consolidation: self.config.memories_between_consolidation,
+                memory_consolidation_settings: Some(memory_consolidation_settings_from_app_config(
+                    &self.config,
+                )),
                 messages_between_self_reflection: self.config.messages_between_self_reflection,
                 defer_auto_memory: options.defer_auto_memory,
                 defer_self_reflection: options.defer_self_reflection,
@@ -1540,6 +1564,7 @@ fn finalize_prompt_event_stream(
             &mut state.connection,
             &state.bootstrap_plan,
             state.memories_between_consolidation,
+            state.memory_consolidation_settings.as_ref(),
             state.existing_transcript_len,
             persisted_transcript.as_slice(),
             state.messages_between_memory,
@@ -1742,6 +1767,7 @@ fn run_prompt_with_model_and_registry_internal(
         connection,
         &options.bootstrap_plan,
         options.memories_between_consolidation,
+        options.memory_consolidation_settings.as_ref(),
         persisted_transcript_start_len,
         persisted_transcript.as_slice(),
         options.messages_between_memory,
@@ -1902,6 +1928,7 @@ fn run_prompt_with_model_and_registry_stream_internal(
             persist_input_message: options.persist_input_message,
             messages_between_memory: options.messages_between_memory,
             memories_between_consolidation: options.memories_between_consolidation,
+            memory_consolidation_settings: options.memory_consolidation_settings,
             messages_between_self_reflection: options.messages_between_self_reflection,
             defer_auto_memory: options.defer_auto_memory,
             defer_self_reflection: options.defer_self_reflection,
@@ -1986,6 +2013,7 @@ fn refresh_context_if_needed(
                 connection,
                 bootstrap_plan,
                 config.memories_between_consolidation,
+                Some(&memory_consolidation_settings_from_app_config(config)),
             )?;
         }
 
@@ -2020,6 +2048,7 @@ fn run_auto_memory_if_needed(
     connection: &mut rusqlite::Connection,
     bootstrap_plan: &BootstrapPlan,
     memories_between_consolidation: usize,
+    memory_consolidation_settings: Option<&MemoryConsolidationSettings>,
     existing_transcript_len: usize,
     transcript: &[ConversationMessage],
     messages_between_memory: usize,
@@ -2067,6 +2096,7 @@ fn run_auto_memory_if_needed(
         connection,
         bootstrap_plan,
         memories_between_consolidation,
+        memory_consolidation_settings,
     )?;
     Ok(())
 }
@@ -2075,6 +2105,7 @@ fn record_memory_creation_and_maybe_consolidate(
     connection: &mut rusqlite::Connection,
     bootstrap_plan: &BootstrapPlan,
     memories_between_consolidation: usize,
+    memory_consolidation_settings: Option<&MemoryConsolidationSettings>,
 ) -> Result<(), AppError> {
     *connection = open_sqlite_connection(&bootstrap_plan.database_path)?;
     run_migrations(connection)?;
@@ -2094,12 +2125,24 @@ fn record_memory_creation_and_maybe_consolidate(
     }
 
     (|| {
-        consolidate_exact_duplicate_memories(connection, bootstrap_plan)?;
+        consolidate_memories(connection, bootstrap_plan, memory_consolidation_settings)?;
         tracker.memories_since_consolidation = 0;
         tracker.updated_at_unix = Utc::now().timestamp();
         save_memory_operation_tracker(connection, &tracker)?;
         Ok(())
     })()
+}
+
+fn consolidate_memories(
+    connection: &mut rusqlite::Connection,
+    bootstrap_plan: &BootstrapPlan,
+    memory_consolidation_settings: Option<&MemoryConsolidationSettings>,
+) -> Result<(), AppError> {
+    consolidate_exact_duplicate_memories(connection, bootstrap_plan)?;
+    if let Some(settings) = memory_consolidation_settings {
+        consolidate_semantic_memory_clusters(connection, bootstrap_plan, settings)?;
+    }
+    Ok(())
 }
 
 fn consolidate_exact_duplicate_memories(
@@ -2126,15 +2169,13 @@ fn consolidate_exact_duplicate_memories(
         let canonical = group.first().ok_or_else(|| {
             AppError::Runtime("duplicate memory group was unexpectedly empty".to_string())
         })?;
-        let source_names = group
-            .iter()
-            .map(|memory| memory.name.as_str())
-            .collect::<Vec<_>>();
-        create_consolidated_memory_from_plan(
+        create_consolidated_memories_from_records(
             bootstrap_plan,
-            &canonical.name,
-            &canonical.body,
-            &source_names,
+            &[ConsolidatedMemoryOutput {
+                name: canonical.name.clone(),
+                text: canonical.body.clone(),
+            }],
+            &group,
         )
         .map_err(AppError::Io)?;
         *connection = open_sqlite_connection(&bootstrap_plan.database_path)?;
@@ -2142,6 +2183,333 @@ fn consolidate_exact_duplicate_memories(
     }
 
     Ok(())
+}
+
+fn consolidate_semantic_memory_clusters(
+    connection: &mut rusqlite::Connection,
+    bootstrap_plan: &BootstrapPlan,
+    settings: &MemoryConsolidationSettings,
+) -> Result<(), AppError> {
+    if settings.min_memory_cluster_size < 2 || settings.max_memory_cluster_size < 2 {
+        return Ok(());
+    }
+
+    let embedding_client =
+        best_effort_embedding_client(settings.embedding_provider_config.as_ref());
+    let Some(embedding_client) = embedding_client else {
+        return Ok(());
+    };
+    let fast_model = best_effort_provider_model(settings.fast_provider_config.as_ref(), "Elroy");
+
+    let memories = list_active_memories_in_scope(connection, &bootstrap_plan.memory_dir, 500)?;
+    if memories.len() < settings.min_memory_cluster_size {
+        return Ok(());
+    }
+
+    let embedded_memories = memories
+        .into_iter()
+        .filter_map(|memory| {
+            let embedding = embedding_client
+                .embed(&format!("# {}\n{}", memory.name, memory.body.trim()))
+                .ok()?;
+            Some((memory, embedding))
+        })
+        .collect::<Vec<_>>();
+    if embedded_memories.len() < settings.min_memory_cluster_size {
+        return Ok(());
+    }
+
+    let embeddings = embedded_memories
+        .iter()
+        .map(|(_, embedding)| embedding.clone())
+        .collect::<Vec<_>>();
+    let memories = embedded_memories
+        .into_iter()
+        .map(|(memory, _)| memory)
+        .collect::<Vec<_>>();
+    let clusters = semantic_memory_clusters(
+        &embeddings,
+        settings.memory_cluster_similarity_threshold as f32,
+        settings.min_memory_cluster_size,
+        settings.max_memory_cluster_size,
+    );
+
+    for cluster in clusters {
+        let cluster_memories = cluster
+            .into_iter()
+            .filter_map(|index| memories.get(index).cloned())
+            .collect::<Vec<_>>();
+        if cluster_memories.len() < settings.min_memory_cluster_size {
+            continue;
+        }
+        let outputs = consolidate_memory_cluster_outputs(
+            &cluster_memories,
+            fast_model.as_ref().map(|model| model as &dyn ModelClient),
+        );
+        if outputs.is_empty() {
+            continue;
+        }
+        create_consolidated_memories_from_records(bootstrap_plan, &outputs, &cluster_memories)
+            .map_err(AppError::Io)?;
+        *connection = open_sqlite_connection(&bootstrap_plan.database_path)?;
+        run_migrations(connection)?;
+    }
+
+    Ok(())
+}
+
+fn semantic_memory_clusters(
+    embeddings: &[Vec<f32>],
+    distance_threshold: f32,
+    min_cluster_size: usize,
+    max_cluster_size: usize,
+) -> Vec<Vec<usize>> {
+    if embeddings.len() < min_cluster_size {
+        return Vec::new();
+    }
+
+    let mut visited = vec![false; embeddings.len()];
+    let mut assigned = vec![false; embeddings.len()];
+    let mut clusters = Vec::new();
+
+    for index in 0..embeddings.len() {
+        if visited[index] {
+            continue;
+        }
+        visited[index] = true;
+        let neighbors = semantic_memory_neighbors(embeddings, index, distance_threshold);
+        if neighbors.len() + 1 < min_cluster_size {
+            continue;
+        }
+
+        let mut cluster = vec![index];
+        assigned[index] = true;
+        let mut seeds = VecDeque::from(neighbors);
+        while let Some(point) = seeds.pop_front() {
+            if !visited[point] {
+                visited[point] = true;
+                let point_neighbors =
+                    semantic_memory_neighbors(embeddings, point, distance_threshold);
+                if point_neighbors.len() + 1 >= min_cluster_size {
+                    for neighbor in point_neighbors {
+                        if !seeds.contains(&neighbor) {
+                            seeds.push_back(neighbor);
+                        }
+                    }
+                }
+            }
+            if !assigned[point] {
+                assigned[point] = true;
+                cluster.push(point);
+            }
+        }
+
+        if cluster.len() > max_cluster_size {
+            cluster = densest_memory_cluster_indices(embeddings, &cluster, max_cluster_size);
+        }
+        clusters.push(cluster);
+    }
+
+    clusters.sort_by(|left, right| {
+        right.len().cmp(&left.len()).then_with(|| {
+            mean_cluster_distance(embeddings, left)
+                .total_cmp(&mean_cluster_distance(embeddings, right))
+        })
+    });
+    clusters
+}
+
+fn semantic_memory_neighbors(
+    embeddings: &[Vec<f32>],
+    index: usize,
+    distance_threshold: f32,
+) -> Vec<usize> {
+    embeddings
+        .iter()
+        .enumerate()
+        .filter_map(|(candidate_index, candidate)| {
+            if candidate_index == index {
+                return None;
+            }
+            let distance = cosine_distance(&embeddings[index], candidate)?;
+            (distance <= distance_threshold).then_some(candidate_index)
+        })
+        .collect()
+}
+
+fn densest_memory_cluster_indices(
+    embeddings: &[Vec<f32>],
+    cluster: &[usize],
+    limit: usize,
+) -> Vec<usize> {
+    if cluster.len() <= limit {
+        return cluster.to_vec();
+    }
+
+    let mut scored = cluster
+        .iter()
+        .map(|&index| {
+            let distances = cluster
+                .iter()
+                .filter(|&&other| other != index)
+                .filter_map(|&other| cosine_distance(&embeddings[index], &embeddings[other]))
+                .collect::<Vec<_>>();
+            let mean_distance = if distances.is_empty() {
+                0.0
+            } else {
+                distances.iter().sum::<f32>() / distances.len() as f32
+            };
+            (mean_distance, index)
+        })
+        .collect::<Vec<_>>();
+    scored.sort_by(|(left, _), (right, _)| left.total_cmp(right));
+    scored
+        .into_iter()
+        .take(limit)
+        .map(|(_, index)| index)
+        .collect()
+}
+
+fn mean_cluster_distance(embeddings: &[Vec<f32>], cluster: &[usize]) -> f32 {
+    if cluster.len() < 2 {
+        return 0.0;
+    }
+
+    let mut distances = Vec::new();
+    for left in 0..cluster.len() {
+        for right in left + 1..cluster.len() {
+            if let Some(distance) =
+                cosine_distance(&embeddings[cluster[left]], &embeddings[cluster[right]])
+            {
+                distances.push(distance);
+            }
+        }
+    }
+
+    if distances.is_empty() {
+        0.0
+    } else {
+        distances.iter().sum::<f32>() / distances.len() as f32
+    }
+}
+
+fn cosine_distance(left: &[f32], right: &[f32]) -> Option<f32> {
+    if left.len() != right.len() {
+        return None;
+    }
+
+    let mut dot = 0.0f32;
+    let mut left_norm = 0.0f32;
+    let mut right_norm = 0.0f32;
+    for (lhs, rhs) in left.iter().zip(right.iter()) {
+        dot += lhs * rhs;
+        left_norm += lhs * lhs;
+        right_norm += rhs * rhs;
+    }
+    if left_norm == 0.0 || right_norm == 0.0 {
+        return None;
+    }
+    Some(1.0 - (dot / (left_norm.sqrt() * right_norm.sqrt())))
+}
+
+fn consolidate_memory_cluster_outputs(
+    memories: &[MemoryRecord],
+    model: Option<&dyn ModelClient>,
+) -> Vec<ConsolidatedMemoryOutput> {
+    let Some(model) = model else {
+        return fallback_consolidated_memory_outputs(memories);
+    };
+
+    let prompt = format!(
+        "You are consolidating overlapping first-person memory excerpts.\n\
+Return exactly one JSON object with key `memories`, whose value is an array of objects with \
+string fields `name` and `text`. If the excerpts are about the same topic, usually return a \
+single consolidated memory. Use ISO 8601 dates when dates matter.\n\n\
+# Memory Consolidation Input\n{}",
+        format_memory_cluster_for_prompt(memories)
+    );
+    let Ok(events) = model.next_events(ConversationRequest {
+        user_message: &prompt,
+        tools: &[],
+        transcript: &[ConversationMessage::new(MessageRole::User, prompt.clone())],
+        force_tool: None,
+    }) else {
+        return fallback_consolidated_memory_outputs(memories);
+    };
+    let response = events
+        .into_iter()
+        .filter_map(|event| match event {
+            StreamEvent::AssistantResponse { content } => Some(content),
+            _ => None,
+        })
+        .collect::<String>();
+    parse_consolidated_memory_response(&response)
+        .filter(|outputs| !outputs.is_empty())
+        .unwrap_or_else(|| fallback_consolidated_memory_outputs(memories))
+}
+
+fn parse_consolidated_memory_response(response: &str) -> Option<Vec<ConsolidatedMemoryOutput>> {
+    let trimmed = response.trim();
+    let json_text = if trimmed.starts_with("```") {
+        trimmed
+            .lines()
+            .skip(1)
+            .take_while(|line| !line.trim_start().starts_with("```"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else {
+        trimmed.to_string()
+    };
+    let value = serde_json::from_str::<Value>(json_text.trim()).ok()?;
+    let memories = value.get("memories")?.as_array()?;
+    Some(
+        memories
+            .iter()
+            .filter_map(|memory| {
+                let name = memory.get("name")?.as_str()?.trim();
+                let text = memory.get("text")?.as_str()?.trim();
+                if name.is_empty() || text.is_empty() {
+                    return None;
+                }
+                Some(ConsolidatedMemoryOutput {
+                    name: name.to_string(),
+                    text: text.to_string(),
+                })
+            })
+            .collect(),
+    )
+}
+
+fn fallback_consolidated_memory_outputs(
+    memories: &[MemoryRecord],
+) -> Vec<ConsolidatedMemoryOutput> {
+    let Some(primary) = memories.first() else {
+        return Vec::new();
+    };
+    let mut seen = HashSet::new();
+    let mut parts = Vec::new();
+    for memory in memories {
+        let body = memory.body.trim();
+        if body.is_empty() || !seen.insert(body.to_string()) {
+            continue;
+        }
+        parts.push(body.to_string());
+    }
+    if parts.is_empty() {
+        parts.push(primary.body.trim().to_string());
+    }
+    vec![ConsolidatedMemoryOutput {
+        name: primary.name.clone(),
+        text: parts.join("\n\n"),
+    }]
+}
+
+fn format_memory_cluster_for_prompt(memories: &[MemoryRecord]) -> String {
+    memories
+        .iter()
+        .map(|memory| format!("## {}\n{}", memory.name, memory.body.trim()))
+        .collect::<Vec<_>>()
+        .join("\n\n")
 }
 
 fn normalize_memory_body(body: &str) -> String {
@@ -2507,6 +2875,9 @@ fn run_background_codex_completion_followup(
             bootstrap_plan: BootstrapPlan::from_config(config),
             messages_between_memory: config.messages_between_memory,
             memories_between_consolidation: config.memories_between_consolidation,
+            memory_consolidation_settings: Some(memory_consolidation_settings_from_app_config(
+                config,
+            )),
             messages_between_self_reflection: config.messages_between_self_reflection,
             defer_auto_memory: false,
             defer_self_reflection: false,
@@ -3481,6 +3852,9 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                     &mut connection,
                     &BootstrapPlan::from_config(&config_for_memory_write),
                     config_for_memory_write.memories_between_consolidation,
+                    Some(&memory_consolidation_settings_from_app_config(
+                        &config_for_memory_write,
+                    )),
                 )
                 .map_err(|error| std::io::Error::other(error.to_string()))?;
                 Ok(path)
@@ -4652,6 +5026,9 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                 &mut connection,
                 &BootstrapPlan::from_config(&config_for_outdated_memory_update),
                 config_for_outdated_memory_update.memories_between_consolidation,
+                Some(&memory_consolidation_settings_from_app_config(
+                    &config_for_outdated_memory_update,
+                )),
             ) {
                 return ToolExecutionResult::error(format!("memory mutation failed: {error}"));
             }
@@ -6954,11 +7331,33 @@ fn create_consolidated_memory_from_plan(
         source_memories.push(memory);
     }
 
+    create_consolidated_memories_from_records(
+        bootstrap_plan,
+        &[ConsolidatedMemoryOutput {
+            name: name.to_string(),
+            text: text.to_string(),
+        }],
+        &source_memories,
+    )
+    .map(|mut created| created.remove(0))
+}
+
+fn create_consolidated_memories_from_records(
+    bootstrap_plan: &BootstrapPlan,
+    outputs: &[ConsolidatedMemoryOutput],
+    source_memories: &[MemoryRecord],
+) -> std::io::Result<Vec<PathBuf>> {
+    if outputs.is_empty() {
+        return Err(std::io::Error::other(
+            "at least one consolidated memory output is required",
+        ));
+    }
+
     let archive_dir = bootstrap_plan.memory_dir.join("archive");
     let mut archived_sources = Vec::new();
     for memory in source_memories {
         let archived_path = archive_memory_file(Path::new(&memory.file_path), &archive_dir)?;
-        archived_sources.push((memory.name, archived_path));
+        archived_sources.push((memory.name.clone(), archived_path));
     }
 
     let frontmatter = memory_source_frontmatter(
@@ -6967,12 +7366,15 @@ fn create_consolidated_memory_from_plan(
             .map(|(source_name, path)| (source_name.as_str(), path.as_path()))
             .collect::<Vec<_>>(),
     );
-    let created = create_memory_file_with_frontmatter(
-        &bootstrap_plan.memory_dir,
-        name,
-        text,
-        frontmatter.as_deref(),
-    )?;
+    let mut created = Vec::new();
+    for output in outputs {
+        created.push(create_memory_file_with_frontmatter(
+            &bootstrap_plan.memory_dir,
+            &output.name,
+            &output.text,
+            frontmatter.as_deref(),
+        )?);
+    }
     elroy_db::bootstrap_database(bootstrap_plan)
         .map_err(|error| std::io::Error::other(error.to_string()))?;
     Ok(created)
@@ -9301,6 +9703,18 @@ fn fast_provider_config_from_app_config(config: &AppConfig) -> Result<ProviderCo
     )
 }
 
+fn memory_consolidation_settings_from_app_config(
+    config: &AppConfig,
+) -> MemoryConsolidationSettings {
+    MemoryConsolidationSettings {
+        memory_cluster_similarity_threshold: config.memory_cluster_similarity_threshold,
+        max_memory_cluster_size: config.max_memory_cluster_size,
+        min_memory_cluster_size: config.min_memory_cluster_size,
+        fast_provider_config: fast_provider_config_from_app_config(config).ok(),
+        embedding_provider_config: embedding_provider_config_from_app_config(config).ok(),
+    }
+}
+
 fn embedding_provider_config_from_app_config(
     config: &AppConfig,
 ) -> Result<EmbeddingProviderConfig, String> {
@@ -10950,6 +11364,170 @@ mod tests {
     }
 
     #[test]
+    fn create_memory_tool_triggers_semantic_consolidation_at_threshold() {
+        let unique = format!(
+            "elroy-rs-app-semantic-memory-consolidation-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+
+        let mut server = mockito::Server::new();
+        let _first_embedding = server
+            .mock("POST", "/embeddings")
+            .match_body(mockito::Matcher::Regex(
+                "I went to the store today, January 1".to_string(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "data": [{"embedding": [1.0, 0.0]}]
+                })
+                .to_string(),
+            )
+            .create();
+        let _second_embedding = server
+            .mock("POST", "/embeddings")
+            .match_body(mockito::Matcher::Regex(
+                "I went shopping at the store on New Year's Day".to_string(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "data": [{"embedding": [0.99, 0.01]}]
+                })
+                .to_string(),
+            )
+            .create();
+        let _third_embedding = server
+            .mock("POST", "/embeddings")
+            .match_body(mockito::Matcher::Regex(
+                "Today, New Year's Day, I bought some items at the store".to_string(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "data": [{"embedding": [0.98, 0.02]}]
+                })
+                .to_string(),
+            )
+            .create();
+        let _consolidation_mock = server
+            .mock("POST", "/responses")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "output": [{
+                        "type": "message",
+                        "content": [{
+                            "type": "output_text",
+                            "text": r#"{"memories":[{"name":"Shopping trip on 2024-01-01","text":"User went to the store on New Year's Day and bought some items."}]}"#
+                        }]
+                    }]
+                })
+                .to_string(),
+            )
+            .create();
+
+        let mut config = AppConfig::defaults();
+        config.memory_dir = memory_dir.clone();
+        config.agenda_dir = agenda_dir;
+        config.database_path = database_path.clone();
+        config.memories_between_consolidation = 3;
+        config.min_memory_cluster_size = 3;
+        config.max_memory_cluster_size = 5;
+        config.memory_cluster_similarity_threshold = 0.1;
+        config.fast_model = Some("gpt-5.4-mini".to_string());
+        config.fast_model_api_key = Some("fast-test-key".to_string());
+        config.fast_model_api_base = Some(format!("{}/responses", server.url()));
+        config.embedding_model = "text-embedding-3-small".to_string();
+        config.embedding_model_api_key = Some("embedding-test-key".to_string());
+        config.embedding_model_api_base = Some(format!("{}/embeddings", server.url()));
+
+        let registry = build_live_tool_registry(&config);
+        let first = registry.invoke(
+            "create_memory",
+            "{\"name\":\"Shopping trip note\",\"text\":\"I went to the store today, January 1\"}",
+        );
+        let second = registry.invoke(
+            "create_memory",
+            "{\"name\":\"New Year's shopping\",\"text\":\"I went shopping at the store on New Year's Day\"}",
+        );
+        let third = registry.invoke(
+            "create_memory",
+            "{\"name\":\"Store purchases\",\"text\":\"Today, New Year's Day, I bought some items at the store\"}",
+        );
+        assert!(!first.is_error);
+        assert!(!second.is_error);
+        assert!(!third.is_error);
+
+        let connection = open_sqlite_connection(&database_path).expect("database should reopen");
+        let active_memories =
+            elroy_db::list_active_memories(&connection, 10).expect("active memories should list");
+        assert_eq!(active_memories.len(), 1);
+        assert_eq!(active_memories[0].name, "shopping trip on 2024 01 01");
+        assert_eq!(
+            active_memories[0].body,
+            "User went to the store on New Year's Day and bought some items."
+        );
+
+        let tracker = load_memory_operation_tracker(&connection, LOCAL_USER_TOKEN)
+            .expect("tracker should load")
+            .expect("tracker should exist");
+        assert_eq!(tracker.memories_since_consolidation, 0);
+
+        let source_list = registry.invoke(
+            "get_source_list_for_memory",
+            "{\"memory_name\":\"shopping trip on 2024 01 01\"}",
+        );
+        assert!(!source_list.is_error);
+        let mut source_entries: Vec<(String, String)> =
+            serde_json::from_str::<Vec<(String, String)>>(&source_list.content)
+                .expect("source list should parse");
+        source_entries.sort();
+        assert_eq!(
+            source_entries,
+            vec![
+                ("Memory".to_string(), "new year s shopping".to_string()),
+                ("Memory".to_string(), "shopping trip note".to_string()),
+                ("Memory".to_string(), "store purchases".to_string()),
+            ]
+        );
+
+        assert!(
+            memory_dir
+                .join("archive")
+                .join("shopping_trip_note.md")
+                .exists()
+        );
+        assert!(
+            memory_dir
+                .join("archive")
+                .join("new_year_s_shopping.md")
+                .exists()
+        );
+        assert!(
+            memory_dir
+                .join("archive")
+                .join("store_purchases.md")
+                .exists()
+        );
+
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
     fn exact_duplicate_consolidation_scopes_to_current_memory_dir() {
         let unique = format!(
             "elroy-rs-app-memory-consolidation-scope-{}",
@@ -11564,6 +12142,9 @@ mod tests {
                 bootstrap_plan: BootstrapPlan::from_config(&config),
                 messages_between_memory: config.messages_between_memory,
                 memories_between_consolidation: config.memories_between_consolidation,
+                memory_consolidation_settings: Some(
+                    crate::memory_consolidation_settings_from_app_config(&config),
+                ),
                 messages_between_self_reflection: config.messages_between_self_reflection,
                 defer_auto_memory: false,
                 defer_self_reflection: false,
@@ -16313,6 +16894,9 @@ mod tests {
                 bootstrap_plan: BootstrapPlan::from_config(&config),
                 messages_between_memory: config.messages_between_memory,
                 memories_between_consolidation: config.memories_between_consolidation,
+                memory_consolidation_settings: Some(
+                    crate::memory_consolidation_settings_from_app_config(&config),
+                ),
                 messages_between_self_reflection: config.messages_between_self_reflection,
                 defer_auto_memory: false,
                 defer_self_reflection: false,
@@ -16390,6 +16974,9 @@ mod tests {
                 bootstrap_plan: BootstrapPlan::from_config(&config),
                 messages_between_memory: config.messages_between_memory,
                 memories_between_consolidation: config.memories_between_consolidation,
+                memory_consolidation_settings: Some(
+                    crate::memory_consolidation_settings_from_app_config(&config),
+                ),
                 messages_between_self_reflection: config.messages_between_self_reflection,
                 defer_auto_memory: false,
                 defer_self_reflection: false,
@@ -16477,6 +17064,9 @@ mod tests {
                 bootstrap_plan: BootstrapPlan::from_config(&config),
                 messages_between_memory: config.messages_between_memory,
                 memories_between_consolidation: config.memories_between_consolidation,
+                memory_consolidation_settings: Some(
+                    crate::memory_consolidation_settings_from_app_config(&config),
+                ),
                 messages_between_self_reflection: config.messages_between_self_reflection,
                 defer_auto_memory: false,
                 defer_self_reflection: false,
@@ -16559,6 +17149,9 @@ mod tests {
                 bootstrap_plan: BootstrapPlan::from_config(&config),
                 messages_between_memory: config.messages_between_memory,
                 memories_between_consolidation: config.memories_between_consolidation,
+                memory_consolidation_settings: Some(
+                    crate::memory_consolidation_settings_from_app_config(&config),
+                ),
                 messages_between_self_reflection: config.messages_between_self_reflection,
                 defer_auto_memory: false,
                 defer_self_reflection: true,
@@ -16632,6 +17225,9 @@ mod tests {
                 bootstrap_plan: BootstrapPlan::from_config(&config),
                 messages_between_memory: config.messages_between_memory,
                 memories_between_consolidation: config.memories_between_consolidation,
+                memory_consolidation_settings: Some(
+                    crate::memory_consolidation_settings_from_app_config(&config),
+                ),
                 messages_between_self_reflection: config.messages_between_self_reflection,
                 defer_auto_memory: true,
                 defer_self_reflection: false,
@@ -16733,6 +17329,9 @@ mod tests {
                 bootstrap_plan: BootstrapPlan::from_config(&config),
                 messages_between_memory: config.messages_between_memory,
                 memories_between_consolidation: config.memories_between_consolidation,
+                memory_consolidation_settings: Some(
+                    crate::memory_consolidation_settings_from_app_config(&config),
+                ),
                 messages_between_self_reflection: config.messages_between_self_reflection,
                 defer_auto_memory: false,
                 defer_self_reflection: false,
@@ -16800,6 +17399,9 @@ mod tests {
                 bootstrap_plan: BootstrapPlan::from_config(&config),
                 messages_between_memory: config.messages_between_memory,
                 memories_between_consolidation: config.memories_between_consolidation,
+                memory_consolidation_settings: Some(
+                    crate::memory_consolidation_settings_from_app_config(&config),
+                ),
                 messages_between_self_reflection: config.messages_between_self_reflection,
                 defer_auto_memory: false,
                 defer_self_reflection: false,
@@ -16894,6 +17496,9 @@ mod tests {
                 bootstrap_plan: BootstrapPlan::from_config(&config),
                 messages_between_memory: config.messages_between_memory,
                 memories_between_consolidation: config.memories_between_consolidation,
+                memory_consolidation_settings: Some(
+                    crate::memory_consolidation_settings_from_app_config(&config),
+                ),
                 messages_between_self_reflection: config.messages_between_self_reflection,
                 defer_auto_memory: false,
                 defer_self_reflection: false,
@@ -16976,6 +17581,9 @@ mod tests {
                 bootstrap_plan: BootstrapPlan::from_config(&config),
                 messages_between_memory: config.messages_between_memory,
                 memories_between_consolidation: config.memories_between_consolidation,
+                memory_consolidation_settings: Some(
+                    crate::memory_consolidation_settings_from_app_config(&config),
+                ),
                 messages_between_self_reflection: config.messages_between_self_reflection,
                 defer_auto_memory: false,
                 defer_self_reflection: false,
@@ -17018,6 +17626,9 @@ mod tests {
                 bootstrap_plan: BootstrapPlan::from_config(&config),
                 messages_between_memory: config.messages_between_memory,
                 memories_between_consolidation: config.memories_between_consolidation,
+                memory_consolidation_settings: Some(
+                    crate::memory_consolidation_settings_from_app_config(&config),
+                ),
                 messages_between_self_reflection: config.messages_between_self_reflection,
                 defer_auto_memory: false,
                 defer_self_reflection: false,
@@ -17128,6 +17739,9 @@ mod tests {
                 bootstrap_plan: BootstrapPlan::from_config(&config),
                 messages_between_memory: config.messages_between_memory,
                 memories_between_consolidation: config.memories_between_consolidation,
+                memory_consolidation_settings: Some(
+                    crate::memory_consolidation_settings_from_app_config(&config),
+                ),
                 messages_between_self_reflection: config.messages_between_self_reflection,
                 defer_auto_memory: false,
                 defer_self_reflection: false,
@@ -17250,6 +17864,9 @@ mod tests {
                 bootstrap_plan: BootstrapPlan::from_config(&config),
                 messages_between_memory: config.messages_between_memory,
                 memories_between_consolidation: config.memories_between_consolidation,
+                memory_consolidation_settings: Some(
+                    crate::memory_consolidation_settings_from_app_config(&config),
+                ),
                 messages_between_self_reflection: config.messages_between_self_reflection,
                 defer_auto_memory: false,
                 defer_self_reflection: false,
@@ -17346,6 +17963,9 @@ mod tests {
                 bootstrap_plan: BootstrapPlan::from_config(&config),
                 messages_between_memory: config.messages_between_memory,
                 memories_between_consolidation: config.memories_between_consolidation,
+                memory_consolidation_settings: Some(
+                    crate::memory_consolidation_settings_from_app_config(&config),
+                ),
                 messages_between_self_reflection: config.messages_between_self_reflection,
                 defer_auto_memory: false,
                 defer_self_reflection: false,
@@ -17466,6 +18086,9 @@ mod tests {
                 bootstrap_plan: BootstrapPlan::from_config(&config),
                 messages_between_memory: config.messages_between_memory,
                 memories_between_consolidation: config.memories_between_consolidation,
+                memory_consolidation_settings: Some(
+                    crate::memory_consolidation_settings_from_app_config(&config),
+                ),
                 messages_between_self_reflection: config.messages_between_self_reflection,
                 defer_auto_memory: false,
                 defer_self_reflection: false,
@@ -17523,6 +18146,9 @@ mod tests {
                 bootstrap_plan: BootstrapPlan::from_config(&config),
                 messages_between_memory: config.messages_between_memory,
                 memories_between_consolidation: config.memories_between_consolidation,
+                memory_consolidation_settings: Some(
+                    crate::memory_consolidation_settings_from_app_config(&config),
+                ),
                 messages_between_self_reflection: config.messages_between_self_reflection,
                 defer_auto_memory: false,
                 defer_self_reflection: false,
@@ -17590,6 +18216,9 @@ mod tests {
                 bootstrap_plan: BootstrapPlan::from_config(&config),
                 messages_between_memory: config.messages_between_memory,
                 memories_between_consolidation: config.memories_between_consolidation,
+                memory_consolidation_settings: Some(
+                    crate::memory_consolidation_settings_from_app_config(&config),
+                ),
                 messages_between_self_reflection: config.messages_between_self_reflection,
                 defer_auto_memory: false,
                 defer_self_reflection: false,
@@ -17661,6 +18290,9 @@ mod tests {
                 bootstrap_plan: BootstrapPlan::from_config(&config),
                 messages_between_memory: config.messages_between_memory,
                 memories_between_consolidation: config.memories_between_consolidation,
+                memory_consolidation_settings: Some(
+                    crate::memory_consolidation_settings_from_app_config(&config),
+                ),
                 messages_between_self_reflection: config.messages_between_self_reflection,
                 defer_auto_memory: false,
                 defer_self_reflection: false,
@@ -17742,6 +18374,9 @@ mod tests {
                 bootstrap_plan: BootstrapPlan::from_config(&config),
                 messages_between_memory: config.messages_between_memory,
                 memories_between_consolidation: config.memories_between_consolidation,
+                memory_consolidation_settings: Some(
+                    crate::memory_consolidation_settings_from_app_config(&config),
+                ),
                 messages_between_self_reflection: config.messages_between_self_reflection,
                 defer_auto_memory: false,
                 defer_self_reflection: false,
@@ -17813,6 +18448,9 @@ mod tests {
                 bootstrap_plan: BootstrapPlan::from_config(&config),
                 messages_between_memory: config.messages_between_memory,
                 memories_between_consolidation: config.memories_between_consolidation,
+                memory_consolidation_settings: Some(
+                    crate::memory_consolidation_settings_from_app_config(&config),
+                ),
                 messages_between_self_reflection: config.messages_between_self_reflection,
                 defer_auto_memory: false,
                 defer_self_reflection: false,
@@ -17842,6 +18480,9 @@ mod tests {
                 bootstrap_plan: BootstrapPlan::from_config(&config),
                 messages_between_memory: config.messages_between_memory,
                 memories_between_consolidation: config.memories_between_consolidation,
+                memory_consolidation_settings: Some(
+                    crate::memory_consolidation_settings_from_app_config(&config),
+                ),
                 messages_between_self_reflection: config.messages_between_self_reflection,
                 defer_auto_memory: false,
                 defer_self_reflection: false,
@@ -17915,6 +18556,9 @@ mod tests {
                 bootstrap_plan: BootstrapPlan::from_config(&config),
                 messages_between_memory: config.messages_between_memory,
                 memories_between_consolidation: config.memories_between_consolidation,
+                memory_consolidation_settings: Some(
+                    crate::memory_consolidation_settings_from_app_config(&config),
+                ),
                 messages_between_self_reflection: config.messages_between_self_reflection,
                 defer_auto_memory: false,
                 defer_self_reflection: false,
@@ -17961,6 +18605,9 @@ mod tests {
                 bootstrap_plan: BootstrapPlan::from_config(&config),
                 messages_between_memory: config.messages_between_memory,
                 memories_between_consolidation: config.memories_between_consolidation,
+                memory_consolidation_settings: Some(
+                    crate::memory_consolidation_settings_from_app_config(&config),
+                ),
                 messages_between_self_reflection: config.messages_between_self_reflection,
                 defer_auto_memory: false,
                 defer_self_reflection: false,
@@ -20911,6 +21558,9 @@ mod tests {
                 bootstrap_plan: BootstrapPlan::from_config(&config),
                 messages_between_memory: config.messages_between_memory,
                 memories_between_consolidation: config.memories_between_consolidation,
+                memory_consolidation_settings: Some(
+                    crate::memory_consolidation_settings_from_app_config(&config),
+                ),
                 messages_between_self_reflection: config.messages_between_self_reflection,
                 defer_auto_memory: false,
                 defer_self_reflection: false,
@@ -20964,6 +21614,9 @@ mod tests {
                 bootstrap_plan: BootstrapPlan::from_config(&config),
                 messages_between_memory: config.messages_between_memory,
                 memories_between_consolidation: config.memories_between_consolidation,
+                memory_consolidation_settings: Some(
+                    crate::memory_consolidation_settings_from_app_config(&config),
+                ),
                 messages_between_self_reflection: config.messages_between_self_reflection,
                 defer_auto_memory: false,
                 defer_self_reflection: false,
@@ -21585,6 +22238,9 @@ mod tests {
                 bootstrap_plan: BootstrapPlan::from_config(&config),
                 messages_between_memory: config.messages_between_memory,
                 memories_between_consolidation: config.memories_between_consolidation,
+                memory_consolidation_settings: Some(
+                    crate::memory_consolidation_settings_from_app_config(&config),
+                ),
                 messages_between_self_reflection: config.messages_between_self_reflection,
                 defer_auto_memory: false,
                 defer_self_reflection: false,
@@ -21683,6 +22339,9 @@ mod tests {
                 bootstrap_plan: BootstrapPlan::from_config(&config),
                 messages_between_memory: config.messages_between_memory,
                 memories_between_consolidation: config.memories_between_consolidation,
+                memory_consolidation_settings: Some(
+                    crate::memory_consolidation_settings_from_app_config(&config),
+                ),
                 messages_between_self_reflection: config.messages_between_self_reflection,
                 defer_auto_memory: false,
                 defer_self_reflection: false,
@@ -21790,6 +22449,9 @@ mod tests {
                 bootstrap_plan: BootstrapPlan::from_config(&config),
                 messages_between_memory: config.messages_between_memory,
                 memories_between_consolidation: config.memories_between_consolidation,
+                memory_consolidation_settings: Some(
+                    crate::memory_consolidation_settings_from_app_config(&config),
+                ),
                 messages_between_self_reflection: config.messages_between_self_reflection,
                 defer_auto_memory: false,
                 defer_self_reflection: false,
@@ -21920,6 +22582,9 @@ mod tests {
                 bootstrap_plan: BootstrapPlan::from_config(&config),
                 messages_between_memory: config.messages_between_memory,
                 memories_between_consolidation: config.memories_between_consolidation,
+                memory_consolidation_settings: Some(
+                    crate::memory_consolidation_settings_from_app_config(&config),
+                ),
                 messages_between_self_reflection: config.messages_between_self_reflection,
                 defer_auto_memory: false,
                 defer_self_reflection: false,
@@ -22084,6 +22749,9 @@ mod tests {
                 bootstrap_plan: BootstrapPlan::from_config(&config),
                 messages_between_memory: config.messages_between_memory,
                 memories_between_consolidation: config.memories_between_consolidation,
+                memory_consolidation_settings: Some(
+                    crate::memory_consolidation_settings_from_app_config(&config),
+                ),
                 messages_between_self_reflection: config.messages_between_self_reflection,
                 defer_auto_memory: false,
                 defer_self_reflection: false,
@@ -22266,6 +22934,9 @@ mod tests {
                 bootstrap_plan: BootstrapPlan::from_config(&config),
                 messages_between_memory: config.messages_between_memory,
                 memories_between_consolidation: config.memories_between_consolidation,
+                memory_consolidation_settings: Some(
+                    crate::memory_consolidation_settings_from_app_config(&config),
+                ),
                 messages_between_self_reflection: config.messages_between_self_reflection,
                 defer_auto_memory: false,
                 defer_self_reflection: false,
@@ -22428,6 +23099,9 @@ mod tests {
                 bootstrap_plan: BootstrapPlan::from_config(&config),
                 messages_between_memory: config.messages_between_memory,
                 memories_between_consolidation: config.memories_between_consolidation,
+                memory_consolidation_settings: Some(
+                    crate::memory_consolidation_settings_from_app_config(&config),
+                ),
                 messages_between_self_reflection: config.messages_between_self_reflection,
                 defer_auto_memory: false,
                 defer_self_reflection: false,
@@ -22536,6 +23210,9 @@ mod tests {
                 bootstrap_plan: BootstrapPlan::from_config(&config),
                 messages_between_memory: config.messages_between_memory,
                 memories_between_consolidation: config.memories_between_consolidation,
+                memory_consolidation_settings: Some(
+                    crate::memory_consolidation_settings_from_app_config(&config),
+                ),
                 messages_between_self_reflection: config.messages_between_self_reflection,
                 defer_auto_memory: false,
                 defer_self_reflection: false,
@@ -22649,6 +23326,9 @@ mod tests {
                 bootstrap_plan: BootstrapPlan::from_config(&config),
                 messages_between_memory: config.messages_between_memory,
                 memories_between_consolidation: config.memories_between_consolidation,
+                memory_consolidation_settings: Some(
+                    crate::memory_consolidation_settings_from_app_config(&config),
+                ),
                 messages_between_self_reflection: config.messages_between_self_reflection,
                 defer_auto_memory: false,
                 defer_self_reflection: false,
@@ -22755,6 +23435,9 @@ mod tests {
                 bootstrap_plan: BootstrapPlan::from_config(&config),
                 messages_between_memory: config.messages_between_memory,
                 memories_between_consolidation: config.memories_between_consolidation,
+                memory_consolidation_settings: Some(
+                    crate::memory_consolidation_settings_from_app_config(&config),
+                ),
                 messages_between_self_reflection: config.messages_between_self_reflection,
                 defer_auto_memory: false,
                 defer_self_reflection: false,
