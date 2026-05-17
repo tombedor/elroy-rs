@@ -259,14 +259,41 @@ struct PromptExecutionOptions<'a> {
     reflect: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AppRuntime {
     config: AppConfig,
+    codex_bin_override: Option<PathBuf>,
+    codex_completion_hook_override: Option<Arc<dyn Fn(CodexSessionResult) + Send + Sync>>,
 }
 
 impl AppRuntime {
     pub fn new(config: AppConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            codex_bin_override: None,
+            codex_completion_hook_override: None,
+        }
+    }
+
+    pub fn with_codex_bin_override(mut self, codex_bin_override: PathBuf) -> Self {
+        self.codex_bin_override = Some(codex_bin_override);
+        self
+    }
+
+    pub fn with_codex_completion_hook(
+        mut self,
+        codex_completion_hook_override: Arc<dyn Fn(CodexSessionResult) + Send + Sync>,
+    ) -> Self {
+        self.codex_completion_hook_override = Some(codex_completion_hook_override);
+        self
+    }
+
+    fn tool_registry(&self) -> ExecutableToolRegistry {
+        build_live_tool_registry_with_codex_bin_and_hook(
+            &self.config,
+            self.codex_bin_override.clone(),
+            self.codex_completion_hook_override.clone(),
+        )
     }
 
     pub fn enable_restart_support(&self) {
@@ -292,7 +319,8 @@ impl AppRuntime {
             &self.config.home_dir,
             &self.config.memory_dir,
         )?;
-        let mut slash_command_names = build_live_tool_registry(&self.config)
+        let mut slash_command_names = self
+            .tool_registry()
             .specs()
             .into_iter()
             .map(|spec| format!("/{}", spec.name))
@@ -315,7 +343,8 @@ impl AppRuntime {
     }
 
     pub fn load_command_palette_entries(&self) -> Result<Vec<TuiCommandPaletteEntry>, AppError> {
-        let mut entries = build_live_tool_registry(&self.config)
+        let mut entries = self
+            .tool_registry()
             .specs()
             .into_iter()
             .map(|spec| TuiCommandPaletteEntry {
@@ -329,7 +358,7 @@ impl AppRuntime {
     }
 
     pub fn launch_named_command(&self, name: &str) -> Result<TuiSlashCommandAction, AppError> {
-        let registry = build_live_tool_registry(&self.config);
+        let registry = self.tool_registry();
         let Some(spec) = registry.specs().into_iter().find(|spec| spec.name == name) else {
             return Err(AppError::Runtime(format!("Invalid command: {name}")));
         };
@@ -375,7 +404,7 @@ impl AppRuntime {
             "help" => "get_help",
             _ => slash_name,
         };
-        let registry = build_live_tool_registry(&self.config);
+        let registry = self.tool_registry();
         let Some(spec) = registry
             .specs()
             .into_iter()
@@ -439,7 +468,7 @@ impl AppRuntime {
         slash_name: &str,
         values: &[(String, String)],
     ) -> Result<TuiSnapshot, AppError> {
-        let registry = build_live_tool_registry(&self.config);
+        let registry = self.tool_registry();
         let arguments = Value::Object(
             values
                 .iter()
@@ -536,7 +565,7 @@ impl AppRuntime {
         let model = live_provider_model(&self.config, preferences.as_ref())?;
         let classifier_model = live_fast_provider_model(&self.config, preferences.as_ref())?;
         let executable_tools = if options.enable_tools {
-            build_live_tool_registry(&self.config)
+            self.tool_registry()
         } else {
             ExecutableToolRegistry::new(vec![])
         };
@@ -582,7 +611,7 @@ impl AppRuntime {
         let model = live_provider_model(&self.config, preferences.as_ref())?;
         let classifier_model = live_fast_provider_model(&self.config, preferences.as_ref())?;
         let executable_tools = if options.enable_tools {
-            build_live_tool_registry(&self.config)
+            self.tool_registry()
         } else {
             ExecutableToolRegistry::new(vec![])
         };
@@ -816,7 +845,7 @@ impl AppRuntime {
         title: &str,
         action: SidebarAction,
     ) -> Result<TuiSnapshot, AppError> {
-        let registry = build_live_tool_registry(&self.config);
+        let registry = self.tool_registry();
         let result = match (section, action) {
             (SidebarSection::Memories, SidebarAction::Archive) => {
                 registry.invoke("archive_memory", &json!({ "name": title }).to_string())
