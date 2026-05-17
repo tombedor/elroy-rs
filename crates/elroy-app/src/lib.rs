@@ -5704,12 +5704,20 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                 &assistant_name_for_search_memories,
             );
             with_tool_connection(&database_path, |connection| {
-                let memories = search_active_memories_in_scope(
-                    connection,
-                    &memory_dir_for_search_memories,
-                    query,
-                    recall_limit * 3,
-                )?;
+                let memories = if relevance_model.is_some() {
+                    list_active_memories_in_scope(
+                        connection,
+                        &memory_dir_for_search_memories,
+                        recall_limit * 3,
+                    )?
+                } else {
+                    search_active_memories_in_scope(
+                        connection,
+                        &memory_dir_for_search_memories,
+                        query,
+                        recall_limit * 3,
+                    )?
+                };
                 let due_items = list_active_due_items(connection, recall_limit * 3)?;
                 let agenda_items = list_active_plain_agenda_items(connection, recall_limit * 3)?;
                 let relevant_memories = select_relevant_recall_memories(
@@ -14281,6 +14289,77 @@ mod tests {
                 .count(),
             2
         );
+
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
+    fn live_tool_registry_search_memories_can_prefer_semantic_memory_over_weaker_overlap() {
+        let unique = format!(
+            "elroy-rs-app-search-memories-semantic-priority-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+        fs::write(
+            memory_dir.join("gear_inventory.md"),
+            "Review the storage locker spreadsheet.\n",
+        )
+        .expect("overlap memory should be written");
+        fs::write(
+            memory_dir.join("bands_note.md"),
+            "Pack resistance bands before drills.\n",
+        )
+        .expect("semantic memory should be written");
+
+        let mut server = mockito::Server::new();
+        let _mock = server
+            .mock("POST", "/responses")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "output": [{
+                        "type": "message",
+                        "content": [{
+                            "type": "output_text",
+                            "text": r#"{"answers":[false,true],"reasoning":"Only the resistance-bands memory matches the user's intent."}"#
+                        }]
+                    }]
+                })
+                .to_string(),
+            )
+            .create();
+
+        let mut config = AppConfig::defaults();
+        config.memory_dir = memory_dir;
+        config.agenda_dir = agenda_dir;
+        config.database_path = database_path;
+        config.openai_api_key = Some("test-key".to_string());
+        config.openai_base_url = format!("{}/responses", server.url());
+        elroy_db::bootstrap_database(&BootstrapPlan::from_config(&config))
+            .expect("bootstrap should succeed");
+
+        let registry = build_live_tool_registry(&config);
+        let search = registry.invoke(
+            "search_memories",
+            "{\"query\":\"What gear should I bring?\",\"limit\":5}",
+        );
+
+        assert!(!search.is_error);
+        assert!(
+            search
+                .content
+                .contains("Memory | bands note | Pack resistance bands before drills.")
+        );
+        assert!(!search.content.contains("Memory | gear inventory |"));
 
         fs::remove_dir_all(home).expect("home should be removed");
     }
