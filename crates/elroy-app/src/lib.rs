@@ -21,8 +21,8 @@ use elroy_core::{
 use elroy_db::{
     AgendaItemRecord, BootstrapPlan, MemoryRecord, UserPreferenceRecord,
     find_active_agenda_item_by_name, get_or_create_memory_operation_tracker, list_active_due_items,
-    list_active_plain_agenda_items, list_inactive_due_items, load_context_messages,
-    load_messages_by_ids, load_user_preferences, open_sqlite_connection,
+    list_active_plain_agenda_items, list_all_active_memories, list_inactive_due_items,
+    load_context_messages, load_messages_by_ids, load_user_preferences, open_sqlite_connection,
     record_deleted_due_item_tombstone, replace_context_messages, run_migrations,
     save_memory_operation_tracker, save_user_preferences, search_active_memories,
 };
@@ -2152,7 +2152,7 @@ fn consolidate_exact_duplicate_memories(
     bootstrap_plan: &BootstrapPlan,
 ) -> Result<(), AppError> {
     let active_memories =
-        list_active_memories_in_scope(connection, &bootstrap_plan.memory_dir, 500)?;
+        list_all_active_memories_in_scope(connection, &bootstrap_plan.memory_dir)?;
     let mut groups = HashMap::<String, Vec<MemoryRecord>>::new();
     for memory in active_memories {
         let normalized = normalize_memory_body(&memory.body);
@@ -2203,7 +2203,7 @@ fn consolidate_semantic_memory_clusters(
     };
     let fast_model = best_effort_provider_model(settings.fast_provider_config.as_ref(), "Elroy");
 
-    let memories = list_active_memories_in_scope(connection, &bootstrap_plan.memory_dir, 500)?;
+    let memories = list_all_active_memories_in_scope(connection, &bootstrap_plan.memory_dir)?;
     if memories.len() < settings.min_memory_cluster_size {
         return Ok(());
     }
@@ -7809,10 +7809,19 @@ fn list_active_memories_in_scope(
     memory_dir: &Path,
     limit: usize,
 ) -> rusqlite::Result<Vec<elroy_db::MemoryRecord>> {
-    Ok(elroy_db::list_active_memories(connection, 10_000)?
+    Ok(list_all_active_memories_in_scope(connection, memory_dir)?
+        .into_iter()
+        .take(limit)
+        .collect())
+}
+
+fn list_all_active_memories_in_scope(
+    connection: &rusqlite::Connection,
+    memory_dir: &Path,
+) -> rusqlite::Result<Vec<elroy_db::MemoryRecord>> {
+    Ok(list_all_active_memories(connection)?
         .into_iter()
         .filter(|memory| Path::new(&memory.file_path).starts_with(memory_dir))
-        .take(limit)
         .collect())
 }
 
@@ -12091,6 +12100,51 @@ User still wants to compare grocery prices after the shopping trip.",
         assert!(!other_memory_dir.join("archive").exists());
 
         fs::remove_dir_all(root).expect("root should be removed");
+    }
+
+    #[test]
+    fn semantic_consolidation_source_fetch_includes_memories_beyond_old_500_cap() {
+        let unique = format!(
+            "elroy-rs-app-memory-consolidation-source-fetch-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+
+        for index in 0..503 {
+            fs::write(
+                memory_dir.join(format!("memory_{index:03}.md")),
+                format!("Memory body {index}\n"),
+            )
+            .expect("memory file should be written");
+        }
+
+        let mut config = AppConfig::defaults();
+        config.home_dir = home.clone();
+        config.memory_dir = memory_dir.clone();
+        config.agenda_dir = agenda_dir;
+        config.database_path = database_path.clone();
+        elroy_db::bootstrap_database(&BootstrapPlan::from_config(&config))
+            .expect("bootstrap should succeed");
+
+        let connection = open_sqlite_connection(&database_path).expect("database should open");
+        let fetched = crate::list_all_active_memories_in_scope(&connection, &memory_dir)
+            .expect("all active memories in scope should load");
+
+        assert_eq!(fetched.len(), 503);
+        assert!(
+            fetched.iter().any(|memory| memory.name == "memory 502"),
+            "the consolidation source fetch should include memories beyond the old 500-row preload"
+        );
+
+        fs::remove_dir_all(home).expect("home should be removed");
     }
 
     #[test]

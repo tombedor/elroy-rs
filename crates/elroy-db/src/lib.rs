@@ -466,6 +466,34 @@ pub fn list_active_memories(
     rows.collect()
 }
 
+pub fn list_all_active_memories(connection: &Connection) -> rusqlite::Result<Vec<MemoryRecord>> {
+    let mut statement = connection.prepare(
+        "SELECT
+            id,
+            legacy_frontmatter_id,
+            name,
+            file_path,
+            body,
+            is_active,
+            updated_at_unix
+        FROM memories
+        WHERE is_active = 1
+        ORDER BY updated_at_unix DESC, name ASC",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok(MemoryRecord {
+            id: row.get(0)?,
+            legacy_frontmatter_id: row.get(1)?,
+            name: row.get(2)?,
+            file_path: row.get(3)?,
+            body: row.get(4)?,
+            is_active: row.get::<_, i64>(5)? != 0,
+            updated_at_unix: row.get(6)?,
+        })
+    })?;
+    rows.collect()
+}
+
 pub fn search_active_memories(
     connection: &Connection,
     query: &str,
