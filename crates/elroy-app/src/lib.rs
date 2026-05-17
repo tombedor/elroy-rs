@@ -63,6 +63,7 @@ const DEFAULT_MAX_LIST_DEPTH: usize = 2;
 const DEFAULT_READ_LINE_LIMIT: usize = 200;
 const CONTEXT_MESSAGE_SOURCE_TYPE: &str = "ContextMessageSet";
 const MEMORY_SOURCE_TYPE: &str = "Memory";
+const MEMORY_WORD_COUNT_LIMIT: usize = 300;
 const DEFAULT_RESTART_RESUME_PROMPT: &str =
     "Elroy just restarted. Send a brief message that you are back and ready to continue.";
 
@@ -2420,14 +2421,7 @@ fn consolidate_memory_cluster_outputs(
         return fallback_consolidated_memory_outputs(memories);
     };
 
-    let prompt = format!(
-        "You are consolidating overlapping first-person memory excerpts.\n\
-Return exactly one JSON object with key `memories`, whose value is an array of objects with \
-string fields `name` and `text`. If the excerpts are about the same topic, usually return a \
-single consolidated memory. Use ISO 8601 dates when dates matter.\n\n\
-# Memory Consolidation Input\n{}",
-        format_memory_cluster_for_prompt(memories)
-    );
+    let prompt = build_memory_consolidation_prompt(memories);
     let Ok(events) = model.next_events(ConversationRequest {
         user_message: &prompt,
         tools: &[],
@@ -2446,6 +2440,30 @@ single consolidated memory. Use ISO 8601 dates when dates matter.\n\n\
     parse_consolidated_memory_response(&response)
         .filter(|outputs| !outputs.is_empty())
         .unwrap_or_else(|| fallback_consolidated_memory_outputs(memories))
+}
+
+fn build_memory_consolidation_prompt(memories: &[MemoryRecord]) -> String {
+    format!(
+        "# Memory Consolidation Task\n\n\
+Your task is to consolidate or reorganize two or more memory excerpts. These excerpts have been flagged as having overlapping or redundant content and require consolidation or reorganization.\n\n\
+Each excerpt has the following characteristics:\n\
+- They are written from the first-person perspective of an AI assistant.\n\
+- They consist of a title and a main body.\n\n\
+If the excerpts cover the same topic, consolidate them into a single, cohesive memory. If they address distinct topics, create separate, reorganized memories for each.\n\n\
+## Dates and times\n\n\
+The memories being consolidated can be from any time in the past. Note that the current time is {}, or {} UTC\n\n\
+Use ISO 8601 format for dates and times to ensure references remain unambiguous in future retrievals.\n\n\
+## Style Guidelines\n\n\
+- Limit each new memory excerpt to {} words.\n\n\
+## Formatting\n\n\
+Return exactly one JSON object with key `memories`, whose value is an array of objects with string fields `name` and `text`.\n\
+If the excerpts are about the same topic, usually return a single consolidated memory. If they are distinct, return multiple reorganized memories.\n\n\
+# Memory Consolidation Input\n{}",
+        Local::now().to_rfc3339(),
+        Utc::now().to_rfc3339(),
+        MEMORY_WORD_COUNT_LIMIT,
+        format_memory_cluster_for_prompt(memories)
+    )
 }
 
 fn parse_consolidated_memory_response(response: &str) -> Option<Vec<ConsolidatedMemoryOutput>> {
@@ -11525,6 +11543,70 @@ mod tests {
         );
 
         fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
+    fn consolidate_memory_cluster_uses_python_style_prompt_contract() {
+        struct ConsolidationPromptInspectionModel;
+
+        impl ModelClient for ConsolidationPromptInspectionModel {
+            fn next_events(
+                &self,
+                request: ConversationRequest<'_>,
+            ) -> Result<Vec<StreamEvent>, elroy_core::ModelClientError> {
+                let prompt = request.user_message;
+                assert!(prompt.contains("# Memory Consolidation Task"), "{prompt}");
+                assert!(prompt.contains("## Dates and times"), "{prompt}");
+                assert!(prompt.contains("Use ISO 8601 format"), "{prompt}");
+                assert!(
+                    prompt.contains("Limit each new memory excerpt to 300 words."),
+                    "{prompt}"
+                );
+                assert!(prompt.contains("# Memory Consolidation Input"), "{prompt}");
+                assert!(prompt.contains("## shopping trip note"), "{prompt}");
+                assert!(
+                    prompt.contains("I went shopping at the store on New Year's Day"),
+                    "{prompt}"
+                );
+                Ok(vec![StreamEvent::AssistantResponse {
+                    content: r#"{"memories":[{"name":"Shopping trip on 2024-01-01","text":"User went to the store on New Year's Day and bought some items."}]}"#
+                        .to_string(),
+                }])
+            }
+        }
+
+        let memories = vec![
+            MemoryRecord {
+                id: 1,
+                legacy_frontmatter_id: None,
+                name: "shopping trip note".to_string(),
+                file_path: "/tmp/shopping_trip_note.md".to_string(),
+                body: "I went to the store today, January 1".to_string(),
+                is_active: true,
+                updated_at_unix: 1,
+            },
+            MemoryRecord {
+                id: 2,
+                legacy_frontmatter_id: None,
+                name: "new year s shopping".to_string(),
+                file_path: "/tmp/new_year_s_shopping.md".to_string(),
+                body: "I went shopping at the store on New Year's Day".to_string(),
+                is_active: true,
+                updated_at_unix: 2,
+            },
+        ];
+
+        let outputs = crate::consolidate_memory_cluster_outputs(
+            &memories,
+            Some(&ConsolidationPromptInspectionModel),
+        );
+        assert_eq!(
+            outputs,
+            vec![crate::ConsolidatedMemoryOutput {
+                name: "Shopping trip on 2024-01-01".to_string(),
+                text: "User went to the store on New Year's Day and bought some items.".to_string(),
+            }]
+        );
     }
 
     #[test]
