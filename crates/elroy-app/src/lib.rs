@@ -8917,16 +8917,17 @@ mod tests {
     };
 
     use super::{
-        AppRuntime, LOCAL_USER_TOKEN, PromptExecutionOptions, SYNTHETIC_FIRST_USER_MESSAGE,
-        argument_limit, build_live_tool_registry, build_live_tool_registry_with_codex_bin_and_hook,
-        build_recall_query, classify_memory_recall_with_model, codex_background_status_key,
-        compress_context_messages, consolidate_exact_duplicate_memories,
-        context_due_item_tool_call_id, context_due_item_tool_messages,
-        context_memory_tool_messages, context_task_tool_messages, count_context_tokens,
-        determine_memory_recall_decision, drop_old_context_messages, due_item_context_messages,
-        fast_provider_config_from_app_config, format_context_messages_for_summary,
-        format_context_summary_message, is_context_refresh_needed, memory_recall_status_updates,
-        message_matches_tool_call_id, parse_memory_recall_decision, parse_recalled_item_refs,
+        AppRuntime, LOCAL_USER_TOKEN, MessageProcessOptions, PromptExecutionOptions,
+        SYNTHETIC_FIRST_USER_MESSAGE, argument_limit, build_live_tool_registry,
+        build_live_tool_registry_with_codex_bin_and_hook, build_recall_query,
+        classify_memory_recall_with_model, codex_background_status_key, compress_context_messages,
+        consolidate_exact_duplicate_memories, context_due_item_tool_call_id,
+        context_due_item_tool_messages, context_memory_tool_messages, context_task_tool_messages,
+        count_context_tokens, determine_memory_recall_decision, drop_old_context_messages,
+        due_item_context_messages, fast_provider_config_from_app_config,
+        format_context_messages_for_summary, format_context_summary_message,
+        is_context_refresh_needed, memory_recall_status_updates, message_matches_tool_call_id,
+        parse_memory_recall_decision, parse_recalled_item_refs,
         parse_reflective_recall_model_response, parse_relevance_filter_response,
         prompt_prelude_status_updates, provider_config_from_app_config,
         recall_due_item_context_messages, recall_memory_context_messages,
@@ -17399,6 +17400,131 @@ mod tests {
             "Recent conversation summary: I condensed the earlier practice discussion into a short first-person summary."
         );
 
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
+    fn process_message_can_use_fast_model_for_prompt_time_recall_classifier_when_chat_model_differs()
+     {
+        let unique = format!(
+            "elroy-rs-app-process-message-fast-model-recall-classifier-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+        fs::write(
+            memory_dir.join("python_library.md"),
+            "# Python Library\n\nYou mentioned the requests library for Python projects.\n",
+        )
+        .expect("memory file should be written");
+
+        let mut fast_server = mockito::Server::new();
+        let fast_mock = fast_server
+            .mock("POST", "/responses")
+            .match_header("authorization", "Bearer fast-test-key")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "output": [{
+                        "type": "message",
+                        "content": [{
+                            "type": "output_text",
+                            "text": r#"{"needs_recall":false,"reasoning":"This follow-up does not need memory recall."}"#
+                        }]
+                    }]
+                })
+                .to_string(),
+            )
+            .create();
+
+        let mut chat_server = mockito::Server::new();
+        let chat_mock = chat_server
+            .mock("POST", "/messages")
+            .match_header("x-api-key", "anthropic-test-key")
+            .match_header("anthropic-version", "2023-06-01")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "content": [{
+                        "type": "text",
+                        "text": "Main chat model replied without injected recall."
+                    }]
+                })
+                .to_string(),
+            )
+            .create();
+
+        let mut config = AppConfig::defaults();
+        config.home_dir = home.clone();
+        config.memory_dir = memory_dir;
+        config.agenda_dir = agenda_dir;
+        config.database_path = database_path.clone();
+        config.chat_model = "claude-sonnet-4-20250514".to_string();
+        config.anthropic_api_key = Some("anthropic-test-key".to_string());
+        config.anthropic_base_url = format!("{}/messages", chat_server.url());
+        config.fast_model = Some("gpt-5.4-mini".to_string());
+        config.fast_model_api_key = Some("fast-test-key".to_string());
+        config.fast_model_api_base = Some(format!("{}/responses", fast_server.url()));
+        config.memory_recall_classifier_enabled = true;
+        elroy_db::bootstrap_database(&BootstrapPlan::from_config(&config))
+            .expect("bootstrap should succeed");
+
+        let runtime = AppRuntime::new(config.clone());
+        let mut connection =
+            open_sqlite_connection(&config.database_path).expect("database should open");
+        run_migrations(&mut connection).expect("migrations should run");
+        elroy_db::replace_context_messages(
+            &mut connection,
+            LOCAL_USER_TOKEN,
+            &[ConversationMessage::new(
+                MessageRole::Assistant,
+                "You should look at the requests library.",
+            )],
+        )
+        .expect("messages should persist");
+        drop(connection);
+
+        let result = runtime
+            .process_message(
+                "What was that library you mentioned?",
+                MessageProcessOptions::default(),
+            )
+            .expect("prompt should succeed");
+
+        assert!(result.events.iter().any(|event| matches!(
+            event,
+            StreamEvent::StatusUpdate { content } if content == "classifying recall..."
+        )));
+        assert!(!result.events.iter().any(|event| matches!(
+            event,
+            StreamEvent::StatusUpdate { content } if content == "fetching memories..."
+        )));
+        assert!(result.events.iter().any(|event| matches!(
+            event,
+            StreamEvent::AssistantResponse { content }
+                if content == "Main chat model replied without injected recall."
+        )));
+
+        let mut reopened =
+            open_sqlite_connection(&config.database_path).expect("database should reopen");
+        let stored =
+            elroy_db::load_context_messages(&mut reopened, LOCAL_USER_TOKEN).expect("load ok");
+        assert!(!stored.iter().any(|message| {
+            message.role == MessageRole::Tool
+                && message.tool_call_id.as_deref() == Some("bootstrap-memory-recall")
+        }));
+
+        fast_mock.assert();
+        chat_mock.assert();
         fs::remove_dir_all(home).expect("home should be removed");
     }
 
