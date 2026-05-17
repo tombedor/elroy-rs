@@ -1922,18 +1922,41 @@ impl From<TuiCommandForm> for CommandFormState {
 }
 
 impl CommandFormState {
+    fn required_field_error() -> String {
+        "This field is required".to_string()
+    }
+
     fn footer_text(&self) -> String {
         "Type to edit  Tab complete/move  Shift+Tab move  Enter run  Escape cancel".to_string()
     }
 
-    fn move_selection(&mut self, delta: isize) {
+    fn selected_field_is_invalid(&self) -> bool {
+        self.fields
+            .get(self.selected_field)
+            .is_some_and(|field| !field.optional && field.value.trim().is_empty())
+    }
+
+    fn validate_selected_field(&mut self) -> bool {
+        if self.selected_field_is_invalid() {
+            self.error = Some(Self::required_field_error());
+            return false;
+        }
+        self.error = None;
+        true
+    }
+
+    fn move_selection(&mut self, delta: isize) -> bool {
         if self.fields.is_empty() {
-            return;
+            return false;
+        }
+        if !self.validate_selected_field() {
+            return false;
         }
         let len = self.fields.len() as isize;
         let current = self.selected_field as isize;
         self.selected_field = (current + delta).rem_euclid(len) as usize;
         self.error = None;
+        true
     }
 
     fn selected_field_mut(&mut self) -> Option<&mut CommandFormFieldState> {
@@ -2106,13 +2129,13 @@ fn handle_command_form_key(app: &mut TuiApp, key: KeyEvent, runtime: &mut impl T
         (KeyCode::Backspace, _) => {
             if let Some(field) = command_form.selected_field_mut() {
                 field.value.pop();
-                command_form.error = None;
+                command_form.validate_selected_field();
             }
         }
         (KeyCode::Char(ch), modifiers) if !modifiers.contains(KeyModifiers::CONTROL) => {
             if let Some(field) = command_form.selected_field_mut() {
                 field.value.push(ch);
-                command_form.error = None;
+                command_form.validate_selected_field();
             }
         }
         (KeyCode::Enter, _) => {
@@ -2121,7 +2144,7 @@ fn handle_command_form_key(app: &mut TuiApp, key: KeyEvent, runtime: &mut impl T
                 .iter()
                 .find(|field| !field.optional && field.value.trim().is_empty())
             {
-                command_form.error = Some(format!("Missing required value for '{}'", field.name));
+                command_form.error = Some(CommandFormState::required_field_error());
                 command_form.selected_field = command_form
                     .fields
                     .iter()
@@ -3597,6 +3620,87 @@ mod tests {
             .as_ref()
             .expect("command form should remain open");
         assert_eq!(command_form.selected_field, 1);
+    }
+
+    #[test]
+    fn command_form_tab_keeps_focus_on_blank_required_field() {
+        let mut app = TuiApp::bootstrap();
+        app.open_command_form(TuiCommandForm {
+            command_name: "create_memory".to_string(),
+            description: "Create a memory".to_string(),
+            parameters: vec![
+                TuiCommandParameter {
+                    name: "name".to_string(),
+                    optional: false,
+                    default_text: String::new(),
+                    suggestions: vec![],
+                },
+                TuiCommandParameter {
+                    name: "text".to_string(),
+                    optional: false,
+                    default_text: String::new(),
+                    suggestions: vec![],
+                },
+            ],
+            initial_values: vec![],
+        });
+        let mut runtime = FakeRuntime::default();
+        let mut pending = None;
+
+        apply_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+            &mut runtime,
+            &mut pending,
+        );
+
+        let command_form = app
+            .command_form
+            .as_ref()
+            .expect("command form should remain open");
+        assert_eq!(command_form.selected_field, 0);
+        assert_eq!(
+            command_form.error.as_deref(),
+            Some("This field is required")
+        );
+    }
+
+    #[test]
+    fn command_form_backspace_validates_required_field_before_submit() {
+        let mut app = TuiApp::bootstrap();
+        app.open_command_form(TuiCommandForm {
+            command_name: "create_memory".to_string(),
+            description: "Create a memory".to_string(),
+            parameters: vec![TuiCommandParameter {
+                name: "name".to_string(),
+                optional: false,
+                default_text: String::new(),
+                suggestions: vec![],
+            }],
+            initial_values: vec![("name".to_string(), "trip".to_string())],
+        });
+        let mut runtime = FakeRuntime::default();
+        let mut pending = None;
+
+        for _ in 0.."trip".len() {
+            apply_key_event(
+                &mut app,
+                KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+                &mut runtime,
+                &mut pending,
+            );
+        }
+
+        let command_form = app
+            .command_form
+            .as_ref()
+            .expect("command form should remain open");
+        assert_eq!(command_form.fields[0].value, "");
+        assert_eq!(
+            command_form.error.as_deref(),
+            Some("This field is required")
+        );
+        assert!(runtime.started_command_executions.is_empty());
     }
 
     #[test]
