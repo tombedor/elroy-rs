@@ -602,6 +602,9 @@ impl AppRuntime {
             RecallModelClients {
                 classifier_model: Some(&classifier_model),
                 embedding_client: embedding_client.as_ref(),
+                embedding_distance_threshold: Some(
+                    self.config.l2_memory_relevance_distance_threshold as f32,
+                ),
             },
             executable_tools,
         )
@@ -636,6 +639,9 @@ impl AppRuntime {
             RecallModelClients {
                 classifier_model: Some(&classifier_model),
                 embedding_client: embedding_client.as_ref(),
+                embedding_distance_threshold: Some(
+                    self.config.l2_memory_relevance_distance_threshold as f32,
+                ),
             },
             executable_tools,
             PromptExecutionOptions {
@@ -1609,12 +1615,14 @@ fn best_effort_provider_model(
 struct RecallModelClients<'a> {
     classifier_model: Option<&'a dyn ModelClient>,
     embedding_client: Option<&'a LiveEmbeddingClient>,
+    embedding_distance_threshold: Option<f32>,
 }
 
 fn recall_model_clients(classifier_model: Option<&dyn ModelClient>) -> RecallModelClients<'_> {
     RecallModelClients {
         classifier_model,
         embedding_client: None,
+        embedding_distance_threshold: None,
     }
 }
 
@@ -1670,8 +1678,11 @@ fn run_prompt_with_model_and_registry_internal(
         options.reflect,
         prompt,
         memory_recall_decision.needs_recall,
-        recall_models.classifier_model,
-        recall_models.embedding_client,
+        RecallSelectionClients {
+            relevance_model: recall_models.classifier_model,
+            embedding_client: recall_models.embedding_client,
+            embedding_distance_threshold: recall_models.embedding_distance_threshold,
+        },
         RecallContext {
             transcript: &existing_transcript,
             memories: &list_active_memories_in_scope(
@@ -1698,6 +1709,7 @@ fn run_prompt_with_model_and_registry_internal(
         &now_iso,
         recall_models.classifier_model,
         recall_models.embedding_client,
+        recall_models.embedding_distance_threshold,
     );
     let mut model_transcript = existing_transcript.clone();
     model_transcript.extend(contextual_due_item_context.iter().cloned());
@@ -1822,8 +1834,11 @@ fn run_prompt_with_model_and_registry_stream_internal(
         options.reflect,
         prompt,
         memory_recall_decision.needs_recall,
-        recall_models.classifier_model,
-        recall_models.embedding_client,
+        RecallSelectionClients {
+            relevance_model: recall_models.classifier_model,
+            embedding_client: recall_models.embedding_client,
+            embedding_distance_threshold: recall_models.embedding_distance_threshold,
+        },
         RecallContext {
             transcript: &existing_transcript,
             memories: &list_active_memories_in_scope(
@@ -1850,6 +1865,7 @@ fn run_prompt_with_model_and_registry_stream_internal(
         &now_iso,
         recall_models.classifier_model,
         recall_models.embedding_client,
+        recall_models.embedding_distance_threshold,
     );
     let mut model_transcript = existing_transcript.clone();
     model_transcript.extend(contextual_due_item_context.iter().cloned());
@@ -5841,6 +5857,8 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
     let embedding_provider_config_for_search_memories =
         embedding_provider_config_from_app_config(config).ok();
     let assistant_name_for_search_memories = config.assistant_name.clone();
+    let embedding_distance_threshold_for_search_memories =
+        config.l2_memory_relevance_distance_threshold as f32;
     let search_memories = ExecutableTool::new(
         ToolSpec::new(
             "search_memories",
@@ -5897,6 +5915,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                         .as_ref()
                         .map(|model| model as &dyn ModelClient),
                     embedding_client.as_ref(),
+                    Some(embedding_distance_threshold_for_search_memories),
                 );
                 let relevant_due_items = select_relevant_recall_due_items(
                     query,
@@ -5906,6 +5925,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                         .as_ref()
                         .map(|model| model as &dyn ModelClient),
                     embedding_client.as_ref(),
+                    Some(embedding_distance_threshold_for_search_memories),
                 );
                 let relevant_agenda_items = select_relevant_recall_agenda_items(
                     query,
@@ -5915,6 +5935,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                         .as_ref()
                         .map(|model| model as &dyn ModelClient),
                     embedding_client.as_ref(),
+                    Some(embedding_distance_threshold_for_search_memories),
                 );
                 Ok(ToolExecutionResult::success(format_memory_search_results(
                     &relevant_memories,
@@ -5931,6 +5952,8 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
     let embedding_provider_config_for_examine_memories =
         embedding_provider_config_from_app_config(config).ok();
     let assistant_name_for_examine_memories = config.assistant_name.clone();
+    let embedding_distance_threshold_for_examine_memories =
+        config.l2_memory_relevance_distance_threshold as f32;
     let examine_memories = ExecutableTool::new(
         ToolSpec::new(
             "examine_memories",
@@ -5973,6 +5996,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                         .as_ref()
                         .map(|model| model as &dyn ModelClient),
                     embedding_client.as_ref(),
+                    Some(embedding_distance_threshold_for_examine_memories),
                 );
                 let relevant_due_items = select_relevant_recall_due_items(
                     question,
@@ -5982,6 +6006,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                         .as_ref()
                         .map(|model| model as &dyn ModelClient),
                     embedding_client.as_ref(),
+                    Some(embedding_distance_threshold_for_examine_memories),
                 );
                 let relevant_agenda_items = select_relevant_recall_agenda_items(
                     question,
@@ -5991,6 +6016,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                         .as_ref()
                         .map(|model| model as &dyn ModelClient),
                     embedding_client.as_ref(),
+                    Some(embedding_distance_threshold_for_examine_memories),
                 );
 
                 let mut sections = relevant_memories
@@ -7620,13 +7646,19 @@ struct RecalledItemRef {
     name: String,
 }
 
+#[derive(Clone, Copy)]
+struct RecallSelectionClients<'a> {
+    relevance_model: Option<&'a dyn ModelClient>,
+    embedding_client: Option<&'a LiveEmbeddingClient>,
+    embedding_distance_threshold: Option<f32>,
+}
+
 fn recall_memory_context_messages_with_decision(
     memory_recall_classifier_window: usize,
     reflect: bool,
     prompt: &str,
     should_recall: bool,
-    reflective_model: Option<&dyn ModelClient>,
-    embedding_client: Option<&LiveEmbeddingClient>,
+    selection_clients: RecallSelectionClients<'_>,
     context: RecallContext<'_>,
 ) -> Vec<ConversationMessage> {
     if !should_recall {
@@ -7635,7 +7667,7 @@ fn recall_memory_context_messages_with_decision(
 
     let recall_query =
         build_recall_query(prompt, context.transcript, memory_recall_classifier_window);
-    let relevance_model = reflective_model;
+    let relevance_model = selection_clients.relevance_model;
     let already_recalled_memories = recalled_item_refs_by_type(context.transcript, "Memory");
     let recalled = select_relevant_recall_memories(
         &recall_query,
@@ -7643,7 +7675,8 @@ fn recall_memory_context_messages_with_decision(
         &already_recalled_memories,
         2,
         relevance_model,
-        embedding_client,
+        selection_clients.embedding_client,
+        selection_clients.embedding_distance_threshold,
     );
     let already_recalled_agenda_items =
         recalled_item_refs_by_type(context.transcript, "AgendaItem");
@@ -7655,7 +7688,8 @@ fn recall_memory_context_messages_with_decision(
             context.due_items,
             2,
             relevance_model,
-            embedding_client,
+            selection_clients.embedding_client,
+            selection_clients.embedding_distance_threshold,
         )
         .into_iter()
         .filter(|item| !recalled_item_matches(&already_recalled_agenda_items, item.id, &item.name))
@@ -7669,7 +7703,8 @@ fn recall_memory_context_messages_with_decision(
             context.agenda_items,
             2,
             relevance_model,
-            embedding_client,
+            selection_clients.embedding_client,
+            selection_clients.embedding_distance_threshold,
         )
         .into_iter()
         .filter(|item| !recalled_item_matches(&already_recalled_agenda_items, item.id, &item.name))
@@ -7681,7 +7716,8 @@ fn recall_memory_context_messages_with_decision(
             context.due_items,
             2,
             relevance_model,
-            embedding_client,
+            selection_clients.embedding_client,
+            selection_clients.embedding_distance_threshold,
         )
         .into_iter()
         .filter(|item| !recalled_item_matches(&already_recalled_agenda_items, item.id, &item.name))
@@ -7695,7 +7731,8 @@ fn recall_memory_context_messages_with_decision(
             context.agenda_items,
             2,
             relevance_model,
-            embedding_client,
+            selection_clients.embedding_client,
+            selection_clients.embedding_distance_threshold,
         )
         .into_iter()
         .filter(|item| !recalled_item_matches(&already_recalled_agenda_items, item.id, &item.name))
@@ -7722,7 +7759,7 @@ fn recall_memory_context_messages_with_decision(
             &recent_context,
         );
         let Some(content) = build_reflective_recall_content_with_model(
-            reflective_model,
+            selection_clients.relevance_model,
             &recalled,
             &reflective_due_items,
             &reflective_agenda_items,
@@ -7816,8 +7853,11 @@ fn recall_memory_context_messages(
         reflect,
         prompt,
         should_recall,
-        None,
-        None,
+        RecallSelectionClients {
+            relevance_model: None,
+            embedding_client: None,
+            embedding_distance_threshold: None,
+        },
         context,
     )
 }
@@ -7829,6 +7869,7 @@ fn recall_due_item_context_messages(
     now_iso: &str,
     relevance_model: Option<&dyn ModelClient>,
     embedding_client: Option<&LiveEmbeddingClient>,
+    embedding_distance_threshold: Option<f32>,
 ) -> Vec<ConversationMessage> {
     let recall_query = build_recall_query(prompt, transcript, 6);
     let recalled = select_relevant_contextual_due_items(
@@ -7838,6 +7879,7 @@ fn recall_due_item_context_messages(
         2,
         relevance_model,
         embedding_client,
+        embedding_distance_threshold,
     );
     if recalled.is_empty() {
         return Vec::new();
@@ -8115,6 +8157,7 @@ fn l2_distance(left: &[f32], right: &[f32]) -> Option<f32> {
 
 fn embedding_rank_candidates<'a, T>(
     embedding_client: Option<&LiveEmbeddingClient>,
+    distance_threshold: Option<f32>,
     query: &str,
     candidates: impl IntoIterator<Item = &'a T>,
     extraction_fn: impl Fn(&T) -> String,
@@ -8132,6 +8175,11 @@ fn embedding_rank_candidates<'a, T>(
         .filter_map(|candidate| {
             let embedding = embedding_client.embed(&extraction_fn(candidate)).ok()?;
             let distance = l2_distance(&query_embedding, &embedding)?;
+            if let Some(distance_threshold) = distance_threshold
+                && distance > distance_threshold
+            {
+                return None;
+            }
             Some((distance, candidate))
         })
         .collect::<Vec<_>>();
@@ -8151,6 +8199,7 @@ fn select_relevant_recall_memories<'a>(
     limit: usize,
     relevance_model: Option<&dyn ModelClient>,
     embedding_client: Option<&LiveEmbeddingClient>,
+    embedding_distance_threshold: Option<f32>,
 ) -> Vec<&'a MemoryRecord> {
     let candidate_limit = semantic_recall_candidate_limit(limit, relevance_model, embedding_client);
     let overlap_candidates =
@@ -8159,6 +8208,7 @@ fn select_relevant_recall_memories<'a>(
         let mut merged_candidates = overlap_candidates;
         for candidate in embedding_rank_candidates(
             embedding_client,
+            embedding_distance_threshold,
             query,
             memories
                 .iter()
@@ -8193,6 +8243,7 @@ fn select_relevant_recall_memories<'a>(
     } else if embedding_client.is_some() {
         let embedding_candidates = embedding_rank_candidates(
             embedding_client,
+            embedding_distance_threshold,
             query,
             memories
                 .iter()
@@ -8222,6 +8273,7 @@ fn select_relevant_recall_due_items<'a>(
     limit: usize,
     relevance_model: Option<&dyn ModelClient>,
     embedding_client: Option<&LiveEmbeddingClient>,
+    embedding_distance_threshold: Option<f32>,
 ) -> Vec<&'a AgendaItemRecord> {
     let candidate_limit = semantic_recall_candidate_limit(limit, relevance_model, embedding_client);
     let overlap_candidates = select_due_items_by_overlap(query, due_items, candidate_limit, None);
@@ -8229,6 +8281,7 @@ fn select_relevant_recall_due_items<'a>(
         let mut merged_candidates = overlap_candidates;
         for candidate in embedding_rank_candidates(
             embedding_client,
+            embedding_distance_threshold,
             query,
             due_items.iter(),
             |item| {
@@ -8270,6 +8323,7 @@ fn select_relevant_recall_due_items<'a>(
     } else if embedding_client.is_some() {
         let embedding_candidates = embedding_rank_candidates(
             embedding_client,
+            embedding_distance_threshold,
             query,
             due_items.iter(),
             |item| {
@@ -8314,6 +8368,7 @@ fn select_relevant_contextual_due_items<'a>(
     limit: usize,
     relevance_model: Option<&dyn ModelClient>,
     embedding_client: Option<&LiveEmbeddingClient>,
+    embedding_distance_threshold: Option<f32>,
 ) -> Vec<&'a AgendaItemRecord> {
     let candidate_limit = semantic_recall_candidate_limit(limit, relevance_model, embedding_client);
     let overlap_candidates =
@@ -8322,6 +8377,7 @@ fn select_relevant_contextual_due_items<'a>(
         let mut merged_candidates = overlap_candidates;
         for candidate in embedding_rank_candidates(
             embedding_client,
+            embedding_distance_threshold,
             query,
             due_items.iter().filter(|item| {
                 item.trigger_context.is_some()
@@ -8370,6 +8426,7 @@ fn select_relevant_contextual_due_items<'a>(
     } else if embedding_client.is_some() {
         let embedding_candidates = embedding_rank_candidates(
             embedding_client,
+            embedding_distance_threshold,
             query,
             due_items.iter().filter(|item| {
                 item.trigger_context.is_some()
@@ -8419,6 +8476,7 @@ fn select_relevant_recall_agenda_items<'a>(
     limit: usize,
     relevance_model: Option<&dyn ModelClient>,
     embedding_client: Option<&LiveEmbeddingClient>,
+    embedding_distance_threshold: Option<f32>,
 ) -> Vec<&'a AgendaItemRecord> {
     let candidate_limit = semantic_recall_candidate_limit(limit, relevance_model, embedding_client);
     let overlap_candidates = select_agenda_items_by_overlap(query, agenda_items, candidate_limit);
@@ -8426,6 +8484,7 @@ fn select_relevant_recall_agenda_items<'a>(
         let mut merged_candidates = overlap_candidates;
         for candidate in embedding_rank_candidates(
             embedding_client,
+            embedding_distance_threshold,
             query,
             agenda_items
                 .iter()
@@ -8460,6 +8519,7 @@ fn select_relevant_recall_agenda_items<'a>(
     } else if embedding_client.is_some() {
         let embedding_candidates = embedding_rank_candidates(
             embedding_client,
+            embedding_distance_threshold,
             query,
             agenda_items
                 .iter()
@@ -14469,6 +14529,7 @@ mod tests {
             "2026-05-15T12:00:00",
             None,
             None,
+            None,
         );
 
         assert_eq!(messages.len(), 2);
@@ -14528,6 +14589,7 @@ mod tests {
             "2026-05-15T12:00:00",
             None,
             None,
+            None,
         );
 
         assert!(messages.is_empty());
@@ -14573,6 +14635,7 @@ mod tests {
             &transcript,
             &due_items,
             "2026-05-15T12:00:00",
+            None,
             None,
             None,
         );
@@ -14622,6 +14685,7 @@ mod tests {
             "2026-05-15T12:00:00",
             None,
             None,
+            None,
         );
 
         assert_eq!(messages.len(), 2);
@@ -14667,6 +14731,7 @@ mod tests {
             &due_items,
             "2026-05-15T12:00:00",
             Some(&model),
+            None,
             None,
         );
 
@@ -14748,6 +14813,7 @@ mod tests {
             "2026-05-15T12:00:00",
             Some(&SemanticReminderRelevanceModel),
             None,
+            None,
         );
 
         let joined_tool_content = messages
@@ -14816,6 +14882,7 @@ mod tests {
             "2026-05-15T12:00:00",
             2,
             Some(&model),
+            None,
             None,
         );
 
@@ -15459,6 +15526,11 @@ mod tests {
             search
                 .content
                 .contains("Memory | old training note | Pack resistance bands before drills.")
+        );
+        assert!(
+            !search.content.contains("recent note 000"),
+            "{}",
+            search.content
         );
 
         fs::remove_dir_all(home).expect("home should be removed");
@@ -21667,6 +21739,10 @@ mod tests {
                     recall_payload.contains("Resistance Bands"),
                     "{recall_payload}"
                 );
+                assert!(
+                    !recall_payload.contains("Recent Memory 00"),
+                    "{recall_payload}"
+                );
                 Ok(vec![StreamEvent::AssistantResponse {
                     content: "Pack the resistance bands.".to_string(),
                 }])
@@ -21950,6 +22026,9 @@ mod tests {
             RecallModelClients {
                 classifier_model: None,
                 embedding_client: Some(&embedding_client),
+                embedding_distance_threshold: Some(
+                    config.l2_memory_relevance_distance_threshold as f32,
+                ),
             },
             ExecutableToolRegistry::new(vec![]),
             PromptExecutionOptions {
@@ -22806,8 +22885,11 @@ mod tests {
             config.reflect,
             "I am heading to basketball practice",
             true,
-            Some(&model),
-            None,
+            crate::RecallSelectionClients {
+                relevance_model: Some(&model),
+                embedding_client: None,
+                embedding_distance_threshold: None,
+            },
             RecallContext {
                 transcript: &[],
                 memories: &[MemoryRecord {
@@ -22856,8 +22938,11 @@ mod tests {
             config.reflect,
             "I am heading to basketball practice",
             true,
-            Some(&model),
-            None,
+            crate::RecallSelectionClients {
+                relevance_model: Some(&model),
+                embedding_client: None,
+                embedding_distance_threshold: None,
+            },
             RecallContext {
                 transcript: &[],
                 memories: &[MemoryRecord {
@@ -22901,8 +22986,11 @@ mod tests {
             config.reflect,
             "What gear should I bring to practice?",
             true,
-            Some(&model),
-            None,
+            crate::RecallSelectionClients {
+                relevance_model: Some(&model),
+                embedding_client: None,
+                embedding_distance_threshold: None,
+            },
             RecallContext {
                 transcript: &[],
                 memories: &[],
@@ -23651,6 +23739,7 @@ mod tests {
             2,
             Some(&model),
             None,
+            None,
         );
         let relevant_due_items = select_relevant_recall_due_items(
             "What workout gear should I bring?",
@@ -23658,12 +23747,14 @@ mod tests {
             2,
             Some(&model),
             None,
+            None,
         );
         let relevant_agenda_items = select_relevant_recall_agenda_items(
             "What workout gear should I bring?",
             &agenda_items,
             2,
             Some(&model),
+            None,
             None,
         );
 
@@ -23740,6 +23831,7 @@ mod tests {
             2,
             Some(&model),
             None,
+            None,
         );
         let relevant_due_items = select_relevant_recall_due_items(
             "What gear should I bring to practice?",
@@ -23747,12 +23839,14 @@ mod tests {
             2,
             Some(&model),
             None,
+            None,
         );
         let relevant_agenda_items = select_relevant_recall_agenda_items(
             "What gear should I bring to practice?",
             &agenda_items,
             2,
             Some(&model),
+            None,
             None,
         );
 
@@ -23915,6 +24009,7 @@ mod tests {
             2,
             Some(&SemanticPriorityRelevanceModel),
             None,
+            None,
         );
         let relevant_due_items = select_relevant_recall_due_items(
             "What gear should I bring to practice?",
@@ -23922,12 +24017,14 @@ mod tests {
             2,
             Some(&SemanticPriorityRelevanceModel),
             None,
+            None,
         );
         let relevant_agenda_items = select_relevant_recall_agenda_items(
             "What gear should I bring to practice?",
             &agenda_items,
             2,
             Some(&SemanticPriorityRelevanceModel),
+            None,
             None,
         );
 
@@ -23981,8 +24078,11 @@ mod tests {
             false,
             "What gear should I bring to practice?",
             true,
-            Some(&model),
-            None,
+            crate::RecallSelectionClients {
+                relevance_model: Some(&model),
+                embedding_client: None,
+                embedding_distance_threshold: None,
+            },
             RecallContext {
                 transcript: &transcript,
                 memories: &memories,
