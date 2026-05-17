@@ -17893,6 +17893,123 @@ mod tests {
     }
 
     #[test]
+    fn process_message_surfaces_and_cleans_up_due_items_end_to_end() {
+        let unique = format!(
+            "elroy-rs-app-process-message-due-item-cleanup-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+        fs::write(
+            agenda_dir.join("medicine_reminder.md"),
+            "---\ndate: unscheduled\ncompleted: false\nstatus: created\ntrigger_datetime: 2000-01-01T09:00:00\n---\n\nTake your daily medicine\n",
+        )
+        .expect("due item file should be written");
+
+        let mut server = mockito::Server::new();
+        let first_mock = server
+            .mock("POST", "/responses")
+            .match_header("authorization", "Bearer test-key")
+            .match_body(mockito::Matcher::Regex(
+                "Take your daily medicine".to_string(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "output": [{
+                        "type": "function_call",
+                        "call_id": "call-delete-due-item",
+                        "name": "delete_due_item",
+                        "arguments": "{\"name\":\"medicine reminder\"}"
+                    }]
+                })
+                .to_string(),
+            )
+            .create();
+        let second_mock = server
+            .mock("POST", "/responses")
+            .match_header("authorization", "Bearer test-key")
+            .match_body(mockito::Matcher::Regex(
+                "function_call_output".to_string(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "output": [{
+                        "type": "message",
+                        "content": [{
+                            "type": "output_text",
+                            "text": "You had a reminder to take your daily medicine, and I've cleared it for you."
+                        }]
+                    }]
+                })
+                .to_string(),
+            )
+            .create();
+
+        let mut config = AppConfig::defaults();
+        config.home_dir = home.clone();
+        config.memory_dir = memory_dir;
+        config.agenda_dir = agenda_dir.clone();
+        config.database_path = database_path.clone();
+        config.openai_api_key = Some("test-key".to_string());
+        config.openai_base_url = format!("{}/responses", server.url());
+        elroy_db::bootstrap_database(&BootstrapPlan::from_config(&config))
+            .expect("bootstrap should succeed");
+
+        let runtime = AppRuntime::new(config.clone());
+        let result = runtime
+            .process_message(
+                "Hi, how are you doing today?",
+                MessageProcessOptions::default(),
+            )
+            .expect("prompt should succeed");
+
+        assert!(result.events.iter().any(|event| matches!(
+            event,
+            StreamEvent::ToolCallRequested(call)
+                if call.name == "delete_due_item"
+                    && call.arguments_json == "{\"name\":\"medicine reminder\"}"
+        )));
+        assert!(result.events.iter().any(|event| matches!(
+            event,
+            StreamEvent::AssistantToolResult { content, is_error }
+                if !is_error
+                    && content.contains("Due item 'medicine reminder' has been deleted.")
+        )));
+        assert!(result.events.iter().any(|event| matches!(
+            event,
+            StreamEvent::AssistantResponse { content }
+                if content.contains("take your daily medicine")
+        )));
+
+        let mut connection =
+            open_sqlite_connection(&config.database_path).expect("database should open");
+        run_migrations(&mut connection).expect("migrations should run");
+        let active_due_items =
+            list_active_due_items(&connection, 10).expect("due items should list");
+        assert!(
+            !active_due_items
+                .iter()
+                .any(|item| item.name == "medicine reminder")
+        );
+        assert!(!agenda_dir.join("medicine_reminder.md").exists());
+
+        first_mock.assert();
+        second_mock.assert();
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
     fn format_context_summary_message_creates_bounded_summary_text() {
         let now = Utc::now().timestamp();
         let summary = format_context_summary_message(&[
