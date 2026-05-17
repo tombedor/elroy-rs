@@ -11767,6 +11767,63 @@ mod tests {
             .expect("tracker should exist");
         assert_eq!(tracker.memories_since_consolidation, 0);
 
+        let shopping_source_list = registry.invoke(
+            "get_source_list_for_memory",
+            "{\"memory_name\":\"shopping trip on 2024 01 01\"}",
+        );
+        assert!(!shopping_source_list.is_error);
+        let mut shopping_sources: Vec<(String, String)> =
+            serde_json::from_str::<Vec<(String, String)>>(&shopping_source_list.content)
+                .expect("source list should parse");
+        shopping_sources.sort();
+        assert_eq!(
+            shopping_sources,
+            vec![
+                ("Memory".to_string(), "grocery purchases".to_string()),
+                (
+                    "Memory".to_string(),
+                    "price comparison follow up".to_string()
+                ),
+                ("Memory".to_string(), "shopping trip note".to_string()),
+            ]
+        );
+        let shopping_trip_note_index =
+            serde_json::from_str::<Vec<(String, String)>>(&shopping_source_list.content)
+                .expect("source list should parse")
+                .iter()
+                .position(|entry| {
+                    entry == &("Memory".to_string(), "shopping trip note".to_string())
+                })
+                .expect("shopping trip note source should be present");
+        let shopping_source_content = registry.invoke(
+            "get_source_content_for_memory",
+            &format!(
+                "{{\"memory_name\":\"shopping trip on 2024 01 01\",\"index\":{shopping_trip_note_index}}}"
+            ),
+        );
+        assert!(!shopping_source_content.is_error);
+        assert!(
+            shopping_source_content
+                .content
+                .contains("#shopping trip note")
+        );
+        assert!(
+            shopping_source_content
+                .content
+                .contains("I went to the store today, January 1")
+        );
+
+        let follow_up_source_list = registry.invoke(
+            "get_source_list_for_memory",
+            "{\"memory_name\":\"user s grocery price comparison follow up\"}",
+        );
+        assert!(!follow_up_source_list.is_error);
+        let mut follow_up_sources: Vec<(String, String)> =
+            serde_json::from_str::<Vec<(String, String)>>(&follow_up_source_list.content)
+                .expect("source list should parse");
+        follow_up_sources.sort();
+        assert_eq!(follow_up_sources, shopping_sources);
+
         fs::remove_dir_all(home).expect("home should be removed");
     }
 
