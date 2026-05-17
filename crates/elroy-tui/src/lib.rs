@@ -325,42 +325,20 @@ fn run_event_loop(
     let mut previous_background_status = None;
 
     loop {
-        if let Some(resume_message) = maybe_complete_command_execution(app, runtime) {
-            return Ok(TuiRunResult::RestartRequested(resume_message));
-        }
-        match advance_prompt_stream(app, runtime, pending_prompt) {
-            PromptAdvance::CompletedTurn => {
-                deferred_context_refresh_at = Some(Instant::now() + Duration::from_secs(5));
-            }
-            PromptAdvance::RestartRequested(resume_message) => {
-                return Ok(TuiRunResult::RestartRequested(resume_message));
-            }
-            PromptAdvance::Noop => {}
-        }
-        app.prompt_active = pending_prompt.is_some();
-        let current_background_status = runtime.background_status().unwrap_or(None);
-        maybe_refresh_snapshot_after_background_completion(
+        if let Some(result) = drive_runtime_tick(
             app,
             runtime,
-            pending_prompt.is_some(),
-            app.command_active,
-            previous_background_status.as_deref(),
-            current_background_status.as_deref(),
-        );
-        app.background_status = current_background_status.clone();
-        previous_background_status = current_background_status;
+            pending_prompt,
+            Instant::now(),
+            &mut deferred_context_refresh_at,
+            &mut previous_background_status,
+        ) {
+            return Ok(result);
+        }
         if !context_poll_ready && pending_prompt.is_none() {
             context_poll_ready = true;
             last_context_poll = Instant::now();
         }
-        maybe_run_deferred_context_refresh(
-            app,
-            runtime,
-            pending_prompt.is_some(),
-            app.command_active,
-            Instant::now(),
-            &mut deferred_context_refresh_at,
-        );
         if context_poll_ready && last_context_poll.elapsed() >= Duration::from_secs(1) {
             poll_context_updates(app, runtime);
             last_context_poll = Instant::now();
@@ -391,6 +369,49 @@ fn run_event_loop(
             _ => {}
         }
     }
+}
+
+fn drive_runtime_tick(
+    app: &mut TuiApp,
+    runtime: &mut impl TuiRuntime,
+    pending_prompt: &mut Option<PendingPrompt>,
+    now: Instant,
+    deferred_context_refresh_at: &mut Option<Instant>,
+    previous_background_status: &mut Option<String>,
+) -> Option<TuiRunResult> {
+    if let Some(resume_message) = maybe_complete_command_execution(app, runtime) {
+        return Some(TuiRunResult::RestartRequested(resume_message));
+    }
+    match advance_prompt_stream(app, runtime, pending_prompt) {
+        PromptAdvance::CompletedTurn => {
+            *deferred_context_refresh_at = Some(now + Duration::from_secs(5));
+        }
+        PromptAdvance::RestartRequested(resume_message) => {
+            return Some(TuiRunResult::RestartRequested(resume_message));
+        }
+        PromptAdvance::Noop => {}
+    }
+    app.prompt_active = pending_prompt.is_some();
+    let current_background_status = runtime.background_status().unwrap_or(None);
+    maybe_refresh_snapshot_after_background_completion(
+        app,
+        runtime,
+        pending_prompt.is_some(),
+        app.command_active,
+        previous_background_status.as_deref(),
+        current_background_status.as_deref(),
+    );
+    app.background_status = current_background_status.clone();
+    *previous_background_status = current_background_status;
+    maybe_run_deferred_context_refresh(
+        app,
+        runtime,
+        pending_prompt.is_some(),
+        app.command_active,
+        now,
+        deferred_context_refresh_at,
+    );
+    None
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2269,9 +2290,10 @@ mod tests {
         CommandFormState, CommandPane, FocusTarget, PendingPrompt, PromptAdvance, PromptUpdate,
         SidebarAction, SidebarSection, TuiApp, TuiCommandExecution, TuiCommandForm,
         TuiCommandPaletteAction, TuiCommandPaletteEntry, TuiCommandParameter, TuiContextMessage,
-        TuiExit, TuiPromptStream, TuiRuntime, TuiSidebarDetail, TuiSlashCommandAction, TuiSnapshot,
-        UiIntent, advance_prompt_stream, apply_intent_with_runtime, apply_key_event,
-        apply_mouse_event, apply_paste_event, key_event_token, maybe_complete_command_execution,
+        TuiExit, TuiPromptStream, TuiRunResult, TuiRuntime, TuiSidebarDetail,
+        TuiSlashCommandAction, TuiSnapshot, UiIntent, advance_prompt_stream,
+        apply_intent_with_runtime, apply_key_event, apply_mouse_event, apply_paste_event,
+        drive_runtime_tick, key_event_token, maybe_complete_command_execution,
         maybe_refresh_snapshot_after_background_completion, maybe_run_deferred_context_refresh,
         poll_context_updates, start_startup_prompt_stream,
     };
@@ -3624,6 +3646,42 @@ mod tests {
         );
         assert!(!app.command_active);
         assert_eq!(app.focus, FocusTarget::Input);
+    }
+
+    #[test]
+    fn runtime_tick_returns_restart_requested_after_background_command_completion() {
+        let mut app = TuiApp::bootstrap();
+        app.command_active = true;
+        let mut runtime = FakeRuntime {
+            completed_command_execution_snapshot: Some(TuiSnapshot {
+                status: Some("slash command executed: /restart_session".to_string()),
+                ..TuiSnapshot::default()
+            }),
+            pending_restart_request: Some("Restarted successfully. Ready to continue.".to_string()),
+            ..FakeRuntime::default()
+        };
+        let mut pending = None;
+        let mut deferred_context_refresh_at = None;
+        let mut previous_background_status = None;
+
+        let result = drive_runtime_tick(
+            &mut app,
+            &mut runtime,
+            &mut pending,
+            Instant::now(),
+            &mut deferred_context_refresh_at,
+            &mut previous_background_status,
+        );
+
+        assert_eq!(
+            result,
+            Some(TuiRunResult::RestartRequested(
+                "Restarted successfully. Ready to continue.".to_string()
+            ))
+        );
+        assert!(!app.command_active);
+        assert_eq!(app.focus, FocusTarget::Input);
+        assert!(runtime.pending_restart_request.is_none());
     }
 
     #[test]
