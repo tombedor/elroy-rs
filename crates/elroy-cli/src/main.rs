@@ -115,18 +115,16 @@ fn run_live_prompt(runtime: &AppRuntime, prompt: &str) {
 }
 
 fn restart_current_process(args: &[String], resume_message: &str) -> ! {
+    let current_exe = env::current_exe().unwrap_or_else(|error| {
+        eprintln!("failed to resolve current executable for restart: {error}");
+        std::process::exit(1);
+    });
+
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
 
-        let current_exe = env::current_exe().unwrap_or_else(|error| {
-            eprintln!("failed to resolve current executable for restart: {error}");
-            std::process::exit(1);
-        });
-
-        let mut command = std::process::Command::new(&current_exe);
-        command.args(args);
-        command.env(RESTART_RESUME_MESSAGE_ENV, resume_message);
+        let mut command = build_restart_command(&current_exe, args, resume_message);
         let error = command.exec();
         eprintln!("failed to restart elroy-rs process: {error}");
         std::process::exit(1);
@@ -134,13 +132,7 @@ fn restart_current_process(args: &[String], resume_message: &str) -> ! {
 
     #[cfg(not(unix))]
     {
-        let current_exe = env::current_exe().unwrap_or_else(|error| {
-            eprintln!("failed to resolve current executable for restart: {error}");
-            std::process::exit(1);
-        });
-        let status = std::process::Command::new(&current_exe)
-            .args(args)
-            .env(RESTART_RESUME_MESSAGE_ENV, resume_message)
+        let status = build_restart_command(&current_exe, args, resume_message)
             .status()
             .unwrap_or_else(|error| {
                 eprintln!("failed to restart elroy-rs process: {error}");
@@ -148,6 +140,17 @@ fn restart_current_process(args: &[String], resume_message: &str) -> ! {
             });
         std::process::exit(status.code().unwrap_or(1));
     }
+}
+
+fn build_restart_command(
+    current_exe: &std::path::Path,
+    args: &[String],
+    resume_message: &str,
+) -> std::process::Command {
+    let mut command = std::process::Command::new(current_exe);
+    command.args(args);
+    command.env(RESTART_RESUME_MESSAGE_ENV, resume_message);
+    command
 }
 
 struct CliTuiRuntime {
@@ -1320,6 +1323,40 @@ mod tests {
         );
 
         fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
+    fn build_restart_command_preserves_args_and_resume_env() {
+        let current_exe = std::path::Path::new("/tmp/elroy-rs-test-bin");
+        let args = vec![
+            "--tui".to_string(),
+            "--prompt".to_string(),
+            "hello".to_string(),
+        ];
+        let command = crate::build_restart_command(
+            current_exe,
+            &args,
+            "Restarted successfully. Ready to continue.",
+        );
+
+        assert_eq!(command.get_program(), current_exe);
+        assert_eq!(
+            command
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+            args
+        );
+        assert_eq!(
+            command
+                .get_envs()
+                .find(|(key, _)| {
+                    *key == std::ffi::OsStr::new(crate::RESTART_RESUME_MESSAGE_ENV)
+                })
+                .and_then(|(_, value)| value)
+                .map(|value| value.to_string_lossy().into_owned()),
+            Some("Restarted successfully. Ready to continue.".to_string())
+        );
     }
 
     #[test]
