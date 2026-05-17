@@ -662,7 +662,7 @@ mod tests {
     use std::sync::{Arc, Mutex, OnceLock, mpsc};
     use std::time::Duration;
 
-    use elroy_core::get_background_status;
+    use elroy_core::{clear_background_status, get_background_status, set_background_status};
     use elroy_db::{open_sqlite_connection, replace_context_messages, run_migrations};
     use elroy_llm::{ConversationMessage, MessageRole};
     use elroy_tui::{TuiCommandExecution, TuiRuntime};
@@ -749,6 +749,52 @@ mod tests {
     }
 
     #[test]
+    fn cli_tui_runtime_surfaces_running_deferred_refresh_status() {
+        let _guard = cli_runtime_test_lock()
+            .lock()
+            .expect("cli runtime test lock should work");
+        let config = AppConfig::from_env(&HashMap::new()).expect("config should load");
+        let (tx, rx) = mpsc::channel();
+        let mut runtime = CliTuiRuntime {
+            runtime: AppRuntime::new(config),
+            startup_resume_message: None,
+            deferred_context_refresh: Some(BackgroundTask::spawn(move || {
+                set_background_status("context-refresh", "refreshing context...");
+                rx.recv().expect("signal should arrive");
+                clear_background_status("context-refresh");
+                Ok(())
+            })),
+            deferred_context_refresh_error: None,
+            deferred_auto_memory: None,
+            deferred_auto_memory_error: None,
+            deferred_auto_memory_queue: Arc::new(Mutex::new(VecDeque::new())),
+            deferred_self_reflection: None,
+            deferred_self_reflection_error: None,
+            deferred_command_execution: None,
+        };
+
+        let background_status = loop {
+            let status = runtime
+                .background_status()
+                .expect("background status should load");
+            if status.is_some() {
+                break status;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        };
+
+        assert_eq!(background_status.as_deref(), Some("refreshing context..."));
+        tx.send(()).expect("task should receive completion signal");
+        while runtime.deferred_context_refresh.is_some() {
+            let _ = runtime
+                .background_status()
+                .expect("background status should continue polling");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(runtime.deferred_context_refresh_error.is_none());
+    }
+
+    #[test]
     fn cli_tui_runtime_surfaces_deferred_self_reflection_failures_in_background_status() {
         let _guard = cli_runtime_test_lock()
             .lock()
@@ -787,6 +833,55 @@ mod tests {
     }
 
     #[test]
+    fn cli_tui_runtime_surfaces_running_deferred_self_reflection_status() {
+        let _guard = cli_runtime_test_lock()
+            .lock()
+            .expect("cli runtime test lock should work");
+        let config = AppConfig::from_env(&HashMap::new()).expect("config should load");
+        let (tx, rx) = mpsc::channel();
+        let mut runtime = CliTuiRuntime {
+            runtime: AppRuntime::new(config),
+            startup_resume_message: None,
+            deferred_context_refresh: None,
+            deferred_context_refresh_error: None,
+            deferred_auto_memory: None,
+            deferred_auto_memory_error: None,
+            deferred_auto_memory_queue: Arc::new(Mutex::new(VecDeque::new())),
+            deferred_self_reflection: Some(BackgroundTask::spawn(move || {
+                set_background_status("self-reflection", "reflecting on recent conversation...");
+                rx.recv().expect("signal should arrive");
+                clear_background_status("self-reflection");
+                Ok(())
+            })),
+            deferred_self_reflection_error: None,
+            deferred_command_execution: None,
+        };
+
+        let background_status = loop {
+            let status = runtime
+                .background_status()
+                .expect("background status should load");
+            if status.is_some() {
+                break status;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        };
+
+        assert_eq!(
+            background_status.as_deref(),
+            Some("reflecting on recent conversation...")
+        );
+        tx.send(()).expect("task should receive completion signal");
+        while runtime.deferred_self_reflection.is_some() {
+            let _ = runtime
+                .background_status()
+                .expect("background status should continue polling");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(runtime.deferred_self_reflection_error.is_none());
+    }
+
+    #[test]
     fn cli_tui_runtime_surfaces_deferred_auto_memory_failures_in_background_status() {
         let _guard = cli_runtime_test_lock()
             .lock()
@@ -822,6 +917,55 @@ mod tests {
             Some("auto memory failed: memory exploded")
         );
         assert!(runtime.deferred_auto_memory.is_none());
+    }
+
+    #[test]
+    fn cli_tui_runtime_surfaces_running_deferred_auto_memory_status() {
+        let _guard = cli_runtime_test_lock()
+            .lock()
+            .expect("cli runtime test lock should work");
+        let config = AppConfig::from_env(&HashMap::new()).expect("config should load");
+        let (tx, rx) = mpsc::channel();
+        let mut runtime = CliTuiRuntime {
+            runtime: AppRuntime::new(config),
+            startup_resume_message: None,
+            deferred_context_refresh: None,
+            deferred_context_refresh_error: None,
+            deferred_auto_memory: Some(BackgroundTask::spawn(move || {
+                set_background_status("auto-memory", "creating memory from recent conversation...");
+                rx.recv().expect("signal should arrive");
+                clear_background_status("auto-memory");
+                Ok(())
+            })),
+            deferred_auto_memory_error: None,
+            deferred_auto_memory_queue: Arc::new(Mutex::new(VecDeque::new())),
+            deferred_self_reflection: None,
+            deferred_self_reflection_error: None,
+            deferred_command_execution: None,
+        };
+
+        let background_status = loop {
+            let status = runtime
+                .background_status()
+                .expect("background status should load");
+            if status.is_some() {
+                break status;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        };
+
+        assert_eq!(
+            background_status.as_deref(),
+            Some("creating memory from recent conversation...")
+        );
+        tx.send(()).expect("task should receive completion signal");
+        while runtime.deferred_auto_memory.is_some() {
+            let _ = runtime
+                .background_status()
+                .expect("background status should continue polling");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(runtime.deferred_auto_memory_error.is_none());
     }
 
     #[test]
