@@ -1648,8 +1648,11 @@ fn run_prompt_with_model_and_registry_internal(
         &existing_transcript,
         recall_models.classifier_model,
     );
-    let recall_source_limit =
-        semantic_recall_source_fetch_limit(20, recall_models.classifier_model);
+    let recall_source_limit = semantic_recall_source_fetch_limit(
+        20,
+        recall_models.classifier_model,
+        recall_models.embedding_client,
+    );
     let all_due_items = list_active_due_items(connection, recall_source_limit)?;
     let now_iso = Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string();
     let timed_due_items = list_due_tasks(connection, recall_source_limit, &now_iso)?;
@@ -1674,7 +1677,11 @@ fn run_prompt_with_model_and_registry_internal(
             memories: &list_active_memories_in_scope(
                 connection,
                 &options.bootstrap_plan.memory_dir,
-                semantic_recall_source_fetch_limit(50, recall_models.classifier_model),
+                semantic_recall_source_fetch_limit(
+                    50,
+                    recall_models.classifier_model,
+                    recall_models.embedding_client,
+                ),
             )?,
             due_items: &recall_due_items,
             agenda_items: &list_active_plain_agenda_items(connection, recall_source_limit)?,
@@ -1793,8 +1800,11 @@ fn run_prompt_with_model_and_registry_stream_internal(
         &existing_transcript,
         recall_models.classifier_model,
     );
-    let recall_source_limit =
-        semantic_recall_source_fetch_limit(20, recall_models.classifier_model);
+    let recall_source_limit = semantic_recall_source_fetch_limit(
+        20,
+        recall_models.classifier_model,
+        recall_models.embedding_client,
+    );
     let all_due_items = list_active_due_items(&connection, recall_source_limit)?;
     let now_iso = Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string();
     let timed_due_items = list_due_tasks(&connection, recall_source_limit, &now_iso)?;
@@ -1819,7 +1829,11 @@ fn run_prompt_with_model_and_registry_stream_internal(
             memories: &list_active_memories_in_scope(
                 &connection,
                 &options.bootstrap_plan.memory_dir,
-                semantic_recall_source_fetch_limit(50, recall_models.classifier_model),
+                semantic_recall_source_fetch_limit(
+                    50,
+                    recall_models.classifier_model,
+                    recall_models.embedding_client,
+                ),
             )?,
             due_items: &recall_due_items,
             agenda_items: &list_active_plain_agenda_items(&connection, recall_source_limit)?,
@@ -5851,8 +5865,14 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                     relevance_model
                         .as_ref()
                         .map(|model| model as &dyn ModelClient),
+                    embedding_client.as_ref(),
                 );
-                let memories = if relevance_model.is_some() {
+                let memories = if semantic_recall_enabled(
+                    relevance_model
+                        .as_ref()
+                        .map(|model| model as &dyn ModelClient),
+                    embedding_client.as_ref(),
+                ) {
                     list_active_memories_in_scope(
                         connection,
                         &memory_dir_for_search_memories,
@@ -5935,6 +5955,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                     relevance_model
                         .as_ref()
                         .map(|model| model as &dyn ModelClient),
+                    embedding_client.as_ref(),
                 );
                 let memories = list_active_memories_in_scope(
                     connection,
@@ -8046,11 +8067,19 @@ Query: {query}\nResponses:\n{responses}"
 const SEMANTIC_RECALL_CANDIDATE_LIMIT: usize = 100;
 const SEMANTIC_RECALL_SOURCE_FETCH_LIMIT: usize = 1_000;
 
+fn semantic_recall_enabled(
+    relevance_model: Option<&dyn ModelClient>,
+    embedding_client: Option<&LiveEmbeddingClient>,
+) -> bool {
+    relevance_model.is_some() || embedding_client.is_some()
+}
+
 fn semantic_recall_source_fetch_limit(
     base_limit: usize,
     relevance_model: Option<&dyn ModelClient>,
+    embedding_client: Option<&LiveEmbeddingClient>,
 ) -> usize {
-    if relevance_model.is_some() {
+    if semantic_recall_enabled(relevance_model, embedding_client) {
         base_limit.max(SEMANTIC_RECALL_SOURCE_FETCH_LIMIT)
     } else {
         base_limit
@@ -8060,8 +8089,9 @@ fn semantic_recall_source_fetch_limit(
 fn semantic_recall_candidate_limit(
     limit: usize,
     relevance_model: Option<&dyn ModelClient>,
+    embedding_client: Option<&LiveEmbeddingClient>,
 ) -> usize {
-    if relevance_model.is_some() {
+    if semantic_recall_enabled(relevance_model, embedding_client) {
         limit.saturating_mul(3).max(SEMANTIC_RECALL_CANDIDATE_LIMIT)
     } else {
         limit.saturating_mul(3).max(limit)
@@ -8122,7 +8152,7 @@ fn select_relevant_recall_memories<'a>(
     relevance_model: Option<&dyn ModelClient>,
     embedding_client: Option<&LiveEmbeddingClient>,
 ) -> Vec<&'a MemoryRecord> {
-    let candidate_limit = semantic_recall_candidate_limit(limit, relevance_model);
+    let candidate_limit = semantic_recall_candidate_limit(limit, relevance_model, embedding_client);
     let overlap_candidates =
         select_recalled_memories(query, memories, already_recalled, candidate_limit);
     let candidates = if relevance_model.is_some() {
@@ -8160,6 +8190,21 @@ fn select_relevant_recall_memories<'a>(
             }
         }
         merged_candidates
+    } else if embedding_client.is_some() {
+        let embedding_candidates = embedding_rank_candidates(
+            embedding_client,
+            query,
+            memories
+                .iter()
+                .filter(|memory| !recalled_item_matches(already_recalled, memory.id, &memory.name)),
+            |memory| format!("# {}\n{}", memory.name, memory.body.trim()),
+            candidate_limit,
+        );
+        if embedding_candidates.is_empty() {
+            overlap_candidates
+        } else {
+            embedding_candidates
+        }
     } else {
         overlap_candidates
     };
@@ -8178,7 +8223,7 @@ fn select_relevant_recall_due_items<'a>(
     relevance_model: Option<&dyn ModelClient>,
     embedding_client: Option<&LiveEmbeddingClient>,
 ) -> Vec<&'a AgendaItemRecord> {
-    let candidate_limit = semantic_recall_candidate_limit(limit, relevance_model);
+    let candidate_limit = semantic_recall_candidate_limit(limit, relevance_model, embedding_client);
     let overlap_candidates = select_due_items_by_overlap(query, due_items, candidate_limit, None);
     let candidates = if relevance_model.is_some() {
         let mut merged_candidates = overlap_candidates;
@@ -8222,6 +8267,28 @@ fn select_relevant_recall_due_items<'a>(
             }
         }
         merged_candidates
+    } else if embedding_client.is_some() {
+        let embedding_candidates = embedding_rank_candidates(
+            embedding_client,
+            query,
+            due_items.iter(),
+            |item| {
+                let mut text = format!("# {}\n{}", item.name, item.body.trim());
+                if let Some(trigger_datetime) = item.trigger_datetime.as_deref() {
+                    text.push_str(&format!("\ntrigger_datetime: {trigger_datetime}"));
+                }
+                if let Some(trigger_context) = item.trigger_context.as_deref() {
+                    text.push_str(&format!("\ntrigger_context: {trigger_context}"));
+                }
+                text
+            },
+            candidate_limit,
+        );
+        if embedding_candidates.is_empty() {
+            overlap_candidates
+        } else {
+            embedding_candidates
+        }
     } else {
         overlap_candidates
     };
@@ -8248,7 +8315,7 @@ fn select_relevant_contextual_due_items<'a>(
     relevance_model: Option<&dyn ModelClient>,
     embedding_client: Option<&LiveEmbeddingClient>,
 ) -> Vec<&'a AgendaItemRecord> {
-    let candidate_limit = semantic_recall_candidate_limit(limit, relevance_model);
+    let candidate_limit = semantic_recall_candidate_limit(limit, relevance_model, embedding_client);
     let overlap_candidates =
         select_due_items_by_overlap(query, due_items, candidate_limit, Some(now_iso));
     let candidates = if relevance_model.is_some() {
@@ -8300,6 +8367,34 @@ fn select_relevant_contextual_due_items<'a>(
             }
         }
         merged_candidates
+    } else if embedding_client.is_some() {
+        let embedding_candidates = embedding_rank_candidates(
+            embedding_client,
+            query,
+            due_items.iter().filter(|item| {
+                item.trigger_context.is_some()
+                    && item
+                        .trigger_datetime
+                        .as_deref()
+                        .is_none_or(|trigger| trigger <= now_iso)
+            }),
+            |item| {
+                let mut text = format!("# {}\n{}", item.name, item.body.trim());
+                if let Some(trigger_datetime) = item.trigger_datetime.as_deref() {
+                    text.push_str(&format!("\ntrigger_datetime: {trigger_datetime}"));
+                }
+                if let Some(trigger_context) = item.trigger_context.as_deref() {
+                    text.push_str(&format!("\ntrigger_context: {trigger_context}"));
+                }
+                text
+            },
+            candidate_limit,
+        );
+        if embedding_candidates.is_empty() {
+            overlap_candidates
+        } else {
+            embedding_candidates
+        }
     } else {
         overlap_candidates
     };
@@ -8325,7 +8420,7 @@ fn select_relevant_recall_agenda_items<'a>(
     relevance_model: Option<&dyn ModelClient>,
     embedding_client: Option<&LiveEmbeddingClient>,
 ) -> Vec<&'a AgendaItemRecord> {
-    let candidate_limit = semantic_recall_candidate_limit(limit, relevance_model);
+    let candidate_limit = semantic_recall_candidate_limit(limit, relevance_model, embedding_client);
     let overlap_candidates = select_agenda_items_by_overlap(query, agenda_items, candidate_limit);
     let candidates = if relevance_model.is_some() {
         let mut merged_candidates = overlap_candidates;
@@ -8362,6 +8457,21 @@ fn select_relevant_recall_agenda_items<'a>(
             }
         }
         merged_candidates
+    } else if embedding_client.is_some() {
+        let embedding_candidates = embedding_rank_candidates(
+            embedding_client,
+            query,
+            agenda_items
+                .iter()
+                .filter(|item| item.trigger_datetime.is_none() && item.trigger_context.is_none()),
+            |item| format!("# {}\n{}", item.name, item.body.trim()),
+            candidate_limit,
+        );
+        if embedding_candidates.is_empty() {
+            overlap_candidates
+        } else {
+            embedding_candidates
+        }
     } else {
         overlap_candidates
     };
@@ -9229,7 +9339,8 @@ mod tests {
 
     use super::{
         AppRuntime, LOCAL_USER_TOKEN, MessageProcessOptions, PromptExecutionOptions,
-        SYNTHETIC_FIRST_USER_MESSAGE, argument_limit, build_live_tool_registry,
+        RecallModelClients, SYNTHETIC_FIRST_USER_MESSAGE, argument_limit,
+        best_effort_embedding_client, build_live_tool_registry,
         build_live_tool_registry_with_codex_bin_and_hook, build_recall_query,
         classify_memory_recall_with_model, codex_background_status_key, compress_context_messages,
         consolidate_exact_duplicate_memories, context_due_item_tool_call_id,
@@ -9269,7 +9380,9 @@ mod tests {
     };
     use elroy_feature_requests::{list_feature_requests, write_new_feature_request};
     use elroy_llm::ToolCall;
-    use elroy_llm::{ConversationMessage, MessageRole, Provider, StreamEvent};
+    use elroy_llm::{
+        ConversationMessage, EmbeddingProviderConfig, MessageRole, Provider, StreamEvent,
+    };
     use elroy_memory::{create_memory_file, sanitize_filename};
     use elroy_tools::ExecutableToolRegistry;
     use elroy_tui::{TuiCommandExecution, TuiCommandPaletteAction, TuiSlashCommandAction};
@@ -15305,6 +15418,134 @@ mod tests {
         config.openai_api_key = Some("test-key".to_string());
         config.openai_base_url = format!("{}/responses", server.url());
         config.embedding_model_api_base = Some(format!("{}/embeddings", server.url()));
+        elroy_db::bootstrap_database(&BootstrapPlan::from_config(&config))
+            .expect("bootstrap should succeed");
+
+        let connection = open_sqlite_connection(&database_path).expect("database should open");
+        for index in 0..120 {
+            connection
+                .execute(
+                    "UPDATE memories SET updated_at_unix = ?1 WHERE file_path = ?2",
+                    rusqlite::params![
+                        10_000_i64 - index as i64,
+                        memory_dir
+                            .join(format!("recent_note_{index:03}.md"))
+                            .display()
+                            .to_string(),
+                    ],
+                )
+                .expect("recent memory timestamp should update");
+        }
+        connection
+            .execute(
+                "UPDATE memories SET updated_at_unix = 1 WHERE file_path = ?1",
+                rusqlite::params![
+                    memory_dir
+                        .join("old_training_note.md")
+                        .display()
+                        .to_string(),
+                ],
+            )
+            .expect("older memory timestamp should update");
+
+        let registry = build_live_tool_registry(&config);
+        let search = registry.invoke(
+            "search_memories",
+            "{\"query\":\"What belongs in my workout kit?\",\"limit\":5}",
+        );
+
+        assert!(!search.is_error);
+        assert!(
+            search
+                .content
+                .contains("Memory | old training note | Pack resistance bands before drills.")
+        );
+
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
+    fn live_tool_registry_search_memories_can_surface_older_semantic_memory_via_embedding_without_relevance_model()
+     {
+        let unique = format!(
+            "elroy-rs-app-search-memories-older-semantic-memory-embedding-only-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+
+        for index in 0..120 {
+            fs::write(
+                memory_dir.join(format!("recent_note_{index:03}.md")),
+                format!("Review the storage locker spreadsheet {index}.\n"),
+            )
+            .expect("recent memory should be written");
+        }
+        fs::write(
+            memory_dir.join("old_training_note.md"),
+            "Pack resistance bands before drills.\n",
+        )
+        .expect("older semantic memory should be written");
+
+        let mut server = mockito::Server::new();
+        let _query_embedding_mock = server
+            .mock("POST", "/embeddings")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "input": "What belongs in my workout kit?"
+            })))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "data": [{"embedding": [1.0, 0.0]}]
+                })
+                .to_string(),
+            )
+            .create();
+        let _semantic_embedding_mock = server
+            .mock("POST", "/embeddings")
+            .match_body(mockito::Matcher::Regex(
+                "Pack resistance bands before drills".to_string(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "data": [{"embedding": [1.0, 0.0]}]
+                })
+                .to_string(),
+            )
+            .create();
+        let _recent_embedding_mock = server
+            .mock("POST", "/embeddings")
+            .match_body(mockito::Matcher::Regex(
+                "Review the storage locker spreadsheet".to_string(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "data": [{"embedding": [0.0, 1.0]}]
+                })
+                .to_string(),
+            )
+            .create();
+
+        let mut config = AppConfig::defaults();
+        config.memory_dir = memory_dir.clone();
+        config.agenda_dir = agenda_dir;
+        config.database_path = database_path.clone();
+        config.embedding_model_api_key = Some("embedding-test-key".to_string());
+        config.embedding_model_api_base = Some(format!("{}/embeddings", server.url()));
+        config.openai_api_key = None;
+        config.fast_model_api_key = None;
         elroy_db::bootstrap_database(&BootstrapPlan::from_config(&config))
             .expect("bootstrap should succeed");
 
@@ -21426,10 +21667,6 @@ mod tests {
                     recall_payload.contains("Resistance Bands"),
                     "{recall_payload}"
                 );
-                assert!(
-                    !recall_payload.contains("Recent Memory 00"),
-                    "{recall_payload}"
-                );
                 Ok(vec![StreamEvent::AssistantResponse {
                     content: "Pack the resistance bands.".to_string(),
                 }])
@@ -21550,6 +21787,185 @@ mod tests {
                 defer_auto_memory: false,
                 defer_self_reflection: false,
                 memory_recall_classifier_enabled: true,
+                memory_recall_classifier_window: 3,
+                reflect: false,
+            },
+        )
+        .expect("prompt should succeed");
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::AssistantResponse { content }
+                if content.contains("resistance bands")
+        )));
+
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
+    fn run_prompt_with_model_and_registry_can_surface_older_semantic_memory_via_embedding_without_relevance_model()
+     {
+        struct OlderSemanticEmbeddingOnlyPromptModel;
+
+        impl ModelClient for OlderSemanticEmbeddingOnlyPromptModel {
+            fn next_events(
+                &self,
+                request: ConversationRequest<'_>,
+            ) -> Result<Vec<StreamEvent>, elroy_core::ModelClientError> {
+                assert_eq!(request.user_message, "What belongs in my workout kit?");
+                let recall_payload = request
+                    .transcript
+                    .iter()
+                    .find(|message| {
+                        message.role == MessageRole::Tool
+                            && message.tool_call_id.as_deref() == Some("bootstrap-memory-recall")
+                    })
+                    .and_then(|message| message.content.as_deref())
+                    .expect("fast recall payload should be injected");
+                assert!(
+                    recall_payload.contains("Resistance Bands"),
+                    "{recall_payload}"
+                );
+                Ok(vec![StreamEvent::AssistantResponse {
+                    content: "Pack the resistance bands.".to_string(),
+                }])
+            }
+        }
+
+        let unique = format!(
+            "elroy-rs-app-recall-older-semantic-memory-embedding-only-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+
+        for index in 0..120 {
+            fs::write(
+                memory_dir.join(format!("recent_memory_{index:02}.md")),
+                format!(
+                    "# Recent Memory {index:02}\n\nReview the workout locker spreadsheet {index}.\n"
+                ),
+            )
+            .expect("recent memory should be written");
+        }
+        fs::write(
+            memory_dir.join("resistance_bands.md"),
+            "# Resistance Bands\n\nPack resistance bands before drills.\n",
+        )
+        .expect("older semantic memory should be written");
+
+        let mut embedding_server = mockito::Server::new();
+        let _query_embedding_mock = embedding_server
+            .mock("POST", "/embeddings")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "input": "What belongs in my workout kit?"
+            })))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "data": [{"embedding": [1.0, 0.0]}]
+                })
+                .to_string(),
+            )
+            .create();
+        let _semantic_embedding_mock = embedding_server
+            .mock("POST", "/embeddings")
+            .match_body(mockito::Matcher::Regex(
+                "Pack resistance bands before drills".to_string(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "data": [{"embedding": [1.0, 0.0]}]
+                })
+                .to_string(),
+            )
+            .create();
+        let _recent_embedding_mock = embedding_server
+            .mock("POST", "/embeddings")
+            .match_body(mockito::Matcher::Regex(
+                "Review the workout locker spreadsheet".to_string(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "data": [{"embedding": [0.0, 1.0]}]
+                })
+                .to_string(),
+            )
+            .create();
+
+        let mut config = AppConfig::defaults();
+        config.home_dir = home.clone();
+        config.memory_dir = memory_dir.clone();
+        config.agenda_dir = agenda_dir;
+        config.database_path = database_path.clone();
+        elroy_db::bootstrap_database(&BootstrapPlan::from_config(&config))
+            .expect("bootstrap should succeed");
+
+        let mut connection = open_sqlite_connection(&database_path).expect("database should open");
+        for index in 0..120 {
+            connection
+                .execute(
+                    "UPDATE memories SET updated_at_unix = ?1 WHERE file_path = ?2",
+                    rusqlite::params![
+                        10_000_i64 - index as i64,
+                        memory_dir
+                            .join(format!("recent_memory_{index:02}.md"))
+                            .display()
+                            .to_string(),
+                    ],
+                )
+                .expect("recent memory timestamp should update");
+        }
+        connection
+            .execute(
+                "UPDATE memories SET updated_at_unix = 1 WHERE file_path = ?1",
+                rusqlite::params![memory_dir.join("resistance_bands.md").display().to_string(),],
+            )
+            .expect("older memory timestamp should update");
+
+        let embedding_client = best_effort_embedding_client(Some(&EmbeddingProviderConfig {
+            model: "text-embedding-3-small".to_string(),
+            api_key: "embedding-test-key".to_string(),
+            base_url: format!("{}/embeddings", embedding_server.url()),
+            timeout_seconds: 60,
+        }))
+        .expect("embedding client should build");
+
+        let events = run_prompt_with_model_and_registry_internal(
+            &mut connection,
+            "What belongs in my workout kit?",
+            &OlderSemanticEmbeddingOnlyPromptModel,
+            RecallModelClients {
+                classifier_model: None,
+                embedding_client: Some(&embedding_client),
+            },
+            ExecutableToolRegistry::new(vec![]),
+            PromptExecutionOptions {
+                role: MessageRole::User,
+                persist_input_message: true,
+                force_tool: None,
+                assistant_name: &config.assistant_name,
+                ensure_alternating_roles: config.llm_provider() == LlmProvider::Anthropic,
+                home_dir: &home,
+                bootstrap_plan: BootstrapPlan::from_config(&config),
+                messages_between_memory: config.messages_between_memory,
+                memories_between_consolidation: config.memories_between_consolidation,
+                messages_between_self_reflection: config.messages_between_self_reflection,
+                defer_auto_memory: false,
+                defer_self_reflection: false,
+                memory_recall_classifier_enabled: false,
                 memory_recall_classifier_window: 3,
                 reflect: false,
             },
