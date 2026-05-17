@@ -3688,6 +3688,81 @@ mod tests {
     }
 
     #[test]
+    fn command_palette_can_focus_memories_section() {
+        let mut app = TuiApp::bootstrap();
+        app.sidebar_section = SidebarSection::Agenda;
+        app.selected_sidebar_index = 1;
+        app.open_command_palette(vec![]);
+        select_command_palette_entry(&mut app, "Focus Memories");
+        let mut runtime = FakeRuntime::default();
+        let mut pending = None;
+
+        apply_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut runtime,
+            &mut pending,
+        );
+
+        assert!(app.command_palette.is_none());
+        assert_eq!(app.focus, FocusTarget::Command(CommandPane::Sidebar));
+        assert_eq!(app.last_command_pane, CommandPane::Sidebar);
+        assert_eq!(app.sidebar_section, SidebarSection::Memories);
+        assert_eq!(app.status, "focused memories");
+        assert_eq!(app.selected_sidebar_index, 0);
+    }
+
+    #[test]
+    fn command_palette_can_focus_agenda_section() {
+        let mut app = TuiApp::bootstrap();
+        app.sidebar_section = SidebarSection::Memories;
+        app.selected_sidebar_index = 1;
+        app.open_command_palette(vec![]);
+        select_command_palette_entry(&mut app, "Focus Agenda");
+        let mut runtime = FakeRuntime::default();
+        let mut pending = None;
+
+        apply_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut runtime,
+            &mut pending,
+        );
+
+        assert!(app.command_palette.is_none());
+        assert_eq!(app.focus, FocusTarget::Command(CommandPane::Sidebar));
+        assert_eq!(app.last_command_pane, CommandPane::Sidebar);
+        assert_eq!(app.sidebar_section, SidebarSection::Agenda);
+        assert_eq!(app.status, "focused agenda");
+        assert_eq!(app.selected_sidebar_index, 0);
+    }
+
+    #[test]
+    fn command_palette_can_focus_improvements_section() {
+        let mut app = TuiApp::bootstrap();
+        app.sidebar_section = SidebarSection::Memories;
+        app.selected_sidebar_index = 1;
+        app.open_command_palette(vec![]);
+        select_command_palette_entry(&mut app, "Focus Improvements");
+        let mut runtime = FakeRuntime::default();
+        let mut pending = None;
+
+        apply_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut runtime,
+            &mut pending,
+        );
+
+        assert!(app.command_palette.is_none());
+        assert_eq!(app.focus, FocusTarget::Command(CommandPane::Sidebar));
+        assert_eq!(app.last_command_pane, CommandPane::Sidebar);
+        assert_eq!(app.sidebar_section, SidebarSection::Improvements);
+        assert_eq!(app.status, "focused improvements");
+        assert_eq!(app.selected_sidebar_index, 0);
+    }
+
+    #[test]
     fn command_palette_can_focus_feature_requests_section() {
         let mut app = TuiApp::bootstrap();
         app.open_command_palette(vec![]);
