@@ -2418,7 +2418,28 @@ fn format_context_messages_for_summary(
     user_name: &str,
     assistant_name: &str,
 ) -> String {
-    messages
+    let conversation_range = messages
+        .iter()
+        .filter(|message| message.role == MessageRole::User)
+        .map(|message| message.created_at_unix)
+        .min()
+        .zip(
+            messages
+                .iter()
+                .filter(|message| message.role == MessageRole::User)
+                .map(|message| message.created_at_unix)
+                .max(),
+        )
+        .map(|(min, max)| {
+            format!(
+                "Messages from {} to {}",
+                format_context_summary_timestamp(min),
+                format_context_summary_timestamp(max)
+            )
+        })
+        .unwrap_or_else(|| "No messages in context".to_string());
+
+    let lines = messages
         .iter()
         .filter_map(|message| match message.role {
             MessageRole::System => None,
@@ -2427,18 +2448,29 @@ fn format_context_messages_for_summary(
                 .as_deref()
                 .map(str::trim)
                 .filter(|content| !content.is_empty())
-                .map(|content| format!("{user_name}: {}", excerpt(content, 400))),
+                .map(|content| {
+                    format!(
+                        "{user_name} ({}): {}",
+                        format_context_summary_timestamp(message.created_at_unix),
+                        excerpt(content, 400)
+                    )
+                }),
             MessageRole::Assistant => {
                 let mut lines = Vec::new();
                 if let Some(content) = message.content.as_deref().map(str::trim)
                     && !content.is_empty()
                 {
-                    lines.push(format!("{assistant_name}: {}", excerpt(content, 400)));
+                    lines.push(format!(
+                        "{assistant_name} ({}): {}",
+                        format_context_summary_timestamp(message.created_at_unix),
+                        excerpt(content, 400)
+                    ));
                 }
                 if let Some(tool_calls) = &message.tool_calls {
                     lines.extend(tool_calls.iter().map(|call| {
                         format!(
-                            "{assistant_name} Tool Call: {} {}",
+                            "{assistant_name} TOOL CALL REQUEST ({}): function name: {}, arguments: {}",
+                            format_context_summary_timestamp(message.created_at_unix),
                             call.name,
                             excerpt(&call.arguments_json, 200)
                         )
@@ -2451,10 +2483,22 @@ fn format_context_messages_for_summary(
                 .as_deref()
                 .map(str::trim)
                 .filter(|content| !content.is_empty())
-                .map(|content| format!("Tool Result: {}", excerpt(content, 400))),
+                .map(|content| {
+                    format!(
+                        "TOOL CALL RESULT ({}): {}",
+                        format_context_summary_timestamp(message.created_at_unix),
+                        excerpt(content, 400)
+                    )
+                }),
         })
+        .collect::<Vec<_>>();
+
+    ["Conversation Summary".to_string()]
+        .into_iter()
+        .chain(lines)
+        .chain(std::iter::once(conversation_range))
         .collect::<Vec<_>>()
-        .join("\n")
+        .join("\n\n")
 }
 
 fn summarize_context_messages_with_model(
@@ -15851,10 +15895,17 @@ mod tests {
             "Elroy",
         );
 
-        assert!(formatted.contains("User: I need to finish payroll"));
-        assert!(formatted.contains("Elroy: I should look that up."));
-        assert!(formatted.contains("Elroy Tool Call: search_memories"));
-        assert!(formatted.contains("Tool Result: Found payroll reminder."));
+        assert!(formatted.starts_with("Conversation Summary"));
+        assert!(formatted.contains("User ("));
+        assert!(formatted.contains("): I need to finish payroll"));
+        assert!(formatted.contains("Elroy ("));
+        assert!(formatted.contains("): I should look that up."));
+        assert!(formatted.contains("Elroy TOOL CALL REQUEST ("));
+        assert!(formatted.contains("function name: search_memories"));
+        assert!(formatted.contains("arguments: {\"query\":\"payroll\"}"));
+        assert!(formatted.contains("TOOL CALL RESULT ("));
+        assert!(formatted.contains("): Found payroll reminder."));
+        assert!(formatted.contains("Messages from "));
         assert!(!formatted.contains("system"));
     }
 
