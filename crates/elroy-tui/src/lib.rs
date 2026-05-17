@@ -3706,6 +3706,51 @@ mod tests {
     }
 
     #[test]
+    fn runtime_tick_returns_restart_requested_after_prompt_completion() {
+        let mut app = TuiApp::bootstrap();
+        let mut runtime = FakeRuntime {
+            pending_restart_request: Some("Restarted successfully. Ready to continue.".to_string()),
+            ..FakeRuntime::default()
+        };
+        let mut pending = Some(PendingPrompt {
+            submitted_prompt: Some("hello runtime".to_string()),
+            schedule_self_reflection: true,
+            before_ids: HashSet::new(),
+            stream: Box::new(FakePromptStream {
+                updates: vec![],
+                finalized_snapshot: TuiSnapshot {
+                    conversation_lines: vec!["assistant: runtime response".to_string()],
+                    ..TuiSnapshot::default()
+                },
+                cancelled_snapshot: TuiSnapshot::default(),
+            }),
+        });
+        let mut deferred_context_refresh_at = None;
+        let mut previous_background_status = None;
+
+        let result = drive_runtime_tick(
+            &mut app,
+            &mut runtime,
+            &mut pending,
+            Instant::now(),
+            &mut deferred_context_refresh_at,
+            &mut previous_background_status,
+        );
+
+        assert_eq!(
+            result,
+            Some(TuiRunResult::RestartRequested(
+                "Restarted successfully. Ready to continue.".to_string()
+            ))
+        );
+        assert!(pending.is_none());
+        assert_eq!(app.focus, FocusTarget::Input);
+        assert_eq!(app.status, "submitted prompt: hello runtime");
+        assert_eq!(runtime.self_reflection_runs, 0);
+        assert!(runtime.pending_restart_request.is_none());
+    }
+
+    #[test]
     fn command_palette_enter_launches_command_form() {
         let mut app = TuiApp::bootstrap();
         app.open_command_palette(vec![TuiCommandPaletteEntry {
