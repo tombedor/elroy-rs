@@ -16274,6 +16274,126 @@ mod tests {
     }
 
     #[test]
+    fn run_prompt_with_model_and_registry_does_not_duplicate_contextual_due_items_already_pinned_in_current_context()
+     {
+        struct CurrentContextDueItemModel;
+        struct NoRecallClassifierModel;
+
+        impl ModelClient for CurrentContextDueItemModel {
+            fn next_events(
+                &self,
+                request: ConversationRequest<'_>,
+            ) -> Result<Vec<StreamEvent>, elroy_core::ModelClientError> {
+                assert_eq!(request.user_message, "I just got the payroll email");
+                let due_item_tool_mentions = request
+                    .transcript
+                    .iter()
+                    .filter(|message| message.role == MessageRole::Tool)
+                    .filter(|message| {
+                        message.content.as_deref().is_some_and(|content| {
+                            content.to_ascii_lowercase().contains("payroll follow up")
+                        })
+                    })
+                    .count();
+                assert_eq!(
+                    due_item_tool_mentions, 1,
+                    "a due item already pinned in current context should not be re-injected by contextual due-item surfacing"
+                );
+                Ok(vec![StreamEvent::AssistantResponse {
+                    content: "You should reply to payroll.".to_string(),
+                }])
+            }
+        }
+
+        impl ModelClient for NoRecallClassifierModel {
+            fn next_events(
+                &self,
+                _request: ConversationRequest<'_>,
+            ) -> Result<Vec<StreamEvent>, elroy_core::ModelClientError> {
+                Ok(vec![StreamEvent::AssistantResponse {
+                    content: r#"{"needs_recall":false,"reasoning":"Contextual reminder should come only from current context here."}"#
+                        .to_string(),
+                }])
+            }
+        }
+
+        let unique = format!(
+            "elroy-rs-app-contextual-due-item-current-context-no-duplicate-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+        fs::write(
+            agenda_dir.join("payroll_follow_up.md"),
+            "---\ndate: unscheduled\ncompleted: false\nstatus: created\ntrigger_context: after payroll email\n---\n\nReply to payroll\n",
+        )
+        .expect("contextual due item file should be written");
+
+        let mut config = AppConfig::defaults();
+        config.home_dir = home.clone();
+        config.memory_dir = memory_dir;
+        config.agenda_dir = agenda_dir;
+        config.database_path = database_path.clone();
+        elroy_db::bootstrap_database(&BootstrapPlan::from_config(&config))
+            .expect("bootstrap should succeed");
+
+        let mut connection = open_sqlite_connection(&database_path).expect("database should open");
+        run_migrations(&mut connection).expect("migrations should run");
+
+        let pinned_due_item =
+            elroy_db::find_active_agenda_item_by_name(&connection, "payroll follow up")
+                .expect("due item lookup should succeed")
+                .expect("due item should exist");
+        elroy_db::replace_context_messages(
+            &mut connection,
+            LOCAL_USER_TOKEN,
+            &context_due_item_tool_messages(&pinned_due_item),
+        )
+        .expect("pinned due item context should persist");
+
+        let events = run_prompt_with_model_and_registry_internal(
+            &mut connection,
+            "I just got the payroll email",
+            &CurrentContextDueItemModel,
+            Some(&NoRecallClassifierModel),
+            build_live_tool_registry(&config),
+            PromptExecutionOptions {
+                role: MessageRole::User,
+                persist_input_message: true,
+                force_tool: None,
+                assistant_name: &config.assistant_name,
+                ensure_alternating_roles: config.llm_provider() == LlmProvider::Anthropic,
+                home_dir: &home,
+                bootstrap_plan: BootstrapPlan::from_config(&config),
+                messages_between_memory: config.messages_between_memory,
+                memories_between_consolidation: config.memories_between_consolidation,
+                messages_between_self_reflection: config.messages_between_self_reflection,
+                defer_auto_memory: false,
+                defer_self_reflection: false,
+                memory_recall_classifier_enabled: config.memory_recall_classifier_enabled,
+                memory_recall_classifier_window: config.memory_recall_classifier_window,
+                reflect: config.reflect,
+            },
+        )
+        .expect("prompt should succeed");
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::AssistantResponse { content }
+                if content.contains("reply to payroll")
+        )));
+
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
     fn run_prompt_with_model_and_registry_can_persist_non_user_roles() {
         let unique = format!(
             "elroy-rs-app-system-role-{}",
