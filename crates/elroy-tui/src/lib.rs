@@ -694,6 +694,31 @@ fn start_command_execution(
     }
 }
 
+fn launch_named_command(
+    app: &mut TuiApp,
+    runtime: &mut impl TuiRuntime,
+    name: &str,
+) -> Result<(), String> {
+    match runtime.launch_named_command(name) {
+        Ok(TuiSlashCommandAction::Execute(command)) => {
+            start_command_execution(app, runtime, command)
+        }
+        Ok(TuiSlashCommandAction::OpenForm(form)) => {
+            app.open_command_form(form);
+            app.status = format!(
+                "editing command: /{}",
+                app.command_form
+                    .as_ref()
+                    .expect("command form should open")
+                    .command_name
+            );
+            Ok(())
+        }
+        Ok(TuiSlashCommandAction::NotHandled) => Err(name.to_string()),
+        Err(error) => Err(error),
+    }
+}
+
 fn apply_paste_event(app: &mut TuiApp, text: &str) {
     let flattened = flatten_pasted_text(text);
     if flattened.is_empty() {
@@ -2034,30 +2059,9 @@ fn handle_command_palette_key(app: &mut TuiApp, key: KeyEvent, runtime: &mut imp
                     app.status = "focused codex sessions".to_string();
                 }
                 TuiCommandPaletteAction::ToolCommand(name) => {
-                    match runtime.launch_named_command(&name) {
-                        Ok(TuiSlashCommandAction::Execute(command)) => {
-                            match start_command_execution(app, runtime, command) {
-                                Ok(()) => {
-                                    app.command_palette = None;
-                                }
-                                Err(error) => {
-                                    app.status = format!("command launch failed: {error}");
-                                }
-                            }
-                        }
-                        Ok(TuiSlashCommandAction::OpenForm(form)) => {
+                    match launch_named_command(app, runtime, &name) {
+                        Ok(()) => {
                             app.command_palette = None;
-                            app.open_command_form(form);
-                            app.status = format!(
-                                "editing command: /{}",
-                                app.command_form
-                                    .as_ref()
-                                    .expect("command form should open")
-                                    .command_name
-                            );
-                        }
-                        Ok(TuiSlashCommandAction::NotHandled) => {
-                            app.status = format!("command launch failed: {name}");
                         }
                         Err(error) => {
                             app.status = format!("command launch failed: {error}");
@@ -3982,6 +3986,104 @@ mod tests {
         assert!(app.command_palette.is_none());
         assert!(app.command_form.is_some());
         assert_eq!(app.status, "editing command: /create_memory");
+    }
+
+    #[test]
+    fn direct_named_command_launch_can_open_and_submit_command_form() {
+        let mut app = TuiApp::bootstrap();
+        let mut runtime = FakeRuntime {
+            launch_named_command_action: Some(TuiSlashCommandAction::OpenForm(TuiCommandForm {
+                command_name: "create_memory".to_string(),
+                description: "Create a memory".to_string(),
+                parameters: vec![
+                    TuiCommandParameter {
+                        name: "name".to_string(),
+                        optional: false,
+                        default_text: String::new(),
+                        suggestions: vec![],
+                    },
+                    TuiCommandParameter {
+                        name: "text".to_string(),
+                        optional: false,
+                        default_text: String::new(),
+                        suggestions: vec![],
+                    },
+                ],
+                initial_values: vec![],
+            })),
+            ..FakeRuntime::default()
+        };
+
+        crate::launch_named_command(&mut app, &mut runtime, "create_memory")
+            .expect("direct command launch should open a form");
+
+        assert!(app.command_form.is_some());
+        assert_eq!(app.status, "editing command: /create_memory");
+
+        let mut pending = None;
+        apply_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('T'), KeyModifiers::SHIFT),
+            &mut runtime,
+            &mut pending,
+        );
+        apply_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+            &mut runtime,
+            &mut pending,
+        );
+        apply_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE),
+            &mut runtime,
+            &mut pending,
+        );
+        apply_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE),
+            &mut runtime,
+            &mut pending,
+        );
+        apply_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+            &mut runtime,
+            &mut pending,
+        );
+        for ch in "User prefers aisle seats.".chars() {
+            let modifiers = if ch.is_ascii_uppercase() {
+                KeyModifiers::SHIFT
+            } else {
+                KeyModifiers::NONE
+            };
+            apply_key_event(
+                &mut app,
+                KeyEvent::new(KeyCode::Char(ch), modifiers),
+                &mut runtime,
+                &mut pending,
+            );
+        }
+        apply_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut runtime,
+            &mut pending,
+        );
+
+        assert!(app.command_form.is_none());
+        assert!(app.command_active);
+        assert_eq!(
+            runtime.started_command_executions,
+            vec![TuiCommandExecution {
+                command_name: "create_memory".to_string(),
+                display_name: "create_memory".to_string(),
+                values: vec![
+                    ("name".to_string(), "Trip".to_string()),
+                    ("text".to_string(), "User prefers aisle seats.".to_string()),
+                ],
+            }]
+        );
     }
 
     #[test]
