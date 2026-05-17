@@ -155,6 +155,7 @@ fn build_restart_command(
 
 struct CliTuiRuntime {
     runtime: AppRuntime,
+    startup_resume_message: Option<String>,
     deferred_context_refresh: Option<BackgroundTask<()>>,
     deferred_context_refresh_error: Option<String>,
     deferred_auto_memory: Option<BackgroundTask<()>>,
@@ -206,6 +207,7 @@ impl CliTuiRuntime {
         runtime.enable_restart_support();
         Self {
             runtime,
+            startup_resume_message: env::var(RESTART_RESUME_MESSAGE_ENV).ok(),
             deferred_context_refresh: None,
             deferred_context_refresh_error: None,
             deferred_auto_memory: None,
@@ -477,7 +479,7 @@ impl TuiRuntime for CliTuiRuntime {
     }
 
     fn start_startup_prompt_stream(&mut self) -> Result<Option<Box<dyn TuiPromptStream>>, String> {
-        let restart_resume_message = std::env::var(RESTART_RESUME_MESSAGE_ENV).ok();
+        let restart_resume_message = self.startup_resume_message.take();
         self.start_startup_prompt_stream_with_resume_message(restart_resume_message.as_deref())
     }
 
@@ -716,6 +718,7 @@ mod tests {
         let config = AppConfig::from_env(&HashMap::new()).expect("config should load");
         let mut runtime = CliTuiRuntime {
             runtime: AppRuntime::new(config),
+            startup_resume_message: None,
             deferred_context_refresh: Some(BackgroundTask::spawn(|| {
                 Err("refresh exploded".to_string())
             })),
@@ -753,6 +756,7 @@ mod tests {
         let config = AppConfig::from_env(&HashMap::new()).expect("config should load");
         let mut runtime = CliTuiRuntime {
             runtime: AppRuntime::new(config),
+            startup_resume_message: None,
             deferred_context_refresh: None,
             deferred_context_refresh_error: None,
             deferred_auto_memory: None,
@@ -790,6 +794,7 @@ mod tests {
         let config = AppConfig::from_env(&HashMap::new()).expect("config should load");
         let mut runtime = CliTuiRuntime {
             runtime: AppRuntime::new(config),
+            startup_resume_message: None,
             deferred_context_refresh: None,
             deferred_context_refresh_error: None,
             deferred_auto_memory: Some(BackgroundTask::spawn(
@@ -1065,6 +1070,71 @@ mod tests {
                 .expect("memory dir should read")
                 .next()
                 .is_some()
+        );
+
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
+    fn cli_tui_runtime_consumes_startup_resume_message_only_once() {
+        let _guard = cli_runtime_test_lock()
+            .lock()
+            .expect("cli runtime test lock should work");
+        let unique = format!(
+            "elroy-rs-cli-startup-resume-once-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+
+        let mut server = mockito::Server::new();
+        let _mock = server
+            .mock("POST", "/responses")
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_body(concat!(
+                "event: response.output_text.delta\n",
+                "data: {\"delta\":\"Restarted successfully. Ready to continue.\"}\n\n",
+                "data: [DONE]\n\n"
+            ))
+            .create();
+
+        let mut config = AppConfig::defaults();
+        config.home_dir = home.clone();
+        config.config_path = home.join("elroy.conf.yaml");
+        config.memory_dir = memory_dir;
+        config.agenda_dir = agenda_dir;
+        config.database_path = database_path;
+        config.openai_api_key = Some("test-key".to_string());
+        config.openai_base_url = format!("{}/responses", server.url());
+
+        let mut runtime = CliTuiRuntime::new(AppRuntime::new(config));
+        runtime.startup_resume_message =
+            Some("Restarted successfully. Ready to continue.".to_string());
+
+        let mut first_stream = runtime
+            .start_startup_prompt_stream()
+            .expect("first startup stream should evaluate")
+            .expect("first startup stream should exist");
+        while first_stream
+            .next_update()
+            .expect("stream should advance")
+            .is_some()
+        {}
+        let _ = first_stream.finalize().expect("snapshot should finalize");
+
+        assert!(
+            runtime
+                .start_startup_prompt_stream()
+                .expect("second startup stream should evaluate")
+                .is_none()
         );
 
         fs::remove_dir_all(home).expect("home should be removed");
