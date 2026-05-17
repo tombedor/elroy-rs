@@ -18089,6 +18089,111 @@ mod tests {
     }
 
     #[test]
+    fn process_message_skips_future_due_item_context_end_to_end() {
+        let unique = format!(
+            "elroy-rs-app-process-message-future-due-item-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+        fs::write(
+            agenda_dir.join("future_reminder.md"),
+            "---\ndate: unscheduled\ncompleted: false\nstatus: created\ntrigger_datetime: 2999-01-01T09:00:00\n---\n\nThis is for tomorrow\n",
+        )
+        .expect("future due item file should be written");
+
+        let mut fast_server = mockito::Server::new();
+        let fast_mock = fast_server
+            .mock("POST", "/responses")
+            .match_header("authorization", "Bearer fast-test-key")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "output": [{
+                        "type": "message",
+                        "content": [{
+                            "type": "output_text",
+                            "text": r#"{"answers":[false],"reasoning":"The future reminder is not relevant to the weather question."}"#
+                        }]
+                    }]
+                })
+                .to_string(),
+            )
+            .create();
+
+        let mut chat_server = mockito::Server::new();
+        let chat_mock = chat_server
+            .mock("POST", "/responses")
+            .match_header("authorization", "Bearer test-key")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "output": [{
+                        "type": "message",
+                        "content": [{
+                            "type": "output_text",
+                            "text": "Weather looks calm today."
+                        }]
+                    }]
+                })
+                .to_string(),
+            )
+            .create();
+
+        let mut config = AppConfig::defaults();
+        config.home_dir = home.clone();
+        config.memory_dir = memory_dir;
+        config.agenda_dir = agenda_dir;
+        config.database_path = database_path.clone();
+        config.openai_api_key = Some("test-key".to_string());
+        config.openai_base_url = format!("{}/responses", chat_server.url());
+        config.fast_model = Some("gpt-5.4-mini".to_string());
+        config.fast_model_api_key = Some("fast-test-key".to_string());
+        config.fast_model_api_base = Some(format!("{}/responses", fast_server.url()));
+        config.memory_recall_classifier_enabled = false;
+        elroy_db::bootstrap_database(&BootstrapPlan::from_config(&config))
+            .expect("bootstrap should succeed");
+
+        let runtime = AppRuntime::new(config.clone());
+        let result = runtime
+            .process_message("How's the weather today?", MessageProcessOptions::default())
+            .expect("prompt should succeed");
+
+        assert!(!result.events.iter().any(|event| matches!(
+            event,
+            StreamEvent::ToolCallRequested(call) if call.name == "delete_due_item"
+        )));
+        assert!(result.events.iter().any(|event| matches!(
+            event,
+            StreamEvent::AssistantResponse { content } if content == "Weather looks calm today."
+        )));
+
+        let mut connection =
+            open_sqlite_connection(&config.database_path).expect("database should open");
+        run_migrations(&mut connection).expect("migrations should run");
+        let active_due_items =
+            list_active_due_items(&connection, 10).expect("due items should list");
+        assert!(
+            active_due_items
+                .iter()
+                .any(|item| item.name == "future reminder")
+        );
+
+        fast_mock.assert();
+        chat_mock.assert();
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
     fn format_context_summary_message_creates_bounded_summary_text() {
         let now = Utc::now().timestamp();
         let summary = format_context_summary_message(&[
