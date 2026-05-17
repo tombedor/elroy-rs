@@ -405,7 +405,12 @@ fn drive_runtime_tick(
         current_background_status.as_deref(),
     );
     app.background_status = current_background_status.clone();
-    *previous_background_status = current_background_status;
+    let foreground_blocked = pending_prompt.is_some() || app.command_active;
+    let background_completion_pending =
+        previous_background_status.is_some() && current_background_status.is_none();
+    if !(foreground_blocked && background_completion_pending) {
+        *previous_background_status = current_background_status;
+    }
     maybe_run_deferred_context_refresh(
         app,
         runtime,
@@ -4350,6 +4355,116 @@ mod tests {
         );
 
         assert_eq!(app.memory_titles, vec!["Stale Memory".to_string()]);
+    }
+
+    #[test]
+    fn runtime_tick_defers_background_snapshot_refresh_until_prompt_stream_finishes() {
+        let mut app = TuiApp::from_snapshot(TuiSnapshot {
+            memory_titles: vec!["Stale Memory".to_string()],
+            ..TuiSnapshot::default()
+        });
+        let mut runtime = FakeRuntime {
+            snapshot: TuiSnapshot {
+                memory_titles: vec!["Fresh Memory".to_string()],
+                ..TuiSnapshot::default()
+            },
+            ..FakeRuntime::default()
+        };
+        let mut pending = Some(PendingPrompt {
+            submitted_prompt: Some("hello runtime".to_string()),
+            schedule_self_reflection: false,
+            before_ids: HashSet::new(),
+            stream: Box::new(FakePromptStream {
+                updates: vec![PromptUpdate::Status("thinking...".to_string())],
+                finalized_snapshot: TuiSnapshot::default(),
+                cancelled_snapshot: TuiSnapshot::default(),
+            }),
+        });
+        let mut deferred_context_refresh_at = None;
+        let mut previous_background_status = Some("refreshing context...".to_string());
+
+        let result = drive_runtime_tick(
+            &mut app,
+            &mut runtime,
+            &mut pending,
+            Instant::now(),
+            &mut deferred_context_refresh_at,
+            &mut previous_background_status,
+        );
+
+        assert_eq!(result, None);
+        assert!(pending.is_some());
+        assert!(app.prompt_active);
+        assert_eq!(app.memory_titles, vec!["Stale Memory".to_string()]);
+        assert_eq!(
+            previous_background_status,
+            Some("refreshing context...".to_string())
+        );
+
+        pending = None;
+        app.prompt_active = false;
+        let result = drive_runtime_tick(
+            &mut app,
+            &mut runtime,
+            &mut pending,
+            Instant::now(),
+            &mut deferred_context_refresh_at,
+            &mut previous_background_status,
+        );
+
+        assert_eq!(result, None);
+        assert_eq!(app.memory_titles, vec!["Fresh Memory".to_string()]);
+        assert_eq!(previous_background_status, None);
+    }
+
+    #[test]
+    fn runtime_tick_defers_background_snapshot_refresh_until_command_action_finishes() {
+        let mut app = TuiApp::from_snapshot(TuiSnapshot {
+            memory_titles: vec!["Stale Memory".to_string()],
+            ..TuiSnapshot::default()
+        });
+        app.command_active = true;
+        let mut runtime = FakeRuntime {
+            snapshot: TuiSnapshot {
+                memory_titles: vec!["Fresh Memory".to_string()],
+                ..TuiSnapshot::default()
+            },
+            ..FakeRuntime::default()
+        };
+        let mut pending = None;
+        let mut deferred_context_refresh_at = None;
+        let mut previous_background_status = Some("refreshing context...".to_string());
+
+        let result = drive_runtime_tick(
+            &mut app,
+            &mut runtime,
+            &mut pending,
+            Instant::now(),
+            &mut deferred_context_refresh_at,
+            &mut previous_background_status,
+        );
+
+        assert_eq!(result, None);
+        assert!(app.command_active);
+        assert_eq!(app.memory_titles, vec!["Stale Memory".to_string()]);
+        assert_eq!(
+            previous_background_status,
+            Some("refreshing context...".to_string())
+        );
+
+        app.command_active = false;
+        let result = drive_runtime_tick(
+            &mut app,
+            &mut runtime,
+            &mut pending,
+            Instant::now(),
+            &mut deferred_context_refresh_at,
+            &mut previous_background_status,
+        );
+
+        assert_eq!(result, None);
+        assert_eq!(app.memory_titles, vec!["Fresh Memory".to_string()]);
+        assert_eq!(previous_background_status, None);
     }
 
     #[test]
