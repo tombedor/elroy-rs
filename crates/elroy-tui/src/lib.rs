@@ -356,6 +356,7 @@ fn run_event_loop(
             app,
             runtime,
             pending_prompt.is_some(),
+            app.command_active,
             Instant::now(),
             &mut deferred_context_refresh_at,
         );
@@ -804,13 +805,14 @@ fn maybe_run_deferred_context_refresh(
     app: &mut TuiApp,
     runtime: &mut impl TuiRuntime,
     prompt_active: bool,
+    command_active: bool,
     now: Instant,
     deferred_context_refresh_at: &mut Option<Instant>,
 ) {
     let Some(deadline) = *deferred_context_refresh_at else {
         return;
     };
-    if prompt_active || now < deadline {
+    if prompt_active || command_active || now < deadline {
         return;
     }
 
@@ -4643,6 +4645,41 @@ mod tests {
         maybe_run_deferred_context_refresh(
             &mut app,
             &mut runtime,
+            false,
+            false,
+            Instant::now(),
+            &mut deferred_context_refresh_at,
+        );
+
+        assert_eq!(runtime.refresh_context_calls, 1);
+        assert!(deferred_context_refresh_at.is_none());
+    }
+
+    #[test]
+    fn deferred_context_refresh_waits_for_command_action_to_finish() {
+        let mut app = TuiApp::bootstrap();
+        app.command_active = true;
+        let mut runtime = FakeRuntime::default();
+        let scheduled_at = Instant::now();
+        let mut deferred_context_refresh_at = Some(scheduled_at);
+
+        maybe_run_deferred_context_refresh(
+            &mut app,
+            &mut runtime,
+            false,
+            true,
+            Instant::now(),
+            &mut deferred_context_refresh_at,
+        );
+
+        assert_eq!(runtime.refresh_context_calls, 0);
+        assert_eq!(deferred_context_refresh_at, Some(scheduled_at));
+
+        app.command_active = false;
+        maybe_run_deferred_context_refresh(
+            &mut app,
+            &mut runtime,
+            false,
             false,
             Instant::now(),
             &mut deferred_context_refresh_at,
