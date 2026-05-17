@@ -3190,6 +3190,29 @@ mod tests {
     }
 
     #[test]
+    fn slash_prefixed_unknown_input_falls_back_to_plain_chat_stream() {
+        let mut app = TuiApp::bootstrap();
+        app.input = "/set_assistant_name".to_string();
+        let mut runtime = FakeRuntime::default();
+        let mut pending = None;
+
+        apply_intent_with_runtime(&mut app, UiIntent::SubmitPrompt, &mut runtime, &mut pending);
+
+        assert!(pending.is_some());
+        assert_eq!(
+            runtime.submitted_prompts,
+            vec!["/set_assistant_name".to_string()]
+        );
+        assert_eq!(
+            app.conversation_lines.last().map(String::as_str),
+            Some("user: /set_assistant_name")
+        );
+        assert_eq!(app.status, "thinking...");
+        assert_eq!(app.input, "");
+        assert_eq!(app.input_history, vec!["/set_assistant_name".to_string()]);
+    }
+
+    #[test]
     fn slash_command_submit_opens_prefilled_command_form() {
         let mut app = TuiApp::bootstrap();
         app.input = "/create_memory trip".to_string();

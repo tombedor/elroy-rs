@@ -395,7 +395,7 @@ impl AppRuntime {
         };
         let parts = command_text.split_whitespace().collect::<Vec<_>>();
         if parts.is_empty() {
-            return Err(AppError::Runtime("Invalid command: /".to_string()));
+            return Ok(TuiSlashCommandAction::NotHandled);
         }
 
         let slash_name = parts[0];
@@ -410,7 +410,7 @@ impl AppRuntime {
             .into_iter()
             .find(|spec| spec.name == command_name)
         else {
-            return Err(AppError::Runtime(format!("Invalid command: {slash_name}")));
+            return Ok(TuiSlashCommandAction::NotHandled);
         };
         let input_suggestions = self.load_command_form_suggestions()?;
         let JsonSchema::Object {
@@ -12657,10 +12657,17 @@ mod tests {
                 .map(|parameter| parameter.name.as_str())
                 .eq(["name", "text"])
         );
-        assert!(
+        assert_eq!(
             runtime
                 .handle_slash_command("/missing_command")
-                .is_err_and(|error| error.to_string() == "Invalid command: missing_command")
+                .expect("unknown slash command should fall back to plain chat"),
+            TuiSlashCommandAction::NotHandled
+        );
+        assert_eq!(
+            runtime
+                .handle_slash_command("/")
+                .expect("empty slash command should fall back to plain chat"),
+            TuiSlashCommandAction::NotHandled
         );
 
         let submitted_snapshot = runtime
