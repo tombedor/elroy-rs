@@ -4259,6 +4259,47 @@ mod tests {
     }
 
     #[test]
+    fn codex_detail_modal_ignores_destructive_shortcuts() {
+        let mut app = TuiApp::bootstrap();
+        app.codex_session_titles = vec!["sample (completed) thread-123".to_string()];
+        app.handle_key("s");
+        let mut runtime = FakeRuntime::default();
+        let mut pending = None;
+
+        apply_intent_with_runtime(&mut app, UiIntent::OpenSelected, &mut runtime, &mut pending);
+        assert!(app.detail_modal.is_some());
+
+        assert_eq!(
+            apply_key_event(
+                &mut app,
+                KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+                &mut runtime,
+                &mut pending,
+            ),
+            TuiExit::Continue
+        );
+        assert_eq!(
+            apply_key_event(
+                &mut app,
+                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
+                &mut runtime,
+                &mut pending,
+            ),
+            TuiExit::Continue
+        );
+
+        assert!(app.detail_modal.is_some());
+        assert_eq!(runtime.last_mutation, None);
+        assert_eq!(
+            app.detail_modal
+                .as_ref()
+                .expect("codex modal should remain open")
+                .footer_text(),
+            "Escape/Enter/Q: close"
+        );
+    }
+
+    #[test]
     fn runtime_mutation_refreshes_snapshot_data() {
         let mut app = TuiApp::bootstrap();
         app.memory_titles = vec!["Runner Notes".to_string()];
