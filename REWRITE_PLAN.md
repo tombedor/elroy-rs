@@ -87,10 +87,10 @@ Primary parity rows to advance:
 
 Remaining gap checklist (derived from parity matrix "still missing" notes; resolve each as implemented or intentional delta before declaring Phase 1 complete):
 
-- [ ] Broader session workflows in the TUI — enumerate what this means concretely before starting: multi-session history, session switching, greeting on fresh start, full restart/session transitions
-- [ ] Deeper command-form validation parity — forms validate inputs before submit, not only on failure
-- [ ] Fuller Textual-style command-palette system-command behavior — audit which Python palette commands are not yet surfaced
-- [ ] Broader background-status producers — audit which background operations (beyond context-refresh/self-reflection/auto-memory) don't yet surface in the footer
+- [ ] Broader session workflows in the TUI — concretely: decide whether Phase 1 still needs anything beyond the already-ported greeting-on-fresh-start and restart/session transitions, or whether the remaining work is truly multi-session history/session switching and can wait for a later phase
+- [x] Deeper command-form validation parity — required fields now validate before final submit at the TUI layer instead of only surfacing a missing-value failure on `Enter`
+- [x] Fuller Textual-style command-palette system-command behavior — Python’s surfaced system-command set (`Focus Memories`, `Focus Agenda`, `Refresh System Instructions`, `Reset Messages`) is now present in the Rust palette, with additional Rust-only section focus entries documented as intentional extensions
+- [x] Broader background-status producers — the shared Rust footer now covers the real long-running background paths in use (`context-refresh`, `self-reflection`, `auto-memory`, background command execution, Codex dispatch/resume plus completion follow-up); the remaining Python-only worker groups (`session-bootstrap`, `sidebar-refresh`) are foreground or synchronous flows in the current Rust architecture rather than missing shared background producers
 
 Focus areas:
 
