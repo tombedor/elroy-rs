@@ -17733,7 +17733,7 @@ mod tests {
         config.fast_model = Some("gpt-5.4-mini".to_string());
         config.fast_model_api_key = Some("fast-test-key".to_string());
         config.fast_model_api_base = Some(format!("{}/responses", fast_server.url()));
-        config.memory_recall_classifier_enabled = false;
+        config.memory_recall_classifier_enabled = true;
         elroy_db::bootstrap_database(&BootstrapPlan::from_config(&config))
             .expect("bootstrap should succeed");
 
@@ -17759,6 +17759,134 @@ mod tests {
                 if content == "Bring the resistance bands."
         )));
 
+        relevance_mock.assert();
+        chat_mock.assert();
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
+    fn process_message_can_use_fast_model_for_contextual_due_item_selection_when_chat_model_differs()
+     {
+        let unique = format!(
+            "elroy-rs-app-process-message-fast-model-contextual-due-item-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+        fs::write(
+            agenda_dir.join("practice_reminder.md"),
+            "---\ndate: unscheduled\ncompleted: false\nstatus: created\ntrigger_context: before basketball practice\n---\n\nBring the resistance bands\n",
+        )
+        .expect("contextual due item file should be written");
+
+        let mut fast_server = mockito::Server::new();
+        let classifier_mock = fast_server
+            .mock("POST", "/responses")
+            .match_header("authorization", "Bearer fast-test-key")
+            .match_body(mockito::Matcher::Regex(
+                "Analyze if this message requires recalling information from long-term memory"
+                    .to_string(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "output": [{
+                        "type": "message",
+                        "content": [{
+                            "type": "output_text",
+                            "text": r#"{"needs_recall":false,"reasoning":"This should come from contextual reminder surfacing instead of memory recall."}"#
+                        }]
+                    }]
+                })
+                .to_string(),
+            )
+            .create();
+        let relevance_mock = fast_server
+            .mock("POST", "/responses")
+            .match_header("authorization", "Bearer fast-test-key")
+            .match_body(mockito::Matcher::Regex(
+                "Your job is to determine which candidate recall items are relevant to a query\\."
+                    .to_string(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "output": [{
+                        "type": "message",
+                        "content": [{
+                            "type": "output_text",
+                            "text": r#"{"answers":[true],"reasoning":"This reminder is relevant even though the wording differs."}"#
+                        }]
+                    }]
+                })
+                .to_string(),
+            )
+            .create();
+
+        let mut chat_server = mockito::Server::new();
+        let chat_mock = chat_server
+            .mock("POST", "/messages")
+            .match_header("x-api-key", "anthropic-test-key")
+            .match_header("anthropic-version", "2023-06-01")
+            .match_body(mockito::Matcher::Regex(
+                "Bring the resistance bands".to_string(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "content": [{
+                        "type": "text",
+                        "text": "You should bring the resistance bands."
+                    }]
+                })
+                .to_string(),
+            )
+            .create();
+
+        let mut config = AppConfig::defaults();
+        config.home_dir = home.clone();
+        config.memory_dir = memory_dir;
+        config.agenda_dir = agenda_dir;
+        config.database_path = database_path.clone();
+        config.chat_model = "claude-sonnet-4-20250514".to_string();
+        config.anthropic_api_key = Some("anthropic-test-key".to_string());
+        config.anthropic_base_url = format!("{}/messages", chat_server.url());
+        config.fast_model = Some("gpt-5.4-mini".to_string());
+        config.fast_model_api_key = Some("fast-test-key".to_string());
+        config.fast_model_api_base = Some(format!("{}/responses", fast_server.url()));
+        config.memory_recall_classifier_enabled = true;
+        elroy_db::bootstrap_database(&BootstrapPlan::from_config(&config))
+            .expect("bootstrap should succeed");
+
+        let runtime = AppRuntime::new(config.clone());
+        let result = runtime
+            .process_message(
+                "What gear should I bring?",
+                MessageProcessOptions::default(),
+            )
+            .expect("prompt should succeed");
+
+        assert!(result.events.iter().any(|event| matches!(
+            event,
+            StreamEvent::StatusUpdate { content } if content == "classifying recall..."
+        )));
+        assert!(result.events.iter().any(|event| matches!(
+            event,
+            StreamEvent::AssistantResponse { content }
+                if content == "You should bring the resistance bands."
+        )));
+
+        classifier_mock.assert();
         relevance_mock.assert();
         chat_mock.assert();
         fs::remove_dir_all(home).expect("home should be removed");
