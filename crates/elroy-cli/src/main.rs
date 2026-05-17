@@ -1011,6 +1011,18 @@ mod tests {
         {}
         let _ = stream.finalize().expect("snapshot should finalize");
 
+        let mut reopened = open_sqlite_connection(&database_path).expect("database should reopen");
+        let stored = elroy_db::load_context_messages(&mut reopened, "local-user").expect("load ok");
+        assert!(!stored.iter().any(|message| {
+            message.role == MessageRole::User
+                && message.content.as_deref() == Some("Restarted successfully. Ready to continue.")
+        }));
+        assert!(stored.iter().any(|message| {
+            message.role == MessageRole::Assistant
+                && message.content.as_deref() == Some("Restarted successfully. Ready to continue.")
+        }));
+        drop(reopened);
+
         assert_eq!(
             runtime
                 .deferred_auto_memory_queue
