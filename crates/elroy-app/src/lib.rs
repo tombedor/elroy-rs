@@ -14440,6 +14440,81 @@ mod tests {
     }
 
     #[test]
+    fn live_tool_registry_search_memories_can_prefer_semantic_agenda_item_over_weaker_overlap() {
+        let unique = format!(
+            "elroy-rs-app-search-memories-semantic-agenda-item-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+        fs::write(
+            agenda_dir.join("gear_inventory_plan.md"),
+            "---\ndate: 2026-05-20\ncompleted: false\nstatus: created\n---\n\nReview the storage locker spreadsheet.\n",
+        )
+        .expect("overlap agenda item should be written");
+        fs::write(
+            agenda_dir.join("bands_plan.md"),
+            "---\ndate: 2026-05-21\ncompleted: false\nstatus: created\n---\n\nPack resistance bands before drills.\n",
+        )
+        .expect("semantic agenda item should be written");
+
+        let mut server = mockito::Server::new();
+        let _mock = server
+            .mock("POST", "/responses")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "output": [{
+                        "type": "message",
+                        "content": [{
+                            "type": "output_text",
+                            "text": r#"{"answers":[false,true],"reasoning":"Only the resistance-bands agenda item matches the user's intent."}"#
+                        }]
+                    }]
+                })
+                .to_string(),
+            )
+            .create();
+
+        let mut config = AppConfig::defaults();
+        config.memory_dir = memory_dir;
+        config.agenda_dir = agenda_dir;
+        config.database_path = database_path;
+        config.openai_api_key = Some("test-key".to_string());
+        config.openai_base_url = format!("{}/responses", server.url());
+        elroy_db::bootstrap_database(&BootstrapPlan::from_config(&config))
+            .expect("bootstrap should succeed");
+
+        let registry = build_live_tool_registry(&config);
+        let search = registry.invoke(
+            "search_memories",
+            "{\"query\":\"What gear should I bring?\",\"limit\":5}",
+        );
+
+        assert!(!search.is_error);
+        assert!(
+            search
+                .content
+                .contains("AgendaItem | bands plan | Pack resistance bands before drills.")
+        );
+        assert!(
+            !search
+                .content
+                .contains("AgendaItem | gear inventory plan |")
+        );
+
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
     fn live_tool_registry_examine_memories_can_return_memory_and_due_item_sections() {
         let unique = format!(
             "elroy-rs-app-examine-memories-{}",
