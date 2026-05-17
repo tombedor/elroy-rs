@@ -25,6 +25,7 @@ pub struct AppConfig {
     pub max_context_age_minutes: f64,
     pub messages_between_memory: usize,
     pub memories_between_consolidation: usize,
+    pub recency_weight: f64,
     pub l2_memory_relevance_distance_threshold: f64,
     pub memory_cluster_similarity_threshold: f64,
     pub max_memory_cluster_size: usize,
@@ -101,6 +102,7 @@ impl AppConfig {
             max_context_age_minutes: 720.0,
             messages_between_memory: 20,
             memories_between_consolidation: 4,
+            recency_weight: 0.0,
             l2_memory_relevance_distance_threshold: 1.4,
             memory_cluster_similarity_threshold: 0.21125,
             max_memory_cluster_size: 5,
@@ -170,6 +172,9 @@ impl AppConfig {
         }
         if let Some(memories_between_consolidation) = file_config.memories_between_consolidation {
             self.memories_between_consolidation = memories_between_consolidation;
+        }
+        if let Some(recency_weight) = file_config.recency_weight {
+            self.recency_weight = recency_weight;
         }
         if let Some(l2_memory_relevance_distance_threshold) =
             file_config.l2_memory_relevance_distance_threshold
@@ -283,6 +288,9 @@ impl AppConfig {
         {
             self.memories_between_consolidation = parse_usize(memories_between_consolidation);
         }
+        if let Some(recency_weight) = env.get("ELROY_RECENCY_WEIGHT") {
+            self.recency_weight = parse_f64(recency_weight);
+        }
         if let Some(l2_memory_relevance_distance_threshold) =
             env.get("ELROY_L2_MEMORY_RELEVANCE_DISTANCE_THRESHOLD")
         {
@@ -390,6 +398,7 @@ struct FileConfig {
     max_context_age_minutes: Option<f64>,
     messages_between_memory: Option<usize>,
     memories_between_consolidation: Option<usize>,
+    recency_weight: Option<f64>,
     l2_memory_relevance_distance_threshold: Option<f64>,
     memory_cluster_similarity_threshold: Option<f64>,
     max_memory_cluster_size: Option<usize>,
@@ -553,6 +562,7 @@ mod tests {
         assert_eq!(config.max_context_age_minutes, 720.0);
         assert_eq!(config.messages_between_memory, 20);
         assert_eq!(config.memories_between_consolidation, 4);
+        assert_eq!(config.recency_weight, 0.0);
         assert_eq!(config.l2_memory_relevance_distance_threshold, 1.4);
         assert_eq!(config.memory_cluster_similarity_threshold, 0.21125);
         assert_eq!(config.max_memory_cluster_size, 5);
@@ -593,7 +603,7 @@ mod tests {
         let config_path = home_dir.join("elroy.conf.yaml");
         fs::write(
             &config_path,
-            "chat_model: gpt-5-nano\nfast_model: gpt-5.4-mini\nembedding_model: text-embedding-3-large\nembedding_model_size: 3072\nmax_tokens: 9000\nreflect: true\nenable_assistant_greeting: true\nmin_convo_age_for_greeting_minutes: 15.5\nmax_context_age_minutes: 180.0\nmessages_between_memory: 12\nmemories_between_consolidation: 6\nl2_memory_relevance_distance_threshold: 1.11\nmemory_cluster_similarity_threshold: 0.33\nmax_memory_cluster_size: 7\nmin_memory_cluster_size: 4\nmessages_between_self_reflection: 4\nmemory_recall_classifier_enabled: false\nmemory_recall_classifier_window: 7\nexclude_tools:\n  - get_user_preferred_name\n  - get_help\nmemory_dir: /tmp/elroy-memories\nagenda_dir: /tmp/elroy-agenda\ndatabase_url: sqlite:////tmp/elroy.db\nfast_model_api_key: fast-key\nfast_model_api_base: http://localhost:1234/fast\nembedding_model_api_key: embed-key\nembedding_model_api_base: http://localhost:1234/embeddings\nirrelevant_key: ignored\n",
+            "chat_model: gpt-5-nano\nfast_model: gpt-5.4-mini\nembedding_model: text-embedding-3-large\nembedding_model_size: 3072\nmax_tokens: 9000\nreflect: true\nenable_assistant_greeting: true\nmin_convo_age_for_greeting_minutes: 15.5\nmax_context_age_minutes: 180.0\nmessages_between_memory: 12\nmemories_between_consolidation: 6\nrecency_weight: 0.125\nl2_memory_relevance_distance_threshold: 1.11\nmemory_cluster_similarity_threshold: 0.33\nmax_memory_cluster_size: 7\nmin_memory_cluster_size: 4\nmessages_between_self_reflection: 4\nmemory_recall_classifier_enabled: false\nmemory_recall_classifier_window: 7\nexclude_tools:\n  - get_user_preferred_name\n  - get_help\nmemory_dir: /tmp/elroy-memories\nagenda_dir: /tmp/elroy-agenda\ndatabase_url: sqlite:////tmp/elroy.db\nfast_model_api_key: fast-key\nfast_model_api_base: http://localhost:1234/fast\nembedding_model_api_key: embed-key\nembedding_model_api_base: http://localhost:1234/embeddings\nirrelevant_key: ignored\n",
         )
         .expect("config fixture should be written");
 
@@ -617,6 +627,7 @@ mod tests {
         assert_eq!(config.max_context_age_minutes, 180.0);
         assert_eq!(config.messages_between_memory, 12);
         assert_eq!(config.memories_between_consolidation, 6);
+        assert_eq!(config.recency_weight, 0.125);
         assert_eq!(config.l2_memory_relevance_distance_threshold, 1.11);
         assert_eq!(config.memory_cluster_similarity_threshold, 0.33);
         assert_eq!(config.max_memory_cluster_size, 7);
@@ -696,6 +707,7 @@ mod tests {
                 "ELROY_MEMORIES_BETWEEN_CONSOLIDATION".to_string(),
                 "9".to_string(),
             ),
+            ("ELROY_RECENCY_WEIGHT".to_string(), "0.2".to_string()),
             (
                 "ELROY_L2_MEMORY_RELEVANCE_DISTANCE_THRESHOLD".to_string(),
                 "1.75".to_string(),
@@ -777,6 +789,7 @@ mod tests {
         assert_eq!(config.max_context_age_minutes, 45.0);
         assert_eq!(config.messages_between_memory, 8);
         assert_eq!(config.memories_between_consolidation, 9);
+        assert_eq!(config.recency_weight, 0.2);
         assert_eq!(config.l2_memory_relevance_distance_threshold, 1.75);
         assert_eq!(config.memory_cluster_similarity_threshold, 0.44);
         assert_eq!(config.max_memory_cluster_size, 8);

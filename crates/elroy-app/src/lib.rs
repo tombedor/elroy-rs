@@ -628,6 +628,7 @@ impl AppRuntime {
                 embedding_distance_threshold: Some(
                     self.config.l2_memory_relevance_distance_threshold as f32,
                 ),
+                recency_weight: self.config.recency_weight as f32,
             },
             executable_tools,
         )
@@ -665,6 +666,7 @@ impl AppRuntime {
                 embedding_distance_threshold: Some(
                     self.config.l2_memory_relevance_distance_threshold as f32,
                 ),
+                recency_weight: self.config.recency_weight as f32,
             },
             executable_tools,
             PromptExecutionOptions {
@@ -1643,6 +1645,7 @@ struct RecallModelClients<'a> {
     classifier_model: Option<&'a dyn ModelClient>,
     embedding_client: Option<&'a LiveEmbeddingClient>,
     embedding_distance_threshold: Option<f32>,
+    recency_weight: f32,
 }
 
 fn recall_model_clients(classifier_model: Option<&dyn ModelClient>) -> RecallModelClients<'_> {
@@ -1650,6 +1653,7 @@ fn recall_model_clients(classifier_model: Option<&dyn ModelClient>) -> RecallMod
         classifier_model,
         embedding_client: None,
         embedding_distance_threshold: None,
+        recency_weight: 0.0,
     }
 }
 
@@ -1706,9 +1710,11 @@ fn run_prompt_with_model_and_registry_internal(
         prompt,
         memory_recall_decision.needs_recall,
         RecallSelectionClients {
+            limit: 2,
             relevance_model: recall_models.classifier_model,
             embedding_client: recall_models.embedding_client,
             embedding_distance_threshold: recall_models.embedding_distance_threshold,
+            recency_weight: recall_models.recency_weight,
         },
         RecallContext {
             transcript: &existing_transcript,
@@ -1734,9 +1740,13 @@ fn run_prompt_with_model_and_registry_internal(
         &due_item_dedupe_transcript,
         &all_due_items,
         &now_iso,
-        recall_models.classifier_model,
-        recall_models.embedding_client,
-        recall_models.embedding_distance_threshold,
+        RecallSelectionClients {
+            limit: 2,
+            relevance_model: recall_models.classifier_model,
+            embedding_client: recall_models.embedding_client,
+            embedding_distance_threshold: recall_models.embedding_distance_threshold,
+            recency_weight: recall_models.recency_weight,
+        },
     );
     let mut model_transcript = existing_transcript.clone();
     model_transcript.extend(contextual_due_item_context.iter().cloned());
@@ -1863,9 +1873,11 @@ fn run_prompt_with_model_and_registry_stream_internal(
         prompt,
         memory_recall_decision.needs_recall,
         RecallSelectionClients {
+            limit: 2,
             relevance_model: recall_models.classifier_model,
             embedding_client: recall_models.embedding_client,
             embedding_distance_threshold: recall_models.embedding_distance_threshold,
+            recency_weight: recall_models.recency_weight,
         },
         RecallContext {
             transcript: &existing_transcript,
@@ -1891,9 +1903,13 @@ fn run_prompt_with_model_and_registry_stream_internal(
         &due_item_dedupe_transcript,
         &all_due_items,
         &now_iso,
-        recall_models.classifier_model,
-        recall_models.embedding_client,
-        recall_models.embedding_distance_threshold,
+        RecallSelectionClients {
+            limit: 2,
+            relevance_model: recall_models.classifier_model,
+            embedding_client: recall_models.embedding_client,
+            embedding_distance_threshold: recall_models.embedding_distance_threshold,
+            recency_weight: recall_models.recency_weight,
+        },
     );
     let mut model_transcript = existing_transcript.clone();
     model_transcript.extend(contextual_due_item_context.iter().cloned());
@@ -3782,6 +3798,11 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                     config_for_print_config
                         .memories_between_consolidation
                         .to_string(),
+                ],
+                vec![
+                    String::new(),
+                    "Recency Weight".to_string(),
+                    config_for_print_config.recency_weight.to_string(),
                 ],
                 vec![
                     String::new(),
@@ -6344,6 +6365,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
     let assistant_name_for_search_memories = config.assistant_name.clone();
     let embedding_distance_threshold_for_search_memories =
         config.l2_memory_relevance_distance_threshold as f32;
+    let recency_weight_for_search_memories = config.recency_weight as f32;
     let search_memories = ExecutableTool::new(
         ToolSpec::new(
             "search_memories",
@@ -6395,32 +6417,47 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                     query,
                     &memories,
                     &[],
-                    recall_limit,
-                    relevance_model
-                        .as_ref()
-                        .map(|model| model as &dyn ModelClient),
-                    embedding_client.as_ref(),
-                    Some(embedding_distance_threshold_for_search_memories),
+                    RecallSelectionClients {
+                        limit: recall_limit,
+                        relevance_model: relevance_model
+                            .as_ref()
+                            .map(|model| model as &dyn ModelClient),
+                        embedding_client: embedding_client.as_ref(),
+                        embedding_distance_threshold: Some(
+                            embedding_distance_threshold_for_search_memories,
+                        ),
+                        recency_weight: recency_weight_for_search_memories,
+                    },
                 );
                 let relevant_due_items = select_relevant_recall_due_items(
                     query,
                     &due_items,
-                    recall_limit,
-                    relevance_model
-                        .as_ref()
-                        .map(|model| model as &dyn ModelClient),
-                    embedding_client.as_ref(),
-                    Some(embedding_distance_threshold_for_search_memories),
+                    RecallSelectionClients {
+                        limit: recall_limit,
+                        relevance_model: relevance_model
+                            .as_ref()
+                            .map(|model| model as &dyn ModelClient),
+                        embedding_client: embedding_client.as_ref(),
+                        embedding_distance_threshold: Some(
+                            embedding_distance_threshold_for_search_memories,
+                        ),
+                        recency_weight: recency_weight_for_search_memories,
+                    },
                 );
                 let relevant_agenda_items = select_relevant_recall_agenda_items(
                     query,
                     &agenda_items,
-                    recall_limit,
-                    relevance_model
-                        .as_ref()
-                        .map(|model| model as &dyn ModelClient),
-                    embedding_client.as_ref(),
-                    Some(embedding_distance_threshold_for_search_memories),
+                    RecallSelectionClients {
+                        limit: recall_limit,
+                        relevance_model: relevance_model
+                            .as_ref()
+                            .map(|model| model as &dyn ModelClient),
+                        embedding_client: embedding_client.as_ref(),
+                        embedding_distance_threshold: Some(
+                            embedding_distance_threshold_for_search_memories,
+                        ),
+                        recency_weight: recency_weight_for_search_memories,
+                    },
                 );
                 Ok(ToolExecutionResult::success(format_memory_search_results(
                     &relevant_memories,
@@ -6439,6 +6476,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
     let assistant_name_for_examine_memories = config.assistant_name.clone();
     let embedding_distance_threshold_for_examine_memories =
         config.l2_memory_relevance_distance_threshold as f32;
+    let recency_weight_for_examine_memories = config.recency_weight as f32;
     let examine_memories = ExecutableTool::new(
         ToolSpec::new(
             "examine_memories",
@@ -6476,32 +6514,47 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                     question,
                     &memories,
                     &[],
-                    recall_limit,
-                    relevance_model
-                        .as_ref()
-                        .map(|model| model as &dyn ModelClient),
-                    embedding_client.as_ref(),
-                    Some(embedding_distance_threshold_for_examine_memories),
+                    RecallSelectionClients {
+                        limit: recall_limit,
+                        relevance_model: relevance_model
+                            .as_ref()
+                            .map(|model| model as &dyn ModelClient),
+                        embedding_client: embedding_client.as_ref(),
+                        embedding_distance_threshold: Some(
+                            embedding_distance_threshold_for_examine_memories,
+                        ),
+                        recency_weight: recency_weight_for_examine_memories,
+                    },
                 );
                 let relevant_due_items = select_relevant_recall_due_items(
                     question,
                     &due_items,
-                    recall_limit,
-                    relevance_model
-                        .as_ref()
-                        .map(|model| model as &dyn ModelClient),
-                    embedding_client.as_ref(),
-                    Some(embedding_distance_threshold_for_examine_memories),
+                    RecallSelectionClients {
+                        limit: recall_limit,
+                        relevance_model: relevance_model
+                            .as_ref()
+                            .map(|model| model as &dyn ModelClient),
+                        embedding_client: embedding_client.as_ref(),
+                        embedding_distance_threshold: Some(
+                            embedding_distance_threshold_for_examine_memories,
+                        ),
+                        recency_weight: recency_weight_for_examine_memories,
+                    },
                 );
                 let relevant_agenda_items = select_relevant_recall_agenda_items(
                     question,
                     &agenda_items,
-                    recall_limit,
-                    relevance_model
-                        .as_ref()
-                        .map(|model| model as &dyn ModelClient),
-                    embedding_client.as_ref(),
-                    Some(embedding_distance_threshold_for_examine_memories),
+                    RecallSelectionClients {
+                        limit: recall_limit,
+                        relevance_model: relevance_model
+                            .as_ref()
+                            .map(|model| model as &dyn ModelClient),
+                        embedding_client: embedding_client.as_ref(),
+                        embedding_distance_threshold: Some(
+                            embedding_distance_threshold_for_examine_memories,
+                        ),
+                        recency_weight: recency_weight_for_examine_memories,
+                    },
                 );
 
                 let mut sections = relevant_memories
@@ -8239,9 +8292,11 @@ struct RecalledItemRef {
 
 #[derive(Clone, Copy)]
 struct RecallSelectionClients<'a> {
+    limit: usize,
     relevance_model: Option<&'a dyn ModelClient>,
     embedding_client: Option<&'a LiveEmbeddingClient>,
     embedding_distance_threshold: Option<f32>,
+    recency_weight: f32,
 }
 
 fn recall_memory_context_messages_with_decision(
@@ -8258,16 +8313,15 @@ fn recall_memory_context_messages_with_decision(
 
     let recall_query =
         build_recall_query(prompt, context.transcript, memory_recall_classifier_window);
-    let relevance_model = selection_clients.relevance_model;
     let already_recalled_memories = recalled_item_refs_by_type(context.transcript, "Memory");
     let recalled = select_relevant_recall_memories(
         &recall_query,
         context.memories,
         &already_recalled_memories,
-        2,
-        relevance_model,
-        selection_clients.embedding_client,
-        selection_clients.embedding_distance_threshold,
+        RecallSelectionClients {
+            limit: 2,
+            ..selection_clients
+        },
     );
     let already_recalled_agenda_items =
         recalled_item_refs_by_type(context.transcript, "AgendaItem");
@@ -8277,10 +8331,10 @@ fn recall_memory_context_messages_with_decision(
         select_relevant_recall_due_items(
             &recall_query,
             context.due_items,
-            2,
-            relevance_model,
-            selection_clients.embedding_client,
-            selection_clients.embedding_distance_threshold,
+            RecallSelectionClients {
+                limit: 2,
+                ..selection_clients
+            },
         )
         .into_iter()
         .filter(|item| !recalled_item_matches(&already_recalled_agenda_items, item.id, &item.name))
@@ -8292,10 +8346,10 @@ fn recall_memory_context_messages_with_decision(
         select_relevant_recall_agenda_items(
             &recall_query,
             context.agenda_items,
-            2,
-            relevance_model,
-            selection_clients.embedding_client,
-            selection_clients.embedding_distance_threshold,
+            RecallSelectionClients {
+                limit: 2,
+                ..selection_clients
+            },
         )
         .into_iter()
         .filter(|item| !recalled_item_matches(&already_recalled_agenda_items, item.id, &item.name))
@@ -8305,10 +8359,10 @@ fn recall_memory_context_messages_with_decision(
         select_relevant_recall_due_items(
             &recall_query,
             context.due_items,
-            2,
-            relevance_model,
-            selection_clients.embedding_client,
-            selection_clients.embedding_distance_threshold,
+            RecallSelectionClients {
+                limit: 2,
+                ..selection_clients
+            },
         )
         .into_iter()
         .filter(|item| !recalled_item_matches(&already_recalled_agenda_items, item.id, &item.name))
@@ -8320,10 +8374,10 @@ fn recall_memory_context_messages_with_decision(
         select_relevant_recall_agenda_items(
             &recall_query,
             context.agenda_items,
-            2,
-            relevance_model,
-            selection_clients.embedding_client,
-            selection_clients.embedding_distance_threshold,
+            RecallSelectionClients {
+                limit: 2,
+                ..selection_clients
+            },
         )
         .into_iter()
         .filter(|item| !recalled_item_matches(&already_recalled_agenda_items, item.id, &item.name))
@@ -8445,9 +8499,11 @@ fn recall_memory_context_messages(
         prompt,
         should_recall,
         RecallSelectionClients {
+            limit: 2,
             relevance_model: None,
             embedding_client: None,
             embedding_distance_threshold: None,
+            recency_weight: 0.0,
         },
         context,
     )
@@ -8458,19 +8514,17 @@ fn recall_due_item_context_messages(
     transcript: &[ConversationMessage],
     due_items: &[AgendaItemRecord],
     now_iso: &str,
-    relevance_model: Option<&dyn ModelClient>,
-    embedding_client: Option<&LiveEmbeddingClient>,
-    embedding_distance_threshold: Option<f32>,
+    selection_clients: RecallSelectionClients<'_>,
 ) -> Vec<ConversationMessage> {
     let recall_query = build_recall_query(prompt, transcript, 6);
     let recalled = select_relevant_contextual_due_items(
         &recall_query,
         due_items,
         now_iso,
-        2,
-        relevance_model,
-        embedding_client,
-        embedding_distance_threshold,
+        RecallSelectionClients {
+            limit: 2,
+            ..selection_clients
+        },
     );
     if recalled.is_empty() {
         return Vec::new();
@@ -8747,65 +8801,88 @@ fn l2_distance(left: &[f32], right: &[f32]) -> Option<f32> {
 }
 
 fn embedding_rank_candidates<'a, T>(
-    embedding_client: Option<&LiveEmbeddingClient>,
-    distance_threshold: Option<f32>,
     query: &str,
     candidates: impl IntoIterator<Item = &'a T>,
+    selection_clients: RecallSelectionClients<'_>,
     extraction_fn: impl Fn(&T) -> String,
-    limit: usize,
+    updated_at_fn: impl Fn(&T) -> i64,
 ) -> Vec<&'a T> {
-    let Some(embedding_client) = embedding_client else {
+    let Some(embedding_client) = selection_clients.embedding_client else {
         return Vec::new();
     };
     let Ok(query_embedding) = embedding_client.embed(query) else {
         return Vec::new();
     };
+    let now_unix = Utc::now().timestamp();
 
     let mut ranked = candidates
         .into_iter()
         .filter_map(|candidate| {
             let embedding = embedding_client.embed(&extraction_fn(candidate)).ok()?;
             let distance = l2_distance(&query_embedding, &embedding)?;
-            if let Some(distance_threshold) = distance_threshold
+            if let Some(distance_threshold) = selection_clients.embedding_distance_threshold
                 && distance > distance_threshold
             {
                 return None;
             }
-            Some((distance, candidate))
+            let adjusted_distance = distance
+                + recency_penalty(
+                    updated_at_fn(candidate),
+                    now_unix,
+                    selection_clients.recency_weight,
+                );
+            Some((adjusted_distance, distance, candidate))
         })
         .collect::<Vec<_>>();
-    ranked
-        .sort_by(|(left_distance, _), (right_distance, _)| left_distance.total_cmp(right_distance));
+    ranked.sort_by(
+        |(left_adjusted, left_distance, _), (right_adjusted, right_distance, _)| {
+            left_adjusted
+                .total_cmp(right_adjusted)
+                .then_with(|| left_distance.total_cmp(right_distance))
+        },
+    );
     ranked
         .into_iter()
-        .map(|(_, candidate)| candidate)
-        .take(limit)
+        .map(|(_, _, candidate)| candidate)
+        .take(selection_clients.limit)
         .collect()
+}
+
+fn recency_penalty(updated_at_unix: i64, now_unix: i64, recency_weight: f32) -> f32 {
+    if recency_weight <= 0.0 {
+        return 0.0;
+    }
+    let age_seconds = now_unix.saturating_sub(updated_at_unix).max(0) as f32;
+    let age_years = age_seconds / (86_400.0 * 365.0);
+    recency_weight * age_years
 }
 
 fn select_relevant_recall_memories<'a>(
     query: &str,
     memories: &'a [MemoryRecord],
     already_recalled: &[RecalledItemRef],
-    limit: usize,
-    relevance_model: Option<&dyn ModelClient>,
-    embedding_client: Option<&LiveEmbeddingClient>,
-    embedding_distance_threshold: Option<f32>,
+    selection_clients: RecallSelectionClients<'_>,
 ) -> Vec<&'a MemoryRecord> {
-    let candidate_limit = semantic_recall_candidate_limit(limit, relevance_model, embedding_client);
+    let candidate_limit = semantic_recall_candidate_limit(
+        selection_clients.limit,
+        selection_clients.relevance_model,
+        selection_clients.embedding_client,
+    );
     let overlap_candidates =
         select_recalled_memories(query, memories, already_recalled, candidate_limit);
-    let candidates = if relevance_model.is_some() {
+    let candidates = if selection_clients.relevance_model.is_some() {
         let mut merged_candidates = overlap_candidates;
         for candidate in embedding_rank_candidates(
-            embedding_client,
-            embedding_distance_threshold,
             query,
             memories
                 .iter()
                 .filter(|memory| !recalled_item_matches(already_recalled, memory.id, &memory.name)),
+            RecallSelectionClients {
+                limit: candidate_limit,
+                ..selection_clients
+            },
             |memory| format!("# {}\n{}", memory.name, memory.body.trim()),
-            candidate_limit,
+            |memory| memory.updated_at_unix,
         ) {
             if merged_candidates
                 .iter()
@@ -8831,16 +8908,18 @@ fn select_relevant_recall_memories<'a>(
             }
         }
         merged_candidates
-    } else if embedding_client.is_some() {
+    } else if selection_clients.embedding_client.is_some() {
         let embedding_candidates = embedding_rank_candidates(
-            embedding_client,
-            embedding_distance_threshold,
             query,
             memories
                 .iter()
                 .filter(|memory| !recalled_item_matches(already_recalled, memory.id, &memory.name)),
+            RecallSelectionClients {
+                limit: candidate_limit,
+                ..selection_clients
+            },
             |memory| format!("# {}\n{}", memory.name, memory.body.trim()),
-            candidate_limit,
+            |memory| memory.updated_at_unix,
         );
         if embedding_candidates.is_empty() {
             overlap_candidates
@@ -8850,31 +8929,37 @@ fn select_relevant_recall_memories<'a>(
     } else {
         overlap_candidates
     };
-    filter_candidates_for_relevance(relevance_model, query, candidates, |memory| {
-        format!("# {}\n{}", memory.name, memory.body.trim())
-    })
+    filter_candidates_for_relevance(
+        selection_clients.relevance_model,
+        query,
+        candidates,
+        |memory| format!("# {}\n{}", memory.name, memory.body.trim()),
+    )
     .into_iter()
-    .take(limit)
+    .take(selection_clients.limit)
     .collect()
 }
 
 fn select_relevant_recall_due_items<'a>(
     query: &str,
     due_items: &'a [AgendaItemRecord],
-    limit: usize,
-    relevance_model: Option<&dyn ModelClient>,
-    embedding_client: Option<&LiveEmbeddingClient>,
-    embedding_distance_threshold: Option<f32>,
+    selection_clients: RecallSelectionClients<'_>,
 ) -> Vec<&'a AgendaItemRecord> {
-    let candidate_limit = semantic_recall_candidate_limit(limit, relevance_model, embedding_client);
+    let candidate_limit = semantic_recall_candidate_limit(
+        selection_clients.limit,
+        selection_clients.relevance_model,
+        selection_clients.embedding_client,
+    );
     let overlap_candidates = select_due_items_by_overlap(query, due_items, candidate_limit, None);
-    let candidates = if relevance_model.is_some() {
+    let candidates = if selection_clients.relevance_model.is_some() {
         let mut merged_candidates = overlap_candidates;
         for candidate in embedding_rank_candidates(
-            embedding_client,
-            embedding_distance_threshold,
             query,
             due_items.iter(),
+            RecallSelectionClients {
+                limit: candidate_limit,
+                ..selection_clients
+            },
             |item| {
                 let mut text = format!("# {}\n{}", item.name, item.body.trim());
                 if let Some(trigger_datetime) = item.trigger_datetime.as_deref() {
@@ -8885,7 +8970,7 @@ fn select_relevant_recall_due_items<'a>(
                 }
                 text
             },
-            candidate_limit,
+            |item| item.updated_at_unix,
         ) {
             if merged_candidates
                 .iter()
@@ -8911,12 +8996,14 @@ fn select_relevant_recall_due_items<'a>(
             }
         }
         merged_candidates
-    } else if embedding_client.is_some() {
+    } else if selection_clients.embedding_client.is_some() {
         let embedding_candidates = embedding_rank_candidates(
-            embedding_client,
-            embedding_distance_threshold,
             query,
             due_items.iter(),
+            RecallSelectionClients {
+                limit: candidate_limit,
+                ..selection_clients
+            },
             |item| {
                 let mut text = format!("# {}\n{}", item.name, item.body.trim());
                 if let Some(trigger_datetime) = item.trigger_datetime.as_deref() {
@@ -8927,7 +9014,7 @@ fn select_relevant_recall_due_items<'a>(
                 }
                 text
             },
-            candidate_limit,
+            |item| item.updated_at_unix,
         );
         if embedding_candidates.is_empty() {
             overlap_candidates
@@ -8937,18 +9024,23 @@ fn select_relevant_recall_due_items<'a>(
     } else {
         overlap_candidates
     };
-    filter_candidates_for_relevance(relevance_model, query, candidates, |item| {
-        let mut text = format!("# {}\n{}", item.name, item.body.trim());
-        if let Some(trigger_datetime) = item.trigger_datetime.as_deref() {
-            text.push_str(&format!("\ntrigger_datetime: {trigger_datetime}"));
-        }
-        if let Some(trigger_context) = item.trigger_context.as_deref() {
-            text.push_str(&format!("\ntrigger_context: {trigger_context}"));
-        }
-        text
-    })
+    filter_candidates_for_relevance(
+        selection_clients.relevance_model,
+        query,
+        candidates,
+        |item| {
+            let mut text = format!("# {}\n{}", item.name, item.body.trim());
+            if let Some(trigger_datetime) = item.trigger_datetime.as_deref() {
+                text.push_str(&format!("\ntrigger_datetime: {trigger_datetime}"));
+            }
+            if let Some(trigger_context) = item.trigger_context.as_deref() {
+                text.push_str(&format!("\ntrigger_context: {trigger_context}"));
+            }
+            text
+        },
+    )
     .into_iter()
-    .take(limit)
+    .take(selection_clients.limit)
     .collect()
 }
 
@@ -8956,23 +9048,26 @@ fn select_relevant_contextual_due_items<'a>(
     query: &str,
     due_items: &'a [AgendaItemRecord],
     now_iso: &str,
-    limit: usize,
-    relevance_model: Option<&dyn ModelClient>,
-    embedding_client: Option<&LiveEmbeddingClient>,
-    embedding_distance_threshold: Option<f32>,
+    selection_clients: RecallSelectionClients<'_>,
 ) -> Vec<&'a AgendaItemRecord> {
-    let candidate_limit = semantic_recall_candidate_limit(limit, relevance_model, embedding_client);
+    let candidate_limit = semantic_recall_candidate_limit(
+        selection_clients.limit,
+        selection_clients.relevance_model,
+        selection_clients.embedding_client,
+    );
     let overlap_candidates =
         select_due_items_by_overlap(query, due_items, candidate_limit, Some(now_iso));
-    let candidates = if relevance_model.is_some() {
+    let candidates = if selection_clients.relevance_model.is_some() {
         let mut merged_candidates = overlap_candidates;
         for candidate in embedding_rank_candidates(
-            embedding_client,
-            embedding_distance_threshold,
             query,
             due_items
                 .iter()
                 .filter(|item| item.trigger_context.is_some()),
+            RecallSelectionClients {
+                limit: candidate_limit,
+                ..selection_clients
+            },
             |item| {
                 let mut text = format!("# {}\n{}", item.name, item.body.trim());
                 if let Some(trigger_datetime) = item.trigger_datetime.as_deref() {
@@ -8983,7 +9078,7 @@ fn select_relevant_contextual_due_items<'a>(
                 }
                 text
             },
-            candidate_limit,
+            |item| item.updated_at_unix,
         ) {
             if merged_candidates
                 .iter()
@@ -9010,14 +9105,16 @@ fn select_relevant_contextual_due_items<'a>(
             }
         }
         merged_candidates
-    } else if embedding_client.is_some() {
+    } else if selection_clients.embedding_client.is_some() {
         let embedding_candidates = embedding_rank_candidates(
-            embedding_client,
-            embedding_distance_threshold,
             query,
             due_items
                 .iter()
                 .filter(|item| item.trigger_context.is_some()),
+            RecallSelectionClients {
+                limit: candidate_limit,
+                ..selection_clients
+            },
             |item| {
                 let mut text = format!("# {}\n{}", item.name, item.body.trim());
                 if let Some(trigger_datetime) = item.trigger_datetime.as_deref() {
@@ -9028,7 +9125,7 @@ fn select_relevant_contextual_due_items<'a>(
                 }
                 text
             },
-            candidate_limit,
+            |item| item.updated_at_unix,
         );
         if embedding_candidates.is_empty() {
             overlap_candidates
@@ -9038,42 +9135,50 @@ fn select_relevant_contextual_due_items<'a>(
     } else {
         overlap_candidates
     };
-    filter_candidates_for_relevance(relevance_model, query, candidates, |item| {
-        let mut text = format!("# {}\n{}", item.name, item.body.trim());
-        if let Some(trigger_datetime) = item.trigger_datetime.as_deref() {
-            text.push_str(&format!("\ntrigger_datetime: {trigger_datetime}"));
-        }
-        if let Some(trigger_context) = item.trigger_context.as_deref() {
-            text.push_str(&format!("\ntrigger_context: {trigger_context}"));
-        }
-        text
-    })
+    filter_candidates_for_relevance(
+        selection_clients.relevance_model,
+        query,
+        candidates,
+        |item| {
+            let mut text = format!("# {}\n{}", item.name, item.body.trim());
+            if let Some(trigger_datetime) = item.trigger_datetime.as_deref() {
+                text.push_str(&format!("\ntrigger_datetime: {trigger_datetime}"));
+            }
+            if let Some(trigger_context) = item.trigger_context.as_deref() {
+                text.push_str(&format!("\ntrigger_context: {trigger_context}"));
+            }
+            text
+        },
+    )
     .into_iter()
-    .take(limit)
+    .take(selection_clients.limit)
     .collect()
 }
 
 fn select_relevant_recall_agenda_items<'a>(
     query: &str,
     agenda_items: &'a [AgendaItemRecord],
-    limit: usize,
-    relevance_model: Option<&dyn ModelClient>,
-    embedding_client: Option<&LiveEmbeddingClient>,
-    embedding_distance_threshold: Option<f32>,
+    selection_clients: RecallSelectionClients<'_>,
 ) -> Vec<&'a AgendaItemRecord> {
-    let candidate_limit = semantic_recall_candidate_limit(limit, relevance_model, embedding_client);
+    let candidate_limit = semantic_recall_candidate_limit(
+        selection_clients.limit,
+        selection_clients.relevance_model,
+        selection_clients.embedding_client,
+    );
     let overlap_candidates = select_agenda_items_by_overlap(query, agenda_items, candidate_limit);
-    let candidates = if relevance_model.is_some() {
+    let candidates = if selection_clients.relevance_model.is_some() {
         let mut merged_candidates = overlap_candidates;
         for candidate in embedding_rank_candidates(
-            embedding_client,
-            embedding_distance_threshold,
             query,
             agenda_items
                 .iter()
                 .filter(|item| item.trigger_datetime.is_none() && item.trigger_context.is_none()),
+            RecallSelectionClients {
+                limit: candidate_limit,
+                ..selection_clients
+            },
             |item| format!("# {}\n{}", item.name, item.body.trim()),
-            candidate_limit,
+            |item| item.updated_at_unix,
         ) {
             if merged_candidates
                 .iter()
@@ -9099,16 +9204,18 @@ fn select_relevant_recall_agenda_items<'a>(
             }
         }
         merged_candidates
-    } else if embedding_client.is_some() {
+    } else if selection_clients.embedding_client.is_some() {
         let embedding_candidates = embedding_rank_candidates(
-            embedding_client,
-            embedding_distance_threshold,
             query,
             agenda_items
                 .iter()
                 .filter(|item| item.trigger_datetime.is_none() && item.trigger_context.is_none()),
+            RecallSelectionClients {
+                limit: candidate_limit,
+                ..selection_clients
+            },
             |item| format!("# {}\n{}", item.name, item.body.trim()),
-            candidate_limit,
+            |item| item.updated_at_unix,
         );
         if embedding_candidates.is_empty() {
             overlap_candidates
@@ -9118,11 +9225,14 @@ fn select_relevant_recall_agenda_items<'a>(
     } else {
         overlap_candidates
     };
-    filter_candidates_for_relevance(relevance_model, query, candidates, |item| {
-        format!("# {}\n{}", item.name, item.body.trim())
-    })
+    filter_candidates_for_relevance(
+        selection_clients.relevance_model,
+        query,
+        candidates,
+        |item| format!("# {}\n{}", item.name, item.body.trim()),
+    )
     .into_iter()
-    .take(limit)
+    .take(selection_clients.limit)
     .collect()
 }
 
@@ -9994,7 +10104,7 @@ mod tests {
 
     use super::{
         AppRuntime, LOCAL_USER_TOKEN, MessageProcessOptions, PromptExecutionOptions,
-        RecallModelClients, SYNTHETIC_FIRST_USER_MESSAGE, argument_limit,
+        RecallModelClients, RecallSelectionClients, SYNTHETIC_FIRST_USER_MESSAGE, argument_limit,
         best_effort_embedding_client, build_live_tool_registry,
         build_live_tool_registry_with_codex_bin_and_hook, build_recall_query,
         classify_memory_recall_with_model, codex_background_status_key, compress_context_messages,
@@ -16112,9 +16222,13 @@ User still wants to compare grocery prices after the shopping trip.",
             &transcript,
             &due_items,
             "2026-05-15T12:00:00",
-            None,
-            None,
-            None,
+            RecallSelectionClients {
+                limit: 2,
+                relevance_model: None,
+                embedding_client: None,
+                embedding_distance_threshold: None,
+                recency_weight: 0.0,
+            },
         );
 
         assert_eq!(messages.len(), 2);
@@ -16172,9 +16286,13 @@ User still wants to compare grocery prices after the shopping trip.",
             &transcript,
             &due_items,
             "2026-05-15T12:00:00",
-            None,
-            None,
-            None,
+            RecallSelectionClients {
+                limit: 2,
+                relevance_model: None,
+                embedding_client: None,
+                embedding_distance_threshold: None,
+                recency_weight: 0.0,
+            },
         );
 
         assert!(messages.is_empty());
@@ -16220,9 +16338,13 @@ User still wants to compare grocery prices after the shopping trip.",
             &transcript,
             &due_items,
             "2026-05-15T12:00:00",
-            None,
-            None,
-            None,
+            RecallSelectionClients {
+                limit: 2,
+                relevance_model: None,
+                embedding_client: None,
+                embedding_distance_threshold: None,
+                recency_weight: 0.0,
+            },
         );
 
         assert!(messages.is_empty());
@@ -16268,9 +16390,13 @@ User still wants to compare grocery prices after the shopping trip.",
             &transcript,
             &due_items,
             "2026-05-15T12:00:00",
-            None,
-            None,
-            None,
+            RecallSelectionClients {
+                limit: 2,
+                relevance_model: None,
+                embedding_client: None,
+                embedding_distance_threshold: None,
+                recency_weight: 0.0,
+            },
         );
 
         assert_eq!(messages.len(), 2);
@@ -16315,9 +16441,13 @@ User still wants to compare grocery prices after the shopping trip.",
             &transcript,
             &due_items,
             "2026-05-15T12:00:00",
-            Some(&model),
-            None,
-            None,
+            RecallSelectionClients {
+                limit: 2,
+                relevance_model: Some(&model),
+                embedding_client: None,
+                embedding_distance_threshold: None,
+                recency_weight: 0.0,
+            },
         );
 
         assert_eq!(messages.len(), 2);
@@ -16396,9 +16526,13 @@ User still wants to compare grocery prices after the shopping trip.",
             &transcript,
             &due_items,
             "2026-05-15T12:00:00",
-            Some(&SemanticReminderRelevanceModel),
-            None,
-            None,
+            RecallSelectionClients {
+                limit: 2,
+                relevance_model: Some(&SemanticReminderRelevanceModel),
+                embedding_client: None,
+                embedding_distance_threshold: None,
+                recency_weight: 0.0,
+            },
         );
 
         let joined_tool_content = messages
@@ -16465,10 +16599,13 @@ User still wants to compare grocery prices after the shopping trip.",
             "What belongs in my workout kit?",
             &due_items,
             "2026-05-15T12:00:00",
-            2,
-            Some(&model),
-            None,
-            None,
+            RecallSelectionClients {
+                limit: 2,
+                relevance_model: Some(&model),
+                embedding_client: None,
+                embedding_distance_threshold: None,
+                recency_weight: 0.0,
+            },
         );
 
         assert_eq!(relevant_due_items.len(), 1);
@@ -16572,10 +16709,13 @@ User still wants to compare grocery prices after the shopping trip.",
             "What belongs in my workout kit?",
             &due_items,
             "2026-05-15T12:00:00",
-            2,
-            None,
-            Some(&embedding_client),
-            Some(0.5),
+            RecallSelectionClients {
+                limit: 2,
+                relevance_model: None,
+                embedding_client: Some(&embedding_client),
+                embedding_distance_threshold: Some(0.5),
+                recency_weight: 0.0,
+            },
         );
 
         assert_eq!(relevant_due_items.len(), 1);
@@ -16679,10 +16819,13 @@ User still wants to compare grocery prices after the shopping trip.",
             "What belongs in my workout kit?",
             &due_items,
             "2026-05-15T12:00:00",
-            2,
-            None,
-            Some(&embedding_client),
-            Some(0.5),
+            RecallSelectionClients {
+                limit: 2,
+                relevance_model: None,
+                embedding_client: Some(&embedding_client),
+                embedding_distance_threshold: Some(0.5),
+                recency_weight: 0.0,
+            },
         );
 
         assert_eq!(relevant_due_items.len(), 1);
@@ -17590,6 +17733,168 @@ User still wants to compare grocery prices after the shopping trip.",
                 .content
                 .contains("Memory | old training note | Pack resistance bands before drills.")
         );
+
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
+    fn live_tool_registry_search_memories_can_prefer_recent_semantic_memories_when_recency_weight_is_enabled()
+     {
+        let unique = format!(
+            "elroy-rs-app-search-memories-recency-weight-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+
+        fs::write(
+            memory_dir.join("stale_exact_match.md"),
+            "Pack resistance bands before drills.\n",
+        )
+        .expect("stale semantic memory should be written");
+        fs::write(
+            memory_dir.join("recent_warmup_note.md"),
+            "Bring resistance bands for warmups.\n",
+        )
+        .expect("recent warmup memory should be written");
+        fs::write(
+            memory_dir.join("recent_practice_note.md"),
+            "Bring resistance bands and cones to practice.\n",
+        )
+        .expect("recent practice memory should be written");
+
+        let mut server = mockito::Server::new();
+        let _query_embedding_mock = server
+            .mock("POST", "/embeddings")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "input": "What belongs in my workout kit?"
+            })))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "data": [{"embedding": [1.0, 0.0]}]
+                })
+                .to_string(),
+            )
+            .create();
+        let _stale_embedding_mock = server
+            .mock("POST", "/embeddings")
+            .match_body(mockito::Matcher::Regex(
+                "Pack resistance bands before drills".to_string(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "data": [{"embedding": [1.0, 0.0]}]
+                })
+                .to_string(),
+            )
+            .create();
+        let _recent_warmup_embedding_mock = server
+            .mock("POST", "/embeddings")
+            .match_body(mockito::Matcher::Regex(
+                "Bring resistance bands for warmups".to_string(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "data": [{"embedding": [0.92, 0.0]}]
+                })
+                .to_string(),
+            )
+            .create();
+        let _recent_practice_embedding_mock = server
+            .mock("POST", "/embeddings")
+            .match_body(mockito::Matcher::Regex(
+                "Bring resistance bands and cones to practice".to_string(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "data": [{"embedding": [0.93, 0.0]}]
+                })
+                .to_string(),
+            )
+            .create();
+
+        let mut config = AppConfig::defaults();
+        config.memory_dir = memory_dir.clone();
+        config.agenda_dir = agenda_dir;
+        config.database_path = database_path.clone();
+        config.embedding_model_api_key = Some("embedding-test-key".to_string());
+        config.embedding_model_api_base = Some(format!("{}/embeddings", server.url()));
+        config.openai_api_key = None;
+        config.fast_model_api_key = None;
+        config.recency_weight = 0.1;
+        elroy_db::bootstrap_database(&BootstrapPlan::from_config(&config))
+            .expect("bootstrap should succeed");
+
+        let now = Utc::now().timestamp();
+        let connection = open_sqlite_connection(&database_path).expect("database should open");
+        connection
+            .execute(
+                "UPDATE memories SET updated_at_unix = ?1 WHERE file_path = ?2",
+                rusqlite::params![
+                    now - (5 * 365 * 24 * 60 * 60),
+                    memory_dir
+                        .join("stale_exact_match.md")
+                        .display()
+                        .to_string(),
+                ],
+            )
+            .expect("stale memory timestamp should update");
+        connection
+            .execute(
+                "UPDATE memories SET updated_at_unix = ?1 WHERE file_path = ?2",
+                rusqlite::params![
+                    now - (2 * 24 * 60 * 60),
+                    memory_dir
+                        .join("recent_warmup_note.md")
+                        .display()
+                        .to_string(),
+                ],
+            )
+            .expect("recent warmup timestamp should update");
+        connection
+            .execute(
+                "UPDATE memories SET updated_at_unix = ?1 WHERE file_path = ?2",
+                rusqlite::params![
+                    now - (24 * 60 * 60),
+                    memory_dir
+                        .join("recent_practice_note.md")
+                        .display()
+                        .to_string(),
+                ],
+            )
+            .expect("recent practice timestamp should update");
+
+        let registry = build_live_tool_registry(&config);
+        let search = registry.invoke(
+            "search_memories",
+            "{\"query\":\"What belongs in my workout kit?\",\"limit\":2}",
+        );
+
+        assert!(!search.is_error);
+        assert!(search.content.contains(
+            "Memory | recent practice note | Bring resistance bands and cones to practice."
+        ));
+        assert!(
+            search
+                .content
+                .contains("Memory | recent warmup note | Bring resistance bands for warmups.")
+        );
+        assert!(!search.content.contains("Memory | stale exact match |"));
 
         fs::remove_dir_all(home).expect("home should be removed");
     }
@@ -25395,6 +25700,7 @@ User still wants to compare grocery prices after the shopping trip.",
                 embedding_distance_threshold: Some(
                     config.l2_memory_relevance_distance_threshold as f32,
                 ),
+                recency_weight: config.recency_weight as f32,
             },
             ExecutableToolRegistry::new(vec![]),
             PromptExecutionOptions {
@@ -26267,9 +26573,11 @@ User still wants to compare grocery prices after the shopping trip.",
             "I am heading to basketball practice",
             true,
             crate::RecallSelectionClients {
+                limit: 2,
                 relevance_model: Some(&model),
                 embedding_client: None,
                 embedding_distance_threshold: None,
+                recency_weight: 0.0,
             },
             RecallContext {
                 transcript: &[],
@@ -26320,9 +26628,11 @@ User still wants to compare grocery prices after the shopping trip.",
             "I am heading to basketball practice",
             true,
             crate::RecallSelectionClients {
+                limit: 2,
                 relevance_model: Some(&model),
                 embedding_client: None,
                 embedding_distance_threshold: None,
+                recency_weight: 0.0,
             },
             RecallContext {
                 transcript: &[],
@@ -26368,9 +26678,11 @@ User still wants to compare grocery prices after the shopping trip.",
             "What gear should I bring to practice?",
             true,
             crate::RecallSelectionClients {
+                limit: 2,
                 relevance_model: Some(&model),
                 embedding_client: None,
                 embedding_distance_threshold: None,
+                recency_weight: 0.0,
             },
             RecallContext {
                 transcript: &[],
@@ -27117,26 +27429,35 @@ User still wants to compare grocery prices after the shopping trip.",
             "What workout gear should I bring?",
             &memories,
             &[],
-            2,
-            Some(&model),
-            None,
-            None,
+            RecallSelectionClients {
+                limit: 2,
+                relevance_model: Some(&model),
+                embedding_client: None,
+                embedding_distance_threshold: None,
+                recency_weight: 0.0,
+            },
         );
         let relevant_due_items = select_relevant_recall_due_items(
             "What workout gear should I bring?",
             &due_items,
-            2,
-            Some(&model),
-            None,
-            None,
+            RecallSelectionClients {
+                limit: 2,
+                relevance_model: Some(&model),
+                embedding_client: None,
+                embedding_distance_threshold: None,
+                recency_weight: 0.0,
+            },
         );
         let relevant_agenda_items = select_relevant_recall_agenda_items(
             "What workout gear should I bring?",
             &agenda_items,
-            2,
-            Some(&model),
-            None,
-            None,
+            RecallSelectionClients {
+                limit: 2,
+                relevance_model: Some(&model),
+                embedding_client: None,
+                embedding_distance_threshold: None,
+                recency_weight: 0.0,
+            },
         );
 
         assert!(relevant_memories.is_empty());
@@ -27209,26 +27530,35 @@ User still wants to compare grocery prices after the shopping trip.",
             "What gear should I bring to practice?",
             &memories,
             &[],
-            2,
-            Some(&model),
-            None,
-            None,
+            RecallSelectionClients {
+                limit: 2,
+                relevance_model: Some(&model),
+                embedding_client: None,
+                embedding_distance_threshold: None,
+                recency_weight: 0.0,
+            },
         );
         let relevant_due_items = select_relevant_recall_due_items(
             "What gear should I bring to practice?",
             &due_items,
-            2,
-            Some(&model),
-            None,
-            None,
+            RecallSelectionClients {
+                limit: 2,
+                relevance_model: Some(&model),
+                embedding_client: None,
+                embedding_distance_threshold: None,
+                recency_weight: 0.0,
+            },
         );
         let relevant_agenda_items = select_relevant_recall_agenda_items(
             "What gear should I bring to practice?",
             &agenda_items,
-            2,
-            Some(&model),
-            None,
-            None,
+            RecallSelectionClients {
+                limit: 2,
+                relevance_model: Some(&model),
+                embedding_client: None,
+                embedding_distance_threshold: None,
+                recency_weight: 0.0,
+            },
         );
 
         assert_eq!(relevant_memories.len(), 1);
@@ -27387,26 +27717,35 @@ User still wants to compare grocery prices after the shopping trip.",
             "What gear should I bring to practice?",
             &memories,
             &[],
-            2,
-            Some(&SemanticPriorityRelevanceModel),
-            None,
-            None,
+            RecallSelectionClients {
+                limit: 2,
+                relevance_model: Some(&SemanticPriorityRelevanceModel),
+                embedding_client: None,
+                embedding_distance_threshold: None,
+                recency_weight: 0.0,
+            },
         );
         let relevant_due_items = select_relevant_recall_due_items(
             "What gear should I bring to practice?",
             &due_items,
-            2,
-            Some(&SemanticPriorityRelevanceModel),
-            None,
-            None,
+            RecallSelectionClients {
+                limit: 2,
+                relevance_model: Some(&SemanticPriorityRelevanceModel),
+                embedding_client: None,
+                embedding_distance_threshold: None,
+                recency_weight: 0.0,
+            },
         );
         let relevant_agenda_items = select_relevant_recall_agenda_items(
             "What gear should I bring to practice?",
             &agenda_items,
-            2,
-            Some(&SemanticPriorityRelevanceModel),
-            None,
-            None,
+            RecallSelectionClients {
+                limit: 2,
+                relevance_model: Some(&SemanticPriorityRelevanceModel),
+                embedding_client: None,
+                embedding_distance_threshold: None,
+                recency_weight: 0.0,
+            },
         );
 
         assert_eq!(relevant_memories.len(), 1);
@@ -27415,6 +27754,144 @@ User still wants to compare grocery prices after the shopping trip.",
         assert_eq!(relevant_due_items[0].name, "Locker Reminder");
         assert_eq!(relevant_agenda_items.len(), 1);
         assert_eq!(relevant_agenda_items[0].name, "Training Kit List");
+    }
+
+    #[test]
+    fn select_relevant_recall_memories_can_prefer_newer_semantic_matches_when_recency_weight_is_enabled()
+     {
+        let now = Utc::now().timestamp();
+        let memories = vec![
+            MemoryRecord {
+                id: 1,
+                legacy_frontmatter_id: None,
+                name: "stale exact match".to_string(),
+                file_path: "/tmp/stale_exact_match.md".to_string(),
+                body: "Pack resistance bands before drills.".to_string(),
+                is_active: true,
+                updated_at_unix: now - (5 * 365 * 24 * 60 * 60),
+            },
+            MemoryRecord {
+                id: 2,
+                legacy_frontmatter_id: None,
+                name: "recent warmup note".to_string(),
+                file_path: "/tmp/recent_warmup_note.md".to_string(),
+                body: "Bring resistance bands for warmups.".to_string(),
+                is_active: true,
+                updated_at_unix: now - (2 * 24 * 60 * 60),
+            },
+            MemoryRecord {
+                id: 3,
+                legacy_frontmatter_id: None,
+                name: "recent practice note".to_string(),
+                file_path: "/tmp/recent_practice_note.md".to_string(),
+                body: "Bring resistance bands and cones to practice.".to_string(),
+                is_active: true,
+                updated_at_unix: now - (24 * 60 * 60),
+            },
+        ];
+
+        let mut server = mockito::Server::new();
+        let _query_embedding_mock = server
+            .mock("POST", "/embeddings")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "input": "What belongs in my workout kit?"
+            })))
+            .expect(2)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "data": [{"embedding": [1.0, 0.0]}]
+                })
+                .to_string(),
+            )
+            .create();
+        let _stale_embedding_mock = server
+            .mock("POST", "/embeddings")
+            .match_body(mockito::Matcher::Regex(
+                "Pack resistance bands before drills".to_string(),
+            ))
+            .expect(2)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "data": [{"embedding": [1.0, 0.0]}]
+                })
+                .to_string(),
+            )
+            .create();
+        let _recent_warmup_embedding_mock = server
+            .mock("POST", "/embeddings")
+            .match_body(mockito::Matcher::Regex(
+                "Bring resistance bands for warmups".to_string(),
+            ))
+            .expect(2)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "data": [{"embedding": [0.92, 0.0]}]
+                })
+                .to_string(),
+            )
+            .create();
+        let _recent_practice_embedding_mock = server
+            .mock("POST", "/embeddings")
+            .match_body(mockito::Matcher::Regex(
+                "Bring resistance bands and cones to practice".to_string(),
+            ))
+            .expect(2)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "data": [{"embedding": [0.93, 0.0]}]
+                })
+                .to_string(),
+            )
+            .create();
+
+        let embedding_client = best_effort_embedding_client(Some(&EmbeddingProviderConfig {
+            model: "text-embedding-3-small".to_string(),
+            api_key: "embedding-test-key".to_string(),
+            base_url: format!("{}/embeddings", server.url()),
+            timeout_seconds: 60,
+        }))
+        .expect("embedding client should build");
+
+        let without_recency_weight = select_relevant_recall_memories(
+            "What belongs in my workout kit?",
+            &memories,
+            &[],
+            RecallSelectionClients {
+                limit: 2,
+                relevance_model: None,
+                embedding_client: Some(&embedding_client),
+                embedding_distance_threshold: Some(0.5),
+                recency_weight: 0.0,
+            },
+        );
+        let with_recency_weight = select_relevant_recall_memories(
+            "What belongs in my workout kit?",
+            &memories,
+            &[],
+            RecallSelectionClients {
+                limit: 2,
+                relevance_model: None,
+                embedding_client: Some(&embedding_client),
+                embedding_distance_threshold: Some(0.5),
+                recency_weight: 0.1,
+            },
+        );
+
+        assert_eq!(without_recency_weight.len(), 2);
+        assert_eq!(without_recency_weight[0].name, "stale exact match");
+        assert_eq!(without_recency_weight[1].name, "recent practice note");
+
+        assert_eq!(with_recency_weight.len(), 2);
+        assert_eq!(with_recency_weight[0].name, "recent practice note");
+        assert_eq!(with_recency_weight[1].name, "recent warmup note");
     }
 
     #[test]
@@ -27460,9 +27937,11 @@ User still wants to compare grocery prices after the shopping trip.",
             "What gear should I bring to practice?",
             true,
             crate::RecallSelectionClients {
+                limit: 2,
                 relevance_model: Some(&model),
                 embedding_client: None,
                 embedding_distance_threshold: None,
+                recency_weight: 0.0,
             },
             RecallContext {
                 transcript: &transcript,
