@@ -27,6 +27,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "anyhow"
+version = "1.0.102"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
+
+[[package]]
 name = "assert-json-diff"
 version = "2.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -324,6 +330,7 @@ dependencies = [
  "elroy-feature-requests",
  "elroy-llm",
  "elroy-memory",
+ "elroy-recall",
  "elroy-self-reflection",
  "elroy-tasks",
  "elroy-tools",
@@ -362,6 +369,20 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_yaml",
+]
+
+[[package]]
+name = "elroy-context"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "elroy-config",
+ "elroy-core",
+ "elroy-db",
+ "elroy-llm",
+ "elroy-user",
+ "rusqlite",
 ]
 
 [[package]]
@@ -409,6 +430,34 @@ dependencies = [
 [[package]]
 name = "elroy-memory"
 version = "0.1.0"
+
+[[package]]
+name = "elroy-recall"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "elroy-config",
+ "elroy-core",
+ "elroy-db",
+ "elroy-llm",
+ "elroy-memory",
+ "rusqlite",
+ "serde_json",
+]
+
+[[package]]
+name = "elroy-reminders"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "elroy-config",
+ "elroy-core",
+ "elroy-db",
+ "elroy-llm",
+ "rusqlite",
+]
 
 [[package]]
 name = "elroy-self-reflection"

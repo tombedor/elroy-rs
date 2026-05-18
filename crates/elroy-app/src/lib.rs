@@ -34,7 +34,7 @@ use elroy_feature_requests::{
 };
 use elroy_llm::{
     ConversationMessage, EmbeddingProviderConfig, LiveEmbeddingClient, LiveModelClient,
-    MessageRole, Provider, ProviderConfig, StreamEvent, ToolCall,
+    MessageRole, Provider, ProviderConfig, StreamEvent,
 };
 use elroy_memory::{
     archive_memory_file, create_memory_file_with_frontmatter, read_memory_parts, sanitize_filename,
@@ -1932,28 +1932,6 @@ fn format_due_item_listing(items: &[AgendaItemRecord], active: bool) -> String {
         lines.push(line);
     }
     lines.join("\n")
-}
-
-pub(crate) fn format_memory_detail(memory: &MemoryRecord) -> String {
-    format!("#{}\n{}", memory.name, memory.body)
-}
-
-pub(crate) fn format_agenda_item_recall_detail(item: &AgendaItemRecord) -> String {
-    if let Some(trigger_datetime) = item.trigger_datetime.as_deref() {
-        let formatted = parse_sidebar_trigger_datetime(trigger_datetime)
-            .map(|datetime| datetime.format("%Y-%m-%d %H:%M:%S").to_string())
-            .unwrap_or_else(|| trigger_datetime.to_string());
-        return format!("#{} (Timed: {formatted})\n{}", item.name, item.body.trim());
-    }
-    if let Some(trigger_context) = item.trigger_context.as_deref() {
-        return format!(
-            "#{} (Context: {})\n{}",
-            item.name,
-            trigger_context,
-            item.body.trim()
-        );
-    }
-    format!("#Agenda: {}\n{}", item.name, item.body.trim())
 }
 
 fn format_memory_examination(memory: &MemoryRecord) -> String {
@@ -6698,15 +6676,6 @@ fn parse_optional_line_number_argument(
     }
 }
 
-pub(crate) fn excerpt(body: &str, max_chars: usize) -> String {
-    let trimmed = body.trim();
-    if trimmed.chars().count() <= max_chars {
-        return trimmed.to_string();
-    }
-    let shortened = trimmed.chars().take(max_chars).collect::<String>();
-    format!("{shortened}...")
-}
-
 fn task_payload(item: AgendaItemRecord) -> Value {
     json!({
         "name": item.name,
@@ -6786,38 +6755,6 @@ fn due_item_context_messages(items: &[AgendaItemRecord]) -> Vec<ConversationMess
         "{}",
         lines.join("\n\n"),
     )
-}
-
-pub(crate) fn synthetic_tool_context_messages(
-    tool_call_id: impl Into<String>,
-    tool_name: impl Into<String>,
-    arguments_json: impl Into<String>,
-    content: impl Into<String>,
-) -> Vec<ConversationMessage> {
-    let tool_call_id = tool_call_id.into();
-    vec![
-        ConversationMessage::assistant_with_tool_calls(
-            "",
-            vec![ToolCall {
-                id: tool_call_id.clone(),
-                name: tool_name.into(),
-                arguments_json: arguments_json.into(),
-            }],
-        ),
-        ConversationMessage::tool_result(tool_call_id, content),
-    ]
-}
-
-pub(crate) fn context_memory_tool_call_id(name: &str) -> String {
-    format!("context-memory:{}", name.to_ascii_lowercase())
-}
-
-pub(crate) fn context_due_item_tool_call_id(name: &str) -> String {
-    format!("context-due-item:{}", name.to_ascii_lowercase())
-}
-
-pub(crate) fn context_task_tool_call_id(name: &str) -> String {
-    format!("context-task:{}", name.to_ascii_lowercase())
 }
 
 fn find_active_memory_by_name_in_scope(
