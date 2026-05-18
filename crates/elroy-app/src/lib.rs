@@ -66,6 +66,9 @@ use context::*;
 mod recall;
 use recall::*;
 
+mod reminders;
+use reminders::*;
+
 const DEFAULT_MAX_LIST_ENTRIES: usize = 50;
 const DEFAULT_MAX_LIST_DEPTH: usize = 2;
 const DEFAULT_READ_LINE_LIMIT: usize = 200;
@@ -6620,38 +6623,6 @@ fn codex_session_result_payload(result: CodexSessionResult) -> String {
     .to_string()
 }
 
-fn due_item_context_messages(items: &[AgendaItemRecord]) -> Vec<ConversationMessage> {
-    if items.is_empty() {
-        return Vec::new();
-    }
-
-    let lines = items
-        .iter()
-        .filter_map(|item| {
-            let trigger_datetime = item.trigger_datetime.as_deref()?;
-            let formatted_trigger_datetime = parse_sidebar_trigger_datetime(trigger_datetime)
-                .map(|datetime| datetime.format("%Y-%m-%d %H:%M:%S").to_string())
-                .unwrap_or_else(|| trigger_datetime.to_string());
-            Some(format!(
-                "⏰ DUE ITEM: '{}' - {}\n\nThis item was scheduled for {} and is now due. Please inform the user about it and then use the delete_due_item tool to remove it from active due items.",
-                item.name,
-                item.body,
-                formatted_trigger_datetime,
-            ))
-        })
-        .collect::<Vec<_>>();
-    if lines.is_empty() {
-        return Vec::new();
-    }
-
-    synthetic_tool_context_messages(
-        "bootstrap-due-items",
-        "get_due_items",
-        "{}",
-        lines.join("\n\n"),
-    )
-}
-
 fn find_active_memory_by_name_in_scope(
     connection: &rusqlite::Connection,
     name: &str,
@@ -6707,33 +6678,6 @@ fn context_memory_tool_messages(memory: &elroy_db::MemoryRecord) -> Vec<Conversa
     .expect("context-memory payload should serialize");
     synthetic_tool_context_messages(
         context_memory_tool_call_id(&memory.name),
-        "get_fast_recall",
-        "{}",
-        content,
-    )
-}
-
-pub(crate) fn context_due_item_tool_messages(item: &AgendaItemRecord) -> Vec<ConversationMessage> {
-    let content = serde_json::to_string_pretty(&json!({
-        "content": format!("DUE ITEM: '{}' - {}", item.name, item.body),
-        "recall_metadata": [{
-            "memory_type": "AgendaItem",
-            "memory_id": item.id,
-            "name": item.name,
-        }],
-        "due_items": [{
-            "type": "due_item",
-            "name": item.name,
-            "trigger_datetime": item.trigger_datetime,
-            "trigger_context": item.trigger_context,
-            "status": item.status,
-            "closing_comment": item.closing_comment,
-            "excerpt": excerpt(&item.body, 180),
-        }],
-    }))
-    .expect("context-due-item payload should serialize");
-    synthetic_tool_context_messages(
-        context_due_item_tool_call_id(&item.name),
         "get_fast_recall",
         "{}",
         content,

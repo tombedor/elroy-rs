@@ -13,6 +13,7 @@ workspace = true
 elroy-agenda = { path = "../elroy-agenda" }
 elroy-context = { path = "../elroy-context" }
 elroy-recall = { path = "../elroy-recall" }
+elroy-reminders = { path = "../elroy-reminders" }
 elroy-codex = { path = "../elroy-codex" }
 elroy-config = { path = "../elroy-config" }
 elroy-core = { path = "../elroy-core" }

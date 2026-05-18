@@ -333,6 +333,7 @@ dependencies = [
  "elroy-llm",
  "elroy-memory",
  "elroy-recall",
+ "elroy-reminders",
  "elroy-self-reflection",
  "elroy-tasks",
  "elroy-tools",
@@ -461,6 +462,7 @@ dependencies = [
  "elroy-core",
  "elroy-db",
  "elroy-llm",
+ "elroy-recall",
  "rusqlite",
 ]
 

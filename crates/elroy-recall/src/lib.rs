@@ -117,7 +117,7 @@ pub fn context_due_item_tool_messages(item: &AgendaItemRecord) -> Vec<Conversati
     )
 }
 
-fn parse_sidebar_trigger_datetime(value: &str) -> Option<chrono::NaiveDateTime> {
+pub fn parse_sidebar_trigger_datetime(value: &str) -> Option<chrono::NaiveDateTime> {
     chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M:%S")
         .ok()
         .or_else(|| chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M").ok())
