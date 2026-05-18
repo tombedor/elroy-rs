@@ -78,35 +78,80 @@ Why this comes first:
 - this makes Phase 2 and 3 improvements (recall quality, context refresh quality) expensive to implement because all the logic is co-located with unrelated concerns
 - fixing structure now makes every subsequent phase faster and better tested
 
+### Session Progress (2025-05-18)
+
+**Done:**
+
+- `elroy-recall` crate created and fully populated (~1,800 LOC moved). All recall structs, classification, selection, embedding, reflective recall logic moved from `elroy-app`. `elroy-app/src/recall.rs` is now a 2-line re-export. Committed.
+
+- `elroy-context` crate created and fully populated (~580 LOC moved). All transcript loading/validation, system message building, context compression/summary logic moved from `elroy-app`. `elroy-app/src/context.rs` is now a 2-line re-export. Committed.
+
+- `LOCAL_USER_TOKEN` and `SYNTHETIC_FIRST_USER_MESSAGE` constants moved to `elroy-db` as `pub const`, eliminating the duplicated string literals scattered across crates.
+
+- Provider config conversion functions (`provider_config_from_app_config`, `fast_provider_config_from_app_config`, `embedding_provider_config_from_app_config`) moved from `elroy-app` to `elroy-config` (added `elroy-llm` dep to `elroy-config`). Eliminates 80-line duplication in `elroy-app`.
+
+- `From<anyhow::Error> for AppError` added to `elroy-app` so domain crates returning `anyhow::Result` can interoperate with `elroy-app`'s error type via `?`.
+
+**State after session:**
+
+- `elroy-app/src/lib.rs`: ~25,600 LOC total (7,057 production + 18,562 test)
+- `elroy-app/src/consolidation.rs`: 786 LOC (still inline module in elroy-app, not yet moved to elroy-recall)
+- Production code (non-test) in elroy-app is ~7,850 LOC across lib.rs + consolidation.rs — already close to 8K target if only counting non-test code
+- `cargo build` and `cargo test` clean
+
+**Remaining for this phase:**
+
+1. **Move `consolidation.rs` to `elroy-recall`** — the module is 786 LOC and belongs in elroy-recall per the plan. Key dependencies to resolve:
+   - `formulate_memory_from_transcript` (in lib.rs ~line 2014) → move to elroy-recall
+   - `create_consolidated_memories_from_records` (in lib.rs ~line 6457) → move to elroy-recall
+   - `list_all_active_memories_in_scope` (in lib.rs ~line 6796) → move to elroy-recall or elroy-db
+   - `best_effort_provider_model` (in lib.rs ~line 1463) → move to elroy-recall
+   - Constants `CONTEXT_MESSAGE_SOURCE_TYPE`, `MEMORY_SOURCE_TYPE`, `MEMORY_WORD_COUNT_LIMIT`, `MEMORY_CONSOLIDATION_CLUSTER_LIMIT` → define in elroy-recall, re-import in elroy-app where still needed
+
+2. **Create `elroy-reminders`** — due-item surfacing functions are still embedded in `elroy-app`. Identify the ~300-500 LOC of reminder selection + synthetic message generation and move to `crates/elroy-reminders/src/lib.rs`. The skeleton Cargo.toml already exists.
+
+3. **Move tool execution to domain crates** — the `build_live_tool_registry_with_codex_bin_and_hook` function is ~3,900 LOC (lines 2273–6184 in lib.rs). Each domain crate should export `fn {domain}_tools(config: AppConfig) -> Vec<ExecutableTool>`. elroy-app calls each and combines. Groupings:
+   - `elroy-memory/src/tools.rs`: create_memory, create_consolidated_memory, get_fast_recall, get_reflective_recall, update_memory, update_outdated_or_incorrect_memory, archive_memory, list_memories, print_memories, search_memories, examine_memories, show_memory, print_memory, get_source_list_for_memory, get_source_content_for_memory
+   - `elroy-agenda/src/tools.rs`: add_agenda_item, add_agenda_item_update, complete_agenda_item, delete_agenda_item, add_agenda_checklist_item, edit_agenda_checklist_item, complete_agenda_checklist_item, list_agenda, list_agenda_items, list_agenda_items_cmd, list_due_items, print_active_due_items, list_inactive_due_items, print_inactive_due_items, show_agenda_item, create_due_item, update_due_item_text, rename_due_item, complete_due_item, delete_due_item, show_due_item, print_due_item
+   - `elroy-tasks/src/tools.rs`: create_task, update_task_text, rename_task, complete_task, delete_task, list_tasks, list_triggered_tasks, list_due_tasks, list_today_tasks, show_task
+   - `elroy-user/src/tools.rs`: set_assistant_name, set_persona, reset_system_persona, set_user_preferred_name, get_user_preferred_name, set_user_full_name, get_user_full_name
+   - `elroy-feature-requests/src/tools.rs`: list_feature_requests, make_feature_request, edit_feature_request
+   - `elroy-codex/src/tools.rs`: dispatch_codex_session, resume_codex_session, list_codex_sessions, show_codex_session
+   - `elroy-tools` (base): get_current_date, pwd, ls, read_file, restart_session, print_config, tail_elroy_logs, get_help, show_context_messages, add_memory_to_current_context, drop_memory_from_current_context, clear_context_messages, reset_messages, refresh_system_instructions
+
+4. **Move tests alongside their tools** — the 18,562-line test section is the main reason lib.rs exceeds 8K. Tests for memory tools should live in elroy-memory, etc. This is the most mechanical but largest-volume step.
+
+### Note on 8K LOC Target
+
+The non-test production code in elroy-app is already at ~7,850 LOC. If the 8K target counts only production code, steps 1–2 above would clear it. If it counts tests too, step 4 (moving tests) is required. Tests that exercise tool behavior should move with the tools; integration tests that test elroy-app's routing/wiring layer stay in elroy-app.
+
 ### New Crates To Create
 
-**`elroy-recall`**
+**`elroy-recall`** ✅ Created
 
 Owns all memory recall and consolidation logic currently embedded in `elroy-app`:
 
-- recall classification (heuristic and model-backed)
-- candidate selection and expansion (lexical overlap, embedding ranking)
-- relevance filtering (model-backed)
-- reflective recall generation (deterministic and model-backed)
-- exact-duplicate and semantic-cluster consolidation
-- embedding cache management
-- auto-memory creation from context
+- recall classification (heuristic and model-backed) ✅ moved
+- candidate selection and expansion (lexical overlap, embedding ranking) ✅ moved
+- relevance filtering (model-backed) ✅ moved
+- reflective recall generation (deterministic and model-backed) ✅ moved
+- exact-duplicate and semantic-cluster consolidation ❌ still in elroy-app/src/consolidation.rs
+- embedding cache management ✅ moved
+- auto-memory creation from context ✅ moved
 
 `elroy-memory` becomes a pure file I/O + frontmatter Store. All orchestration moves to `elroy-recall`.
 
-**`elroy-context`**
+**`elroy-context`** ✅ Created
 
 Owns all context message loading and refresh logic currently embedded in `elroy-app`:
 
-- transcript loading and validation (role alternation repair, orphaned tool call repair)
-- system message building and repair
-- context compression and summary generation (deterministic and model-backed)
-- context refresh scheduling and orchestration
-- due-item and reminder pinning into transcript context
+- transcript loading and validation (role alternation repair, orphaned tool call repair) ✅ moved
+- system message building and repair ✅ moved
+- context compression and summary generation (deterministic and model-backed) ✅ moved
+- context refresh scheduling and orchestration ✅ moved
+- due-item and reminder pinning into transcript context ✅ moved
 
-This crate already exists in `ARCHITECTURE.md`'s target shape; it just hasn't been created yet.
-
-**`elroy-reminders`**
+**`elroy-reminders`** ❌ Not yet populated
 
 Owns due-item surfacing workflows currently embedded in `elroy-app`:
 
@@ -115,20 +160,20 @@ Owns due-item surfacing workflows currently embedded in `elroy-app`:
 - reminder selection heuristics
 - interplay between due items, tasks, and current context
 
-This crate already exists in `ARCHITECTURE.md`'s target shape; it just hasn't been created yet.
+Skeleton Cargo.toml exists but lib.rs is empty.
 
 ### Domain Crates That Expand
 
 Each of these crates gains a `tools` module owning its own tool execution and tool specs. The corresponding match arms and execution functions move out of `elroy-app`.
 
-| Crate | Tools to absorb from elroy-app |
-|---|---|
-| `elroy-memory` | `create_memory`, `show_memory`, `search_memories`, `print_memories`, `update_memory`, `archive_memory` |
-| `elroy-agenda` | `create_agenda_item`, `update_agenda_item`, `complete_agenda_item`, checklist tools |
-| `elroy-tasks` | `create_task`, `show_task`, `list_tasks`, `update_task`, `complete_task` |
-| `elroy-user` | `update_user_preferred_name`, `update_assistant_name`, user preference tools |
-| `elroy-feature-requests` | `create_feature_request`, `list_feature_requests`, `show_feature_request`, `update_feature_request` |
-| `elroy-codex` | `dispatch_codex_session`, `resume_codex_session`, `list_codex_sessions` |
+| Crate | Tools to absorb from elroy-app | Status |
+|---|---|---|
+| `elroy-memory` | `create_memory`, `show_memory`, `search_memories`, `print_memories`, `update_memory`, `archive_memory`, recall tools | ❌ |
+| `elroy-agenda` | `create_agenda_item`, `update_agenda_item`, `complete_agenda_item`, checklist tools, due-item tools | ❌ |
+| `elroy-tasks` | `create_task`, `show_task`, `list_tasks`, `update_task`, `complete_task` | ❌ |
+| `elroy-user` | `update_user_preferred_name`, `update_assistant_name`, user preference tools | ❌ |
+| `elroy-feature-requests` | `create_feature_request`, `list_feature_requests`, `show_feature_request`, `update_feature_request` | ❌ |
+| `elroy-codex` | `dispatch_codex_session`, `resume_codex_session`, `list_codex_sessions` | ❌ |
 
 ### `elroy-tools` Expands
 
@@ -137,6 +182,8 @@ Each of these crates gains a `tools` module owning its own tool execution and to
 - filesystem tools: `ls`, `read_file`
 - developer tools: `get_help`, `print_config`, `tail_elroy_logs`, `restart_session`
 - context tools: `reset_messages`, `refresh_system_instructions`
+
+Status: ❌ not yet started
 
 ### `elroy-app` After Refactoring
 
@@ -148,7 +195,7 @@ Each of these crates gains a `tools` module owning its own tool execution and to
 - command palette and command form prefilling
 - `process_message` / `load_snapshot` / `load_context_messages` surface API for TUI/CLI
 
-Target size: under 8K LOC (down from ~28K).
+Target size: under 8K LOC (down from ~28K). Current: ~25,600 LOC (7,850 production + 18,562 tests).
 
 ### Dependency Graph (After)
 
@@ -168,8 +215,9 @@ No bidirectional dependencies. Domain orchestrators depend on stores; stores do 
 
 ### Exit Criteria
 
-- [ ] `elroy-recall` created; all recall and consolidation logic moved from `elroy-app`
-- [ ] `elroy-context` created; transcript loading, validation, and refresh orchestration moved from `elroy-app`
+- [x] `elroy-recall` created; all recall logic moved from `elroy-app` (consolidation still pending)
+- [x] `elroy-context` created; transcript loading, validation, and refresh orchestration moved from `elroy-app`
+- [ ] Consolidation logic moved from `elroy-app/src/consolidation.rs` to `elroy-recall`
 - [ ] `elroy-reminders` created; due-item surfacing moved from `elroy-app`
 - [ ] Each domain crate owns its tool execution; match arms removed from `elroy-app`
 - [ ] `elroy-tools` owns base/filesystem/developer tools
