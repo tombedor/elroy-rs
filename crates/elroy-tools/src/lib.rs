@@ -194,6 +194,17 @@ impl ExecutableToolRegistry {
     }
 }
 
+pub fn argument_limit(arguments: &Value, default_limit: usize) -> usize {
+    match arguments
+        .get("limit")
+        .and_then(Value::as_u64)
+        .or_else(|| arguments.get("n").and_then(Value::as_u64))
+    {
+        Some(0) | None => default_limit,
+        Some(value) => value.clamp(1, 50) as usize,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;

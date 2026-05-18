@@ -50,6 +50,7 @@ use elroy_tasks::{
 };
 use elroy_tools::{
     ExecutableTool, ExecutableToolRegistry, JsonSchema, ToolExecutionResult, ToolRegistry, ToolSpec,
+    argument_limit,
 };
 use elroy_tui::{
     SidebarAction, SidebarSection, TuiCommandExecution, TuiCommandForm, TuiCommandPaletteAction,
@@ -5861,17 +5862,6 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
             .filter(|tool| !excluded_tools.contains(&tool.spec().name))
             .collect(),
     )
-}
-
-pub fn argument_limit(arguments: &Value, default_limit: usize) -> usize {
-    match arguments
-        .get("limit")
-        .and_then(Value::as_u64)
-        .or_else(|| arguments.get("n").and_then(Value::as_u64))
-    {
-        Some(0) | None => default_limit,
-        Some(value) => value.clamp(1, 50) as usize,
-    }
 }
 
 fn with_user_preferences_at_path(
