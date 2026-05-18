@@ -117,6 +117,59 @@ pub fn context_due_item_tool_messages(item: &AgendaItemRecord) -> Vec<Conversati
     )
 }
 
+pub fn context_task_tool_messages(item: &AgendaItemRecord) -> Vec<ConversationMessage> {
+    let content = serde_json::to_string_pretty(&serde_json::json!({
+        "content": format!("TASK: '{}' - {}", item.name, item.body),
+        "recall_metadata": [{
+            "memory_type": "AgendaItem",
+            "memory_id": item.id,
+            "name": item.name,
+        }],
+        "tasks": [{
+            "type": "task",
+            "name": item.name,
+            "agenda_date": item.agenda_date,
+            "trigger_datetime": item.trigger_datetime,
+            "trigger_context": item.trigger_context,
+            "status": item.status,
+            "closing_comment": item.closing_comment,
+            "excerpt": excerpt(&item.body, 180),
+        }],
+    }))
+    .expect("context-task payload should serialize");
+    synthetic_tool_context_messages(
+        context_task_tool_call_id(&item.name),
+        "get_fast_recall",
+        "{}",
+        content,
+    )
+}
+
+pub fn context_memory_tool_messages(memory: &elroy_db::MemoryRecord) -> Vec<ConversationMessage> {
+    let content = serde_json::to_string_pretty(&serde_json::json!({
+        "content": format!("MEMORY: '{}' - {}", memory.name, memory.body),
+        "recall_metadata": [{
+            "memory_type": "Memory",
+            "memory_id": memory.id,
+            "name": memory.name,
+        }],
+        "memories": [{
+            "type": "memory",
+            "name": memory.name,
+            "file_path": memory.file_path,
+            "excerpt": excerpt(&memory.body, 180),
+            "updated_at_unix": memory.updated_at_unix,
+        }],
+    }))
+    .expect("context-memory payload should serialize");
+    synthetic_tool_context_messages(
+        context_memory_tool_call_id(&memory.name),
+        "get_fast_recall",
+        "{}",
+        content,
+    )
+}
+
 pub fn parse_sidebar_trigger_datetime(value: &str) -> Option<chrono::NaiveDateTime> {
     chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M:%S")
         .ok()
