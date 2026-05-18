@@ -629,6 +629,7 @@ impl AppRuntime {
                     self.config.l2_memory_relevance_distance_threshold as f32,
                 ),
                 recency_weight: self.config.recency_weight as f32,
+                reflection_max_words: self.config.memory_reflection_max_words,
             },
             executable_tools,
         )
@@ -667,6 +668,7 @@ impl AppRuntime {
                     self.config.l2_memory_relevance_distance_threshold as f32,
                 ),
                 recency_weight: self.config.recency_weight as f32,
+                reflection_max_words: self.config.memory_reflection_max_words,
             },
             executable_tools,
             PromptExecutionOptions {
@@ -1646,6 +1648,7 @@ struct RecallModelClients<'a> {
     embedding_client: Option<&'a LiveEmbeddingClient>,
     embedding_distance_threshold: Option<f32>,
     recency_weight: f32,
+    reflection_max_words: usize,
 }
 
 fn recall_model_clients(classifier_model: Option<&dyn ModelClient>) -> RecallModelClients<'_> {
@@ -1654,6 +1657,7 @@ fn recall_model_clients(classifier_model: Option<&dyn ModelClient>) -> RecallMod
         embedding_client: None,
         embedding_distance_threshold: None,
         recency_weight: 0.0,
+        reflection_max_words: 100,
     }
 }
 
@@ -1709,6 +1713,7 @@ fn run_prompt_with_model_and_registry_internal(
         options.reflect,
         prompt,
         memory_recall_decision.needs_recall,
+        recall_models.reflection_max_words,
         RecallSelectionClients {
             limit: 2,
             relevance_model: recall_models.classifier_model,
@@ -1872,6 +1877,7 @@ fn run_prompt_with_model_and_registry_stream_internal(
         options.reflect,
         prompt,
         memory_recall_decision.needs_recall,
+        recall_models.reflection_max_words,
         RecallSelectionClients {
             limit: 2,
             relevance_model: recall_models.classifier_model,
@@ -8304,6 +8310,7 @@ fn recall_memory_context_messages_with_decision(
     reflect: bool,
     prompt: &str,
     should_recall: bool,
+    reflection_max_words: usize,
     selection_clients: RecallSelectionClients<'_>,
     context: RecallContext<'_>,
 ) -> Vec<ConversationMessage> {
@@ -8405,11 +8412,14 @@ fn recall_memory_context_messages_with_decision(
         );
         let Some(content) = build_reflective_recall_content_with_model(
             selection_clients.relevance_model,
-            &recalled,
-            &reflective_due_items,
-            &reflective_agenda_items,
-            prompt,
-            &recent_context,
+            ReflectiveRecallPromptInputs {
+                memories: &recalled,
+                due_items: &reflective_due_items,
+                agenda_items: &reflective_agenda_items,
+                prompt,
+                recent_context: &recent_context,
+                reflection_max_words,
+            },
             &fallback_content,
         ) else {
             return Vec::new();
@@ -8498,6 +8508,7 @@ fn recall_memory_context_messages(
         reflect,
         prompt,
         should_recall,
+        100,
         RecallSelectionClients {
             limit: 2,
             relevance_model: None,
@@ -9494,6 +9505,7 @@ fn build_reflective_recall_prompt(
     agenda_items: &[&AgendaItemRecord],
     prompt: &str,
     recent_context: &[String],
+    reflection_max_words: usize,
 ) -> String {
     let recalled_memory_facts = memories
         .iter()
@@ -9516,7 +9528,22 @@ fn build_reflective_recall_prompt(
         .collect::<Vec<_>>()
         .join("\n\n");
 
-    let mut body = String::from("Recalled Memory Content\n\n");
+    let mut body = String::from(
+        "I am considering recalled context, as well as the transcript of a recent conversation. I am:\n\
+- Re-stating the most relevant context from the recalled content\n\
+- Reflecting on how the recalled content relates to the conversation transcript\n\n\
+Specific examples are most helpful. For example, if the recalled content is:\n\n\
+\"USER mentioned that when playing basketball, they struggle to remember to follow through on their shots.\"\n\n\
+and the conversation transcript includes:\n\
+\"USER: I'm going to play basketball next week\"\n\n\
+a good response would be:\n\
+\"I remember that USER struggles to remember to follow through on their shots when playing basketball. I should remind USER about following through on their shots for next week's game.\"\n\n\
+My response will be in the first person, and will be transmitted to an AI assistant to inform their response. My response will NOT be transmitted to the user.\n\n",
+    );
+    body.push_str(&format!(
+        "My response is brief and to the point, no more than {reflection_max_words} words.\n\n"
+    ));
+    body.push_str("Recalled Memory Content\n\n");
     body.push_str(&recalled_memory_facts);
     body.push_str("\n\n#Conversation Transcript:\n");
     if recent_context.is_empty() {
@@ -9549,20 +9576,31 @@ fn parse_reflective_recall_model_response(response: &str) -> Option<(bool, Optio
     Some((is_relevant, content))
 }
 
+struct ReflectiveRecallPromptInputs<'a> {
+    memories: &'a [&'a elroy_db::MemoryRecord],
+    due_items: &'a [&'a AgendaItemRecord],
+    agenda_items: &'a [&'a AgendaItemRecord],
+    prompt: &'a str,
+    recent_context: &'a [String],
+    reflection_max_words: usize,
+}
+
 fn build_reflective_recall_content_with_model(
     model: Option<&dyn ModelClient>,
-    memories: &[&elroy_db::MemoryRecord],
-    due_items: &[&AgendaItemRecord],
-    agenda_items: &[&AgendaItemRecord],
-    prompt: &str,
-    recent_context: &[String],
+    inputs: ReflectiveRecallPromptInputs<'_>,
     fallback_content: &str,
 ) -> Option<String> {
     let Some(model) = model else {
         return Some(fallback_content.to_string());
     };
-    let model_prompt =
-        build_reflective_recall_prompt(memories, due_items, agenda_items, prompt, recent_context);
+    let model_prompt = build_reflective_recall_prompt(
+        inputs.memories,
+        inputs.due_items,
+        inputs.agenda_items,
+        inputs.prompt,
+        inputs.recent_context,
+        inputs.reflection_max_words,
+    );
     let response = model
         .next_events(ConversationRequest {
             user_message: &model_prompt,
@@ -10097,7 +10135,7 @@ mod tests {
         fs,
         path::{Path, PathBuf},
         process::Command,
-        sync::Arc,
+        sync::{Arc, Mutex},
         thread,
         time::{Duration, Instant},
     };
@@ -25701,6 +25739,7 @@ User still wants to compare grocery prices after the shopping trip.",
                     config.l2_memory_relevance_distance_threshold as f32,
                 ),
                 recency_weight: config.recency_weight as f32,
+                reflection_max_words: config.memory_reflection_max_words,
             },
             ExecutableToolRegistry::new(vec![]),
             PromptExecutionOptions {
@@ -26572,6 +26611,7 @@ User still wants to compare grocery prices after the shopping trip.",
             config.reflect,
             "I am heading to basketball practice",
             true,
+            config.memory_reflection_max_words,
             crate::RecallSelectionClients {
                 limit: 2,
                 relevance_model: Some(&model),
@@ -26627,6 +26667,7 @@ User still wants to compare grocery prices after the shopping trip.",
             config.reflect,
             "I am heading to basketball practice",
             true,
+            config.memory_reflection_max_words,
             crate::RecallSelectionClients {
                 limit: 2,
                 relevance_model: Some(&model),
@@ -26654,6 +26695,74 @@ User still wants to compare grocery prices after the shopping trip.",
     }
 
     #[test]
+    fn reflective_recall_prompt_uses_configured_word_limit() {
+        struct ReflectivePromptInspectionModel {
+            prompt: Arc<Mutex<Option<String>>>,
+        }
+
+        impl ModelClient for ReflectivePromptInspectionModel {
+            fn next_events(
+                &self,
+                request: ConversationRequest<'_>,
+            ) -> Result<Vec<StreamEvent>, elroy_core::ModelClientError> {
+                *self.prompt.lock().expect("prompt lock should succeed") =
+                    Some(request.user_message.to_string());
+                Ok(vec![StreamEvent::AssistantResponse {
+                    content:
+                        r#"{"is_relevant":true,"content":"I should remind the user about payroll."}"#
+                            .to_string(),
+                }])
+            }
+        }
+
+        let mut config = AppConfig::defaults();
+        config.memory_recall_classifier_enabled = false;
+        config.reflect = true;
+        config.memory_reflection_max_words = 42;
+        let captured_prompt = Arc::new(Mutex::new(None));
+        let model = ReflectivePromptInspectionModel {
+            prompt: Arc::clone(&captured_prompt),
+        };
+
+        let messages = recall_memory_context_messages_with_decision(
+            config.memory_recall_classifier_window,
+            config.reflect,
+            "What should I remember about payroll?",
+            true,
+            config.memory_reflection_max_words,
+            crate::RecallSelectionClients {
+                limit: 2,
+                relevance_model: Some(&model),
+                embedding_client: None,
+                embedding_distance_threshold: None,
+                recency_weight: 0.0,
+            },
+            RecallContext {
+                transcript: &[],
+                memories: &[MemoryRecord {
+                    id: 1,
+                    legacy_frontmatter_id: None,
+                    name: "payroll".to_string(),
+                    file_path: "/tmp/payroll.md".to_string(),
+                    body: "Remember to finish payroll before Friday.".to_string(),
+                    is_active: true,
+                    updated_at_unix: 10,
+                }],
+                due_items: &[],
+                agenda_items: &[],
+            },
+        );
+
+        assert_eq!(messages.len(), 2);
+        let prompt = captured_prompt
+            .lock()
+            .expect("prompt lock should succeed")
+            .clone()
+            .expect("reflective recall prompt should be captured");
+        assert!(prompt.contains("no more than 42 words."), "{}", prompt);
+    }
+
+    #[test]
     fn reflective_recall_can_broaden_candidates_beyond_overlap() {
         let mut config = AppConfig::defaults();
         config.memory_recall_classifier_enabled = false;
@@ -26677,6 +26786,7 @@ User still wants to compare grocery prices after the shopping trip.",
             config.reflect,
             "What gear should I bring to practice?",
             true,
+            config.memory_reflection_max_words,
             crate::RecallSelectionClients {
                 limit: 2,
                 relevance_model: Some(&model),
@@ -27936,6 +28046,7 @@ User still wants to compare grocery prices after the shopping trip.",
             false,
             "What gear should I bring to practice?",
             true,
+            100,
             crate::RecallSelectionClients {
                 limit: 2,
                 relevance_model: Some(&model),
