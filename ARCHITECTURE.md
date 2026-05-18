@@ -247,4 +247,43 @@ These decisions are settled enough to guide implementation now:
 
 These remain open:
 
-- whether crate boundaries should start narrow or be split after a closer 1:1 port
+- *(none — all major structural decisions are now settled)*
+
+## Decision Log
+
+### Crate boundary approach
+
+**Decision:** Aggressive structural refactoring now (REWRITE_PLAN.md Phase 1) rather than waiting for fuller parity.
+
+**Rationale:** `elroy-app` grew into a 28K-line monolith absorbing tool execution, recall orchestration, consolidation, context refresh, and reminder surfacing. Phase 2+ improvements to recall and context-refresh quality require editing in an isolated, testable crate — not a file that also contains tool routing, formatting, and prompt pipeline logic.
+
+**Implementation:** Phase 1 extracts `elroy-recall`, `elroy-context`, and `elroy-reminders` from `elroy-app`, and expands domain crates with tool execution modules. `elroy-app` drops to under 8K LOC.
+
+**Success criterion:** `cargo build && cargo test` clean; `elroy-app` under 8K LOC; no behavioral changes.
+
+## Tool Execution Pattern
+
+Each domain crate that implements tools exports two functions:
+
+```rust
+pub fn tool_specs() -> Vec<ToolSpec>;
+pub async fn execute(name: &str, args: &JsonValue, ctx: &ToolContext) -> Result<ToolExecutionResult>;
+```
+
+`elroy-app` maintains a single `dispatch_tool` function that routes by tool name to the owning crate. This routing table is the only place in `elroy-app` that knows which crate owns which tool.
+
+Tool specs at startup are composed from each domain crate's `tool_specs()`. Adding a tool to a domain crate should not require changes to `elroy-app` beyond one entry in the routing match.
+
+## Config Injection Pattern
+
+Orchestrators must not receive the full `AppConfig`. Each orchestrator takes only the config sub-struct it needs:
+
+```rust
+// Wrong:
+fn new(config: &AppConfig) -> RecallOrchestrator
+
+// Correct:
+fn classify_recall_needed(msg: &str, ctx: &[ContextMessage], cfg: &RecallConfig) -> bool
+```
+
+Each orchestrator crate defines (or re-exports from `elroy-config`) its own narrow config type. `elroy-app` extracts the relevant sub-config and passes it down. This makes dependencies explicit and prevents `AppConfig` from becoming a service locator.

@@ -6,21 +6,7 @@ Resolved questions should be removed from here once the decision is recorded in 
 
 ## Open
 
-### Workspace / Crate Split
-
-Question:
-
-- Should the rewrite begin with many focused crates or start closer to a 1:1 port and split later?
-
-Why it matters:
-
-- too much early splitting may slow the port
-- too little structure may let boundaries collapse
-
-Current direction:
-
-- either approach is acceptable
-- a close 1:1 port is acceptable initially if responsibility boundaries stay explicit
+*(no open questions)*
 
 ## Resolved Direction
 
@@ -35,3 +21,4 @@ These are no longer open at the principle level:
 - Codex workflow support required for the first Rust version
 - strong reliance on tests with explicit test documentation
 - test-layer expectations are defined in `TEST_STRATEGY.md`
+- workspace crate split: aggressive structural refactoring is the decided approach (Phase 1 of `REWRITE_PLAN.md`); `elroy-recall`, `elroy-context`, and `elroy-reminders` are being extracted from `elroy-app`, and domain crates are expanding with tool execution modules

@@ -1722,6 +1722,7 @@ fn run_prompt_with_model_and_registry_internal(
             embedding_distance_threshold: recall_models.embedding_distance_threshold,
             recency_weight: recall_models.recency_weight,
             connection: Some(connection),
+            query_embedding: None,
         },
         RecallContext {
             transcript: &existing_transcript,
@@ -1754,6 +1755,7 @@ fn run_prompt_with_model_and_registry_internal(
             embedding_distance_threshold: recall_models.embedding_distance_threshold,
             recency_weight: recall_models.recency_weight,
             connection: Some(connection),
+            query_embedding: None,
         },
     );
     let mut model_transcript = existing_transcript.clone();
@@ -1888,6 +1890,7 @@ fn run_prompt_with_model_and_registry_stream_internal(
             embedding_distance_threshold: recall_models.embedding_distance_threshold,
             recency_weight: recall_models.recency_weight,
             connection: Some(&connection),
+            query_embedding: None,
         },
         RecallContext {
             transcript: &existing_transcript,
@@ -1920,6 +1923,7 @@ fn run_prompt_with_model_and_registry_stream_internal(
             embedding_distance_threshold: recall_models.embedding_distance_threshold,
             recency_weight: recall_models.recency_weight,
             connection: Some(&connection),
+            query_embedding: None,
         },
     );
     let mut model_transcript = existing_transcript.clone();
@@ -6430,6 +6434,9 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                 embedding_provider_config_for_search_memories.as_ref(),
             );
             with_tool_connection(&database_path, |connection| {
+                let shared_query_embedding = embedding_client
+                    .as_ref()
+                    .and_then(|client| client.embed(query).ok());
                 let source_fetch_limit = semantic_recall_source_fetch_limit(
                     recall_limit * 3,
                     relevance_model
@@ -6473,6 +6480,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                         ),
                         recency_weight: recency_weight_for_search_memories,
                         connection: Some(connection),
+                        query_embedding: shared_query_embedding.as_deref(),
                     },
                 );
                 let relevant_due_items = select_relevant_recall_due_items(
@@ -6489,6 +6497,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                         ),
                         recency_weight: recency_weight_for_search_memories,
                         connection: Some(connection),
+                        query_embedding: shared_query_embedding.as_deref(),
                     },
                 );
                 let relevant_agenda_items = select_relevant_recall_agenda_items(
@@ -6505,6 +6514,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                         ),
                         recency_weight: recency_weight_for_search_memories,
                         connection: Some(connection),
+                        query_embedding: shared_query_embedding.as_deref(),
                     },
                 );
                 Ok(ToolExecutionResult::success(format_memory_search_results(
@@ -6544,6 +6554,9 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                 embedding_provider_config_for_examine_memories.as_ref(),
             );
             with_tool_connection(&database_path, |connection| {
+                let shared_query_embedding = embedding_client
+                    .as_ref()
+                    .and_then(|client| client.embed(question).ok());
                 let source_fetch_limit = semantic_recall_source_fetch_limit(
                     recall_limit * 3,
                     relevance_model
@@ -6573,6 +6586,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                         ),
                         recency_weight: recency_weight_for_examine_memories,
                         connection: Some(connection),
+                        query_embedding: shared_query_embedding.as_deref(),
                     },
                 );
                 let relevant_due_items = select_relevant_recall_due_items(
@@ -6589,6 +6603,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                         ),
                         recency_weight: recency_weight_for_examine_memories,
                         connection: Some(connection),
+                        query_embedding: shared_query_embedding.as_deref(),
                     },
                 );
                 let relevant_agenda_items = select_relevant_recall_agenda_items(
@@ -6605,6 +6620,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                         ),
                         recency_weight: recency_weight_for_examine_memories,
                         connection: Some(connection),
+                        query_embedding: shared_query_embedding.as_deref(),
                     },
                 );
 
@@ -8349,6 +8365,7 @@ struct RecallSelectionClients<'a> {
     embedding_distance_threshold: Option<f32>,
     recency_weight: f32,
     connection: Option<&'a rusqlite::Connection>,
+    query_embedding: Option<&'a [f32]>,
 }
 
 fn recall_memory_context_messages_with_decision(
@@ -8366,6 +8383,9 @@ fn recall_memory_context_messages_with_decision(
 
     let recall_query =
         build_recall_query(prompt, context.transcript, memory_recall_classifier_window);
+    let shared_query_embedding = selection_clients
+        .embedding_client
+        .and_then(|client| client.embed(&recall_query).ok());
     let already_recalled_memories = recalled_item_refs_by_type(context.transcript, "Memory");
     let recalled = select_relevant_recall_memories(
         &recall_query,
@@ -8373,6 +8393,7 @@ fn recall_memory_context_messages_with_decision(
         &already_recalled_memories,
         RecallSelectionClients {
             limit: 2,
+            query_embedding: shared_query_embedding.as_deref(),
             ..selection_clients
         },
     );
@@ -8386,6 +8407,7 @@ fn recall_memory_context_messages_with_decision(
             context.due_items,
             RecallSelectionClients {
                 limit: 2,
+                query_embedding: shared_query_embedding.as_deref(),
                 ..selection_clients
             },
         )
@@ -8401,6 +8423,7 @@ fn recall_memory_context_messages_with_decision(
             context.agenda_items,
             RecallSelectionClients {
                 limit: 2,
+                query_embedding: shared_query_embedding.as_deref(),
                 ..selection_clients
             },
         )
@@ -8414,6 +8437,7 @@ fn recall_memory_context_messages_with_decision(
             context.due_items,
             RecallSelectionClients {
                 limit: 2,
+                query_embedding: shared_query_embedding.as_deref(),
                 ..selection_clients
             },
         )
@@ -8429,6 +8453,7 @@ fn recall_memory_context_messages_with_decision(
             context.agenda_items,
             RecallSelectionClients {
                 limit: 2,
+                query_embedding: shared_query_embedding.as_deref(),
                 ..selection_clients
             },
         )
@@ -8562,6 +8587,7 @@ fn recall_memory_context_messages(
             embedding_distance_threshold: None,
             recency_weight: 0.0,
             connection: None,
+            query_embedding: None,
         },
         context,
     )
@@ -8880,8 +8906,15 @@ fn embedding_rank_candidates<'a, T>(
     let Some(embedding_client) = selection_clients.embedding_client else {
         return Vec::new();
     };
-    let Ok(query_embedding) = embedding_client.embed(query) else {
-        return Vec::new();
+    let owned_query_embedding;
+    let query_embedding = if let Some(query_embedding) = selection_clients.query_embedding {
+        query_embedding
+    } else {
+        let Ok(embedding) = embedding_client.embed(query) else {
+            return Vec::new();
+        };
+        owned_query_embedding = embedding;
+        owned_query_embedding.as_slice()
     };
     let now_unix = Utc::now().timestamp();
     let candidates = candidates.into_iter().collect::<Vec<_>>();
@@ -16451,6 +16484,7 @@ User still wants to compare grocery prices after the shopping trip.",
                 embedding_distance_threshold: None,
                 recency_weight: 0.0,
                 connection: None,
+                query_embedding: None,
             },
         );
 
@@ -16516,6 +16550,7 @@ User still wants to compare grocery prices after the shopping trip.",
                 embedding_distance_threshold: None,
                 recency_weight: 0.0,
                 connection: None,
+                query_embedding: None,
             },
         );
 
@@ -16569,6 +16604,7 @@ User still wants to compare grocery prices after the shopping trip.",
                 embedding_distance_threshold: None,
                 recency_weight: 0.0,
                 connection: None,
+                query_embedding: None,
             },
         );
 
@@ -16622,6 +16658,7 @@ User still wants to compare grocery prices after the shopping trip.",
                 embedding_distance_threshold: None,
                 recency_weight: 0.0,
                 connection: None,
+                query_embedding: None,
             },
         );
 
@@ -16674,6 +16711,7 @@ User still wants to compare grocery prices after the shopping trip.",
                 embedding_distance_threshold: None,
                 recency_weight: 0.0,
                 connection: None,
+                query_embedding: None,
             },
         );
 
@@ -16760,6 +16798,7 @@ User still wants to compare grocery prices after the shopping trip.",
                 embedding_distance_threshold: None,
                 recency_weight: 0.0,
                 connection: None,
+                query_embedding: None,
             },
         );
 
@@ -16834,6 +16873,7 @@ User still wants to compare grocery prices after the shopping trip.",
                 embedding_distance_threshold: None,
                 recency_weight: 0.0,
                 connection: None,
+                query_embedding: None,
             },
         );
 
@@ -16945,6 +16985,7 @@ User still wants to compare grocery prices after the shopping trip.",
                 embedding_distance_threshold: Some(0.5),
                 recency_weight: 0.0,
                 connection: None,
+                query_embedding: None,
             },
         );
 
@@ -17056,6 +17097,7 @@ User still wants to compare grocery prices after the shopping trip.",
                 embedding_distance_threshold: Some(0.5),
                 recency_weight: 0.0,
                 connection: None,
+                query_embedding: None,
             },
         );
 
@@ -18006,7 +18048,7 @@ User still wants to compare grocery prices after the shopping trip.",
             .match_body(mockito::Matcher::PartialJson(serde_json::json!({
                 "input": "What belongs in my workout kit?"
             })))
-            .expect(3)
+            .expect(1)
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(
@@ -22571,7 +22613,7 @@ User still wants to compare grocery prices after the shopping trip.",
             .match_body(mockito::Matcher::PartialJson(serde_json::json!({
                 "input": "What belongs in my workout kit?"
             })))
-            .expect(4)
+            .expect(2)
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(
@@ -27041,6 +27083,7 @@ User still wants to compare grocery prices after the shopping trip.",
                 embedding_distance_threshold: None,
                 recency_weight: 0.0,
                 connection: None,
+            query_embedding: None,
             },
             RecallContext {
                 transcript: &[],
@@ -27098,6 +27141,7 @@ User still wants to compare grocery prices after the shopping trip.",
                 embedding_distance_threshold: None,
                 recency_weight: 0.0,
                 connection: None,
+            query_embedding: None,
             },
             RecallContext {
                 transcript: &[],
@@ -27161,6 +27205,7 @@ User still wants to compare grocery prices after the shopping trip.",
                 embedding_distance_threshold: None,
                 recency_weight: 0.0,
                 connection: None,
+            query_embedding: None,
             },
             RecallContext {
                 transcript: &[],
@@ -27217,6 +27262,7 @@ User still wants to compare grocery prices after the shopping trip.",
                 embedding_distance_threshold: None,
                 recency_weight: 0.0,
                 connection: None,
+            query_embedding: None,
             },
             RecallContext {
                 transcript: &[],
@@ -27262,6 +27308,7 @@ User still wants to compare grocery prices after the shopping trip.",
                 embedding_distance_threshold: None,
                 recency_weight: 0.0,
                 connection: None,
+            query_embedding: None,
             },
             RecallContext {
                 transcript: &[],
@@ -27325,6 +27372,7 @@ User still wants to compare grocery prices after the shopping trip.",
                 embedding_distance_threshold: None,
                 recency_weight: 0.0,
                 connection: None,
+            query_embedding: None,
             },
             RecallContext {
                 transcript: &[],
@@ -28078,6 +28126,7 @@ User still wants to compare grocery prices after the shopping trip.",
                 embedding_distance_threshold: None,
                 recency_weight: 0.0,
                 connection: None,
+            query_embedding: None,
             },
         );
         let relevant_due_items = select_relevant_recall_due_items(
@@ -28090,6 +28139,7 @@ User still wants to compare grocery prices after the shopping trip.",
                 embedding_distance_threshold: None,
                 recency_weight: 0.0,
                 connection: None,
+            query_embedding: None,
             },
         );
         let relevant_agenda_items = select_relevant_recall_agenda_items(
@@ -28102,6 +28152,7 @@ User still wants to compare grocery prices after the shopping trip.",
                 embedding_distance_threshold: None,
                 recency_weight: 0.0,
                 connection: None,
+            query_embedding: None,
             },
         );
 
@@ -28182,6 +28233,7 @@ User still wants to compare grocery prices after the shopping trip.",
                 embedding_distance_threshold: None,
                 recency_weight: 0.0,
                 connection: None,
+            query_embedding: None,
             },
         );
         let relevant_due_items = select_relevant_recall_due_items(
@@ -28194,6 +28246,7 @@ User still wants to compare grocery prices after the shopping trip.",
                 embedding_distance_threshold: None,
                 recency_weight: 0.0,
                 connection: None,
+            query_embedding: None,
             },
         );
         let relevant_agenda_items = select_relevant_recall_agenda_items(
@@ -28206,6 +28259,7 @@ User still wants to compare grocery prices after the shopping trip.",
                 embedding_distance_threshold: None,
                 recency_weight: 0.0,
                 connection: None,
+            query_embedding: None,
             },
         );
 
@@ -28372,6 +28426,7 @@ User still wants to compare grocery prices after the shopping trip.",
                 embedding_distance_threshold: None,
                 recency_weight: 0.0,
                 connection: None,
+            query_embedding: None,
             },
         );
         let relevant_due_items = select_relevant_recall_due_items(
@@ -28384,6 +28439,7 @@ User still wants to compare grocery prices after the shopping trip.",
                 embedding_distance_threshold: None,
                 recency_weight: 0.0,
                 connection: None,
+            query_embedding: None,
             },
         );
         let relevant_agenda_items = select_relevant_recall_agenda_items(
@@ -28396,6 +28452,7 @@ User still wants to compare grocery prices after the shopping trip.",
                 embedding_distance_threshold: None,
                 recency_weight: 0.0,
                 connection: None,
+            query_embedding: None,
             },
         );
 
@@ -28522,6 +28579,7 @@ User still wants to compare grocery prices after the shopping trip.",
                 embedding_distance_threshold: Some(0.5),
                 recency_weight: 0.0,
                 connection: None,
+            query_embedding: None,
             },
         );
         let with_recency_weight = select_relevant_recall_memories(
@@ -28535,6 +28593,7 @@ User still wants to compare grocery prices after the shopping trip.",
                 embedding_distance_threshold: Some(0.5),
                 recency_weight: 0.1,
                 connection: None,
+            query_embedding: None,
             },
         );
 
@@ -28597,6 +28656,7 @@ User still wants to compare grocery prices after the shopping trip.",
                 embedding_distance_threshold: None,
                 recency_weight: 0.0,
                 connection: None,
+            query_embedding: None,
             },
             RecallContext {
                 transcript: &transcript,

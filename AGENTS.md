@@ -22,7 +22,7 @@ If the Rust implementation intentionally diverges from Python, record it in `PAR
 
 ## Required Workflow
 
-- Read the relevant Python source before implementing a subsystem
+- Read the relevant Python source before implementing a subsystem — for Phase 1 structural refactoring, the exact Python-to-Rust module mapping is documented in `REWRITE_PLAN.md` under "Implementation Guidance"
 - Identify the user-visible behavior and invariants first
 - Implement the smallest coherent vertical slice possible
 - Add or update tests in the same change
