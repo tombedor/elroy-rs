@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
@@ -191,6 +192,15 @@ pub struct MemoryOperationTrackerRecord {
     pub user_token: String,
     pub memories_since_consolidation: i64,
     pub messages_since_memory: i64,
+    pub created_at_unix: i64,
+    pub updated_at_unix: i64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MemoryEmbeddingRecord {
+    pub file_path: String,
+    pub embedding: Vec<f32>,
+    pub embedding_text: String,
     pub created_at_unix: i64,
     pub updated_at_unix: i64,
 }
@@ -1217,6 +1227,69 @@ pub fn save_memory_operation_tracker(
     Ok(())
 }
 
+pub fn load_memory_embeddings_for_paths(
+    connection: &Connection,
+    paths: &[String],
+) -> rusqlite::Result<HashMap<String, MemoryEmbeddingRecord>> {
+    if paths.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let placeholders = std::iter::repeat_n("?", paths.len())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let query = format!(
+        "SELECT file_path, embedding_json, embedding_text, created_at_unix, updated_at_unix
+         FROM memory_embeddings
+         WHERE file_path IN ({placeholders})"
+    );
+    let mut statement = connection.prepare(&query)?;
+    let rows = statement.query_map(rusqlite::params_from_iter(paths.iter()), |row| {
+        let embedding_json: String = row.get(1)?;
+        let embedding =
+            serde_json::from_str::<Vec<f32>>(&embedding_json).map_err(json_to_sql_error)?;
+        Ok(MemoryEmbeddingRecord {
+            file_path: row.get(0)?,
+            embedding,
+            embedding_text: row.get(2)?,
+            created_at_unix: row.get(3)?,
+            updated_at_unix: row.get(4)?,
+        })
+    })?;
+
+    let mut embeddings = HashMap::new();
+    for record in rows {
+        let record = record?;
+        embeddings.insert(record.file_path.clone(), record);
+    }
+    Ok(embeddings)
+}
+
+pub fn upsert_memory_embedding(
+    connection: &Connection,
+    file_path: &str,
+    embedding: &[f32],
+    embedding_text: &str,
+) -> rusqlite::Result<()> {
+    let now = unix_timestamp_now();
+    let embedding_json = serde_json::to_string(embedding).map_err(json_to_sql_error)?;
+    connection.execute(
+        "INSERT INTO memory_embeddings (
+            file_path,
+            embedding_json,
+            embedding_text,
+            created_at_unix,
+            updated_at_unix
+        ) VALUES (?1, ?2, ?3, ?4, ?5)
+        ON CONFLICT(file_path) DO UPDATE SET
+            embedding_json = excluded.embedding_json,
+            embedding_text = excluded.embedding_text,
+            updated_at_unix = excluded.updated_at_unix",
+        params![file_path, embedding_json, embedding_text, now, now],
+    )?;
+    Ok(())
+}
+
 fn get_or_create_context_message_set(
     connection: &mut Connection,
     user_token: &str,
@@ -1505,10 +1578,11 @@ mod tests {
         get_or_create_context_message_set, get_or_create_memory_operation_tracker,
         list_active_agenda_items, list_active_due_items, list_active_memories,
         list_active_plain_agenda_items, list_inactive_due_items, load_context_messages,
-        load_memory_operation_tracker, load_messages_by_ids, load_user_preferences, markdown_files,
-        open_sqlite_connection, persist_bootstrap_documents, record_deleted_due_item_tombstone,
-        replace_context_messages, run_migrations, save_memory_operation_tracker,
-        save_user_preferences, search_active_memories, sync_derived_domain_tables,
+        load_memory_embeddings_for_paths, load_memory_operation_tracker, load_messages_by_ids,
+        load_user_preferences, markdown_files, open_sqlite_connection, persist_bootstrap_documents,
+        record_deleted_due_item_tombstone, replace_context_messages, run_migrations,
+        save_memory_operation_tracker, save_user_preferences, search_active_memories,
+        sync_derived_domain_tables, upsert_memory_embedding,
     };
     use elroy_config::AppConfig;
     use elroy_llm::{ConversationMessage, MessageRole, ToolCall};
@@ -2277,6 +2351,53 @@ mod tests {
                 created_at_unix: tracker.created_at_unix,
                 updated_at_unix: tracker.updated_at_unix,
             })
+        );
+    }
+
+    #[test]
+    fn memory_embedding_round_trip_for_multiple_paths() {
+        let mut connection = Connection::open_in_memory().expect("sqlite should open");
+        run_migrations(&mut connection).expect("migrations should run");
+
+        upsert_memory_embedding(
+            &connection,
+            "/tmp/memories/alpha.md",
+            &[1.0, 0.25],
+            "# alpha\nremember the alpha detail",
+        )
+        .expect("alpha embedding should persist");
+        upsert_memory_embedding(
+            &connection,
+            "/tmp/memories/beta.md",
+            &[0.5, 0.75],
+            "# beta\nremember the beta detail",
+        )
+        .expect("beta embedding should persist");
+
+        let embeddings = load_memory_embeddings_for_paths(
+            &connection,
+            &[
+                "/tmp/memories/alpha.md".to_string(),
+                "/tmp/memories/beta.md".to_string(),
+                "/tmp/memories/missing.md".to_string(),
+            ],
+        )
+        .expect("embeddings should load");
+
+        assert_eq!(embeddings.len(), 2);
+        assert_eq!(
+            embeddings
+                .get("/tmp/memories/alpha.md")
+                .expect("alpha embedding should exist")
+                .embedding,
+            vec![1.0, 0.25]
+        );
+        assert_eq!(
+            embeddings
+                .get("/tmp/memories/beta.md")
+                .expect("beta embedding should exist")
+                .embedding_text,
+            "# beta\nremember the beta detail"
         );
     }
 

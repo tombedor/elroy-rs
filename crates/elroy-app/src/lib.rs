@@ -22,9 +22,10 @@ use elroy_db::{
     AgendaItemRecord, BootstrapPlan, MemoryRecord, UserPreferenceRecord,
     find_active_agenda_item_by_name, get_or_create_memory_operation_tracker, list_active_due_items,
     list_active_plain_agenda_items, list_all_active_memories, list_inactive_due_items,
-    load_context_messages, load_messages_by_ids, load_user_preferences, open_sqlite_connection,
-    record_deleted_due_item_tombstone, replace_context_messages, run_migrations,
-    save_memory_operation_tracker, save_user_preferences, search_active_memories,
+    load_context_messages, load_memory_embeddings_for_paths, load_messages_by_ids,
+    load_user_preferences, open_sqlite_connection, record_deleted_due_item_tombstone,
+    replace_context_messages, run_migrations, save_memory_operation_tracker, save_user_preferences,
+    search_active_memories, upsert_memory_embedding,
 };
 use elroy_feature_requests::{
     FeatureRequestRecord, find_best_feature_request_match, get_feature_request,
@@ -2230,15 +2231,8 @@ fn consolidate_semantic_memory_clusters(
         return Ok(());
     }
 
-    let embedded_memories = memories
-        .into_iter()
-        .filter_map(|memory| {
-            let embedding = embedding_client
-                .embed(&format!("# {}\n{}", memory.name, memory.body.trim()))
-                .ok()?;
-            Some((memory, embedding))
-        })
-        .collect::<Vec<_>>();
+    let embedded_memories =
+        load_or_create_cached_memory_embeddings(connection, &memories, &embedding_client)?;
     if embedded_memories.len() < settings.min_memory_cluster_size {
         return Ok(());
     }
@@ -2283,6 +2277,42 @@ fn consolidate_semantic_memory_clusters(
     }
 
     Ok(())
+}
+
+fn load_or_create_cached_memory_embeddings(
+    connection: &rusqlite::Connection,
+    memories: &[MemoryRecord],
+    embedding_client: &LiveEmbeddingClient,
+) -> Result<Vec<(MemoryRecord, Vec<f32>)>, AppError> {
+    let embedding_cache = load_memory_embeddings_for_paths(
+        connection,
+        &memories
+            .iter()
+            .map(|memory| memory.file_path.clone())
+            .collect::<Vec<_>>(),
+    )?;
+
+    let mut embedded_memories = Vec::new();
+    for memory in memories {
+        let embedding_text = memory_embedding_text(memory);
+        if let Some(cached) = embedding_cache.get(&memory.file_path)
+            && cached.embedding_text == embedding_text
+        {
+            embedded_memories.push((memory.clone(), cached.embedding.clone()));
+            continue;
+        }
+
+        let Ok(embedding) = embedding_client.embed(&embedding_text) else {
+            continue;
+        };
+        upsert_memory_embedding(connection, &memory.file_path, &embedding, &embedding_text)?;
+        embedded_memories.push((memory.clone(), embedding));
+    }
+    Ok(embedded_memories)
+}
+
+fn memory_embedding_text(memory: &MemoryRecord) -> String {
+    format!("# {}\n{}", memory.name, memory.body.trim())
 }
 
 fn semantic_memory_clusters(
@@ -10196,7 +10226,7 @@ mod tests {
     use elroy_db::{
         AgendaItemRecord, BootstrapPlan, MemoryRecord, list_active_due_items,
         load_memory_operation_tracker, load_user_preferences, open_sqlite_connection,
-        run_migrations,
+        run_migrations, upsert_memory_embedding,
     };
     use elroy_feature_requests::{list_feature_requests, write_new_feature_request};
     use elroy_llm::ToolCall;
@@ -12663,6 +12693,113 @@ User still wants to compare grocery prices after the shopping trip.",
             fetched.iter().any(|memory| memory.name == "memory 502"),
             "the consolidation source fetch should include memories beyond the old 500-row preload"
         );
+
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
+    fn semantic_consolidation_can_reuse_persisted_embedding_cache() {
+        let unique = format!(
+            "elroy-rs-app-memory-consolidation-embedding-cache-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+        fs::write(
+            memory_dir.join("shopping_trip_note.md"),
+            "I went to the store today, January 1\n",
+        )
+        .expect("first memory should be written");
+        fs::write(
+            memory_dir.join("new_year_s_shopping.md"),
+            "I went shopping at the store on New Year's Day\n",
+        )
+        .expect("second memory should be written");
+        fs::write(
+            memory_dir.join("store_purchases.md"),
+            "Today, New Year's Day, I bought some items at the store\n",
+        )
+        .expect("third memory should be written");
+
+        let mut config = AppConfig::defaults();
+        config.home_dir = home.clone();
+        config.memory_dir = memory_dir.clone();
+        config.agenda_dir = agenda_dir;
+        config.database_path = database_path.clone();
+        config.min_memory_cluster_size = 3;
+        config.max_memory_cluster_size = 5;
+        config.memory_cluster_similarity_threshold = 0.1;
+        config.fast_model = Some("gpt-5.4-mini".to_string());
+        config.fast_model_api_key = Some("fast-test-key".to_string());
+        config.embedding_model = "text-embedding-3-small".to_string();
+        config.embedding_model_api_key = Some("embedding-test-key".to_string());
+
+        elroy_db::bootstrap_database(&BootstrapPlan::from_config(&config))
+            .expect("bootstrap should succeed");
+
+        let mut connection = open_sqlite_connection(&database_path).expect("database should open");
+        run_migrations(&mut connection).expect("migrations should run");
+        let memories = crate::list_all_active_memories_in_scope(&connection, &memory_dir)
+            .expect("memories should load");
+        assert_eq!(memories.len(), 3);
+
+        for memory in &memories {
+            let embedding = match memory.name.as_str() {
+                "shopping trip note" => vec![1.0, 0.0],
+                "new year s shopping" => vec![0.99, 0.01],
+                "store purchases" => vec![0.98, 0.02],
+                other => panic!("unexpected memory name: {other}"),
+            };
+            upsert_memory_embedding(
+                &connection,
+                &memory.file_path,
+                &embedding,
+                &crate::memory_embedding_text(memory),
+            )
+            .expect("embedding cache should persist");
+        }
+
+        let mut server = mockito::Server::new();
+        let _consolidation_mock = server
+            .mock("POST", "/responses")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "output": [{
+                        "type": "message",
+                        "content": [{
+                            "type": "output_text",
+                            "text": r#"{"memories":[{"name":"Shopping trip on 2024-01-01","text":"User went to the store on New Year's Day and bought some items."}]}"#
+                        }]
+                    }]
+                })
+                .to_string(),
+            )
+            .create();
+
+        config.fast_model_api_base = Some(format!("{}/responses", server.url()));
+        config.embedding_model_api_base = Some(format!("{}/embeddings", server.url()));
+
+        crate::consolidate_semantic_memory_clusters(
+            &mut connection,
+            &BootstrapPlan::from_config(&config),
+            &crate::memory_consolidation_settings_from_app_config(&config),
+        )
+        .expect("semantic consolidation should succeed from cached embeddings");
+
+        let reopened = open_sqlite_connection(&database_path).expect("database should reopen");
+        let active_memories =
+            elroy_db::list_active_memories(&reopened, 10).expect("active memories should list");
+        assert_eq!(active_memories.len(), 1);
+        assert_eq!(active_memories[0].name, "shopping trip on 2024 01 01");
 
         fs::remove_dir_all(home).expect("home should be removed");
     }
