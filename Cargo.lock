@@ -446,6 +446,7 @@ dependencies = [
  "elroy-db",
  "elroy-llm",
  "elroy-memory",
+ "elroy-user",
  "rusqlite",
  "serde_json",
 ]

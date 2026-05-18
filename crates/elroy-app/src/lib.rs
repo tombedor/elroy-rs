@@ -24,7 +24,7 @@ use elroy_core::{
 use elroy_db::{
     AgendaItemRecord, BootstrapPlan, LOCAL_USER_TOKEN, MemoryRecord, SYNTHETIC_FIRST_USER_MESSAGE,
     UserPreferenceRecord, find_active_agenda_item_by_name, list_active_due_items,
-    list_active_plain_agenda_items, list_all_active_memories, list_inactive_due_items,
+    list_active_plain_agenda_items, list_inactive_due_items,
     load_context_messages, load_messages_by_ids,
     load_user_preferences, open_sqlite_connection, record_deleted_due_item_tombstone,
     replace_context_messages, run_migrations, save_user_preferences,
@@ -37,7 +37,7 @@ use elroy_feature_requests::{
 };
 use elroy_llm::{
     ConversationMessage, EmbeddingProviderConfig, LiveEmbeddingClient, LiveModelClient,
-    MessageRole, ProviderConfig, StreamEvent,
+    MessageRole, StreamEvent,
 };
 use elroy_memory::{
     archive_memory_file, create_memory_file_with_frontmatter, read_memory_parts, sanitize_filename,
@@ -66,16 +66,9 @@ use context::*;
 mod recall;
 use recall::*;
 
-mod consolidation;
-use consolidation::*;
-
 const DEFAULT_MAX_LIST_ENTRIES: usize = 50;
 const DEFAULT_MAX_LIST_DEPTH: usize = 2;
 const DEFAULT_READ_LINE_LIMIT: usize = 200;
-const CONTEXT_MESSAGE_SOURCE_TYPE: &str = "ContextMessageSet";
-const MEMORY_SOURCE_TYPE: &str = "Memory";
-const MEMORY_WORD_COUNT_LIMIT: usize = 300;
-const MEMORY_CONSOLIDATION_CLUSTER_LIMIT: usize = 3;
 const DEFAULT_RESTART_RESUME_PROMPT: &str =
     "Elroy just restarted. Send a brief message that you are back and ready to continue.";
 
@@ -567,7 +560,7 @@ impl AppRuntime {
             )
         })();
         clear_background_status("auto-memory");
-        result
+        result.map_err(AppError::from)
     }
 
     pub fn background_status(&self) -> Option<String> {
@@ -1460,18 +1453,6 @@ fn live_fast_provider_model(
     ))
 }
 
-fn best_effort_provider_model(
-    provider_config: Option<&ProviderConfig>,
-    assistant_name: &str,
-) -> Option<LiveProviderModel> {
-    let provider_config = provider_config.cloned()?;
-    let client = LiveModelClient::new(provider_config).ok()?;
-    Some(LiveProviderModel::new(
-        client,
-        effective_persona(None, assistant_name),
-    ))
-}
-
 fn run_prompt_with_model_and_registry_internal(
     connection: &mut rusqlite::Connection,
     prompt: &str,
@@ -2009,59 +1990,6 @@ fn derive_agenda_item_name(text: &str) -> String {
         .chars()
         .take(60)
         .collect()
-}
-
-fn formulate_memory_from_transcript(transcript: &[ConversationMessage]) -> (String, String) {
-    let messages = transcript
-        .iter()
-        .filter(|message| {
-            matches!(message.role, MessageRole::User | MessageRole::Assistant)
-                && message
-                    .content
-                    .as_deref()
-                    .is_some_and(|content| !content.trim().is_empty())
-        })
-        .rev()
-        .take(6)
-        .cloned()
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect::<Vec<_>>();
-
-    let title_seed = messages
-        .iter()
-        .find(|message| message.role == MessageRole::User)
-        .and_then(|message| message.content.as_deref())
-        .unwrap_or("Conversation memory");
-    let title_words = title_seed
-        .split_whitespace()
-        .take(6)
-        .collect::<Vec<_>>()
-        .join(" ");
-    let title = if title_words.is_empty() {
-        format!(
-            "Conversation memory {}",
-            Utc::now().format("%Y-%m-%d %H:%M")
-        )
-    } else {
-        format!("Conversation memory: {title_words}")
-    };
-
-    let body = messages
-        .into_iter()
-        .map(|message| {
-            let role = match message.role {
-                MessageRole::User => "User",
-                MessageRole::Assistant => "Assistant",
-                _ => unreachable!("filtered to user/assistant"),
-            };
-            format!("{role}: {}", message.content.unwrap_or_default().trim())
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    (title, body)
 }
 
 fn run_background_codex_completion_followup(
@@ -6454,52 +6382,6 @@ fn create_consolidated_memory_from_plan(
     .map(|mut created| created.remove(0))
 }
 
-fn create_consolidated_memories_from_records(
-    bootstrap_plan: &BootstrapPlan,
-    outputs: &[ConsolidatedMemoryOutput],
-    source_memories: &[MemoryRecord],
-) -> std::io::Result<Vec<PathBuf>> {
-    if outputs.is_empty() {
-        return Err(std::io::Error::other(
-            "at least one consolidated memory output is required",
-        ));
-    }
-
-    let archive_dir = bootstrap_plan.memory_dir.join("archive");
-    let mut archived_sources = Vec::new();
-    for memory in source_memories {
-        let archived_path = archive_memory_file(Path::new(&memory.file_path), &archive_dir)?;
-        archived_sources.push((memory.name.clone(), archived_path));
-    }
-
-    let frontmatter = memory_source_frontmatter(
-        &archived_sources
-            .iter()
-            .map(|(source_name, path)| (source_name.as_str(), path.as_path()))
-            .collect::<Vec<_>>(),
-    );
-    let mut created = Vec::new();
-    for output in outputs {
-        created.push(create_memory_file_with_frontmatter(
-            &bootstrap_plan.memory_dir,
-            &output.name,
-            &output.text,
-            frontmatter.as_deref(),
-        )?);
-    }
-    elroy_db::bootstrap_database(bootstrap_plan)
-        .map_err(|error| std::io::Error::other(error.to_string()))?;
-    remove_context_memory_messages_by_names_from_database_path(
-        &bootstrap_plan.database_path,
-        &source_memories
-            .iter()
-            .map(|memory| memory.name.clone())
-            .collect::<Vec<_>>(),
-    )
-    .map_err(|error| std::io::Error::other(error.to_string()))?;
-    Ok(created)
-}
-
 fn mutate_agenda_file_from_config_with_result(
     config: &AppConfig,
     name: &str,
@@ -6793,16 +6675,6 @@ fn list_active_memories_in_scope(
         .collect())
 }
 
-fn list_all_active_memories_in_scope(
-    connection: &rusqlite::Connection,
-    memory_dir: &Path,
-) -> rusqlite::Result<Vec<elroy_db::MemoryRecord>> {
-    Ok(list_all_active_memories(connection)?
-        .into_iter()
-        .filter(|memory| Path::new(&memory.file_path).starts_with(memory_dir))
-        .collect())
-}
-
 fn search_active_memories_in_scope(
     connection: &rusqlite::Connection,
     memory_dir: &Path,
@@ -6923,26 +6795,9 @@ fn remove_context_memory_messages_by_names_from_database_path(
     database_path: &Path,
     memory_names: &[String],
 ) -> Result<(), AppError> {
-    if memory_names.is_empty() {
-        return Ok(());
-    }
-
-    let tool_call_ids = memory_names
-        .iter()
-        .map(|name| context_memory_tool_call_id(name))
-        .collect::<Vec<_>>();
     let mut connection = open_sqlite_connection(database_path)?;
     run_migrations(&mut connection)?;
-    let transcript = load_context_messages(&mut connection, LOCAL_USER_TOKEN)?;
-    let updated_transcript = transcript
-        .into_iter()
-        .filter(|message| {
-            !tool_call_ids
-                .iter()
-                .any(|tool_call_id| message_matches_tool_call_id(message, tool_call_id))
-        })
-        .collect::<Vec<_>>();
-    replace_context_messages(&mut connection, LOCAL_USER_TOKEN, &updated_transcript)?;
+    remove_context_memory_messages_by_names(&mut connection, memory_names)?;
     Ok(())
 }
 
