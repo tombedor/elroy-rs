@@ -14,6 +14,7 @@ elroy-config = { path = "../elroy-config" }
 elroy-core = { path = "../elroy-core" }
 elroy-db = { path = "../elroy-db" }
 elroy-llm = { path = "../elroy-llm" }
+elroy-recall = { path = "../elroy-recall" }
 elroy-user = { path = "../elroy-user" }
 anyhow = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }

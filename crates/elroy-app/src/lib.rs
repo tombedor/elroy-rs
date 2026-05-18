@@ -12,15 +12,18 @@ use elroy_codex::{
     get_codex_session_by_thread_id, list_recent_codex_sessions, resume_codex_session_with_bin,
     resume_codex_session_with_hook,
 };
-use elroy_config::{AppConfig, LlmProvider};
+use elroy_config::{
+    AppConfig, LlmProvider, embedding_provider_config_from_app_config,
+    fast_provider_config_from_app_config, provider_config_from_app_config,
+};
 use elroy_core::{
     ConversationOrchestrator, LiveProviderModel, LocalToolExecutor,
     ModelClient, StreamingModelClient, TurnEventStream, clear_background_status,
     get_background_status, set_background_status,
 };
 use elroy_db::{
-    AgendaItemRecord, BootstrapPlan, MemoryRecord, UserPreferenceRecord,
-    find_active_agenda_item_by_name, list_active_due_items,
+    AgendaItemRecord, BootstrapPlan, LOCAL_USER_TOKEN, MemoryRecord, SYNTHETIC_FIRST_USER_MESSAGE,
+    UserPreferenceRecord, find_active_agenda_item_by_name, list_active_due_items,
     list_active_plain_agenda_items, list_all_active_memories, list_inactive_due_items,
     load_context_messages, load_messages_by_ids,
     load_user_preferences, open_sqlite_connection, record_deleted_due_item_tombstone,
@@ -34,7 +37,7 @@ use elroy_feature_requests::{
 };
 use elroy_llm::{
     ConversationMessage, EmbeddingProviderConfig, LiveEmbeddingClient, LiveModelClient,
-    MessageRole, Provider, ProviderConfig, StreamEvent,
+    MessageRole, ProviderConfig, StreamEvent,
 };
 use elroy_memory::{
     archive_memory_file, create_memory_file_with_frontmatter, read_memory_parts, sanitize_filename,
@@ -66,8 +69,6 @@ use recall::*;
 mod consolidation;
 use consolidation::*;
 
-const LOCAL_USER_TOKEN: &str = "local-user";
-const SYNTHETIC_FIRST_USER_MESSAGE: &str = "The user has begun the conversation";
 const DEFAULT_MAX_LIST_ENTRIES: usize = 50;
 const DEFAULT_MAX_LIST_DEPTH: usize = 2;
 const DEFAULT_READ_LINE_LIMIT: usize = 200;
@@ -132,6 +133,12 @@ impl From<refinery::Error> for AppError {
 impl From<elroy_core::ModelClientError> for AppError {
     fn from(value: elroy_core::ModelClientError) -> Self {
         Self::Model(value)
+    }
+}
+
+impl From<anyhow::Error> for AppError {
+    fn from(value: anyhow::Error) -> Self {
+        Self::Runtime(value.to_string())
     }
 }
 
@@ -354,6 +361,7 @@ impl AppRuntime {
             &self.config.assistant_name,
             self.config.llm_provider() == LlmProvider::Anthropic,
         )
+        .map_err(AppError::from)
     }
 
     pub fn load_command_palette_entries(&self) -> Result<Vec<TuiCommandPaletteEntry>, AppError> {
@@ -6233,11 +6241,16 @@ fn mutate_user_preferences_in_config(
 
     match operation(&mut record).and_then(|message| {
         save_user_preferences(&mut connection, &record)?;
-        refresh_persisted_system_instructions(&mut connection, config)
-            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
         Ok(message)
     }) {
-        Ok(message) => ToolExecutionResult::success(message),
+        Ok(message) => {
+            if let Err(error) = refresh_persisted_system_instructions(&mut connection, config) {
+                return ToolExecutionResult::error(format!(
+                    "user preference update failed: {error}"
+                ));
+            }
+            ToolExecutionResult::success(message)
+        }
         Err(error) => ToolExecutionResult::error(format!("user preference update failed: {error}")),
     }
 }
@@ -7023,44 +7036,10 @@ fn sync_due_item_context_after_mutation(
     Ok(())
 }
 
-pub fn provider_config_from_app_config(config: &AppConfig) -> Result<ProviderConfig, String> {
-    provider_config_for_model(
-        config.llm_provider(),
-        &config.chat_model,
-        config.openai_api_key.as_deref(),
-        Some(config.openai_base_url.as_str()),
-        config.anthropic_api_key.as_deref(),
-        Some(config.anthropic_base_url.as_str()),
-        Some(config.anthropic_api_version.as_str()),
-    )
-}
-
-pub(crate) fn fast_provider_config_from_app_config(config: &AppConfig) -> Result<ProviderConfig, String> {
-    if config.fast_model.is_none() {
-        return provider_config_from_app_config(config);
-    }
-
-    provider_config_for_model(
-        config.fast_llm_provider(),
-        config.fast_model_name(),
-        config
-            .fast_model_api_key
-            .as_deref()
-            .or(config.openai_api_key.as_deref()),
-        config
-            .fast_model_api_base
-            .as_deref()
-            .or(Some(config.openai_base_url.as_str())),
-        config
-            .fast_model_api_key
-            .as_deref()
-            .or(config.anthropic_api_key.as_deref()),
-        config
-            .fast_model_api_base
-            .as_deref()
-            .or(Some(config.anthropic_base_url.as_str())),
-        Some(config.anthropic_api_version.as_str()),
-    )
+pub(crate) fn best_effort_embedding_client(
+    provider_config: Option<&EmbeddingProviderConfig>,
+) -> Option<LiveEmbeddingClient> {
+    provider_config.and_then(|config| LiveEmbeddingClient::new(config.clone()).ok())
 }
 
 fn memory_consolidation_settings_from_app_config(
@@ -7072,79 +7051,6 @@ fn memory_consolidation_settings_from_app_config(
         min_memory_cluster_size: config.min_memory_cluster_size,
         fast_provider_config: fast_provider_config_from_app_config(config).ok(),
         embedding_provider_config: embedding_provider_config_from_app_config(config).ok(),
-    }
-}
-
-fn embedding_provider_config_from_app_config(
-    config: &AppConfig,
-) -> Result<EmbeddingProviderConfig, String> {
-    let api_key = config
-        .embedding_model_api_key
-        .as_deref()
-        .or(config.openai_api_key.as_deref())
-        .ok_or_else(|| "missing OPENAI_API_KEY for embedding model".to_string())?;
-    Ok(EmbeddingProviderConfig {
-        model: config.embedding_model.clone(),
-        api_key: api_key.to_string(),
-        base_url: config
-            .embedding_model_api_base
-            .as_deref()
-            .unwrap_or("https://api.openai.com/v1/embeddings")
-            .to_string(),
-        timeout_seconds: 60,
-    })
-}
-
-fn best_effort_embedding_client(
-    provider_config: Option<&EmbeddingProviderConfig>,
-) -> Option<LiveEmbeddingClient> {
-    provider_config.and_then(|config| LiveEmbeddingClient::new(config.clone()).ok())
-}
-
-fn provider_config_for_model(
-    provider: LlmProvider,
-    model_name: &str,
-    openai_api_key: Option<&str>,
-    openai_base_url: Option<&str>,
-    anthropic_api_key: Option<&str>,
-    anthropic_base_url: Option<&str>,
-    anthropic_api_version: Option<&str>,
-) -> Result<ProviderConfig, String> {
-    match provider {
-        LlmProvider::OpenAi => {
-            let api_key = openai_api_key
-                .map(ToOwned::to_owned)
-                .ok_or_else(|| "missing OPENAI_API_KEY for OpenAI model".to_string())?;
-            Ok(ProviderConfig {
-                provider: Provider::OpenAi,
-                model: model_name.to_string(),
-                api_key,
-                base_url: openai_base_url
-                    .unwrap_or("https://api.openai.com/v1/responses")
-                    .to_string(),
-                anthropic_api_version: None,
-                timeout_seconds: 60,
-                max_output_tokens: 2048,
-            })
-        }
-        LlmProvider::Anthropic => {
-            let api_key = anthropic_api_key
-                .map(ToOwned::to_owned)
-                .ok_or_else(|| "missing ANTHROPIC_API_KEY for Anthropic model".to_string())?;
-            Ok(ProviderConfig {
-                provider: Provider::Anthropic,
-                model: model_name.to_string(),
-                api_key,
-                base_url: anthropic_base_url
-                    .unwrap_or("https://api.anthropic.com/v1/messages")
-                    .to_string(),
-                anthropic_api_version: Some(
-                    anthropic_api_version.unwrap_or("2023-06-01").to_string(),
-                ),
-                timeout_seconds: 60,
-                max_output_tokens: 2048,
-            })
-        }
     }
 }
 

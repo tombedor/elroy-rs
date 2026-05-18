@@ -534,6 +534,117 @@ fn parse_csv_list(value: &str) -> Vec<String> {
         .collect()
 }
 
+pub fn provider_config_from_app_config(
+    config: &AppConfig,
+) -> Result<elroy_llm::ProviderConfig, String> {
+    provider_config_for_model(
+        config.llm_provider(),
+        &config.chat_model,
+        config.openai_api_key.as_deref(),
+        Some(config.openai_base_url.as_str()),
+        config.anthropic_api_key.as_deref(),
+        Some(config.anthropic_base_url.as_str()),
+        Some(config.anthropic_api_version.as_str()),
+    )
+}
+
+pub fn fast_provider_config_from_app_config(
+    config: &AppConfig,
+) -> Result<elroy_llm::ProviderConfig, String> {
+    if config.fast_model.is_none() {
+        return provider_config_from_app_config(config);
+    }
+
+    provider_config_for_model(
+        config.fast_llm_provider(),
+        config.fast_model_name(),
+        config
+            .fast_model_api_key
+            .as_deref()
+            .or(config.openai_api_key.as_deref()),
+        config
+            .fast_model_api_base
+            .as_deref()
+            .or(Some(config.openai_base_url.as_str())),
+        config
+            .fast_model_api_key
+            .as_deref()
+            .or(config.anthropic_api_key.as_deref()),
+        config
+            .fast_model_api_base
+            .as_deref()
+            .or(Some(config.anthropic_base_url.as_str())),
+        Some(config.anthropic_api_version.as_str()),
+    )
+}
+
+pub fn embedding_provider_config_from_app_config(
+    config: &AppConfig,
+) -> Result<elroy_llm::EmbeddingProviderConfig, String> {
+    let api_key = config
+        .embedding_model_api_key
+        .as_deref()
+        .or(config.openai_api_key.as_deref())
+        .ok_or_else(|| "missing OPENAI_API_KEY for embedding model".to_string())?;
+    Ok(elroy_llm::EmbeddingProviderConfig {
+        model: config.embedding_model.clone(),
+        api_key: api_key.to_string(),
+        base_url: config
+            .embedding_model_api_base
+            .as_deref()
+            .unwrap_or("https://api.openai.com/v1/embeddings")
+            .to_string(),
+        timeout_seconds: 60,
+    })
+}
+
+fn provider_config_for_model(
+    provider: LlmProvider,
+    model_name: &str,
+    openai_api_key: Option<&str>,
+    openai_base_url: Option<&str>,
+    anthropic_api_key: Option<&str>,
+    anthropic_base_url: Option<&str>,
+    anthropic_api_version: Option<&str>,
+) -> Result<elroy_llm::ProviderConfig, String> {
+    match provider {
+        LlmProvider::OpenAi => {
+            let api_key = openai_api_key
+                .map(ToOwned::to_owned)
+                .ok_or_else(|| "missing OPENAI_API_KEY for OpenAI model".to_string())?;
+            Ok(elroy_llm::ProviderConfig {
+                provider: elroy_llm::Provider::OpenAi,
+                model: model_name.to_string(),
+                api_key,
+                base_url: openai_base_url
+                    .unwrap_or("https://api.openai.com/v1/responses")
+                    .to_string(),
+                anthropic_api_version: None,
+                timeout_seconds: 60,
+                max_output_tokens: 2048,
+            })
+        }
+        LlmProvider::Anthropic => {
+            let api_key = anthropic_api_key
+                .map(ToOwned::to_owned)
+                .ok_or_else(|| "missing ANTHROPIC_API_KEY for Anthropic model".to_string())?;
+            Ok(elroy_llm::ProviderConfig {
+                provider: elroy_llm::Provider::Anthropic,
+                model: model_name.to_string(),
+                api_key,
+                base_url: anthropic_base_url
+                    .unwrap_or("https://api.anthropic.com/v1/messages")
+                    .to_string(),
+                anthropic_api_version: Some(
+                    anthropic_api_version.unwrap_or("2023-06-01").to_string(),
+                ),
+                timeout_seconds: 60,
+                max_output_tokens: 2048,
+            })
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;

@@ -15,6 +15,9 @@ mod embedded {
     embed_migrations!("migrations");
 }
 
+pub const LOCAL_USER_TOKEN: &str = "local-user";
+pub const SYNTHETIC_FIRST_USER_MESSAGE: &str = "The user has begun the conversation";
+
 const MEMORY_KIND: &str = "memory";
 const AGENDA_KIND: &str = "agenda";
 

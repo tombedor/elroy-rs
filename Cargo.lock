@@ -321,10 +321,12 @@ dependencies = [
 name = "elroy-app"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "chrono",
  "elroy-agenda",
  "elroy-codex",
  "elroy-config",
+ "elroy-context",
  "elroy-core",
  "elroy-db",
  "elroy-feature-requests",
@@ -367,6 +369,7 @@ dependencies = [
 name = "elroy-config"
 version = "0.1.0"
 dependencies = [
+ "elroy-llm",
  "serde",
  "serde_yaml",
 ]
@@ -381,6 +384,7 @@ dependencies = [
  "elroy-core",
  "elroy-db",
  "elroy-llm",
+ "elroy-recall",
  "elroy-user",
  "rusqlite",
 ]

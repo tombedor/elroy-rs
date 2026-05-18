@@ -11,6 +11,7 @@ workspace = true
 
 [dependencies]
 elroy-agenda = { path = "../elroy-agenda" }
+elroy-context = { path = "../elroy-context" }
 elroy-recall = { path = "../elroy-recall" }
 elroy-codex = { path = "../elroy-codex" }
 elroy-config = { path = "../elroy-config" }
@@ -24,6 +25,7 @@ elroy-tasks = { path = "../elroy-tasks" }
 elroy-tools = { path = "../elroy-tools" }
 elroy-tui = { path = "../elroy-tui" }
 elroy-user = { path = "../elroy-user" }
+anyhow = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 rusqlite = { version = "0.37", features = ["bundled"] }
 refinery = { version = "0.9", features = ["rusqlite"] }
