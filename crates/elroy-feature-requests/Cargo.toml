@@ -10,6 +10,10 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
+elroy-db = { path = "../elroy-db" }
 elroy-memory = { path = "../elroy-memory" }
+elroy-tools = { path = "../elroy-tools" }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+serde_json = "1"
 serde_yaml = "0.9"
 strsim = "0.11"

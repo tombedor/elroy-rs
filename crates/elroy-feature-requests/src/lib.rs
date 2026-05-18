@@ -1,3 +1,6 @@
+pub mod tools;
+pub use tools::feature_request_tools;
+
 use std::path::{Path, PathBuf};
 
 use elroy_memory::sanitize_filename;

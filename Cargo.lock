@@ -416,7 +416,11 @@ dependencies = [
 name = "elroy-feature-requests"
 version = "0.1.0"
 dependencies = [
+ "chrono",
+ "elroy-db",
  "elroy-memory",
+ "elroy-tools",
+ "serde_json",
  "serde_yaml",
  "strsim",
 ]
