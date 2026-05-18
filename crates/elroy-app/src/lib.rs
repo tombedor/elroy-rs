@@ -19,7 +19,7 @@ use elroy_core::{
     get_background_status, set_background_status, validated_transcript,
 };
 use elroy_db::{
-    AgendaItemRecord, BootstrapPlan, MemoryRecord, UserPreferenceRecord,
+    AgendaItemRecord, BootstrapPlan, MemoryEmbeddingRecord, MemoryRecord, UserPreferenceRecord,
     find_active_agenda_item_by_name, get_or_create_memory_operation_tracker, list_active_due_items,
     list_active_plain_agenda_items, list_all_active_memories, list_inactive_due_items,
     load_context_messages, load_memory_embeddings_for_paths, load_messages_by_ids,
@@ -1721,6 +1721,7 @@ fn run_prompt_with_model_and_registry_internal(
             embedding_client: recall_models.embedding_client,
             embedding_distance_threshold: recall_models.embedding_distance_threshold,
             recency_weight: recall_models.recency_weight,
+            connection: Some(connection),
         },
         RecallContext {
             transcript: &existing_transcript,
@@ -1752,6 +1753,7 @@ fn run_prompt_with_model_and_registry_internal(
             embedding_client: recall_models.embedding_client,
             embedding_distance_threshold: recall_models.embedding_distance_threshold,
             recency_weight: recall_models.recency_weight,
+            connection: Some(connection),
         },
     );
     let mut model_transcript = existing_transcript.clone();
@@ -1885,6 +1887,7 @@ fn run_prompt_with_model_and_registry_stream_internal(
             embedding_client: recall_models.embedding_client,
             embedding_distance_threshold: recall_models.embedding_distance_threshold,
             recency_weight: recall_models.recency_weight,
+            connection: Some(&connection),
         },
         RecallContext {
             transcript: &existing_transcript,
@@ -1916,6 +1919,7 @@ fn run_prompt_with_model_and_registry_stream_internal(
             embedding_client: recall_models.embedding_client,
             embedding_distance_threshold: recall_models.embedding_distance_threshold,
             recency_weight: recall_models.recency_weight,
+            connection: Some(&connection),
         },
     );
     let mut model_transcript = existing_transcript.clone();
@@ -6468,6 +6472,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                             embedding_distance_threshold_for_search_memories,
                         ),
                         recency_weight: recency_weight_for_search_memories,
+                        connection: Some(connection),
                     },
                 );
                 let relevant_due_items = select_relevant_recall_due_items(
@@ -6483,6 +6488,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                             embedding_distance_threshold_for_search_memories,
                         ),
                         recency_weight: recency_weight_for_search_memories,
+                        connection: Some(connection),
                     },
                 );
                 let relevant_agenda_items = select_relevant_recall_agenda_items(
@@ -6498,6 +6504,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                             embedding_distance_threshold_for_search_memories,
                         ),
                         recency_weight: recency_weight_for_search_memories,
+                        connection: Some(connection),
                     },
                 );
                 Ok(ToolExecutionResult::success(format_memory_search_results(
@@ -6565,6 +6572,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                             embedding_distance_threshold_for_examine_memories,
                         ),
                         recency_weight: recency_weight_for_examine_memories,
+                        connection: Some(connection),
                     },
                 );
                 let relevant_due_items = select_relevant_recall_due_items(
@@ -6580,6 +6588,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                             embedding_distance_threshold_for_examine_memories,
                         ),
                         recency_weight: recency_weight_for_examine_memories,
+                        connection: Some(connection),
                     },
                 );
                 let relevant_agenda_items = select_relevant_recall_agenda_items(
@@ -6595,6 +6604,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                             embedding_distance_threshold_for_examine_memories,
                         ),
                         recency_weight: recency_weight_for_examine_memories,
+                        connection: Some(connection),
                     },
                 );
 
@@ -8338,6 +8348,7 @@ struct RecallSelectionClients<'a> {
     embedding_client: Option<&'a LiveEmbeddingClient>,
     embedding_distance_threshold: Option<f32>,
     recency_weight: f32,
+    connection: Option<&'a rusqlite::Connection>,
 }
 
 fn recall_memory_context_messages_with_decision(
@@ -8550,6 +8561,7 @@ fn recall_memory_context_messages(
             embedding_client: None,
             embedding_distance_threshold: None,
             recency_weight: 0.0,
+            connection: None,
         },
         context,
     )
@@ -8831,6 +8843,17 @@ fn semantic_recall_candidate_limit(
     }
 }
 
+fn agenda_item_embedding_text(item: &AgendaItemRecord) -> String {
+    let mut text = format!("# {}\n{}", item.name, item.body.trim());
+    if let Some(trigger_datetime) = item.trigger_datetime.as_deref() {
+        text.push_str(&format!("\ntrigger_datetime: {trigger_datetime}"));
+    }
+    if let Some(trigger_context) = item.trigger_context.as_deref() {
+        text.push_str(&format!("\ntrigger_context: {trigger_context}"));
+    }
+    text
+}
+
 fn l2_distance(left: &[f32], right: &[f32]) -> Option<f32> {
     if left.len() != right.len() {
         return None;
@@ -8851,6 +8874,7 @@ fn embedding_rank_candidates<'a, T>(
     candidates: impl IntoIterator<Item = &'a T>,
     selection_clients: RecallSelectionClients<'_>,
     extraction_fn: impl Fn(&T) -> String,
+    file_path_fn: impl Fn(&T) -> &str,
     updated_at_fn: impl Fn(&T) -> i64,
 ) -> Vec<&'a T> {
     let Some(embedding_client) = selection_clients.embedding_client else {
@@ -8860,11 +8884,50 @@ fn embedding_rank_candidates<'a, T>(
         return Vec::new();
     };
     let now_unix = Utc::now().timestamp();
+    let candidates = candidates.into_iter().collect::<Vec<_>>();
+    let mut embedding_cache = selection_clients
+        .connection
+        .and_then(|connection| {
+            let paths = candidates
+                .iter()
+                .map(|candidate| file_path_fn(candidate).to_string())
+                .collect::<Vec<_>>();
+            load_memory_embeddings_for_paths(connection, &paths).ok()
+        })
+        .unwrap_or_default();
 
     let mut ranked = candidates
         .into_iter()
         .filter_map(|candidate| {
-            let embedding = embedding_client.embed(&extraction_fn(candidate)).ok()?;
+            let embedding_text = extraction_fn(candidate);
+            let file_path = file_path_fn(candidate);
+            let embedding = if let Some(cached) = embedding_cache.get(file_path) {
+                if cached.embedding_text == embedding_text {
+                    Some(cached.embedding.clone())
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+            .or_else(|| {
+                let embedding = embedding_client.embed(&embedding_text).ok()?;
+                if let Some(connection) = selection_clients.connection {
+                    let _ =
+                        upsert_memory_embedding(connection, file_path, &embedding, &embedding_text);
+                    embedding_cache.insert(
+                        file_path.to_string(),
+                        MemoryEmbeddingRecord {
+                            file_path: file_path.to_string(),
+                            embedding: embedding.clone(),
+                            embedding_text: embedding_text.clone(),
+                            created_at_unix: 0,
+                            updated_at_unix: 0,
+                        },
+                    );
+                }
+                Some(embedding)
+            })?;
             let distance = l2_distance(&query_embedding, &embedding)?;
             if let Some(distance_threshold) = selection_clients.embedding_distance_threshold
                 && distance > distance_threshold
@@ -8927,7 +8990,8 @@ fn select_relevant_recall_memories<'a>(
                 limit: candidate_limit,
                 ..selection_clients
             },
-            |memory| format!("# {}\n{}", memory.name, memory.body.trim()),
+            memory_embedding_text,
+            |memory| memory.file_path.as_str(),
             |memory| memory.updated_at_unix,
         ) {
             if merged_candidates
@@ -8964,7 +9028,8 @@ fn select_relevant_recall_memories<'a>(
                 limit: candidate_limit,
                 ..selection_clients
             },
-            |memory| format!("# {}\n{}", memory.name, memory.body.trim()),
+            memory_embedding_text,
+            |memory| memory.file_path.as_str(),
             |memory| memory.updated_at_unix,
         );
         if embedding_candidates.is_empty() {
@@ -8979,7 +9044,7 @@ fn select_relevant_recall_memories<'a>(
         selection_clients.relevance_model,
         query,
         candidates,
-        |memory| format!("# {}\n{}", memory.name, memory.body.trim()),
+        memory_embedding_text,
     )
     .into_iter()
     .take(selection_clients.limit)
@@ -9006,16 +9071,8 @@ fn select_relevant_recall_due_items<'a>(
                 limit: candidate_limit,
                 ..selection_clients
             },
-            |item| {
-                let mut text = format!("# {}\n{}", item.name, item.body.trim());
-                if let Some(trigger_datetime) = item.trigger_datetime.as_deref() {
-                    text.push_str(&format!("\ntrigger_datetime: {trigger_datetime}"));
-                }
-                if let Some(trigger_context) = item.trigger_context.as_deref() {
-                    text.push_str(&format!("\ntrigger_context: {trigger_context}"));
-                }
-                text
-            },
+            agenda_item_embedding_text,
+            |item| item.file_path.as_str(),
             |item| item.updated_at_unix,
         ) {
             if merged_candidates
@@ -9050,16 +9107,8 @@ fn select_relevant_recall_due_items<'a>(
                 limit: candidate_limit,
                 ..selection_clients
             },
-            |item| {
-                let mut text = format!("# {}\n{}", item.name, item.body.trim());
-                if let Some(trigger_datetime) = item.trigger_datetime.as_deref() {
-                    text.push_str(&format!("\ntrigger_datetime: {trigger_datetime}"));
-                }
-                if let Some(trigger_context) = item.trigger_context.as_deref() {
-                    text.push_str(&format!("\ntrigger_context: {trigger_context}"));
-                }
-                text
-            },
+            agenda_item_embedding_text,
+            |item| item.file_path.as_str(),
             |item| item.updated_at_unix,
         );
         if embedding_candidates.is_empty() {
@@ -9074,16 +9123,7 @@ fn select_relevant_recall_due_items<'a>(
         selection_clients.relevance_model,
         query,
         candidates,
-        |item| {
-            let mut text = format!("# {}\n{}", item.name, item.body.trim());
-            if let Some(trigger_datetime) = item.trigger_datetime.as_deref() {
-                text.push_str(&format!("\ntrigger_datetime: {trigger_datetime}"));
-            }
-            if let Some(trigger_context) = item.trigger_context.as_deref() {
-                text.push_str(&format!("\ntrigger_context: {trigger_context}"));
-            }
-            text
-        },
+        agenda_item_embedding_text,
     )
     .into_iter()
     .take(selection_clients.limit)
@@ -9114,16 +9154,8 @@ fn select_relevant_contextual_due_items<'a>(
                 limit: candidate_limit,
                 ..selection_clients
             },
-            |item| {
-                let mut text = format!("# {}\n{}", item.name, item.body.trim());
-                if let Some(trigger_datetime) = item.trigger_datetime.as_deref() {
-                    text.push_str(&format!("\ntrigger_datetime: {trigger_datetime}"));
-                }
-                if let Some(trigger_context) = item.trigger_context.as_deref() {
-                    text.push_str(&format!("\ntrigger_context: {trigger_context}"));
-                }
-                text
-            },
+            agenda_item_embedding_text,
+            |item| item.file_path.as_str(),
             |item| item.updated_at_unix,
         ) {
             if merged_candidates
@@ -9161,16 +9193,8 @@ fn select_relevant_contextual_due_items<'a>(
                 limit: candidate_limit,
                 ..selection_clients
             },
-            |item| {
-                let mut text = format!("# {}\n{}", item.name, item.body.trim());
-                if let Some(trigger_datetime) = item.trigger_datetime.as_deref() {
-                    text.push_str(&format!("\ntrigger_datetime: {trigger_datetime}"));
-                }
-                if let Some(trigger_context) = item.trigger_context.as_deref() {
-                    text.push_str(&format!("\ntrigger_context: {trigger_context}"));
-                }
-                text
-            },
+            agenda_item_embedding_text,
+            |item| item.file_path.as_str(),
             |item| item.updated_at_unix,
         );
         if embedding_candidates.is_empty() {
@@ -9185,16 +9209,7 @@ fn select_relevant_contextual_due_items<'a>(
         selection_clients.relevance_model,
         query,
         candidates,
-        |item| {
-            let mut text = format!("# {}\n{}", item.name, item.body.trim());
-            if let Some(trigger_datetime) = item.trigger_datetime.as_deref() {
-                text.push_str(&format!("\ntrigger_datetime: {trigger_datetime}"));
-            }
-            if let Some(trigger_context) = item.trigger_context.as_deref() {
-                text.push_str(&format!("\ntrigger_context: {trigger_context}"));
-            }
-            text
-        },
+        agenda_item_embedding_text,
     )
     .into_iter()
     .take(selection_clients.limit)
@@ -9223,7 +9238,8 @@ fn select_relevant_recall_agenda_items<'a>(
                 limit: candidate_limit,
                 ..selection_clients
             },
-            |item| format!("# {}\n{}", item.name, item.body.trim()),
+            agenda_item_embedding_text,
+            |item| item.file_path.as_str(),
             |item| item.updated_at_unix,
         ) {
             if merged_candidates
@@ -9260,7 +9276,8 @@ fn select_relevant_recall_agenda_items<'a>(
                 limit: candidate_limit,
                 ..selection_clients
             },
-            |item| format!("# {}\n{}", item.name, item.body.trim()),
+            agenda_item_embedding_text,
+            |item| item.file_path.as_str(),
             |item| item.updated_at_unix,
         );
         if embedding_candidates.is_empty() {
@@ -9275,7 +9292,7 @@ fn select_relevant_recall_agenda_items<'a>(
         selection_clients.relevance_model,
         query,
         candidates,
-        |item| format!("# {}\n{}", item.name, item.body.trim()),
+        agenda_item_embedding_text,
     )
     .into_iter()
     .take(selection_clients.limit)
@@ -16433,6 +16450,7 @@ User still wants to compare grocery prices after the shopping trip.",
                 embedding_client: None,
                 embedding_distance_threshold: None,
                 recency_weight: 0.0,
+                connection: None,
             },
         );
 
@@ -16497,6 +16515,7 @@ User still wants to compare grocery prices after the shopping trip.",
                 embedding_client: None,
                 embedding_distance_threshold: None,
                 recency_weight: 0.0,
+                connection: None,
             },
         );
 
@@ -16549,6 +16568,7 @@ User still wants to compare grocery prices after the shopping trip.",
                 embedding_client: None,
                 embedding_distance_threshold: None,
                 recency_weight: 0.0,
+                connection: None,
             },
         );
 
@@ -16601,6 +16621,7 @@ User still wants to compare grocery prices after the shopping trip.",
                 embedding_client: None,
                 embedding_distance_threshold: None,
                 recency_weight: 0.0,
+                connection: None,
             },
         );
 
@@ -16652,6 +16673,7 @@ User still wants to compare grocery prices after the shopping trip.",
                 embedding_client: None,
                 embedding_distance_threshold: None,
                 recency_weight: 0.0,
+                connection: None,
             },
         );
 
@@ -16737,6 +16759,7 @@ User still wants to compare grocery prices after the shopping trip.",
                 embedding_client: None,
                 embedding_distance_threshold: None,
                 recency_weight: 0.0,
+                connection: None,
             },
         );
 
@@ -16810,6 +16833,7 @@ User still wants to compare grocery prices after the shopping trip.",
                 embedding_client: None,
                 embedding_distance_threshold: None,
                 recency_weight: 0.0,
+                connection: None,
             },
         );
 
@@ -16920,6 +16944,7 @@ User still wants to compare grocery prices after the shopping trip.",
                 embedding_client: Some(&embedding_client),
                 embedding_distance_threshold: Some(0.5),
                 recency_weight: 0.0,
+                connection: None,
             },
         );
 
@@ -17030,6 +17055,7 @@ User still wants to compare grocery prices after the shopping trip.",
                 embedding_client: Some(&embedding_client),
                 embedding_distance_threshold: Some(0.5),
                 recency_weight: 0.0,
+                connection: None,
             },
         );
 
@@ -17939,6 +17965,107 @@ User still wants to compare grocery prices after the shopping trip.",
                 .contains("Memory | old training note | Pack resistance bands before drills.")
         );
 
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
+    fn live_tool_registry_search_memories_can_reuse_persisted_embedding_cache() {
+        let unique = format!(
+            "elroy-rs-app-search-memories-persisted-embedding-cache-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+
+        fs::write(
+            memory_dir.join("recent_planning_note.md"),
+            "Review the storage locker spreadsheet.\n",
+        )
+        .expect("recent memory should be written");
+        fs::write(
+            memory_dir.join("recent_inventory_note.md"),
+            "Double-check the equipment inventory list.\n",
+        )
+        .expect("second recent memory should be written");
+        fs::write(
+            memory_dir.join("old_training_note.md"),
+            "Pack resistance bands before drills.\n",
+        )
+        .expect("older semantic memory should be written");
+
+        let mut server = mockito::Server::new();
+        let query_embedding_mock = server
+            .mock("POST", "/embeddings")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "input": "What belongs in my workout kit?"
+            })))
+            .expect(3)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "data": [{"embedding": [1.0, 0.0]}]
+                })
+                .to_string(),
+            )
+            .create();
+
+        let mut config = AppConfig::defaults();
+        config.memory_dir = memory_dir.clone();
+        config.agenda_dir = agenda_dir;
+        config.database_path = database_path.clone();
+        config.embedding_model_api_key = Some("embedding-test-key".to_string());
+        config.embedding_model_api_base = Some(format!("{}/embeddings", server.url()));
+        config.openai_api_key = None;
+        config.fast_model_api_key = None;
+        elroy_db::bootstrap_database(&BootstrapPlan::from_config(&config))
+            .expect("bootstrap should succeed");
+
+        let connection = open_sqlite_connection(&database_path).expect("database should open");
+        let memories = crate::list_active_memories_in_scope(&connection, &memory_dir, 10)
+            .expect("memories should load");
+        for memory in &memories {
+            let embedding = match memory.name.as_str() {
+                "old training note" => vec![1.0, 0.0],
+                "recent planning note" => vec![0.0, 1.0],
+                "recent inventory note" => vec![0.0, 0.95],
+                other => panic!("unexpected memory name: {other}"),
+            };
+            upsert_memory_embedding(
+                &connection,
+                &memory.file_path,
+                &embedding,
+                &crate::memory_embedding_text(memory),
+            )
+            .expect("embedding cache should persist");
+        }
+
+        let registry = build_live_tool_registry(&config);
+        let search = registry.invoke(
+            "search_memories",
+            "{\"query\":\"What belongs in my workout kit?\",\"limit\":5}",
+        );
+
+        assert!(!search.is_error);
+        assert!(
+            search
+                .content
+                .contains("Memory | old training note | Pack resistance bands before drills.")
+        );
+        assert!(
+            !search.content.contains("recent planning note"),
+            "{}",
+            search.content
+        );
+
+        query_embedding_mock.assert();
         fs::remove_dir_all(home).expect("home should be removed");
     }
 
@@ -22408,6 +22535,134 @@ User still wants to compare grocery prices after the shopping trip.",
     }
 
     #[test]
+    fn process_message_can_reuse_persisted_embedding_cache_for_prompt_time_recall() {
+        let unique = format!(
+            "elroy-rs-app-process-message-persisted-embedding-cache-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+        fs::write(
+            memory_dir.join("recent_planning_note.md"),
+            "Review the storage locker spreadsheet.\n",
+        )
+        .expect("recent memory should be written");
+        fs::write(
+            memory_dir.join("recent_inventory_note.md"),
+            "Double-check the equipment inventory list.\n",
+        )
+        .expect("second recent memory should be written");
+        fs::write(
+            memory_dir.join("old_training_note.md"),
+            "Pack resistance bands before drills.\n",
+        )
+        .expect("older semantic memory should be written");
+
+        let mut embedding_server = mockito::Server::new();
+        let query_embedding_mock = embedding_server
+            .mock("POST", "/embeddings")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "input": "What belongs in my workout kit?"
+            })))
+            .expect(4)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "data": [{"embedding": [1.0, 0.0]}]
+                })
+                .to_string(),
+            )
+            .create();
+
+        let mut chat_server = mockito::Server::new();
+        let chat_mock = chat_server
+            .mock("POST", "/messages")
+            .match_header("x-api-key", "anthropic-test-key")
+            .match_header("anthropic-version", "2023-06-01")
+            .match_body(mockito::Matcher::Regex(
+                "Pack resistance bands before drills\\.".to_string(),
+            ))
+            .expect_at_least(1)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "content": [{
+                        "type": "text",
+                        "text": "Bring the resistance bands before drills."
+                    }]
+                })
+                .to_string(),
+            )
+            .create();
+
+        let mut config = AppConfig::defaults();
+        config.home_dir = home.clone();
+        config.memory_dir = memory_dir.clone();
+        config.agenda_dir = agenda_dir;
+        config.database_path = database_path.clone();
+        config.chat_model = "claude-sonnet-4-20250514".to_string();
+        config.anthropic_api_key = Some("anthropic-test-key".to_string());
+        config.anthropic_base_url = format!("{}/messages", chat_server.url());
+        config.embedding_model_api_key = Some("embedding-test-key".to_string());
+        config.embedding_model_api_base = Some(format!("{}/embeddings", embedding_server.url()));
+        config.openai_api_key = None;
+        config.fast_model_api_key = None;
+        config.memory_recall_classifier_enabled = false;
+        elroy_db::bootstrap_database(&BootstrapPlan::from_config(&config))
+            .expect("bootstrap should succeed");
+
+        let connection = open_sqlite_connection(&database_path).expect("database should open");
+        let memories = crate::list_active_memories_in_scope(&connection, &memory_dir, 10)
+            .expect("memories should load");
+        for memory in &memories {
+            let embedding = match memory.name.as_str() {
+                "old training note" => vec![1.0, 0.0],
+                "recent planning note" => vec![0.0, 1.0],
+                "recent inventory note" => vec![0.0, 0.95],
+                other => panic!("unexpected memory name: {other}"),
+            };
+            upsert_memory_embedding(
+                &connection,
+                &memory.file_path,
+                &embedding,
+                &crate::memory_embedding_text(memory),
+            )
+            .expect("embedding cache should persist");
+        }
+
+        let runtime = AppRuntime::new(config);
+        let result = runtime
+            .process_message(
+                "What belongs in my workout kit?",
+                MessageProcessOptions::default(),
+            )
+            .expect("prompt should succeed");
+
+        assert!(result.events.iter().any(|event| matches!(
+            event,
+            StreamEvent::StatusUpdate { content } if content == "fetching memories..."
+        )));
+        assert!(result.events.iter().any(|event| matches!(
+            event,
+            StreamEvent::AssistantResponse { content }
+                if content == "Bring the resistance bands before drills."
+        )));
+
+        query_embedding_mock.assert();
+        chat_mock.assert();
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
     fn process_message_can_surface_older_semantic_due_item_via_embedding_without_relevance_model() {
         let unique = format!(
             "elroy-rs-app-process-message-embedding-due-item-recall-{}",
@@ -26785,6 +27040,7 @@ User still wants to compare grocery prices after the shopping trip.",
                 embedding_client: None,
                 embedding_distance_threshold: None,
                 recency_weight: 0.0,
+                connection: None,
             },
             RecallContext {
                 transcript: &[],
@@ -26841,6 +27097,7 @@ User still wants to compare grocery prices after the shopping trip.",
                 embedding_client: None,
                 embedding_distance_threshold: None,
                 recency_weight: 0.0,
+                connection: None,
             },
             RecallContext {
                 transcript: &[],
@@ -26903,6 +27160,7 @@ User still wants to compare grocery prices after the shopping trip.",
                 embedding_client: None,
                 embedding_distance_threshold: None,
                 recency_weight: 0.0,
+                connection: None,
             },
             RecallContext {
                 transcript: &[],
@@ -26958,6 +27216,7 @@ User still wants to compare grocery prices after the shopping trip.",
                 embedding_client: None,
                 embedding_distance_threshold: None,
                 recency_weight: 0.0,
+                connection: None,
             },
             RecallContext {
                 transcript: &[],
@@ -27002,6 +27261,7 @@ User still wants to compare grocery prices after the shopping trip.",
                 embedding_client: None,
                 embedding_distance_threshold: None,
                 recency_weight: 0.0,
+                connection: None,
             },
             RecallContext {
                 transcript: &[],
@@ -27064,6 +27324,7 @@ User still wants to compare grocery prices after the shopping trip.",
                 embedding_client: None,
                 embedding_distance_threshold: None,
                 recency_weight: 0.0,
+                connection: None,
             },
             RecallContext {
                 transcript: &[],
@@ -27816,6 +28077,7 @@ User still wants to compare grocery prices after the shopping trip.",
                 embedding_client: None,
                 embedding_distance_threshold: None,
                 recency_weight: 0.0,
+                connection: None,
             },
         );
         let relevant_due_items = select_relevant_recall_due_items(
@@ -27827,6 +28089,7 @@ User still wants to compare grocery prices after the shopping trip.",
                 embedding_client: None,
                 embedding_distance_threshold: None,
                 recency_weight: 0.0,
+                connection: None,
             },
         );
         let relevant_agenda_items = select_relevant_recall_agenda_items(
@@ -27838,6 +28101,7 @@ User still wants to compare grocery prices after the shopping trip.",
                 embedding_client: None,
                 embedding_distance_threshold: None,
                 recency_weight: 0.0,
+                connection: None,
             },
         );
 
@@ -27917,6 +28181,7 @@ User still wants to compare grocery prices after the shopping trip.",
                 embedding_client: None,
                 embedding_distance_threshold: None,
                 recency_weight: 0.0,
+                connection: None,
             },
         );
         let relevant_due_items = select_relevant_recall_due_items(
@@ -27928,6 +28193,7 @@ User still wants to compare grocery prices after the shopping trip.",
                 embedding_client: None,
                 embedding_distance_threshold: None,
                 recency_weight: 0.0,
+                connection: None,
             },
         );
         let relevant_agenda_items = select_relevant_recall_agenda_items(
@@ -27939,6 +28205,7 @@ User still wants to compare grocery prices after the shopping trip.",
                 embedding_client: None,
                 embedding_distance_threshold: None,
                 recency_weight: 0.0,
+                connection: None,
             },
         );
 
@@ -28104,6 +28371,7 @@ User still wants to compare grocery prices after the shopping trip.",
                 embedding_client: None,
                 embedding_distance_threshold: None,
                 recency_weight: 0.0,
+                connection: None,
             },
         );
         let relevant_due_items = select_relevant_recall_due_items(
@@ -28115,6 +28383,7 @@ User still wants to compare grocery prices after the shopping trip.",
                 embedding_client: None,
                 embedding_distance_threshold: None,
                 recency_weight: 0.0,
+                connection: None,
             },
         );
         let relevant_agenda_items = select_relevant_recall_agenda_items(
@@ -28126,6 +28395,7 @@ User still wants to compare grocery prices after the shopping trip.",
                 embedding_client: None,
                 embedding_distance_threshold: None,
                 recency_weight: 0.0,
+                connection: None,
             },
         );
 
@@ -28251,6 +28521,7 @@ User still wants to compare grocery prices after the shopping trip.",
                 embedding_client: Some(&embedding_client),
                 embedding_distance_threshold: Some(0.5),
                 recency_weight: 0.0,
+                connection: None,
             },
         );
         let with_recency_weight = select_relevant_recall_memories(
@@ -28263,6 +28534,7 @@ User still wants to compare grocery prices after the shopping trip.",
                 embedding_client: Some(&embedding_client),
                 embedding_distance_threshold: Some(0.5),
                 recency_weight: 0.1,
+                connection: None,
             },
         );
 
@@ -28324,6 +28596,7 @@ User still wants to compare grocery prices after the shopping trip.",
                 embedding_client: None,
                 embedding_distance_threshold: None,
                 recency_weight: 0.0,
+                connection: None,
             },
             RecallContext {
                 transcript: &transcript,
