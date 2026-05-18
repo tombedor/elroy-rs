@@ -9561,6 +9561,14 @@ My response will be in the first person, and will be transmitted to an AI assist
     body
 }
 
+fn truncate_reflective_recall_content(content: &str, reflection_max_words: usize) -> String {
+    let words = content.split_whitespace().collect::<Vec<_>>();
+    if words.len() <= reflection_max_words {
+        return content.trim().to_string();
+    }
+    words[..reflection_max_words].join(" ")
+}
+
 fn parse_reflective_recall_model_response(response: &str) -> Option<(bool, Option<String>)> {
     let trimmed = response.trim();
     let json_text = if trimmed.starts_with("```") {
@@ -9595,8 +9603,10 @@ fn build_reflective_recall_content_with_model(
     inputs: ReflectiveRecallPromptInputs<'_>,
     fallback_content: &str,
 ) -> Option<String> {
+    let truncated_fallback =
+        truncate_reflective_recall_content(fallback_content, inputs.reflection_max_words);
     let Some(model) = model else {
-        return Some(fallback_content.to_string());
+        return Some(truncated_fallback);
     };
     let model_prompt = build_reflective_recall_prompt(
         inputs.memories,
@@ -9625,8 +9635,10 @@ fn build_reflective_recall_content_with_model(
         .collect::<String>();
     match parse_reflective_recall_model_response(&response) {
         Some((false, _)) => None,
-        Some((true, Some(content))) if !content.trim().is_empty() => Some(content),
-        _ => Some(fallback_content.to_string()),
+        Some((true, Some(content))) if !content.trim().is_empty() => Some(
+            truncate_reflective_recall_content(&content, inputs.reflection_max_words),
+        ),
+        _ => Some(truncated_fallback),
     }
 }
 
@@ -26778,6 +26790,110 @@ User still wants to compare grocery prices after the shopping trip.",
             .clone()
             .expect("reflective recall prompt should be captured");
         assert!(prompt.contains("no more than 42 words."), "{}", prompt);
+    }
+
+    #[test]
+    fn reflective_recall_truncates_model_authored_content_to_configured_word_limit() {
+        let mut config = AppConfig::defaults();
+        config.memory_recall_classifier_enabled = false;
+        config.reflect = true;
+        config.memory_reflection_max_words = 5;
+        let model = FakeModel::new(vec![
+            vec![StreamEvent::AssistantResponse {
+                content: r#"{"answers":[true],"reasoning":"The recalled memory is relevant enough to inspect."}"#
+                    .to_string(),
+            }],
+            vec![StreamEvent::AssistantResponse {
+                content: r#"{"is_relevant":true,"content":"one two three four five six seven"}"#
+                    .to_string(),
+            }],
+        ]);
+
+        let messages = recall_memory_context_messages_with_decision(
+            config.memory_recall_classifier_window,
+            config.reflect,
+            "What should I remember about payroll?",
+            true,
+            config.memory_reflection_max_words,
+            crate::RecallSelectionClients {
+                limit: 2,
+                relevance_model: Some(&model),
+                embedding_client: None,
+                embedding_distance_threshold: None,
+                recency_weight: 0.0,
+            },
+            RecallContext {
+                transcript: &[],
+                memories: &[MemoryRecord {
+                    id: 1,
+                    legacy_frontmatter_id: None,
+                    name: "payroll".to_string(),
+                    file_path: "/tmp/payroll.md".to_string(),
+                    body: "Remember to finish payroll before Friday.".to_string(),
+                    is_active: true,
+                    updated_at_unix: 10,
+                }],
+                due_items: &[],
+                agenda_items: &[],
+            },
+        );
+
+        let payload = messages[1]
+            .content
+            .as_deref()
+            .expect("reflective recall payload should exist");
+        assert!(payload.contains("one two three four five"));
+        assert!(!payload.contains("six seven"));
+    }
+
+    #[test]
+    fn reflective_recall_truncates_fallback_content_to_configured_word_limit() {
+        let mut config = AppConfig::defaults();
+        config.memory_recall_classifier_enabled = false;
+        config.reflect = true;
+        config.memory_reflection_max_words = 6;
+
+        let messages = recall_memory_context_messages_with_decision(
+            config.memory_recall_classifier_window,
+            config.reflect,
+            "Should I ask about the marathon date?",
+            true,
+            config.memory_reflection_max_words,
+            crate::RecallSelectionClients {
+                limit: 2,
+                relevance_model: None,
+                embedding_client: None,
+                embedding_distance_threshold: None,
+                recency_weight: 0.0,
+            },
+            RecallContext {
+                transcript: &[],
+                memories: &[MemoryRecord {
+                    id: 1,
+                    legacy_frontmatter_id: None,
+                    name: "marathon".to_string(),
+                    file_path: "/tmp/marathon.md".to_string(),
+                    body: "User wants to train for a marathon and asked for encouragement."
+                        .to_string(),
+                    is_active: true,
+                    updated_at_unix: 10,
+                }],
+                due_items: &[],
+                agenda_items: &[],
+            },
+        );
+
+        let payload = messages[1]
+            .content
+            .as_deref()
+            .expect("reflective recall payload should exist");
+        let parsed =
+            serde_json::from_str::<serde_json::Value>(payload).expect("payload should parse");
+        let content = parsed
+            .get("content")
+            .and_then(|value| value.as_str())
+            .expect("reflective recall content should exist");
+        assert_eq!(content.split_whitespace().count(), 6);
     }
 
     #[test]
