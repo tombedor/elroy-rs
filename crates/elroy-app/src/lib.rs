@@ -2479,6 +2479,11 @@ If the excerpts cover the same topic, consolidate them into a single, cohesive m
 ## Dates and times\n\n\
 The memories being consolidated can be from any time in the past. Note that the current time is {}, or {} UTC\n\n\
 Use ISO 8601 format for dates and times to ensure references remain unambiguous in future retrievals.\n\n\
+## Synthesis Guidelines\n\n\
+- Resolve contradictions instead of carrying conflicting claims forward unchanged.\n\
+- When dates or times are present and memories disagree, prefer the most recent dated information.\n\
+- Call out recurring patterns or repeated events when the excerpts support that inference.\n\
+- If the excerpts describe the same topic, produce a single synthesis rather than a list of lightly edited duplicates.\n\n\
 ## Style Guidelines\n\n\
 - Limit each new memory excerpt to {} words.\n\n\
 ## Memory Title Guidelines\n\n\
@@ -12431,6 +12436,19 @@ mod tests {
                 assert!(prompt.contains("# Memory Consolidation Task"), "{prompt}");
                 assert!(prompt.contains("## Dates and times"), "{prompt}");
                 assert!(prompt.contains("Use ISO 8601 format"), "{prompt}");
+                assert!(prompt.contains("## Synthesis Guidelines"), "{prompt}");
+                assert!(
+                    prompt.contains("Resolve contradictions instead of carrying conflicting claims forward unchanged."),
+                    "{prompt}"
+                );
+                assert!(
+                    prompt.contains("prefer the most recent dated information."),
+                    "{prompt}"
+                );
+                assert!(
+                    prompt.contains("Call out recurring patterns or repeated events"),
+                    "{prompt}"
+                );
                 assert!(
                     prompt.contains("Limit each new memory excerpt to 300 words."),
                     "{prompt}"
