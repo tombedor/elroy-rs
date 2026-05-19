@@ -1,21 +1,21 @@
 use elroy_config::AppConfig;
+use elroy_core::memory_store::{archive_memory_file, update_memory_body};
 use elroy_db::{
     BootstrapPlan, LOCAL_USER_TOKEN, load_context_messages, open_sqlite_connection, run_migrations,
 };
-use elroy_core::memory_store::{archive_memory_file, update_memory_body};
 use elroy_recall::{
     archive_memory_file_from_config, create_consolidated_memory_from_config,
     create_memory_file_from_context_messages, examine_memories_from_config,
     find_active_memory_by_name_in_scope, format_memory_detail, format_memory_listing,
     get_source_content_for_memory_from_config, get_source_list_for_memory_from_config,
     list_active_memories_in_scope, memory_consolidation_settings_from_app_config,
-    mutate_memory_file_from_config, record_memory_creation_and_maybe_consolidate,
-    search_active_memories_in_scope, search_memories_from_config,
+ mutate_memory_file_from_config,
+    record_memory_creation_and_maybe_consolidate, search_memories_from_config,
     update_outdated_or_incorrect_memory_from_config,
 };
 use elroy_tools::{ExecutableTool, JsonSchema, ToolExecutionResult, ToolSpec};
 use serde_json::{Value, json};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 pub fn memory_tools(config: &AppConfig) -> Vec<ExecutableTool> {
     let config_for_memory_write = config.clone();
@@ -263,24 +263,26 @@ pub fn memory_tools(config: &AppConfig) -> Vec<ExecutableTool> {
                         name,
                         &config_for_memory_show.memory_dir,
                     ) {
-                        Ok(Some(memory)) => {
-                            ToolExecutionResult::success(
-                                json!({
-                                    "name": memory.name,
-                                    "file_path": memory.file_path,
-                                    "body": memory.body,
-                                    "updated_at_unix": memory.updated_at_unix,
-                                })
-                                .to_string(),
-                            )
-                        }
-                        Ok(None) => ToolExecutionResult::error(format!("Memory '{name}' not found for the current user.")),
+                        Ok(Some(memory)) => ToolExecutionResult::success(
+                            json!({
+                                "name": memory.name,
+                                "file_path": memory.file_path,
+                                "body": memory.body,
+                                "updated_at_unix": memory.updated_at_unix,
+                            })
+                            .to_string(),
+                        ),
+                        Ok(None) => ToolExecutionResult::error(format!(
+                            "Memory '{name}' not found for the current user."
+                        )),
                         Err(error) => {
                             ToolExecutionResult::error(format!("database query failed: {error}"))
                         }
                     }
                 }
-                Err(error) => ToolExecutionResult::error(format!("failed to open database: {error}")),
+                Err(error) => {
+                    ToolExecutionResult::error(format!("failed to open database: {error}"))
+                }
             }
         },
     );
@@ -290,7 +292,10 @@ pub fn memory_tools(config: &AppConfig) -> Vec<ExecutableTool> {
         ToolSpec::new(
             "print_memory",
             "Print the detailed content of an active memory in fact format.",
-            JsonSchema::object([("memory_name", json!({"type": "string"}))], ["memory_name"]),
+            JsonSchema::object(
+                [("memory_name", json!({"type": "string"}))],
+                ["memory_name"],
+            ),
         ),
         move |arguments| {
             let Some(name) = arguments.get("memory_name").and_then(Value::as_str) else {
@@ -306,13 +311,17 @@ pub fn memory_tools(config: &AppConfig) -> Vec<ExecutableTool> {
                         Ok(Some(memory)) => {
                             ToolExecutionResult::success(format_memory_detail(&memory))
                         }
-                        Ok(None) => ToolExecutionResult::success(format!("Memory '{name}' not found for the current user.")),
+                        Ok(None) => ToolExecutionResult::success(format!(
+                            "Memory '{name}' not found for the current user."
+                        )),
                         Err(error) => {
                             ToolExecutionResult::error(format!("database query failed: {error}"))
                         }
                     }
                 }
-                Err(error) => ToolExecutionResult::error(format!("failed to open database: {error}")),
+                Err(error) => {
+                    ToolExecutionResult::error(format!("failed to open database: {error}"))
+                }
             }
         },
     );
@@ -325,10 +334,7 @@ pub fn memory_tools(config: &AppConfig) -> Vec<ExecutableTool> {
             JsonSchema::object([("limit", json!({"type": "integer"}))], [] as [&str; 0]),
         ),
         move |arguments| {
-            let limit = arguments
-                .get("limit")
-                .and_then(Value::as_i64)
-                .unwrap_or(10) as usize;
+            let limit = arguments.get("limit").and_then(Value::as_i64).unwrap_or(10) as usize;
             match open_sqlite_connection(&config_for_memory_list.database_path) {
                 Ok(connection) => {
                     match list_active_memories_in_scope(
@@ -381,7 +387,9 @@ pub fn memory_tools(config: &AppConfig) -> Vec<ExecutableTool> {
                         &config_for_memory_print_list.memory_dir,
                         limit,
                     ) {
-                        Ok(memories) => ToolExecutionResult::success(format_memory_listing(&memories)),
+                        Ok(memories) => {
+                            ToolExecutionResult::success(format_memory_listing(&memories))
+                        }
                         Err(error) => {
                             ToolExecutionResult::error(format!("database query failed: {error}"))
                         }
@@ -415,10 +423,7 @@ pub fn memory_tools(config: &AppConfig) -> Vec<ExecutableTool> {
         ToolSpec::new(
             "examine_memories",
             "Deeply examine active memories and items for relevance to a complex question.",
-            JsonSchema::object(
-                [("question", json!({"type": "string"}))],
-                ["question"],
-            ),
+            JsonSchema::object([("question", json!({"type": "string"}))], ["question"]),
         ),
         move |arguments| {
             let Some(question) = arguments.get("question").and_then(Value::as_str) else {
@@ -440,7 +445,9 @@ pub fn memory_tools(config: &AppConfig) -> Vec<ExecutableTool> {
         ),
         move |arguments| {
             let Some(name) = arguments.get("memory_name").and_then(Value::as_str) else {
-                return ToolExecutionResult::error("get_source_list_for_memory requires a string memory_name");
+                return ToolExecutionResult::error(
+                    "get_source_list_for_memory requires a string memory_name",
+                );
             };
             match get_source_list_for_memory_from_config(&config_for_source_list, name) {
                 Ok(result) => ToolExecutionResult::success(result),
@@ -464,10 +471,13 @@ pub fn memory_tools(config: &AppConfig) -> Vec<ExecutableTool> {
         ),
         move |arguments| {
             let Some(name) = arguments.get("memory_name").and_then(Value::as_str) else {
-                return ToolExecutionResult::error("get_source_content_for_memory requires a string memory_name");
+                return ToolExecutionResult::error(
+                    "get_source_content_for_memory requires a string memory_name",
+                );
             };
             let index = arguments.get("index").and_then(Value::as_i64).unwrap_or(0) as usize;
-            match get_source_content_for_memory_from_config(&config_for_source_content, name, index) {
+            match get_source_content_for_memory_from_config(&config_for_source_content, name, index)
+            {
                 Ok(result) => ToolExecutionResult::success(result),
                 Err(error) => ToolExecutionResult::error(error.to_string()),
             }

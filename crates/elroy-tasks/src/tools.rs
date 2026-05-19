@@ -73,9 +73,8 @@ pub fn task_tools(config: AppConfig) -> Vec<ExecutableTool> {
                 }
             }
             match (|| -> Result<String, std::io::Error> {
-                let mut connection =
-                    open_sqlite_connection(&config_for_task_write.database_path)
-                        .map_err(|error| std::io::Error::other(error.to_string()))?;
+                let mut connection = open_sqlite_connection(&config_for_task_write.database_path)
+                    .map_err(|error| std::io::Error::other(error.to_string()))?;
                 run_migrations(&mut connection)
                     .map_err(|error| std::io::Error::other(error.to_string()))?;
                 if find_active_agenda_item_by_name(&connection, name)
@@ -120,12 +119,8 @@ pub fn task_tools(config: AppConfig) -> Vec<ExecutableTool> {
                     .map_err(|error| std::io::Error::other(error.to_string()))?;
                     if !transcript_contains_context_task(&transcript, &task.name) {
                         transcript.extend(context_task_tool_messages(&task));
-                        replace_context_messages(
-                            &mut connection,
-                            LOCAL_USER_TOKEN,
-                            &transcript,
-                        )
-                        .map_err(|error| std::io::Error::other(error.to_string()))?;
+                        replace_context_messages(&mut connection, LOCAL_USER_TOKEN, &transcript)
+                            .map_err(|error| std::io::Error::other(error.to_string()))?;
                     }
                 }
                 Ok(logical_task_name)
@@ -136,9 +131,7 @@ pub fn task_tools(config: AppConfig) -> Vec<ExecutableTool> {
                 Err(error) if error.to_string().starts_with("Task '") => {
                     ToolExecutionResult::error(error.to_string())
                 }
-                Err(error) => {
-                    ToolExecutionResult::error(format!("failed to create task: {error}"))
-                }
+                Err(error) => ToolExecutionResult::error(format!("failed to create task: {error}")),
             }
         },
     );
@@ -177,9 +170,9 @@ pub fn task_tools(config: AppConfig) -> Vec<ExecutableTool> {
             }
             match sync_task_context_after_mutation(&config_for_task_text, name, Some(name)) {
                 Ok(()) => result,
-                Err(error) => ToolExecutionResult::error(format!(
-                    "failed to refresh task context: {error}"
-                )),
+                Err(error) => {
+                    ToolExecutionResult::error(format!("failed to refresh task context: {error}"))
+                }
             }
         },
     );
@@ -225,15 +218,11 @@ pub fn task_tools(config: AppConfig) -> Vec<ExecutableTool> {
             if result.is_error {
                 return result;
             }
-            match sync_task_context_after_mutation(
-                &config_for_task_rename,
-                name,
-                Some(new_name),
-            ) {
+            match sync_task_context_after_mutation(&config_for_task_rename, name, Some(new_name)) {
                 Ok(()) => result,
-                Err(error) => ToolExecutionResult::error(format!(
-                    "failed to refresh task context: {error}"
-                )),
+                Err(error) => {
+                    ToolExecutionResult::error(format!("failed to refresh task context: {error}"))
+                }
             }
         },
     );
@@ -275,9 +264,9 @@ pub fn task_tools(config: AppConfig) -> Vec<ExecutableTool> {
             }
             match sync_task_context_after_mutation(&config_for_task_complete, name, None) {
                 Ok(()) => result,
-                Err(error) => ToolExecutionResult::error(format!(
-                    "failed to refresh task context: {error}"
-                )),
+                Err(error) => {
+                    ToolExecutionResult::error(format!("failed to refresh task context: {error}"))
+                }
             }
         },
     );
@@ -340,8 +329,7 @@ pub fn task_tools(config: AppConfig) -> Vec<ExecutableTool> {
                 let items = list_active_tasks(connection, limit)?;
                 let payload = items.into_iter().map(task_payload).collect::<Vec<_>>();
                 Ok(ToolExecutionResult::success(
-                    serde_json::to_string_pretty(&payload)
-                        .expect("task payload should serialize"),
+                    serde_json::to_string_pretty(&payload).expect("task payload should serialize"),
                 ))
             })
         },

@@ -5,19 +5,21 @@ use std::path::{Path, PathBuf};
 
 use anyhow::anyhow;
 use chrono::{Local, Utc};
+use elroy_core::memory_store::{
+    archive_memory_file, create_memory_file_with_frontmatter, read_memory_parts,
+};
 use elroy_core::{ConversationRequest, LiveProviderModel, ModelClient, excerpt};
 use elroy_db::{
     AgendaItemRecord, BootstrapPlan, LOCAL_USER_TOKEN, MemoryEmbeddingRecord, MemoryRecord,
-    get_or_create_memory_operation_tracker, list_all_active_memories,
-    load_context_messages, load_memory_embeddings_for_paths, open_sqlite_connection,
-    replace_context_messages, run_migrations, save_memory_operation_tracker, upsert_memory_embedding,
-    search_active_memories, load_messages_by_ids,
+    get_or_create_memory_operation_tracker, list_all_active_memories, load_context_messages,
+    load_memory_embeddings_for_paths, load_messages_by_ids, open_sqlite_connection,
+    replace_context_messages, run_migrations, save_memory_operation_tracker,
+    search_active_memories, upsert_memory_embedding,
 };
 use elroy_llm::{
     ConversationMessage, EmbeddingProviderConfig, LiveEmbeddingClient, LiveModelClient,
     MessageRole, ProviderConfig, StreamEvent, ToolCall,
 };
-use elroy_core::memory_store::{archive_memory_file, create_memory_file_with_frontmatter, read_memory_parts};
 use elroy_user::effective_persona;
 use serde_json::Value;
 
@@ -205,8 +207,9 @@ pub fn sync_due_item_context_after_mutation(
         .collect::<Vec<_>>();
 
     if let Some(current_name) = current_name
-        && let Some(due_item) = elroy_db::find_active_agenda_item_by_name(&connection, current_name)?
-            .filter(|item| item.trigger_datetime.is_some() || item.trigger_context.is_some())
+        && let Some(due_item) =
+            elroy_db::find_active_agenda_item_by_name(&connection, current_name)?
+                .filter(|item| item.trigger_datetime.is_some() || item.trigger_context.is_some())
         && !transcript_contains_context_due_item(&updated_transcript, &due_item.name)
     {
         updated_transcript.extend(context_due_item_tool_messages(&due_item));
@@ -336,7 +339,7 @@ pub fn format_memory_listing(memories: &[MemoryRecord]) -> String {
     for memory in memories.iter().rev() {
         lines.push(format!(
             "- {} | Text: {}",
-            memory.name,
+            memory.name.replace('_', " "),
             excerpt(&memory.body, 180)
         ));
     }
@@ -384,32 +387,47 @@ pub fn get_source_content_for_memory_from_config(
     let memory = find_active_memory_by_name_in_scope(&connection, name, &config.memory_dir)?
         .ok_or_else(|| anyhow::anyhow!("Memory '{name}' not found for the current user."))?;
 
-    let (frontmatter, body) = read_memory_parts(Path::new(&memory.file_path))?;
+    let (frontmatter, _body) = read_memory_parts(Path::new(&memory.file_path))?;
     let sources = get_source_list_from_frontmatter(frontmatter.as_deref());
 
     if sources.is_empty() {
-        return Ok(format!("No sources found for memory '{}'", name.to_lowercase()));
+        return Ok(format!(
+            "No sources found for memory '{}'",
+            name.to_lowercase()
+        ));
     }
 
     if index >= sources.len() {
-        anyhow::bail!("Index {index} out of range. Available indices: {:?}", (0..sources.len()).collect::<Vec<_>>());
+        anyhow::bail!(
+            "Index {index} out of range. Available indices: {:?}",
+            (0..sources.len()).collect::<Vec<_>>()
+        );
     }
 
     let source = &sources[index];
     match source.source_type {
         MemorySourceType::ContextMessageSet => {
-            let messages = load_messages_by_ids(&mut connection, &source.message_ids)?;
+            let messages = load_messages_by_ids(&connection, &source.message_ids)?;
             Ok(format_context_message_source_content(&messages))
         }
         MemorySourceType::Memory => {
-            let source_path = source.path.as_deref().ok_or_else(|| anyhow::anyhow!("missing path for memory source"))?;
-            let source_body = if let Ok(content) = std::fs::read_to_string(source_path) {
+            let source_path = source
+                .path
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("missing path for memory source"))?;
+            let source_body = if let Ok(_content) = std::fs::read_to_string(source_path) {
                 let (_, body) = read_memory_parts(Path::new(source_path))?;
                 body
             } else {
-                format!("Error: Unable to read source memory file for '{}'", source.name)
+                format!(
+                    "Error: Unable to read source memory file for '{}'",
+                    source.name
+                )
             };
-            Ok(format_memory_file_source_content(&source.name, &source_body))
+            Ok(format_memory_file_source_content(
+                &source.name,
+                &source_body,
+            ))
         }
     }
 }
@@ -706,7 +724,10 @@ pub fn transcript_contains_context_due_item(
         .any(|message| message_matches_tool_call_id(message, &tool_call_id))
 }
 
-pub fn transcript_contains_context_task(transcript: &[ConversationMessage], task_name: &str) -> bool {
+pub fn transcript_contains_context_task(
+    transcript: &[ConversationMessage],
+    task_name: &str,
+) -> bool {
     let tool_call_id = context_task_tool_call_id(task_name);
     transcript
         .iter()
@@ -1328,7 +1349,7 @@ fn embedding_rank_candidates<'a, T>(
                 }
                 Some(embedding)
             })?;
-            let distance = l2_distance(&query_embedding, &embedding)?;
+            let distance = l2_distance(query_embedding, &embedding)?;
             if let Some(distance_threshold) = selection_clients.embedding_distance_threshold
                 && distance > distance_threshold
             {
@@ -1461,12 +1482,8 @@ pub fn select_relevant_recall_due_items<'a>(
         selection_clients.relevance_model,
         selection_clients.embedding_client,
     );
-    let overlap_candidates = select_due_items_by_overlap(
-        query,
-        due_items,
-        candidate_limit,
-        selection_clients.now_iso,
-    );
+    let overlap_candidates =
+        select_due_items_by_overlap(query, due_items, candidate_limit, selection_clients.now_iso);
     let candidates = if selection_clients.relevance_model.is_some() {
         let mut merged_candidates = overlap_candidates;
         for candidate in embedding_rank_candidates(
@@ -1851,7 +1868,11 @@ pub fn determine_memory_recall_decision(
     }
 }
 
-pub fn build_recall_query(prompt: &str, transcript: &[ConversationMessage], window: usize) -> String {
+pub fn build_recall_query(
+    prompt: &str,
+    transcript: &[ConversationMessage],
+    window: usize,
+) -> String {
     let mut parts = recent_recall_context(transcript, window);
     parts.push(prompt.trim().to_string());
     parts.retain(|part| !part.is_empty());
@@ -2400,7 +2421,9 @@ pub fn list_all_active_memories_in_scope(
     connection: &rusqlite::Connection,
     memory_dir: &Path,
 ) -> rusqlite::Result<Vec<MemoryRecord>> {
-    let memory_dir = memory_dir.canonicalize().unwrap_or_else(|_| memory_dir.to_path_buf());
+    let memory_dir = memory_dir
+        .canonicalize()
+        .unwrap_or_else(|_| memory_dir.to_path_buf());
     Ok(list_all_active_memories(connection)?
         .into_iter()
         .filter(|memory| {
@@ -2478,8 +2501,7 @@ pub fn create_consolidated_memories_from_records(
         .map_err(|error| std::io::Error::other(error.to_string()))?;
     let mut connection = open_sqlite_connection(&bootstrap_plan.database_path)
         .map_err(|e| std::io::Error::other(e.to_string()))?;
-    run_migrations(&mut connection)
-        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    run_migrations(&mut connection).map_err(|e| std::io::Error::other(e.to_string()))?;
     remove_context_memory_messages_by_names(
         &mut connection,
         &source_memories
@@ -2551,8 +2573,7 @@ pub fn run_auto_memory_if_needed(
         &text,
         &persisted_context_messages,
     )?;
-    elroy_db::bootstrap_database(bootstrap_plan)
-        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    elroy_db::bootstrap_database(bootstrap_plan).map_err(|error| anyhow::anyhow!("{error}"))?;
     *connection = open_sqlite_connection(&bootstrap_plan.database_path)?;
     record_memory_creation_and_maybe_consolidate(
         connection,
@@ -2686,7 +2707,10 @@ pub fn consolidate_semantic_memory_clusters(
         settings.max_memory_cluster_size,
     );
 
-    for cluster in clusters.into_iter().take(MEMORY_CONSOLIDATION_CLUSTER_LIMIT) {
+    for cluster in clusters
+        .into_iter()
+        .take(MEMORY_CONSOLIDATION_CLUSTER_LIMIT)
+    {
         let cluster_memories = cluster
             .into_iter()
             .filter_map(|index| memories.get(index).cloned())
@@ -2723,15 +2747,16 @@ pub fn update_outdated_or_incorrect_memory_from_config(
     if let Err(error) = run_migrations(&mut connection) {
         return ToolExecutionResult::error(format!("failed to run migrations: {error}"));
     }
-    let memory = match find_active_memory_by_name_in_scope(&connection, memory_name, &config.memory_dir) {
-        Ok(Some(memory)) => memory,
-        Ok(None) => {
-            return ToolExecutionResult::success(format!("Memory '{memory_name}' not found"));
-        }
-        Err(error) => {
-            return ToolExecutionResult::error(format!("database query failed: {error}"));
-        }
-    };
+    let memory =
+        match find_active_memory_by_name_in_scope(&connection, memory_name, &config.memory_dir) {
+            Ok(Some(memory)) => memory,
+            Ok(None) => {
+                return ToolExecutionResult::success(format!("Memory '{memory_name}' not found"));
+            }
+            Err(error) => {
+                return ToolExecutionResult::error(format!("database query failed: {error}"));
+            }
+        };
     let path = Path::new(&memory.file_path);
     let existing = match read_memory_parts(path) {
         Ok((_, body)) => body,
@@ -2761,12 +2786,16 @@ pub fn update_outdated_or_incorrect_memory_from_config(
                 frontmatter.as_deref(),
             ) {
                 Ok(_) => {
-                    if let Err(error) = elroy_db::bootstrap_database(&BootstrapPlan::from_config(config)) {
+                    if let Err(error) =
+                        elroy_db::bootstrap_database(&BootstrapPlan::from_config(config))
+                    {
                         return ToolExecutionResult::error(format!(
                             "failed to rebuild derived state: {error}"
                         ));
                     }
-                    if let Err(error) = sync_memory_context_after_mutation(config, memory_name, Some(memory_name)) {
+                    if let Err(error) =
+                        sync_memory_context_after_mutation(config, memory_name, Some(memory_name))
+                    {
                         return ToolExecutionResult::error(format!(
                             "failed to sync context: {error}"
                         ));
@@ -2776,7 +2805,9 @@ pub fn update_outdated_or_incorrect_memory_from_config(
                         memory_name
                     ))
                 }
-                Err(error) => ToolExecutionResult::error(format!("failed to create updated memory file: {error}")),
+                Err(error) => ToolExecutionResult::error(format!(
+                    "failed to create updated memory file: {error}"
+                )),
             }
         }
         Err(error) => ToolExecutionResult::error(format!("failed to archive old memory: {error}")),
@@ -2802,10 +2833,13 @@ pub fn search_memories_from_config(
     let provider_config = fast_provider_config_from_app_config(config).ok();
     let embedding_provider_config = embedding_provider_config_from_app_config(config).ok();
 
-    let relevance_model = best_effort_provider_model(provider_config.as_ref(), &config.assistant_name);
+    let relevance_model =
+        best_effort_provider_model(provider_config.as_ref(), &config.assistant_name);
     let embedding_client = best_effort_embedding_client(embedding_provider_config.as_ref());
 
-    let query_embedding = embedding_client.as_ref().and_then(|client| client.embed(query).ok());
+    let query_embedding = embedding_client
+        .as_ref()
+        .and_then(|client| client.embed(query).ok());
 
     let selection_clients = RecallSelectionClients {
         limit,
@@ -2820,22 +2854,30 @@ pub fn search_memories_from_config(
 
     let source_fetch_limit = semantic_recall_source_fetch_limit(
         limit * 3,
-        relevance_model.as_ref().map(|model| model as &dyn ModelClient),
+        relevance_model
+            .as_ref()
+            .map(|model| model as &dyn ModelClient),
         embedding_client.as_ref(),
     );
 
     let memories = if semantic_recall_enabled(
-        relevance_model.as_ref().map(|model| model as &dyn ModelClient),
+        relevance_model
+            .as_ref()
+            .map(|model| model as &dyn ModelClient),
         embedding_client.as_ref(),
     ) {
         match list_all_active_memories_in_scope(&connection, &config.memory_dir) {
             Ok(memories) => memories,
-            Err(error) => return ToolExecutionResult::error(format!("database query failed: {error}")),
+            Err(error) => {
+                return ToolExecutionResult::error(format!("database query failed: {error}"));
+            }
         }
     } else {
         match search_active_memories_in_scope(&connection, &config.memory_dir, query, 10_000) {
             Ok(memories) => memories,
-            Err(error) => return ToolExecutionResult::error(format!("database query failed: {error}")),
+            Err(error) => {
+                return ToolExecutionResult::error(format!("database query failed: {error}"));
+            }
         }
     };
 
@@ -2843,27 +2885,19 @@ pub fn search_memories_from_config(
         Ok(items) => items,
         Err(error) => return ToolExecutionResult::error(format!("database query failed: {error}")),
     };
-    let agenda_items = match elroy_db::list_active_plain_agenda_items(&connection, source_fetch_limit) {
-        Ok(items) => items,
-        Err(error) => return ToolExecutionResult::error(format!("database query failed: {error}")),
-    };
+    let agenda_items =
+        match elroy_db::list_active_plain_agenda_items(&connection, source_fetch_limit) {
+            Ok(items) => items,
+            Err(error) => {
+                return ToolExecutionResult::error(format!("database query failed: {error}"));
+            }
+        };
 
-    let relevant_memories = select_relevant_recall_memories(
-        query,
-        &memories,
-        &[],
-        selection_clients,
-    );
-    let relevant_due_items = select_relevant_recall_due_items(
-        query,
-        &due_items,
-        selection_clients,
-    );
-    let relevant_agenda_items = select_relevant_recall_agenda_items(
-        query,
-        &agenda_items,
-        selection_clients,
-    );
+    let relevant_memories =
+        select_relevant_recall_memories(query, &memories, &[], selection_clients);
+    let relevant_due_items = select_relevant_recall_due_items(query, &due_items, selection_clients);
+    let relevant_agenda_items =
+        select_relevant_recall_agenda_items(query, &agenda_items, selection_clients);
 
     ToolExecutionResult::success(format_memory_search_results(
         &relevant_memories,
@@ -2882,10 +2916,7 @@ pub fn format_due_item_examination(item: &elroy_db::AgendaItemRecord) -> String 
     text
 }
 
-pub fn examine_memories_from_config(
-    config: &AppConfig,
-    question: &str,
-) -> ToolExecutionResult {
+pub fn examine_memories_from_config(config: &AppConfig, question: &str) -> ToolExecutionResult {
     let mut connection = match open_sqlite_connection(&config.database_path) {
         Ok(connection) => connection,
         Err(error) => {
@@ -2899,10 +2930,13 @@ pub fn examine_memories_from_config(
     let provider_config = fast_provider_config_from_app_config(config).ok();
     let embedding_provider_config = embedding_provider_config_from_app_config(config).ok();
 
-    let relevance_model = best_effort_provider_model(provider_config.as_ref(), &config.assistant_name);
+    let relevance_model =
+        best_effort_provider_model(provider_config.as_ref(), &config.assistant_name);
     let embedding_client = best_effort_embedding_client(embedding_provider_config.as_ref());
 
-    let query_embedding = embedding_client.as_ref().and_then(|client| client.embed(question).ok());
+    let query_embedding = embedding_client
+        .as_ref()
+        .and_then(|client| client.embed(question).ok());
 
     let selection_clients = RecallSelectionClients {
         limit: 2,
@@ -2928,45 +2962,35 @@ pub fn examine_memories_from_config(
         Err(error) => return ToolExecutionResult::error(format!("database query failed: {error}")),
     };
 
-    let recalled_memories = select_relevant_recall_memories(
-        question,
-        &memories,
-        &[],
-        selection_clients,
-    );
+    let recalled_memories =
+        select_relevant_recall_memories(question, &memories, &[], selection_clients);
 
-    let recalled_due_items = select_relevant_recall_due_items(
-        question,
-        &due_items,
-        selection_clients,
-    );
+    let recalled_due_items =
+        select_relevant_recall_due_items(question, &due_items, selection_clients);
 
-    let recalled_agenda_items = select_relevant_recall_agenda_items(
-        question,
-        &agenda_items,
-        selection_clients,
-    );
+    let recalled_agenda_items =
+        select_relevant_recall_agenda_items(question, &agenda_items, selection_clients);
 
     let mut reports = Vec::new();
 
     if !recalled_memories.is_empty() {
         reports.push("### RELEVANT MEMORIES".to_string());
         for memory in recalled_memories {
-            reports.push(format_memory_examination(&memory));
+            reports.push(format_memory_examination(memory));
         }
     }
 
     if !recalled_due_items.is_empty() {
         reports.push("### RELEVANT DUE ITEMS".to_string());
         for item in recalled_due_items {
-            reports.push(format_due_item_examination(&item));
+            reports.push(format_due_item_examination(item));
         }
     }
 
     if !recalled_agenda_items.is_empty() {
         reports.push("### RELEVANT AGENDA ITEMS".to_string());
         for item in recalled_agenda_items {
-            reports.push(format_agenda_item_detail(&item));
+            reports.push(format_agenda_item_detail(item));
         }
     }
 
@@ -3249,9 +3273,7 @@ If the excerpts are about the same topic, usually return a single consolidated m
     )
 }
 
-pub fn parse_consolidated_memory_response(
-    response: &str,
-) -> Option<Vec<ConsolidatedMemoryOutput>> {
+pub fn parse_consolidated_memory_response(response: &str) -> Option<Vec<ConsolidatedMemoryOutput>> {
     let normalized = strip_outer_code_fence(response.trim());
     if let Some(outputs) = parse_markdown_consolidated_memory_response(&normalized) {
         return Some(outputs);

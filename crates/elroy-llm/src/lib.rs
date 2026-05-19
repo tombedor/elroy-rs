@@ -1364,8 +1364,14 @@ mod tests {
         assert_eq!(request["max_output_tokens"], 1024);
         assert_eq!(request["tools"][0]["type"], "function");
         assert_eq!(request["tools"][0]["name"], "get_weather");
-        assert!(request["tools"][0]["function"].is_null(), "responses API uses flat format, not wrapped");
-        assert!(request["tools"][0]["strict"].is_null(), "responses API omits strict to allow optional params");
+        assert!(
+            request["tools"][0]["function"].is_null(),
+            "responses API uses flat format, not wrapped"
+        );
+        assert!(
+            request["tools"][0]["strict"].is_null(),
+            "responses API omits strict to allow optional params"
+        );
     }
 
     #[test]

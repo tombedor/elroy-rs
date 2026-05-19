@@ -376,7 +376,10 @@ impl ConversationOrchestrator {
             }
 
             if !assistant_response_buffer.is_empty() {
-                transcript.push(ConversationMessage::new(MessageRole::Assistant, &assistant_response_buffer));
+                transcript.push(ConversationMessage::new(
+                    MessageRole::Assistant,
+                    &assistant_response_buffer,
+                ));
             }
 
             if !saw_tool_call {
@@ -423,7 +426,8 @@ impl TurnEventStream {
     fn flush_response_buffer(&mut self) {
         if !self.current_response_buffer.is_empty() {
             let content = std::mem::take(&mut self.current_response_buffer);
-            self.transcript.push(ConversationMessage::new(MessageRole::Assistant, &content));
+            self.transcript
+                .push(ConversationMessage::new(MessageRole::Assistant, &content));
         }
     }
 

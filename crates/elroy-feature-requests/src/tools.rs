@@ -202,7 +202,11 @@ pub fn feature_request_tools(home_dir: PathBuf) -> Vec<ExecutableTool> {
         },
     );
 
-    vec![list_feature_requests_tool, make_feature_request, edit_feature_request]
+    vec![
+        list_feature_requests_tool,
+        make_feature_request,
+        edit_feature_request,
+    ]
 }
 
 fn feature_request_listing_content(records: &[FeatureRequestRecord]) -> String {

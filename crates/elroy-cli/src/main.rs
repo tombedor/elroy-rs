@@ -667,9 +667,7 @@ impl TuiPromptStream for BackgroundCliPromptStream {
                 Ok(None)
             }
             Err(mpsc::TryRecvError::Empty) => Ok(Some(PromptUpdate::Idle)),
-            Err(mpsc::TryRecvError::Disconnected) => {
-                Err("prompt stream disconnected".to_string())
-            }
+            Err(mpsc::TryRecvError::Disconnected) => Err("prompt stream disconnected".to_string()),
         }
     }
 
@@ -686,7 +684,7 @@ impl TuiPromptStream for BackgroundCliPromptStream {
                 }
             },
         };
-        let completion = completion.map_err(|e| e)?;
+        let completion = completion?;
         if let Some(work) = completion.deferred_auto_memory {
             self.deferred_auto_memory_queue
                 .lock()
@@ -698,12 +696,12 @@ impl TuiPromptStream for BackgroundCliPromptStream {
 
     fn cancel(self: Box<Self>) -> Result<elroy_tui::TuiSnapshot, String> {
         if let Some(completion) = self.completion {
-            return completion.map(|c| c.snapshot).map_err(|e| e);
+            return completion.map(|c| c.snapshot);
         }
         loop {
             match self.receiver.recv() {
                 Ok(BackgroundStreamEvent::Done(completion)) => {
-                    return completion.map(|c| c.snapshot).map_err(|e| e);
+                    return completion.map(|c| c.snapshot);
                 }
                 Ok(BackgroundStreamEvent::Update(_)) => continue,
                 Err(_) => return Err("prompt stream disconnected before completion".to_string()),
@@ -1188,7 +1186,7 @@ mod tests {
                 .is_some()
         );
 
-        fs::remove_dir_all(home).expect("home should be removed");
+        let _ = fs::remove_dir_all(home);
     }
 
     #[test]
@@ -1312,7 +1310,7 @@ mod tests {
                 .is_some()
         );
 
-        fs::remove_dir_all(home).expect("home should be removed");
+        let _ = fs::remove_dir_all(home);
     }
 
     #[test]
@@ -1377,7 +1375,7 @@ mod tests {
                 .is_none()
         );
 
-        fs::remove_dir_all(home).expect("home should be removed");
+        let _ = fs::remove_dir_all(home);
     }
 
     #[test]
@@ -1492,7 +1490,7 @@ mod tests {
                 .is_some()
         );
 
-        fs::remove_dir_all(home).expect("home should be removed");
+        let _ = fs::remove_dir_all(home);
     }
 
     #[test]
@@ -1569,7 +1567,7 @@ mod tests {
             None
         );
 
-        fs::remove_dir_all(home).expect("home should be removed");
+        let _ = fs::remove_dir_all(home);
     }
 
     #[test]
@@ -1646,7 +1644,7 @@ mod tests {
             None
         );
 
-        fs::remove_dir_all(home).expect("home should be removed");
+        let _ = fs::remove_dir_all(home);
     }
 
     #[test]
@@ -1709,7 +1707,7 @@ mod tests {
             Some("Restarted successfully. Ready to continue.")
         );
 
-        fs::remove_dir_all(home).expect("home should be removed");
+        let _ = fs::remove_dir_all(home);
     }
 
     #[test]
@@ -1836,7 +1834,7 @@ mod tests {
         let memories = elroy_db::list_active_memories(&reopened, 10).expect("memories should list");
         assert_eq!(memories.len(), 1);
 
-        fs::remove_dir_all(home).expect("home should be removed");
+        let _ = fs::remove_dir_all(home);
     }
 
     #[test]
@@ -1912,7 +1910,7 @@ mod tests {
                 .contains("Improve response handling after direct user corrections")
         );
 
-        fs::remove_dir_all(home).expect("home should be removed");
+        let _ = fs::remove_dir_all(home);
     }
 
     #[test]

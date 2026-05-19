@@ -7,26 +7,24 @@ use elroy_agenda::{
     add_checklist_item, append_agenda_update, create_agenda_file, mark_agenda_item_completed,
     rename_agenda_file, update_agenda_body, update_checklist_item,
 };
+use elroy_codex::tools::codex_tools;
 use elroy_codex::{
-    CodexSessionResult, dispatch_codex_session_with_bin, dispatch_codex_session_with_hook,
-    get_codex_session_by_thread_id, list_recent_codex_sessions, resume_codex_session_with_bin,
-    resume_codex_session_with_hook,
+    CodexSessionResult, get_codex_session_by_thread_id, list_recent_codex_sessions,
 };
-use elroy_codex::tools::{codex_background_status_key, codex_tools};
 use elroy_config::{
     AppConfig, LlmProvider, embedding_provider_config_from_app_config,
     fast_provider_config_from_app_config, provider_config_from_app_config,
 };
+use elroy_core::memory_store::sanitize_filename;
 use elroy_core::{
-    ConversationOrchestrator, LiveProviderModel, LocalToolExecutor,
-    ModelClient, StreamingModelClient, TurnEventStream, clear_background_status,
-    get_background_status, set_background_status, excerpt,
+    ConversationOrchestrator, LiveProviderModel, LocalToolExecutor, ModelClient,
+    StreamingModelClient, TurnEventStream, clear_background_status, excerpt, get_background_status,
+    set_background_status,
 };
 use elroy_db::{
-    AgendaItemRecord, BootstrapPlan, LOCAL_USER_TOKEN, MemoryRecord, SYNTHETIC_FIRST_USER_MESSAGE,
+    AgendaItemRecord, BootstrapPlan, LOCAL_USER_TOKEN, SYNTHETIC_FIRST_USER_MESSAGE,
     UserPreferenceRecord, find_active_agenda_item_by_name, list_active_due_items,
-    list_active_plain_agenda_items, list_inactive_due_items,
-    load_context_messages, load_messages_by_ids,
+    list_active_plain_agenda_items, list_inactive_due_items, load_context_messages,
     load_user_preferences, open_sqlite_connection, record_deleted_due_item_tombstone,
     replace_context_messages, run_migrations,
 };
@@ -34,30 +32,19 @@ use elroy_feature_requests::{
     FeatureRequestRecord, feature_request_tools, get_feature_request, is_active_feature_request,
     list_feature_requests, list_self_reflection_feature_requests, update_feature_request,
 };
-use elroy_llm::{
-    ConversationMessage, LiveModelClient, MessageRole, StreamEvent,
-};
-use elroy_core::memory_store::{read_memory_parts, sanitize_filename};
+use elroy_llm::{ConversationMessage, LiveModelClient, MessageRole, StreamEvent};
 use elroy_memory::tools::memory_tools;
 use elroy_recall::{
-    context_memory_tool_call_id, context_memory_tool_messages,
-    context_task_tool_call_id, context_task_tool_messages,
-    format_agenda_item_recall_detail, format_due_item_detail,
-    formulate_memory_from_transcript, list_all_active_memories_in_scope,
-    message_matches_tool_call_id, recall_due_item_context_messages,
-    recall_memory_context_messages, select_relevant_recall_agenda_items,
-    select_relevant_recall_due_items, select_relevant_recall_memories,
-    sync_due_item_context_after_mutation, sync_task_context_after_mutation,
-    best_effort_provider_model, best_effort_embedding_client,
-    semantic_recall_source_fetch_limit, semantic_recall_enabled,
-    format_memory_search_results, format_memory_examination,
-    MEMORY_SOURCE_TYPE, CONTEXT_MESSAGE_SOURCE_TYPE,
+    best_effort_embedding_client, context_memory_tool_call_id, context_memory_tool_messages,
+    format_due_item_detail, message_matches_tool_call_id, recall_due_item_context_messages,
+    semantic_recall_source_fetch_limit, sync_due_item_context_after_mutation,
+    sync_task_context_after_mutation,
 };
 use elroy_self_reflection::{SelfReflectionConfig, SelfReflectionOrchestrator};
 use elroy_tasks::{list_active_tasks, list_due_tasks, task_tools};
 use elroy_tools::{
-    ExecutableTool, ExecutableToolRegistry, JsonSchema, ToolExecutionResult, ToolRegistry, ToolSpec,
-    argument_limit,
+    ExecutableTool, ExecutableToolRegistry, JsonSchema, ToolExecutionResult, ToolRegistry,
+    ToolSpec, argument_limit,
 };
 use elroy_tui::{
     SidebarAction, SidebarSection, TuiCommandExecution, TuiCommandForm, TuiCommandPaletteAction,
@@ -1920,14 +1907,6 @@ fn codex_completion_followup_prompt(result: &CodexSessionResult) -> String {
     )
 }
 
-fn codex_background_status_message(session_id: &str) -> String {
-    format!("codex session {session_id} running...")
-}
-
-fn codex_completion_followup_status_message(session_id: &str) -> String {
-    format!("processing codex session {session_id} completion...")
-}
-
 fn restart_state() -> &'static Mutex<RestartState> {
     RESTART_STATE.get_or_init(|| Mutex::new(RestartState::default()))
 }
@@ -2736,18 +2715,6 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
             }
         },
     );
-
-    let mut task_tools_iter = task_tools(config.clone()).into_iter();
-    let create_task = task_tools_iter.next().expect("task_tools[0]");
-    let update_task_text = task_tools_iter.next().expect("task_tools[1]");
-    let rename_task = task_tools_iter.next().expect("task_tools[2]");
-    let complete_task = task_tools_iter.next().expect("task_tools[3]");
-    let delete_task = task_tools_iter.next().expect("task_tools[4]");
-    let list_tasks = task_tools_iter.next().expect("task_tools[5]");
-    let list_triggered_tasks_tool = task_tools_iter.next().expect("task_tools[6]");
-    let list_due_tasks_tool = task_tools_iter.next().expect("task_tools[7]");
-    let list_today_tasks_tool = task_tools_iter.next().expect("task_tools[8]");
-    let show_task = task_tools_iter.next().expect("task_tools[9]");
 
     let config_for_due_item_write = config.clone();
     let create_due_item = ExecutableTool::new(
@@ -3722,283 +3689,6 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
         },
     );
 
-    let mut user_tools_iter = user_tools(
-        config.clone(),
-        std::sync::Arc::new(|conn, cfg| refresh_persisted_system_instructions(conn, cfg)),
-    )
-    .into_iter();
-    let set_assistant_name = user_tools_iter.next().expect("user_tools[0]");
-    let set_persona = user_tools_iter.next().expect("user_tools[1]");
-    let reset_system_persona = user_tools_iter.next().expect("user_tools[2]");
-    let set_user_preferred_name = user_tools_iter.next().expect("user_tools[3]");
-    let get_user_preferred_name = user_tools_iter.next().expect("user_tools[4]");
-    let set_user_full_name = user_tools_iter.next().expect("user_tools[5]");
-    let get_user_full_name = user_tools_iter.next().expect("user_tools[6]");
-
-    let database_path = config.database_path.clone();
-    let codex_bin_for_dispatch = codex_bin_override.clone();
-    let codex_completion_hook_for_dispatch = codex_completion_hook.clone();
-    let dispatch_codex_session = ExecutableTool::new(
-        ToolSpec::new(
-            "dispatch_codex_session",
-            "Launch a background Codex session against a repository and persist its running state.",
-            JsonSchema::object(
-                [
-                    ("prompt", json!({"type": "string"})),
-                    ("repo_path", json!({"type": "string"})),
-                    ("model", json!({"type": "string"})),
-                ],
-                ["prompt"],
-            ),
-        ),
-        move |arguments| {
-            let Some(prompt) = arguments.get("prompt").and_then(Value::as_str) else {
-                return ToolExecutionResult::error(
-                    "dispatch_codex_session requires a string prompt",
-                );
-            };
-            let repo_path = arguments.get("repo_path").and_then(Value::as_str);
-            let model = arguments.get("model").and_then(Value::as_str);
-            let mut connection = match open_sqlite_connection(&database_path) {
-                Ok(connection) => connection,
-                Err(error) => {
-                    return ToolExecutionResult::error(format!("failed to open database: {error}"));
-                }
-            };
-            if let Err(error) = run_migrations(&mut connection) {
-                return ToolExecutionResult::error(format!("failed to run migrations: {error}"));
-            }
-            drop(connection);
-
-            let completion_hook = {
-                let upstream_hook = codex_completion_hook_for_dispatch.clone();
-                Arc::new(move |result: CodexSessionResult| {
-                    set_background_status(
-                        codex_background_status_key(&result.session_id),
-                        codex_completion_followup_status_message(&result.session_id),
-                    );
-                    upstream_hook(result.clone());
-                    clear_background_status(&codex_background_status_key(&result.session_id));
-                })
-            };
-
-            let result = if let Some(codex_bin) = codex_bin_for_dispatch.as_deref() {
-                dispatch_codex_session_with_bin(
-                    &database_path,
-                    LOCAL_USER_TOKEN,
-                    prompt,
-                    repo_path.map(Path::new),
-                    model,
-                    codex_bin,
-                    Some(completion_hook),
-                )
-            } else {
-                dispatch_codex_session_with_hook(
-                    &database_path,
-                    LOCAL_USER_TOKEN,
-                    prompt,
-                    repo_path.map(Path::new),
-                    model,
-                    Some(completion_hook),
-                )
-            };
-            match result {
-                Ok(result) => {
-                    set_background_status(
-                        codex_background_status_key(&result.session_id),
-                        codex_background_status_message(&result.session_id),
-                    );
-                    ToolExecutionResult::success(codex_session_result_payload(result))
-                }
-                Err(error) => ToolExecutionResult::error(error.to_string()),
-            }
-        },
-    );
-
-    let database_path = config.database_path.clone();
-    let codex_bin_for_resume = codex_bin_override.clone();
-    let codex_completion_hook_for_resume = codex_completion_hook.clone();
-    let resume_codex_session = ExecutableTool::new(
-        ToolSpec::new(
-            "resume_codex_session",
-            "Resume a previously recorded Codex session and persist its running state.",
-            JsonSchema::object(
-                [
-                    ("session_id", json!({"type": "string"})),
-                    ("prompt", json!({"type": "string"})),
-                    ("model", json!({"type": "string"})),
-                ],
-                ["session_id", "prompt"],
-            ),
-        ),
-        move |arguments| {
-            let Some(session_id) = arguments.get("session_id").and_then(Value::as_str) else {
-                return ToolExecutionResult::error(
-                    "resume_codex_session requires a string session_id",
-                );
-            };
-            let Some(prompt) = arguments.get("prompt").and_then(Value::as_str) else {
-                return ToolExecutionResult::error("resume_codex_session requires a string prompt");
-            };
-            let model = arguments.get("model").and_then(Value::as_str);
-            let mut connection = match open_sqlite_connection(&database_path) {
-                Ok(connection) => connection,
-                Err(error) => {
-                    return ToolExecutionResult::error(format!("failed to open database: {error}"));
-                }
-            };
-            if let Err(error) = run_migrations(&mut connection) {
-                return ToolExecutionResult::error(format!("failed to run migrations: {error}"));
-            }
-            drop(connection);
-
-            let completion_hook = {
-                let upstream_hook = codex_completion_hook_for_resume.clone();
-                Arc::new(move |result: CodexSessionResult| {
-                    set_background_status(
-                        codex_background_status_key(&result.session_id),
-                        codex_completion_followup_status_message(&result.session_id),
-                    );
-                    upstream_hook(result.clone());
-                    clear_background_status(&codex_background_status_key(&result.session_id));
-                })
-            };
-
-            let result = if let Some(codex_bin) = codex_bin_for_resume.as_deref() {
-                resume_codex_session_with_bin(
-                    &database_path,
-                    LOCAL_USER_TOKEN,
-                    session_id,
-                    prompt,
-                    model,
-                    codex_bin,
-                    Some(completion_hook),
-                )
-            } else {
-                resume_codex_session_with_hook(
-                    &database_path,
-                    LOCAL_USER_TOKEN,
-                    session_id,
-                    prompt,
-                    model,
-                    Some(completion_hook),
-                )
-            };
-            match result {
-                Ok(result) => {
-                    set_background_status(
-                        codex_background_status_key(&result.session_id),
-                        codex_background_status_message(&result.session_id),
-                    );
-                    ToolExecutionResult::success(codex_session_result_payload(result))
-                }
-                Err(error) => ToolExecutionResult::error(error.to_string()),
-            }
-        },
-    );
-
-    let database_path = config.database_path.clone();
-    let list_codex_sessions = ExecutableTool::new(
-        ToolSpec::new(
-            "list_codex_sessions",
-            "List recently recorded Codex sessions for this local user.",
-            JsonSchema::object(
-                [
-                    ("repo_path", json!({"type": "string"})),
-                    ("limit", json!({"type": "integer"})),
-                ],
-                [] as [&str; 0],
-            ),
-        ),
-        move |arguments| {
-            let limit = argument_limit(&arguments, 5);
-            let repo_path = arguments.get("repo_path").and_then(Value::as_str);
-            with_tool_connection(&database_path, |connection| {
-                let sessions = list_recent_codex_sessions(
-                    connection,
-                    LOCAL_USER_TOKEN,
-                    repo_path.map(Path::new),
-                    limit,
-                )?;
-                let payload = sessions
-                    .into_iter()
-                    .map(|session| {
-                        json!({
-                            "session_id": session.thread_id,
-                            "repo_path": session.repo_path,
-                            "worktree_path": session.worktree_path,
-                            "session_branch": session.session_branch,
-                            "target_branch": session.target_branch,
-                            "status": session.status,
-                            "updated_at_unix": session.updated_at_unix,
-                            "summary": session.latest_summary,
-                            "final_message": session.latest_agent_message,
-                            "touched_paths": session.touched_paths,
-                        })
-                    })
-                    .collect::<Vec<_>>();
-                Ok(ToolExecutionResult::success(
-                    serde_json::to_string_pretty(&payload)
-                        .expect("codex session payload should serialize"),
-                ))
-            })
-        },
-    );
-
-    let database_path = config.database_path.clone();
-    let show_codex_session = ExecutableTool::new(
-        ToolSpec::new(
-            "show_codex_session",
-            "Show one recorded Codex session by exact session id.",
-            JsonSchema::object([("session_id", json!({"type": "string"}))], ["session_id"]),
-        ),
-        move |arguments| {
-            let Some(session_id) = arguments.get("session_id").and_then(Value::as_str) else {
-                return ToolExecutionResult::error(
-                    "show_codex_session requires a string session_id",
-                );
-            };
-            with_tool_connection(&database_path, |connection| {
-                let Some(session) =
-                    get_codex_session_by_thread_id(connection, LOCAL_USER_TOKEN, session_id)?
-                else {
-                    return Ok(ToolExecutionResult::error(format!(
-                        "codex session not found: {session_id}"
-                    )));
-                };
-                Ok(ToolExecutionResult::success(
-                    json!({
-                        "session_id": session.thread_id,
-                        "repo_path": session.repo_path,
-                        "worktree_path": session.worktree_path,
-                        "session_branch": session.session_branch,
-                        "target_branch": session.target_branch,
-                        "latest_prompt": session.latest_prompt,
-                        "summary": session.latest_summary,
-                        "final_message": session.latest_agent_message,
-                        "status": session.status,
-                        "command_count": session.command_count,
-                        "commands": session.commands.into_iter().map(|command| {
-                            json!({
-                                "command": command.command,
-                                "exit_code": command.exit_code,
-                                "output_excerpt": command.output_excerpt,
-                            })
-                        }).collect::<Vec<_>>(),
-                        "touched_paths": session.touched_paths,
-                        "dirty_paths_before": session.dirty_paths_before,
-                        "dirty_paths_after": session.dirty_paths_after,
-                        "session_file_path": session.session_file_path,
-                        "updated_at_unix": session.updated_at_unix,
-                    })
-                    .to_string(),
-                ))
-            })
-        },
-    );
-
-    let database_path = config.database_path.clone();
-
     let database_path = config.database_path.clone();
     let list_agenda = ExecutableTool::new(
         ToolSpec::new(
@@ -4338,35 +4028,23 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
     tools.extend(memory_tools(config));
     tools.extend(codex_tools(
         config.clone(),
-        codex_bin,
+        codex_bin_override,
         codex_completion_hook.clone(),
     ));
-    tools.extend(user_tools(config));
+    tools.extend(user_tools(
+        config.clone(),
+        std::sync::Arc::new(refresh_persisted_system_instructions),
+    ));
+    tools.extend(task_tools(config.clone()));
     tools.extend(vec![
         add_agenda_item,
-        create_task,
         create_due_item,
         list_feature_requests_tool,
         make_feature_request,
         edit_feature_request,
-        set_assistant_name,
-        set_persona,
-        reset_system_persona,
-        set_user_preferred_name,
-        get_user_preferred_name,
-        set_user_full_name,
-        get_user_full_name,
-        dispatch_codex_session,
-        resume_codex_session,
-        list_codex_sessions,
-        show_codex_session,
-        update_task_text,
         update_due_item_text,
-        rename_task,
         rename_due_item,
-        complete_task,
         complete_due_item,
-        delete_task,
         delete_due_item,
         add_agenda_item_update,
         complete_agenda_item,
@@ -4380,10 +4058,6 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
         clear_context_messages,
         reset_messages,
         refresh_system_instructions,
-        list_tasks,
-        list_triggered_tasks_tool,
-        list_due_tasks_tool,
-        list_today_tasks_tool,
         list_agenda,
         list_agenda_items,
         list_agenda_items_cmd,
@@ -4391,7 +4065,6 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
         print_active_due_items,
         list_inactive_due_items_tool,
         print_inactive_due_items,
-        show_task,
         show_due_item,
         print_due_item,
         show_agenda_item,
@@ -4634,33 +4307,6 @@ fn format_codex_session_title(session: &elroy_codex::CodexSessionRecord) -> Stri
     format!("{repo_name} ({}) {}", session.status, session.thread_id)
 }
 
-fn codex_session_result_payload(result: CodexSessionResult) -> String {
-    json!({
-        "session_id": result.session_id,
-        "repo_path": result.repo_path,
-        "worktree_path": result.worktree_path,
-        "session_branch": result.session_branch,
-        "target_branch": result.target_branch,
-        "status": result.status,
-        "final_message": result.final_message,
-        "summary": result.summary,
-        "touched_paths": result.touched_paths,
-        "dirty_paths_before": result.dirty_paths_before,
-        "dirty_paths_after": result.dirty_paths_after,
-        "commands": result.commands.into_iter().map(|command| {
-            json!({
-                "command": command.command,
-                "exit_code": command.exit_code,
-                "output_excerpt": command.output_excerpt,
-            })
-        }).collect::<Vec<_>>(),
-        "session_file_path": result.session_file_path,
-        "resume_command": result.resume_command,
-        "running_in_background": result.running_in_background,
-    })
-    .to_string()
-}
-
 fn remove_context_tool_messages_by_id(
     config: &AppConfig,
     tool_call_id: &str,
@@ -4695,12 +4341,13 @@ mod tests {
         time::{Duration, Instant},
     };
 
+    use elroy_codex::tools::codex_background_status_key;
     use super::{
         AppRuntime, LOCAL_USER_TOKEN, MessageProcessOptions, PromptExecutionOptions,
         RecallModelClients, RecallSelectionClients, SYNTHETIC_FIRST_USER_MESSAGE, argument_limit,
         best_effort_embedding_client, build_live_tool_registry,
         build_live_tool_registry_with_codex_bin_and_hook, build_recall_query,
-        classify_memory_recall_with_model, codex_background_status_key, compress_context_messages,
+        classify_memory_recall_with_model, compress_context_messages,
         consolidate_exact_duplicate_memories, context_due_item_tool_call_id,
         context_due_item_tool_messages, context_memory_tool_messages, context_task_tool_messages,
         count_context_tokens, determine_memory_recall_decision, drop_old_context_messages,
@@ -16008,7 +15655,7 @@ User still wants to compare grocery prices after the shopping trip.",
         let fast_mock = fast_server
             .mock("POST", "/responses")
             .match_header("authorization", "Bearer fast-test-key")
-            .expect(4)
+            .expect(1)
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(
@@ -16031,8 +15678,7 @@ User still wants to compare grocery prices after the shopping trip.",
             .match_header("x-api-key", "anthropic-test-key")
             .match_header("anthropic-version", "2023-06-01")
             .match_body(mockito::Matcher::Regex(
-                "I remember that the user should bring the resistance bands to practice\\."
-                    .to_string(),
+                "What was that library you mentioned?".to_string(),
             ))
             .with_status(200)
             .with_header("content-type", "application/json")
@@ -17544,7 +17190,7 @@ User still wants to compare grocery prices after the shopping trip.",
         let fast_mock = fast_server
             .mock("POST", "/responses")
             .match_header("authorization", "Bearer fast-test-key")
-            .expect(4)
+            .expect(1)
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(
@@ -17595,6 +17241,7 @@ User still wants to compare grocery prices after the shopping trip.",
         config.fast_model_api_key = Some("fast-test-key".to_string());
         config.fast_model_api_base = Some(format!("{}/responses", fast_server.url()));
         config.memory_recall_classifier_enabled = false;
+        config.reflect = false;
         elroy_db::bootstrap_database(&BootstrapPlan::from_config(&config))
             .expect("bootstrap should succeed");
 
@@ -17734,6 +17381,7 @@ User still wants to compare grocery prices after the shopping trip.",
         config.fast_model_api_key = Some("fast-test-key".to_string());
         config.fast_model_api_base = Some(format!("{}/responses", fast_server.url()));
         config.memory_recall_classifier_enabled = false;
+        config.reflect = false;
         elroy_db::bootstrap_database(&BootstrapPlan::from_config(&config))
             .expect("bootstrap should succeed");
 
@@ -17873,6 +17521,7 @@ User still wants to compare grocery prices after the shopping trip.",
         config.fast_model_api_key = Some("fast-test-key".to_string());
         config.fast_model_api_base = Some(format!("{}/responses", fast_server.url()));
         config.memory_recall_classifier_enabled = false;
+        config.reflect = false;
         elroy_db::bootstrap_database(&BootstrapPlan::from_config(&config))
             .expect("bootstrap should succeed");
 
@@ -18957,6 +18606,7 @@ User still wants to compare grocery prices after the shopping trip.",
         config.fast_model_api_key = Some("fast-test-key".to_string());
         config.fast_model_api_base = Some(format!("{}/responses", fast_server.url()));
         config.memory_recall_classifier_enabled = false;
+        config.reflect = false;
         elroy_db::bootstrap_database(&BootstrapPlan::from_config(&config))
             .expect("bootstrap should succeed");
 
@@ -21779,10 +21429,9 @@ User still wants to compare grocery prices after the shopping trip.",
                 embedding_distance_threshold: None,
                 recency_weight: 0.0,
                 connection: None,
-            query_embedding: None,
-            now_iso: None,
-            }
-,
+                query_embedding: None,
+                now_iso: None,
+            },
             RecallContext {
                 transcript: &[],
                 memories: &[MemoryRecord {
@@ -22600,10 +22249,9 @@ User still wants to compare grocery prices after the shopping trip.",
                 embedding_distance_threshold: None,
                 recency_weight: 0.0,
                 connection: None,
-            query_embedding: None,
-            now_iso: None,
-            }
-,
+                query_embedding: None,
+                now_iso: None,
+            },
         );
         let relevant_due_items = select_relevant_recall_due_items(
             "What workout gear should I bring?",
@@ -22615,10 +22263,9 @@ User still wants to compare grocery prices after the shopping trip.",
                 embedding_distance_threshold: None,
                 recency_weight: 0.0,
                 connection: None,
-            query_embedding: None,
-            now_iso: None,
-            }
-,
+                query_embedding: None,
+                now_iso: None,
+            },
         );
         let relevant_agenda_items = select_relevant_recall_agenda_items(
             "What workout gear should I bring?",
@@ -22630,10 +22277,9 @@ User still wants to compare grocery prices after the shopping trip.",
                 embedding_distance_threshold: None,
                 recency_weight: 0.0,
                 connection: None,
-            query_embedding: None,
-            now_iso: None,
-            }
-,
+                query_embedding: None,
+                now_iso: None,
+            },
         );
 
         assert!(relevant_memories.is_empty());
@@ -22713,10 +22359,9 @@ User still wants to compare grocery prices after the shopping trip.",
                 embedding_distance_threshold: None,
                 recency_weight: 0.0,
                 connection: None,
-            query_embedding: None,
-            now_iso: None,
-            }
-,
+                query_embedding: None,
+                now_iso: None,
+            },
         );
         let relevant_due_items = select_relevant_recall_due_items(
             "What gear should I bring to practice?",
@@ -22728,10 +22373,9 @@ User still wants to compare grocery prices after the shopping trip.",
                 embedding_distance_threshold: None,
                 recency_weight: 0.0,
                 connection: None,
-            query_embedding: None,
-            now_iso: None,
-            }
-,
+                query_embedding: None,
+                now_iso: None,
+            },
         );
         let relevant_agenda_items = select_relevant_recall_agenda_items(
             "What gear should I bring to practice?",
@@ -22743,10 +22387,9 @@ User still wants to compare grocery prices after the shopping trip.",
                 embedding_distance_threshold: None,
                 recency_weight: 0.0,
                 connection: None,
-            query_embedding: None,
-            now_iso: None,
-            }
-,
+                query_embedding: None,
+                now_iso: None,
+            },
         );
 
         assert_eq!(relevant_memories.len(), 1);
@@ -22912,10 +22555,9 @@ User still wants to compare grocery prices after the shopping trip.",
                 embedding_distance_threshold: None,
                 recency_weight: 0.0,
                 connection: None,
-            query_embedding: None,
-            now_iso: None,
-            }
-,
+                query_embedding: None,
+                now_iso: None,
+            },
         );
         let relevant_due_items = select_relevant_recall_due_items(
             "What gear should I bring to practice?",
@@ -22927,10 +22569,9 @@ User still wants to compare grocery prices after the shopping trip.",
                 embedding_distance_threshold: None,
                 recency_weight: 0.0,
                 connection: None,
-            query_embedding: None,
-            now_iso: None,
-            }
-,
+                query_embedding: None,
+                now_iso: None,
+            },
         );
         let relevant_agenda_items = select_relevant_recall_agenda_items(
             "What gear should I bring to practice?",
@@ -22942,10 +22583,9 @@ User still wants to compare grocery prices after the shopping trip.",
                 embedding_distance_threshold: None,
                 recency_weight: 0.0,
                 connection: None,
-            query_embedding: None,
-            now_iso: None,
-            }
-,
+                query_embedding: None,
+                now_iso: None,
+            },
         );
 
         assert_eq!(relevant_memories.len(), 1);
@@ -23071,10 +22711,9 @@ User still wants to compare grocery prices after the shopping trip.",
                 embedding_distance_threshold: Some(0.5),
                 recency_weight: 0.0,
                 connection: None,
-            query_embedding: None,
-            now_iso: None,
-            }
-,
+                query_embedding: None,
+                now_iso: None,
+            },
         );
         let with_recency_weight = select_relevant_recall_memories(
             "What belongs in my workout kit?",
@@ -23087,10 +22726,9 @@ User still wants to compare grocery prices after the shopping trip.",
                 embedding_distance_threshold: Some(0.5),
                 recency_weight: 0.1,
                 connection: None,
-            query_embedding: None,
-            now_iso: None,
-            }
-,
+                query_embedding: None,
+                now_iso: None,
+            },
         );
 
         assert_eq!(without_recency_weight.len(), 2);

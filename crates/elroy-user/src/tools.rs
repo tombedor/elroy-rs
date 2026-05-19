@@ -9,11 +9,15 @@ use elroy_db::{
 use elroy_tools::{ExecutableTool, JsonSchema, ToolExecutionResult, ToolSpec};
 use serde_json::{Value, json};
 
-use super::{DEFAULT_USER_PREFERRED_NAME, UNKNOWN_FULL_NAME, effective_user_full_name, effective_user_preferred_name};
+use super::{
+    DEFAULT_USER_PREFERRED_NAME, UNKNOWN_FULL_NAME, effective_user_full_name,
+    effective_user_preferred_name,
+};
 
 /// Callback invoked after user preferences are saved.
 /// Receives a mutable connection and the app config; returns an error string on failure.
-pub type PostSaveCallback = Arc<dyn Fn(&mut rusqlite::Connection, &AppConfig) -> anyhow::Result<()> + Send + Sync>;
+pub type PostSaveCallback =
+    Arc<dyn Fn(&mut rusqlite::Connection, &AppConfig) -> anyhow::Result<()> + Send + Sync>;
 
 pub fn user_tools(config: AppConfig, post_save: PostSaveCallback) -> Vec<ExecutableTool> {
     let config_for_assistant_name = config.clone();
@@ -65,13 +69,17 @@ pub fn user_tools(config: AppConfig, post_save: PostSaveCallback) -> Vec<Executa
             if system_persona.is_empty() {
                 return ToolExecutionResult::error("System persona cannot be blank.");
             }
-            mutate_user_preferences_in_config(&config_for_persona, &post_save_for_persona, |record| {
-                if record.system_persona.as_deref() == Some(system_persona) {
-                    return Ok("New system persona and old system persona are identical".into());
-                }
-                record.system_persona = Some(system_persona.to_string());
-                Ok("System persona updated.".into())
-            })
+            mutate_user_preferences_in_config(
+                &config_for_persona,
+                &post_save_for_persona,
+                |record| {
+                    if record.system_persona.as_deref() == Some(system_persona) {
+                        return Ok("New system persona and old system persona are identical".into());
+                    }
+                    record.system_persona = Some(system_persona.to_string());
+                    Ok("System persona updated.".into())
+                },
+            )
         },
     );
 

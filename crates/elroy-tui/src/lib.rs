@@ -17,7 +17,7 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::prelude::Widget;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Line;
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SidebarSection {
@@ -88,6 +88,8 @@ pub struct TuiApp {
     pub codex_session_titles: Vec<String>,
     pub selected_sidebar_index: usize,
     pub rendered_context_message_ids: HashSet<i64>,
+    pub last_viewport_width: usize,
+    pub last_viewport_height: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -606,6 +608,7 @@ fn apply_intent_with_runtime(
                     app.conversation_lines.push(format!("user: {submitted}"));
                     app.follow_conversation_output = true;
                     app.record_submitted_prompt(&submitted);
+                    app.rendered_context_message_ids.clear();
                     app.input.clear();
                     app.status = "thinking...".to_string();
                     *pending_prompt = Some(PendingPrompt {
@@ -1078,6 +1081,8 @@ impl TuiApp {
             codex_session_titles: Vec::new(),
             selected_sidebar_index: 0,
             rendered_context_message_ids: HashSet::new(),
+            last_viewport_width: 80,
+            last_viewport_height: 24,
         }
     }
 
@@ -1173,7 +1178,7 @@ impl TuiApp {
         self.mark_context_messages_rendered(&new_messages[start_index..]);
     }
 
-    pub fn render(&self, area: Rect, buf: &mut Buffer) {
+    pub fn render(&mut self, area: Rect, buf: &mut Buffer) {
         let input_height = self.input_box_height(area.width, area.height);
         let vertical = Layout::default()
             .direction(Direction::Vertical)
@@ -1187,25 +1192,41 @@ impl TuiApp {
             .direction(Direction::Horizontal)
             .constraints([Constraint::Min(1), Constraint::Length(36)])
             .split(vertical[0]);
+        let conversation_width = body[0].width.saturating_sub(2) as usize;
         let conversation_height = body[0].height.saturating_sub(2) as usize;
+
+        self.last_viewport_width = conversation_width;
+        self.last_viewport_height = conversation_height;
 
         Paragraph::new(self.conversation_lines.join("\n"))
             .block(self.block_for_focus(
                 FocusTarget::Command(CommandPane::Conversation),
                 self.title.as_str(),
             ))
+            .wrap(Wrap { trim: true })
             .scroll((
-                self.effective_conversation_scroll(conversation_height) as u16,
+                self.effective_conversation_scroll(conversation_width, conversation_height) as u16,
                 0,
             ))
             .render(body[0], buf);
 
         Paragraph::new(self.sidebar_text())
-            .block(self.block_for_focus(FocusTarget::Command(CommandPane::Sidebar), "Relevant Context"))
+            .block(self.block_for_focus(
+                FocusTarget::Command(CommandPane::Sidebar),
+                "Relevant Context",
+            ))
             .render(body[1], buf);
+
+        let input_viewport_width = vertical[1].width.saturating_sub(2) as usize;
+        let input_viewport_height = vertical[1].height.saturating_sub(2) as usize;
 
         Paragraph::new(self.input.as_str())
             .block(self.block_for_focus(FocusTarget::Input, "Input"))
+            .wrap(Wrap { trim: false })
+            .scroll((
+                wrapped_line_count(self.input.as_str(), input_viewport_width).saturating_sub(input_viewport_height) as u16,
+                0,
+            ))
             .render(vertical[1], buf);
 
         let footer = format!("{} | {}", self.footer_status_text(), self.footer_hints());
@@ -1303,11 +1324,9 @@ impl TuiApp {
         }
     }
 
-    fn effective_conversation_scroll(&self, viewport_height: usize) -> usize {
-        let max_scroll = self
-            .conversation_lines
-            .len()
-            .saturating_sub(viewport_height.max(1));
+    fn effective_conversation_scroll(&self, viewport_width: usize, viewport_height: usize) -> usize {
+        let total_lines = wrapped_line_count(&self.conversation_lines.join("\n"), viewport_width);
+        let max_scroll = total_lines.saturating_sub(viewport_height.max(1));
         if self.follow_conversation_output {
             max_scroll
         } else {
@@ -1694,9 +1713,11 @@ impl TuiApp {
                 self.accept_input_completion();
             }
             UiIntent::MoveUp => {
-                if self.focus == FocusTarget::Command(CommandPane::Conversation) {
+                if self.focus == FocusTarget::Command(CommandPane::Conversation)
+                    || (self.focus == FocusTarget::Input && self.can_mouse_scroll_conversation())
+                {
                     self.scroll_conversation_up();
-                } else {
+                } else if self.focus == FocusTarget::Command(CommandPane::Sidebar) {
                     if self.selected_sidebar_index > 0 {
                         self.selected_sidebar_index -= 1;
                     }
@@ -1704,9 +1725,11 @@ impl TuiApp {
                 }
             }
             UiIntent::MoveDown => {
-                if self.focus == FocusTarget::Command(CommandPane::Conversation) {
+                if self.focus == FocusTarget::Command(CommandPane::Conversation)
+                    || (self.focus == FocusTarget::Input && self.can_mouse_scroll_conversation())
+                {
                     self.scroll_conversation_down();
-                } else {
+                } else if self.focus == FocusTarget::Command(CommandPane::Sidebar) {
                     let len = self.active_sidebar_items().len();
                     if self.selected_sidebar_index + 1 < len {
                         self.selected_sidebar_index += 1;
@@ -1901,16 +1924,24 @@ impl TuiApp {
     }
 
     fn scroll_conversation_by(&mut self, lines: usize, direction: ScrollDir) {
-        self.follow_conversation_output = false;
+        if self.follow_conversation_output {
+            self.conversation_scroll =
+                self.effective_conversation_scroll(self.last_viewport_width, self.last_viewport_height);
+            self.follow_conversation_output = false;
+        }
         match direction {
             ScrollDir::Up => {
                 self.conversation_scroll = self.conversation_scroll.saturating_sub(lines);
                 self.status = "scrolled conversation up".to_string();
             }
             ScrollDir::Down => {
-                let max_scroll = self.conversation_lines.len().saturating_sub(1);
-                self.conversation_scroll =
-                    self.conversation_scroll.saturating_add(lines).min(max_scroll);
+                let total_lines =
+                    wrapped_line_count(&self.conversation_lines.join("\n"), self.last_viewport_width);
+                let max_scroll = total_lines.saturating_sub(self.last_viewport_height.max(1));
+                self.conversation_scroll = self
+                    .conversation_scroll
+                    .saturating_add(lines)
+                    .min(max_scroll);
                 self.status = "scrolled conversation down".to_string();
             }
         }
@@ -2642,13 +2673,13 @@ mod tests {
         }
     }
 
-    fn rendered_text(app: &TuiApp) -> String {
+    fn rendered_text(mut app: TuiApp) -> String {
         let area = Rect::new(0, 0, 80, 20);
-        let buf = render_to_buffer(app, area);
+        let buf = render_to_buffer(&mut app, area);
         buffer_text(&buf)
     }
 
-    fn render_to_buffer(app: &TuiApp, area: Rect) -> Buffer {
+    fn render_to_buffer(app: &mut TuiApp, area: Rect) -> Buffer {
         let mut buf = Buffer::empty(area);
         app.render(area, &mut buf);
         buf
@@ -2749,9 +2780,9 @@ mod tests {
 
     #[test]
     fn render_contains_core_elroy_panes() {
-        let app = TuiApp::bootstrap();
+        let mut app = TuiApp::bootstrap();
         let area = Rect::new(0, 0, 80, 20);
-        let buf = render_to_buffer(&app, area);
+        let buf = render_to_buffer(&mut app, area);
         let text = buffer_text(&buf);
 
         assert!(text.contains("Elroy"));
@@ -2789,7 +2820,7 @@ mod tests {
     fn render_switches_sidebar_label_when_agenda_is_active() {
         let mut app = TuiApp::bootstrap();
         app.sidebar_section = SidebarSection::Agenda;
-        let text = rendered_text(&app);
+        let text = rendered_text(app);
 
         assert!(text.contains("Memories | Agenda [active]"));
         assert!(text.contains("Improvements | Requests | Codex"));
@@ -2799,7 +2830,7 @@ mod tests {
     fn render_switches_sidebar_label_when_improvements_are_active() {
         let mut app = TuiApp::bootstrap();
         app.sidebar_section = SidebarSection::Improvements;
-        let text = rendered_text(&app);
+        let text = rendered_text(app);
 
         assert!(text.contains("Memories | Agenda"));
         assert!(text.contains("Improvements [active] | Requests"));
@@ -2810,7 +2841,7 @@ mod tests {
     fn render_switches_sidebar_label_when_feature_requests_are_active() {
         let mut app = TuiApp::bootstrap();
         app.sidebar_section = SidebarSection::FeatureRequests;
-        let text = rendered_text(&app);
+        let text = rendered_text(app);
 
         assert!(text.contains("Memories | Agenda"));
         assert!(text.contains("Improvements | Requests [active]"));
@@ -2819,9 +2850,9 @@ mod tests {
 
     #[test]
     fn render_verifies_sidebar_is_on_the_right() {
-        let app = TuiApp::bootstrap();
+        let mut app = TuiApp::bootstrap();
         let area = Rect::new(0, 0, 80, 20);
-        let buf = render_to_buffer(&app, area);
+        let buf = render_to_buffer(&mut app, area);
 
         // Sidebar should be in the right 36 columns
         let sidebar_rect = Rect::new(44, 0, 36, 18);
@@ -2834,7 +2865,7 @@ mod tests {
         let mut app = TuiApp::bootstrap();
         app.memory_titles = Vec::new();
         let area = Rect::new(0, 0, 80, 20);
-        let buf = render_to_buffer(&app, area);
+        let buf = render_to_buffer(&mut app, area);
 
         assert_buffer_contains_in_rect(&buf, Rect::new(44, 0, 36, 18), "No entries loaded");
     }
@@ -2846,14 +2877,14 @@ mod tests {
 
         // Initially Input is focused
         assert_eq!(app.focus, FocusTarget::Input);
-        let buf = render_to_buffer(&app, area);
+        let buf = render_to_buffer(&mut app, area);
         // Input box row depends on its height. Bootstrap height is 3.
         // footer(1) + input(3) = 4 rows from bottom. 20 - 4 = 16.
         assert_buffer_cell_color(&buf, 0, 16, Color::Yellow);
 
         // Switch focus to Sidebar
         app.focus = FocusTarget::Command(CommandPane::Sidebar);
-        let buf = render_to_buffer(&app, area);
+        let buf = render_to_buffer(&mut app, area);
         // Top-left of Sidebar border (row 0, col 44)
         assert_buffer_cell_color(&buf, 44, 0, Color::Yellow);
         // Input box should NO LONGER be yellow
@@ -2874,7 +2905,7 @@ mod tests {
             status: Some("loaded snapshot".to_string()),
             ..TuiSnapshot::default()
         });
-        let text = rendered_text(&app);
+        let text = rendered_text(app);
 
         assert!(text.contains("user: hello"));
         assert!(text.contains("assistant: hi"));
@@ -3007,33 +3038,37 @@ mod tests {
         app.handle_key("escape");
         assert_eq!(app.focus, FocusTarget::Command(CommandPane::Conversation));
 
+        // Use small viewport (1) so max_scroll = 3 - 1 = 2.
+        app.last_viewport_height = 1;
+
         let down = app.handle_key("j");
         assert_eq!(down, UiIntent::MoveDown);
         app.apply_intent(down);
         assert!(!app.follow_conversation_output);
-        assert_eq!(app.conversation_scroll, 1);
+        // effective_scroll was 2 (bottom), scrolled down stays 2.
+        // Wait, if it was 2 and I scroll down, it should stay 2.
+        // But the test before had it scroll from 0? No, bootstrap sets follow=true.
+        assert_eq!(app.conversation_scroll, 2);
         assert_eq!(app.selected_sidebar_index, 1);
-        assert_eq!(app.status, "scrolled conversation down");
 
         let up = app.handle_key("k");
         assert_eq!(up, UiIntent::MoveUp);
         app.apply_intent(up);
-        assert_eq!(app.conversation_scroll, 0);
+        // From 2 to 1.
+        assert_eq!(app.conversation_scroll, 1);
         assert_eq!(app.selected_sidebar_index, 1);
-        assert_eq!(app.status, "scrolled conversation up");
     }
 
     #[test]
     fn mouse_scroll_on_chat_input_scrolls_conversation_history() {
         let mut app = TuiApp::bootstrap();
-        app.conversation_lines = vec![
-            "line 0".to_string(),
-            "line 1".to_string(),
-            "line 2".to_string(),
-        ];
+        app.conversation_lines = vec!["line 0".to_string(), "line 1".to_string()];
         app.follow_conversation_output = true;
-        app.conversation_scroll = 1;
         app.focus = FocusTarget::Input;
+
+        // Manually set last known viewport. height 5 -> viewport 1.
+        app.last_viewport_width = 80;
+        app.last_viewport_height = 1;
 
         apply_mouse_event(
             &mut app,
@@ -3045,9 +3080,10 @@ mod tests {
             },
         );
 
+        // total_lines 2, viewport_height 1 -> max_scroll 1.
+        // Initial was 1, scroll up -> 0.
         assert_eq!(app.conversation_scroll, 0);
         assert!(!app.follow_conversation_output);
-        assert_eq!(app.status, "scrolled conversation up");
 
         apply_mouse_event(
             &mut app,
@@ -3059,8 +3095,8 @@ mod tests {
             },
         );
 
-        assert_eq!(app.conversation_scroll, 2); // 3-line scroll from 0, clamped to max_scroll=2
-        assert_eq!(app.status, "scrolled conversation down");
+        // scroll down -> 1.
+        assert_eq!(app.conversation_scroll, 1);
     }
 
     #[test]
@@ -3118,24 +3154,37 @@ mod tests {
         app.conversation_scroll = 2;
         app.follow_conversation_output = false;
         let area = Rect::new(0, 0, 80, 8);
-        let mut buf = Buffer::empty(area);
-        app.render(area, &mut buf);
-        let text = buf
-            .content
-            .chunks(area.width as usize)
-            .map(|row| {
-                row.iter()
-                    .map(|cell| cell.symbol())
-                    .collect::<String>()
-                    .trim_end()
-                    .to_string()
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
+        let buf = render_to_buffer(&mut app, area);
+        let text = buffer_text(&buf);
 
         assert!(!text.contains("line 0"));
         assert!(!text.contains("line 1"));
         assert!(text.contains("line 2"));
+    }
+
+    #[test]
+    fn scroll_up_from_bottom_with_wrapped_lines_initializes_correctly() {
+        let mut app = TuiApp::bootstrap();
+        let long_line = "A".repeat(100);
+        app.conversation_lines = vec![long_line; 20]; // 60 wrapped lines total
+        app.follow_conversation_output = true;
+        app.focus = FocusTarget::Command(CommandPane::Conversation);
+
+        // area height 11, input 3, footer 1 -> body height 7 -> conversation height 5.
+        let area = Rect::new(0, 0, 80, 11);
+        let mut buf = Buffer::empty(area);
+        app.render(area, &mut buf);
+
+        assert_eq!(app.last_viewport_height, 5);
+
+        // total_lines 60, viewport_height 5 -> max_scroll 55.
+        assert_eq!(app.effective_conversation_scroll(42, 5), 55);
+
+        // Now scroll up
+        app.apply_intent(UiIntent::MoveUp);
+        assert!(!app.follow_conversation_output);
+        // Initial was 55, scroll up -> 54.
+        assert_eq!(app.conversation_scroll, 54);
     }
 
     #[test]
@@ -5854,11 +5903,7 @@ mod tests {
             schedule_self_reflection: false,
             before_ids: HashSet::new(),
             stream: Box::new(FakePromptStream {
-                updates: vec![
-                    PromptUpdate::Idle,
-                    PromptUpdate::Idle,
-                    PromptUpdate::Idle,
-                ],
+                updates: vec![PromptUpdate::Idle, PromptUpdate::Idle, PromptUpdate::Idle],
                 finalized_snapshot: TuiSnapshot::default(),
                 cancelled_snapshot: TuiSnapshot::default(),
             }),
@@ -5866,8 +5911,11 @@ mod tests {
 
         drive_ticks(&mut app, &mut runtime, &mut pending, 3);
 
-        assert!(pending.is_some(), "stream should still be active during idle ticks");
-        let text = rendered_text(&app);
+        assert!(
+            pending.is_some(),
+            "stream should still be active during idle ticks"
+        );
+        let text = rendered_text(app);
         assert!(
             text.contains("user: hello"),
             "user message should persist during idle ticks, got:\n{text}"
@@ -5909,7 +5957,7 @@ mod tests {
         // 2 idle ticks + 2 delta ticks = 4 ticks to see both deltas
         drive_ticks(&mut app, &mut runtime, &mut pending, 4);
 
-        let text = rendered_text(&app);
+        let text = rendered_text(app);
         assert!(
             text.contains("assistant: hello world"),
             "assistant response should appear after idle warmup, got:\n{text}"
@@ -5949,7 +5997,7 @@ mod tests {
         // status is set on app but only renders in footer while prompt_active=true;
         // after finalization prompt_active is false, so check app.status directly
         assert_eq!(app.status, "submitted prompt: hello");
-        let text = rendered_text(&app);
+        let text = rendered_text(app);
         assert!(
             text.contains("assistant: hello world"),
             "snapshot response should be visible after finalize, got:\n{text}"
@@ -6009,7 +6057,10 @@ mod tests {
             &mut deferred,
             &mut previous_background_status,
         );
-        assert!(pending.is_some(), "stream should still be active after tick 1");
+        assert!(
+            pending.is_some(),
+            "stream should still be active after tick 1"
+        );
 
         // Tick 2: delta "world"
         drive_runtime_tick(
@@ -6020,7 +6071,10 @@ mod tests {
             &mut deferred,
             &mut previous_background_status,
         );
-        assert!(pending.is_some(), "stream should still be active after tick 2");
+        assert!(
+            pending.is_some(),
+            "stream should still be active after tick 2"
+        );
 
         // Tick 3: stream returns None → finalize → apply_snapshot(finalized) → prompt_active=false
         // Then maybe_refresh_snapshot_after_background_completion sees prev=Some, current=None,

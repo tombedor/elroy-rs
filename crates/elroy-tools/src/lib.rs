@@ -268,8 +268,14 @@ mod tests {
 
         assert_eq!(definition["type"], "function");
         assert_eq!(definition["name"], "get_weather");
-        assert!(definition["function"].is_null(), "responses format must not wrap in 'function' key");
-        assert!(definition["strict"].is_null(), "responses format omits strict to allow optional params");
+        assert!(
+            definition["function"].is_null(),
+            "responses format must not wrap in 'function' key"
+        );
+        assert!(
+            definition["strict"].is_null(),
+            "responses format omits strict to allow optional params"
+        );
         assert_eq!(definition["parameters"]["additionalProperties"], false);
     }
 
