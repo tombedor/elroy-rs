@@ -1,9 +1,9 @@
 use std::collections::VecDeque;
 use std::env;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 
-use elroy_app::{AppRuntime, DeferredAutoMemoryWork, MessageProcessOptions};
+use elroy_app::{AppRuntime, DeferredAutoMemoryWork, MessageProcessOptions, PromptCompletion};
 use elroy_config::AppConfig;
 use elroy_core::{AppSession, TurnContext, clear_background_status, set_background_status};
 use elroy_db::{BootstrapInventory, BootstrapPlan, bootstrap_database};
@@ -168,6 +168,17 @@ struct CliTuiRuntime {
 
 struct CliPromptStream {
     inner: elroy_app::PromptEventStream,
+    deferred_auto_memory_queue: Arc<Mutex<VecDeque<DeferredAutoMemoryWork>>>,
+}
+
+enum BackgroundStreamEvent {
+    Update(StreamEvent),
+    Done(Result<PromptCompletion, String>),
+}
+
+struct BackgroundCliPromptStream {
+    receiver: mpsc::Receiver<BackgroundStreamEvent>,
+    completion: Option<Result<PromptCompletion, String>>,
     deferred_auto_memory_queue: Arc<Mutex<VecDeque<DeferredAutoMemoryWork>>>,
 }
 
@@ -460,22 +471,37 @@ impl TuiRuntime for CliTuiRuntime {
         self.clear_deferred_auto_memory_error();
         self.clear_deferred_self_reflection_error();
         let deferred_auto_memory_queue = Arc::clone(&self.deferred_auto_memory_queue);
-        self.runtime
-            .process_message_stream(
-                prompt,
+        let runtime = self.runtime.clone();
+        let prompt = prompt.to_string();
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            match runtime.process_message_stream(
+                &prompt,
                 MessageProcessOptions {
                     defer_auto_memory: true,
                     defer_self_reflection: true,
                     ..MessageProcessOptions::default()
                 },
-            )
-            .map(|inner| {
-                Box::new(CliPromptStream {
-                    inner,
-                    deferred_auto_memory_queue,
-                }) as Box<dyn TuiPromptStream>
-            })
-            .map_err(|error| error.to_string())
+            ) {
+                Err(error) => {
+                    let _ = sender.send(BackgroundStreamEvent::Done(Err(error.to_string())));
+                }
+                Ok(mut stream) => {
+                    for event in stream.by_ref() {
+                        if sender.send(BackgroundStreamEvent::Update(event)).is_err() {
+                            break;
+                        }
+                    }
+                    let completion = stream.into_completion().map_err(|e| e.to_string());
+                    let _ = sender.send(BackgroundStreamEvent::Done(completion));
+                }
+            }
+        });
+        Ok(Box::new(BackgroundCliPromptStream {
+            receiver,
+            completion: None,
+            deferred_auto_memory_queue,
+        }))
     }
 
     fn start_startup_prompt_stream(&mut self) -> Result<Option<Box<dyn TuiPromptStream>>, String> {
@@ -613,6 +639,76 @@ impl TuiRuntime for CliTuiRuntime {
         self.runtime
             .mutate_sidebar_item(section, title, action)
             .map_err(|error| error.to_string())
+    }
+}
+
+impl TuiPromptStream for BackgroundCliPromptStream {
+    fn next_update(&mut self) -> Result<Option<PromptUpdate>, String> {
+        if self.completion.is_some() {
+            return Ok(None);
+        }
+        match self.receiver.try_recv() {
+            Ok(BackgroundStreamEvent::Update(event)) => Ok(Some(match event {
+                StreamEvent::AssistantResponse { content } => PromptUpdate::AssistantDelta(content),
+                StreamEvent::AssistantInternalThought { content } => {
+                    PromptUpdate::InternalThought(content)
+                }
+                StreamEvent::AssistantToolResult { content, is_error } => {
+                    PromptUpdate::ToolResult { content, is_error }
+                }
+                StreamEvent::StatusUpdate { content } => PromptUpdate::Status(content),
+                StreamEvent::ToolCallRequested(call) => PromptUpdate::ToolCall {
+                    name: call.name,
+                    arguments_json: call.arguments_json,
+                },
+            })),
+            Ok(BackgroundStreamEvent::Done(completion)) => {
+                self.completion = Some(completion);
+                Ok(None)
+            }
+            Err(mpsc::TryRecvError::Empty) => Ok(Some(PromptUpdate::Idle)),
+            Err(mpsc::TryRecvError::Disconnected) => {
+                Err("prompt stream disconnected".to_string())
+            }
+        }
+    }
+
+    fn finalize(self: Box<Self>) -> Result<elroy_tui::TuiSnapshot, String> {
+        let completion = match self.completion {
+            Some(completion) => completion,
+            None => loop {
+                match self.receiver.recv() {
+                    Ok(BackgroundStreamEvent::Done(completion)) => break completion,
+                    Ok(BackgroundStreamEvent::Update(_)) => continue,
+                    Err(_) => {
+                        return Err("prompt stream disconnected before completion".to_string());
+                    }
+                }
+            },
+        };
+        let completion = completion.map_err(|e| e)?;
+        if let Some(work) = completion.deferred_auto_memory {
+            self.deferred_auto_memory_queue
+                .lock()
+                .expect("deferred auto memory queue lock should work")
+                .push_back(work);
+        }
+        Ok(completion.snapshot)
+    }
+
+    fn cancel(self: Box<Self>) -> Result<elroy_tui::TuiSnapshot, String> {
+        if let Some(completion) = self.completion {
+            return completion.map(|c| c.snapshot).map_err(|e| e);
+        }
+        loop {
+            match self.receiver.recv() {
+                Ok(BackgroundStreamEvent::Done(completion)) => {
+                    return completion.map(|c| c.snapshot).map_err(|e| e);
+                }
+                Ok(BackgroundStreamEvent::Update(_)) => continue,
+                Err(_) => return Err("prompt stream disconnected before completion".to_string()),
+            }
+        }
     }
 }
 

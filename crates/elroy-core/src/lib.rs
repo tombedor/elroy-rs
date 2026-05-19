@@ -135,9 +135,11 @@ pub struct TurnEventStream {
     current_round: usize,
     current_stream: Option<Box<dyn Iterator<Item = Result<StreamEvent, ModelClientError>>>>,
     current_round_saw_tool_call: bool,
+    current_response_buffer: String,
     pending: VecDeque<Result<StreamEvent, ModelClientError>>,
     events: Vec<StreamEvent>,
     finished: bool,
+    initialized: bool,
 }
 
 #[derive(Debug)]
@@ -320,6 +322,7 @@ impl ConversationOrchestrator {
             })?;
 
             let mut saw_tool_call = false;
+            let mut assistant_response_buffer = String::new();
 
             for event in model_events {
                 match event {
@@ -342,7 +345,7 @@ impl ConversationOrchestrator {
                         });
                     }
                     StreamEvent::AssistantResponse { content } => {
-                        transcript.push(ConversationMessage::new(MessageRole::Assistant, &content));
+                        assistant_response_buffer.push_str(&content);
                         events.push(StreamEvent::AssistantResponse { content });
                     }
                     StreamEvent::AssistantInternalThought { content } => {
@@ -361,6 +364,10 @@ impl ConversationOrchestrator {
                 }
             }
 
+            if !assistant_response_buffer.is_empty() {
+                transcript.push(ConversationMessage::new(MessageRole::Assistant, &assistant_response_buffer));
+            }
+
             if !saw_tool_call {
                 break;
             }
@@ -377,11 +384,11 @@ impl ConversationOrchestrator {
         existing_transcript: &[ConversationMessage],
         options: ConversationOptions<'_>,
         message: &str,
-    ) -> Result<TurnEventStream, ModelClientError> {
+    ) -> TurnEventStream {
         let mut transcript = existing_transcript.to_vec();
         transcript.push(ConversationMessage::new(options.role, message));
 
-        let mut stream = TurnEventStream {
+        TurnEventStream {
             model,
             tools,
             tool_executor,
@@ -392,16 +399,23 @@ impl ConversationOrchestrator {
             current_round: 0,
             current_stream: None,
             current_round_saw_tool_call: false,
+            current_response_buffer: String::new(),
             pending: VecDeque::new(),
             events: Vec::new(),
             finished: false,
-        };
-        stream.start_next_round()?;
-        Ok(stream)
+            initialized: false,
+        }
     }
 }
 
 impl TurnEventStream {
+    fn flush_response_buffer(&mut self) {
+        if !self.current_response_buffer.is_empty() {
+            let content = std::mem::take(&mut self.current_response_buffer);
+            self.transcript.push(ConversationMessage::new(MessageRole::Assistant, &content));
+        }
+    }
+
     fn start_next_round(&mut self) -> Result<(), ModelClientError> {
         if self.current_round > self.max_tool_rounds {
             self.finished = true;
@@ -451,8 +465,7 @@ impl TurnEventStream {
                 }));
             }
             StreamEvent::AssistantResponse { content } => {
-                self.transcript
-                    .push(ConversationMessage::new(MessageRole::Assistant, &content));
+                self.current_response_buffer.push_str(&content);
                 self.events.push(StreamEvent::AssistantResponse {
                     content: content.clone(),
                 });
@@ -501,6 +514,14 @@ impl Iterator for TurnEventStream {
     type Item = Result<StreamEvent, ModelClientError>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        if !self.initialized {
+            self.initialized = true;
+            if let Err(error) = self.start_next_round() {
+                self.finished = true;
+                return Some(Err(error));
+            }
+        }
+
         loop {
             if let Some(event) = self.pending.pop_front() {
                 return Some(event);
@@ -523,6 +544,7 @@ impl Iterator for TurnEventStream {
                     return Some(Err(error));
                 }
                 None => {
+                    self.flush_response_buffer();
                     if self.current_round_saw_tool_call && self.current_round < self.max_tool_rounds
                     {
                         self.current_round += 1;
@@ -835,16 +857,14 @@ mod tests {
             }],
         ]);
         let orchestrator = ConversationOrchestrator::new(2);
-        let stream = orchestrator
-            .stream_turn_with_transcript_and_options(
-                Box::new(model),
-                vec![weather_tool()],
-                Box::new(FakeToolExecutor),
-                &[],
-                super::ConversationOptions::default(),
-                "weather?",
-            )
-            .expect("stream should start");
+        let stream = orchestrator.stream_turn_with_transcript_and_options(
+            Box::new(model),
+            vec![weather_tool()],
+            Box::new(FakeToolExecutor),
+            &[],
+            super::ConversationOptions::default(),
+            "weather?",
+        );
 
         let turn_run = stream.finish().expect("stream should finish");
         assert_eq!(
@@ -895,16 +915,14 @@ mod tests {
             }],
         ]);
         let orchestrator = ConversationOrchestrator::new(1);
-        let mut stream = orchestrator
-            .stream_turn_with_transcript_and_options(
-                Box::new(model),
-                vec![weather_tool()],
-                Box::new(FakeToolExecutor),
-                &[],
-                super::ConversationOptions::default(),
-                "weather?",
-            )
-            .expect("stream should start");
+        let mut stream = orchestrator.stream_turn_with_transcript_and_options(
+            Box::new(model),
+            vec![weather_tool()],
+            Box::new(FakeToolExecutor),
+            &[],
+            super::ConversationOptions::default(),
+            "weather?",
+        );
 
         assert!(matches!(
             stream.next(),

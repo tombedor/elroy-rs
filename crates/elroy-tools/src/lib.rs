@@ -45,6 +45,15 @@ impl ToolSpec {
         })
     }
 
+    pub fn openai_responses_definition(&self) -> Value {
+        json!({
+            "type": "function",
+            "name": self.name,
+            "description": self.description,
+            "parameters": self.parameters.as_json_schema(),
+        })
+    }
+
     pub fn anthropic_definition(&self) -> Value {
         json!({
             "name": self.name,
@@ -104,6 +113,13 @@ impl ToolRegistry {
 
     pub fn openai_definitions(&self) -> Vec<Value> {
         self.specs.iter().map(ToolSpec::openai_definition).collect()
+    }
+
+    pub fn openai_responses_definitions(&self) -> Vec<Value> {
+        self.specs
+            .iter()
+            .map(ToolSpec::openai_responses_definition)
+            .collect()
     }
 
     pub fn anthropic_definitions(&self) -> Vec<Value> {
@@ -243,6 +259,18 @@ mod tests {
             definition["function"]["parameters"]["additionalProperties"],
             false
         );
+    }
+
+    #[test]
+    fn openai_responses_definition_uses_flat_format() {
+        let tool = weather_tool();
+        let definition = tool.openai_responses_definition();
+
+        assert_eq!(definition["type"], "function");
+        assert_eq!(definition["name"], "get_weather");
+        assert!(definition["function"].is_null(), "responses format must not wrap in 'function' key");
+        assert!(definition["strict"].is_null(), "responses format omits strict to allow optional params");
+        assert_eq!(definition["parameters"]["additionalProperties"], false);
     }
 
     #[test]

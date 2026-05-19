@@ -969,7 +969,7 @@ pub fn build_openai_responses_request(
     let mut request = json!({
         "model": model,
         "input": input,
-        "tools": tools.openai_definitions(),
+        "tools": tools.openai_responses_definitions(),
         "parallel_tool_calls": false,
         "max_output_tokens": max_output_tokens,
     });
@@ -1362,6 +1362,10 @@ mod tests {
         assert_eq!(request["input"][3]["type"], "function_call_output");
         assert_eq!(request["input"].as_array().map(Vec::len), Some(4));
         assert_eq!(request["max_output_tokens"], 1024);
+        assert_eq!(request["tools"][0]["type"], "function");
+        assert_eq!(request["tools"][0]["name"], "get_weather");
+        assert!(request["tools"][0]["function"].is_null(), "responses API uses flat format, not wrapped");
+        assert!(request["tools"][0]["strict"].is_null(), "responses API omits strict to allow optional params");
     }
 
     #[test]

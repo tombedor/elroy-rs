@@ -483,10 +483,17 @@ dependencies = [
 name = "elroy-tasks"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "chrono",
  "elroy-agenda",
+ "elroy-config",
+ "elroy-context",
  "elroy-db",
+ "elroy-memory",
+ "elroy-recall",
+ "elroy-tools",
  "rusqlite",
+ "serde_json",
 ]
 
 [[package]]
