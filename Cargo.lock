@@ -362,6 +362,10 @@ dependencies = [
 name = "elroy-codex"
 version = "0.1.0"
 dependencies = [
+ "elroy-config",
+ "elroy-core",
+ "elroy-db",
+ "elroy-tools",
  "rusqlite",
  "serde_json",
 ]
@@ -385,7 +389,6 @@ dependencies = [
  "elroy-core",
  "elroy-db",
  "elroy-llm",
- "elroy-recall",
  "elroy-user",
  "rusqlite",
 ]
@@ -439,6 +442,16 @@ dependencies = [
 [[package]]
 name = "elroy-memory"
 version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "elroy-config",
+ "elroy-core",
+ "elroy-db",
+ "elroy-recall",
+ "elroy-tools",
+ "rusqlite",
+ "serde_json",
+]
 
 [[package]]
 name = "elroy-recall"
@@ -447,10 +460,11 @@ dependencies = [
  "anyhow",
  "chrono",
  "elroy-config",
+ "elroy-context",
  "elroy-core",
  "elroy-db",
  "elroy-llm",
- "elroy-memory",
+ "elroy-tools",
  "elroy-user",
  "rusqlite",
  "serde_json",
@@ -516,7 +530,12 @@ dependencies = [
 name = "elroy-user"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "elroy-config",
  "elroy-db",
+ "elroy-tools",
+ "rusqlite",
+ "serde_json",
 ]
 
 [[package]]

@@ -1,13 +1,12 @@
 use chrono::{Local, TimeZone, Utc};
 use elroy_config::{AppConfig, fast_provider_config_from_app_config};
-use elroy_core::{ConversationRequest, LiveProviderModel, ModelClient, validated_transcript};
+use elroy_core::{ConversationRequest, LiveProviderModel, ModelClient, excerpt, validated_transcript};
+use elroy_user::{effective_persona, effective_user_preferred_name};
 use elroy_db::{
     LOCAL_USER_TOKEN, SYNTHETIC_FIRST_USER_MESSAGE, UserPreferenceRecord, load_context_messages,
     load_user_preferences, replace_context_messages,
 };
 use elroy_llm::{ConversationMessage, LiveModelClient, MessageRole, StreamEvent};
-use elroy_recall::excerpt;
-use elroy_user::{effective_persona, effective_user_preferred_name};
 
 const CONTEXT_REFRESH_SUMMARY_WORD_LIMIT: usize = 300;
 

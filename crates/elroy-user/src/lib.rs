@@ -1,3 +1,5 @@
+pub mod tools;
+
 use elroy_db::UserPreferenceRecord;
 
 pub const DEFAULT_USER_PREFERRED_NAME: &str = "User";

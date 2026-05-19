@@ -15,7 +15,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::prelude::Widget;
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
@@ -50,6 +50,8 @@ pub enum UiIntent {
     CompleteInput,
     MoveUp,
     MoveDown,
+    PageScrollUp,
+    PageScrollDown,
     OpenSelected,
     ArchiveSelected,
     CompleteSelected,
@@ -105,6 +107,12 @@ pub enum SidebarAction {
     Archive,
     Complete,
     Delete,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScrollDir {
+    Up,
+    Down,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -211,6 +219,7 @@ pub enum PromptUpdate {
         is_error: bool,
     },
     Status(String),
+    Idle,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -399,6 +408,7 @@ fn drive_runtime_tick(
     if let Some(resume_message) = maybe_complete_command_execution(app, runtime) {
         return Some(TuiRunResult::RestartRequested(resume_message));
     }
+    let prompt_was_active = app.prompt_active;
     match advance_prompt_stream(app, runtime, pending_prompt) {
         PromptAdvance::CompletedTurn => {
             *deferred_context_refresh_at = Some(now + Duration::from_secs(5));
@@ -410,10 +420,13 @@ fn drive_runtime_tick(
     }
     app.prompt_active = pending_prompt.is_some();
     let current_background_status = runtime.background_status().unwrap_or(None);
+    // Guard with prompt_was_active too: if the prompt just ended on this tick,
+    // don't fire the background-completion reload — it would overwrite the
+    // freshly-finalized snapshot with stale DB state.
     maybe_refresh_snapshot_after_background_completion(
         app,
         runtime,
-        pending_prompt.is_some(),
+        pending_prompt.is_some() || prompt_was_active,
         app.command_active,
         previous_background_status.as_deref(),
         current_background_status.as_deref(),
@@ -736,12 +749,12 @@ fn apply_mouse_event(app: &mut TuiApp, mouse: MouseEvent) {
     match mouse.kind {
         MouseEventKind::ScrollUp => {
             if app.can_mouse_scroll_conversation() {
-                app.scroll_conversation_up();
+                app.scroll_conversation_by(3, ScrollDir::Up);
             }
         }
         MouseEventKind::ScrollDown => {
             if app.can_mouse_scroll_conversation() {
-                app.scroll_conversation_down();
+                app.scroll_conversation_by(3, ScrollDir::Down);
             }
         }
         _ => {}
@@ -1006,6 +1019,7 @@ fn apply_prompt_update(app: &mut TuiApp, update: PromptUpdate) {
         PromptUpdate::Status(content) => {
             app.status = content;
         }
+        PromptUpdate::Idle => {}
     }
 }
 
@@ -1015,6 +1029,8 @@ fn key_event_token(key: KeyEvent) -> Option<&'static str> {
         (KeyCode::Esc, _) => Some("escape"),
         (KeyCode::Up, _) => Some("up"),
         (KeyCode::Down, _) => Some("down"),
+        (KeyCode::PageUp, _) => Some("page_up"),
+        (KeyCode::PageDown, _) => Some("page_down"),
         (KeyCode::Tab, KeyModifiers::SHIFT) => Some("shift+tab"),
         (KeyCode::BackTab, _) => Some("shift+tab"),
         (KeyCode::Tab, _) => Some("tab"),
@@ -1174,11 +1190,10 @@ impl TuiApp {
         let conversation_height = body[0].height.saturating_sub(2) as usize;
 
         Paragraph::new(self.conversation_lines.join("\n"))
-            .block(
-                Block::default()
-                    .title(self.title.as_str())
-                    .borders(Borders::ALL),
-            )
+            .block(self.block_for_focus(
+                FocusTarget::Command(CommandPane::Conversation),
+                self.title.as_str(),
+            ))
             .scroll((
                 self.effective_conversation_scroll(conversation_height) as u16,
                 0,
@@ -1186,15 +1201,11 @@ impl TuiApp {
             .render(body[0], buf);
 
         Paragraph::new(self.sidebar_text())
-            .block(
-                Block::default()
-                    .title("Relevant Context")
-                    .borders(Borders::ALL),
-            )
+            .block(self.block_for_focus(FocusTarget::Command(CommandPane::Sidebar), "Relevant Context"))
             .render(body[1], buf);
 
         Paragraph::new(self.input.as_str())
-            .block(Block::default().title("Input").borders(Borders::ALL))
+            .block(self.block_for_focus(FocusTarget::Input, "Input"))
             .render(vertical[1], buf);
 
         let footer = format!("{} | {}", self.footer_status_text(), self.footer_hints());
@@ -1211,6 +1222,19 @@ impl TuiApp {
         } else if let Some(detail_modal) = &self.detail_modal {
             self.render_detail_modal(detail_modal, area, buf);
         }
+    }
+
+    fn block_for_focus<'a>(&self, target: FocusTarget, title: &'a str) -> Block<'a> {
+        let is_focused = self.focus == target;
+        let border_style = if is_focused {
+            Style::default().fg(Color::Yellow)
+        } else {
+            Style::default()
+        };
+        Block::default()
+            .title(title)
+            .borders(Borders::ALL)
+            .border_style(border_style)
     }
 
     fn sidebar_header_lines(&self) -> Vec<String> {
@@ -1294,10 +1318,10 @@ impl TuiApp {
     pub fn footer_hints(&self) -> &'static str {
         match self.focus {
             FocusTarget::Input => {
-                "Esc command mode  Ctrl+C clear/cancel  Ctrl+M memories  Ctrl+A agenda  r improvements  f requests  s codex sessions  Ctrl+D quit"
+                "Esc command mode  PgUp/PgDn scroll  Ctrl+C clear/cancel  Ctrl+M memories  Ctrl+A agenda  r improvements  f requests  s codex sessions  Ctrl+D quit"
             }
             FocusTarget::Command(_) => {
-                "Tab switch pane  j/k move  Enter open  c complete  d archive/delete  i/a/Esc chat mode"
+                "Tab switch pane  j/k move  PgUp/PgDn scroll  Enter open  c complete  d archive/delete  i/a/Esc chat mode"
             }
             FocusTarget::Unknown => "Recovering focus",
         }
@@ -1690,6 +1714,12 @@ impl TuiApp {
                     self.status = "moved selection down".to_string();
                 }
             }
+            UiIntent::PageScrollUp => {
+                self.scroll_conversation_by(10, ScrollDir::Up);
+            }
+            UiIntent::PageScrollDown => {
+                self.scroll_conversation_by(10, ScrollDir::Down);
+            }
             UiIntent::OpenSelected => {
                 let label = self
                     .active_sidebar_items()
@@ -1731,6 +1761,8 @@ impl TuiApp {
             "up" => UiIntent::HistoryPrevious,
             "down" => UiIntent::HistoryNext,
             "tab" => UiIntent::CompleteInput,
+            "page_up" => UiIntent::PageScrollUp,
+            "page_down" => UiIntent::PageScrollDown,
             _ => UiIntent::Noop,
         }
     }
@@ -1739,6 +1771,8 @@ impl TuiApp {
         match key {
             "j" | "down" => UiIntent::MoveDown,
             "k" | "up" => UiIntent::MoveUp,
+            "page_up" => UiIntent::PageScrollUp,
+            "page_down" => UiIntent::PageScrollDown,
             "tab" | "shift+tab" => {
                 self.toggle_command_pane();
                 UiIntent::Noop
@@ -1859,16 +1893,27 @@ impl TuiApp {
     }
 
     fn scroll_conversation_up(&mut self) {
-        self.follow_conversation_output = false;
-        self.conversation_scroll = self.conversation_scroll.saturating_sub(1);
-        self.status = "scrolled conversation up".to_string();
+        self.scroll_conversation_by(1, ScrollDir::Up);
     }
 
     fn scroll_conversation_down(&mut self) {
-        let max_scroll = self.conversation_lines.len().saturating_sub(1);
+        self.scroll_conversation_by(1, ScrollDir::Down);
+    }
+
+    fn scroll_conversation_by(&mut self, lines: usize, direction: ScrollDir) {
         self.follow_conversation_output = false;
-        self.conversation_scroll = self.conversation_scroll.saturating_add(1).min(max_scroll);
-        self.status = "scrolled conversation down".to_string();
+        match direction {
+            ScrollDir::Up => {
+                self.conversation_scroll = self.conversation_scroll.saturating_sub(lines);
+                self.status = "scrolled conversation up".to_string();
+            }
+            ScrollDir::Down => {
+                let max_scroll = self.conversation_lines.len().saturating_sub(1);
+                self.conversation_scroll =
+                    self.conversation_scroll.saturating_add(lines).min(max_scroll);
+                self.status = "scrolled conversation down".to_string();
+            }
+        }
     }
 }
 
@@ -2327,6 +2372,7 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
     use ratatui::buffer::Buffer;
     use ratatui::layout::Rect;
+    use ratatui::style::{Color, Modifier};
 
     use super::{
         CommandFormState, CommandPane, FocusTarget, PendingPrompt, PromptAdvance, PromptUpdate,
@@ -2598,11 +2644,19 @@ mod tests {
 
     fn rendered_text(app: &TuiApp) -> String {
         let area = Rect::new(0, 0, 80, 20);
+        let buf = render_to_buffer(app, area);
+        buffer_text(&buf)
+    }
+
+    fn render_to_buffer(app: &TuiApp, area: Rect) -> Buffer {
         let mut buf = Buffer::empty(area);
         app.render(area, &mut buf);
+        buf
+    }
 
+    fn buffer_text(buf: &Buffer) -> String {
         buf.content
-            .chunks(area.width as usize)
+            .chunks(buf.area.width as usize)
             .map(|row| {
                 row.iter()
                     .map(|cell| cell.symbol())
@@ -2612,6 +2666,75 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    fn assert_buffer_line_contains_with_modifier(
+        buf: &Buffer,
+        row: u16,
+        text: &str,
+        modifier: ratatui::style::Modifier,
+    ) {
+        let content = (0..buf.area.width)
+            .map(|col| buf[(col, row)].symbol())
+            .collect::<String>();
+        let Some(start_col) = content.find(text) else {
+            panic!(
+                "Row {} does not contain '{}'.\nFull content: '{}'",
+                row, text, content
+            );
+        };
+        for col in (start_col as u16)..(start_col as u16 + text.len() as u16) {
+            let cell = &buf[(col, row)];
+            assert!(
+                cell.style().add_modifier.contains(modifier),
+                "Cell at ({}, {}) missing modifier {:?}. Style: {:?}",
+                col,
+                row,
+                modifier,
+                cell.style()
+            );
+        }
+    }
+
+    fn assert_buffer_contains_in_rect(buf: &Buffer, area: Rect, text: &str) {
+        let mut found = false;
+        for row in area.top()..area.bottom() {
+            let row_content = (area.left()..area.right())
+                .map(|col| buf[(col, row)].symbol())
+                .collect::<String>();
+            if row_content.contains(text) {
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            // Panic with more context
+            let full_rect_content = (area.top()..area.bottom())
+                .map(|row| {
+                    (area.left()..area.right())
+                        .map(|col| buf[(col, row)].symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            panic!(
+                "Area {:?} does not contain '{}'.\nActual content in area:\n{}",
+                area, text, full_rect_content
+            );
+        }
+    }
+
+    fn assert_buffer_cell_color(buf: &Buffer, x: u16, y: u16, color: ratatui::style::Color) {
+        let cell = &buf[(x, y)];
+        assert_eq!(
+            cell.style().fg,
+            Some(color),
+            "Cell at ({}, {}) has wrong foreground color. Expected {:?}, found {:?}",
+            x,
+            y,
+            color,
+            cell.style().fg
+        );
     }
 
     #[test]
@@ -2627,7 +2750,9 @@ mod tests {
     #[test]
     fn render_contains_core_elroy_panes() {
         let app = TuiApp::bootstrap();
-        let text = rendered_text(&app);
+        let area = Rect::new(0, 0, 80, 20);
+        let buf = render_to_buffer(&app, area);
+        let text = buffer_text(&buf);
 
         assert!(text.contains("Elroy"));
         assert!(text.contains("Relevant Context"));
@@ -2636,6 +2761,10 @@ mod tests {
         assert!(text.contains("Input"));
         assert!(text.contains("● gpt-5"));
         assert!(text.contains("Esc command mode"));
+
+        // Verify footer is bold
+        assert_buffer_line_contains_with_modifier(&buf, 19, "gpt-5", Modifier::BOLD);
+        assert_buffer_line_contains_with_modifier(&buf, 19, "Esc command mode", Modifier::BOLD);
     }
 
     #[test]
@@ -2689,14 +2818,47 @@ mod tests {
     }
 
     #[test]
-    fn render_switches_sidebar_label_when_codex_sessions_are_active() {
-        let mut app = TuiApp::bootstrap();
-        app.sidebar_section = SidebarSection::CodexSessions;
-        let text = rendered_text(&app);
+    fn render_verifies_sidebar_is_on_the_right() {
+        let app = TuiApp::bootstrap();
+        let area = Rect::new(0, 0, 80, 20);
+        let buf = render_to_buffer(&app, area);
 
-        assert!(text.contains("Memories | Agenda"));
-        assert!(text.contains("Improvements | Requests"));
-        assert!(text.contains("Codex [active]"));
+        // Sidebar should be in the right 36 columns
+        let sidebar_rect = Rect::new(44, 0, 36, 18);
+        assert_buffer_contains_in_rect(&buf, sidebar_rect, "Relevant Context");
+        assert_buffer_contains_in_rect(&buf, sidebar_rect, "Memories [active]");
+    }
+
+    #[test]
+    fn render_verifies_sidebar_empty_state() {
+        let mut app = TuiApp::bootstrap();
+        app.memory_titles = Vec::new();
+        let area = Rect::new(0, 0, 80, 20);
+        let buf = render_to_buffer(&app, area);
+
+        assert_buffer_contains_in_rect(&buf, Rect::new(44, 0, 36, 18), "No entries loaded");
+    }
+
+    #[test]
+    fn render_highlights_focused_pane() {
+        let mut app = TuiApp::bootstrap();
+        let area = Rect::new(0, 0, 80, 20);
+
+        // Initially Input is focused
+        assert_eq!(app.focus, FocusTarget::Input);
+        let buf = render_to_buffer(&app, area);
+        // Input box row depends on its height. Bootstrap height is 3.
+        // footer(1) + input(3) = 4 rows from bottom. 20 - 4 = 16.
+        assert_buffer_cell_color(&buf, 0, 16, Color::Yellow);
+
+        // Switch focus to Sidebar
+        app.focus = FocusTarget::Command(CommandPane::Sidebar);
+        let buf = render_to_buffer(&app, area);
+        // Top-left of Sidebar border (row 0, col 44)
+        assert_buffer_cell_color(&buf, 44, 0, Color::Yellow);
+        // Input box should NO LONGER be yellow
+        let cell = &buf[(0, 16)];
+        assert_ne!(cell.style().fg, Some(Color::Yellow));
     }
 
     #[test]
@@ -2897,7 +3059,7 @@ mod tests {
             },
         );
 
-        assert_eq!(app.conversation_scroll, 1);
+        assert_eq!(app.conversation_scroll, 2); // 3-line scroll from 0, clamped to max_scroll=2
         assert_eq!(app.status, "scrolled conversation down");
     }
 
@@ -5659,5 +5821,226 @@ mod tests {
         assert!(pending.is_none());
         assert_eq!(runtime.self_reflection_runs, 0);
         assert_eq!(app.status, "Chat stream cancelled");
+    }
+
+    fn drive_ticks(
+        app: &mut TuiApp,
+        runtime: &mut FakeRuntime,
+        pending: &mut Option<PendingPrompt>,
+        n: usize,
+    ) {
+        let mut deferred_context_refresh_at = None;
+        let mut previous_background_status = None;
+        for _ in 0..n {
+            drive_runtime_tick(
+                app,
+                runtime,
+                pending,
+                Instant::now(),
+                &mut deferred_context_refresh_at,
+                &mut previous_background_status,
+            );
+        }
+    }
+
+    #[test]
+    fn render_idle_updates_preserve_user_message_and_thinking_status() {
+        let mut app = TuiApp::bootstrap();
+        app.conversation_lines = vec!["user: hello".to_string()];
+        app.status = "thinking...".to_string();
+        let mut runtime = FakeRuntime::default();
+        let mut pending = Some(PendingPrompt {
+            submitted_prompt: Some("hello".to_string()),
+            schedule_self_reflection: false,
+            before_ids: HashSet::new(),
+            stream: Box::new(FakePromptStream {
+                updates: vec![
+                    PromptUpdate::Idle,
+                    PromptUpdate::Idle,
+                    PromptUpdate::Idle,
+                ],
+                finalized_snapshot: TuiSnapshot::default(),
+                cancelled_snapshot: TuiSnapshot::default(),
+            }),
+        });
+
+        drive_ticks(&mut app, &mut runtime, &mut pending, 3);
+
+        assert!(pending.is_some(), "stream should still be active during idle ticks");
+        let text = rendered_text(&app);
+        assert!(
+            text.contains("user: hello"),
+            "user message should persist during idle ticks, got:\n{text}"
+        );
+        assert!(
+            text.contains("thinking..."),
+            "thinking status should persist during idle ticks, got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn render_assistant_delta_visible_after_idle_warmup() {
+        let mut app = TuiApp::bootstrap();
+        app.conversation_lines = vec!["user: hello".to_string()];
+        app.status = "thinking...".to_string();
+        let mut runtime = FakeRuntime::default();
+        let mut pending = Some(PendingPrompt {
+            submitted_prompt: Some("hello".to_string()),
+            schedule_self_reflection: false,
+            before_ids: HashSet::new(),
+            stream: Box::new(FakePromptStream {
+                updates: vec![
+                    PromptUpdate::Idle,
+                    PromptUpdate::Idle,
+                    PromptUpdate::AssistantDelta("hello ".to_string()),
+                    PromptUpdate::AssistantDelta("world".to_string()),
+                ],
+                finalized_snapshot: TuiSnapshot {
+                    conversation_lines: vec![
+                        "user: hello".to_string(),
+                        "assistant: hello world".to_string(),
+                    ],
+                    ..TuiSnapshot::default()
+                },
+                cancelled_snapshot: TuiSnapshot::default(),
+            }),
+        });
+
+        // 2 idle ticks + 2 delta ticks = 4 ticks to see both deltas
+        drive_ticks(&mut app, &mut runtime, &mut pending, 4);
+
+        let text = rendered_text(&app);
+        assert!(
+            text.contains("assistant: hello world"),
+            "assistant response should appear after idle warmup, got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn render_finalized_snapshot_shows_persisted_response() {
+        let mut app = TuiApp::bootstrap();
+        app.conversation_lines = vec!["user: hello".to_string()];
+        app.status = "thinking...".to_string();
+        let mut runtime = FakeRuntime::default();
+        let mut pending = Some(PendingPrompt {
+            submitted_prompt: Some("hello".to_string()),
+            schedule_self_reflection: false,
+            before_ids: HashSet::new(),
+            stream: Box::new(FakePromptStream {
+                updates: vec![
+                    PromptUpdate::Idle,
+                    PromptUpdate::AssistantDelta("hello world".to_string()),
+                ],
+                finalized_snapshot: TuiSnapshot {
+                    conversation_lines: vec![
+                        "user: hello".to_string(),
+                        "assistant: hello world".to_string(),
+                    ],
+                    ..TuiSnapshot::default()
+                },
+                cancelled_snapshot: TuiSnapshot::default(),
+            }),
+        });
+
+        // 1 idle + 1 delta + 1 finalize = 3 ticks
+        drive_ticks(&mut app, &mut runtime, &mut pending, 3);
+
+        assert!(pending.is_none(), "stream should be finalized");
+        // status is set on app but only renders in footer while prompt_active=true;
+        // after finalization prompt_active is false, so check app.status directly
+        assert_eq!(app.status, "submitted prompt: hello");
+        let text = rendered_text(&app);
+        assert!(
+            text.contains("assistant: hello world"),
+            "snapshot response should be visible after finalize, got:\n{text}"
+        );
+    }
+
+    // Regression test: when a background task completes on the same tick that the
+    // prompt stream finalizes, the background-completion snapshot reload must not
+    // overwrite the freshly-finalized conversation lines.
+    #[test]
+    fn background_completion_on_finalize_tick_does_not_overwrite_response() {
+        let mut app = TuiApp::bootstrap();
+        app.conversation_lines = vec!["user: hello".to_string()];
+
+        // DB snapshot does NOT yet contain the assistant response (background task
+        // completed just as the stream was finishing).
+        let mut runtime = FakeRuntime {
+            background_status: None, // background already done
+            snapshot: TuiSnapshot {
+                conversation_lines: vec!["user: hello".to_string()],
+                ..TuiSnapshot::default()
+            },
+            ..FakeRuntime::default()
+        };
+
+        let mut pending = Some(PendingPrompt {
+            submitted_prompt: Some("hello".to_string()),
+            schedule_self_reflection: false,
+            before_ids: HashSet::new(),
+            stream: Box::new(FakePromptStream {
+                updates: vec![
+                    PromptUpdate::AssistantDelta("Hello ".to_string()),
+                    PromptUpdate::AssistantDelta("world".to_string()),
+                ],
+                finalized_snapshot: TuiSnapshot {
+                    conversation_lines: vec![
+                        "user: hello".to_string(),
+                        "assistant: Hello world".to_string(),
+                    ],
+                    ..TuiSnapshot::default()
+                },
+                cancelled_snapshot: TuiSnapshot::default(),
+            }),
+        });
+
+        let mut deferred = None;
+        // Simulate: a background task WAS running while the user prompt was active.
+        // previous_background_status=Some means it was running on the previous tick.
+        let mut previous_background_status = Some("auto-memory task".to_string());
+
+        // Tick 1: delta "Hello " — prompt still active, background guard keeps prev unchanged
+        drive_runtime_tick(
+            &mut app,
+            &mut runtime,
+            &mut pending,
+            Instant::now(),
+            &mut deferred,
+            &mut previous_background_status,
+        );
+        assert!(pending.is_some(), "stream should still be active after tick 1");
+
+        // Tick 2: delta "world"
+        drive_runtime_tick(
+            &mut app,
+            &mut runtime,
+            &mut pending,
+            Instant::now(),
+            &mut deferred,
+            &mut previous_background_status,
+        );
+        assert!(pending.is_some(), "stream should still be active after tick 2");
+
+        // Tick 3: stream returns None → finalize → apply_snapshot(finalized) → prompt_active=false
+        // Then maybe_refresh_snapshot_after_background_completion sees prev=Some, current=None,
+        // prompt_active=false → fires load_snapshot() and overwrites (the bug).
+        drive_runtime_tick(
+            &mut app,
+            &mut runtime,
+            &mut pending,
+            Instant::now(),
+            &mut deferred,
+            &mut previous_background_status,
+        );
+        assert!(pending.is_none(), "stream should be finalized after tick 3");
+
+        assert!(
+            app.conversation_lines
+                .iter()
+                .any(|l| l == "assistant: Hello world"),
+            "finalized response must survive background-completion snapshot reload, got: {:?}",
+            app.conversation_lines
+        );
     }
 }

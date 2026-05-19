@@ -5,30 +5,485 @@ use std::path::{Path, PathBuf};
 
 use anyhow::anyhow;
 use chrono::{Local, Utc};
-use elroy_core::{ConversationRequest, LiveProviderModel, ModelClient};
+use elroy_core::{ConversationRequest, LiveProviderModel, ModelClient, excerpt};
 use elroy_db::{
     AgendaItemRecord, BootstrapPlan, LOCAL_USER_TOKEN, MemoryEmbeddingRecord, MemoryRecord,
     get_or_create_memory_operation_tracker, list_all_active_memories,
     load_context_messages, load_memory_embeddings_for_paths, open_sqlite_connection,
     replace_context_messages, run_migrations, save_memory_operation_tracker, upsert_memory_embedding,
+    search_active_memories, load_messages_by_ids,
 };
 use elroy_llm::{
     ConversationMessage, EmbeddingProviderConfig, LiveEmbeddingClient, LiveModelClient,
     MessageRole, ProviderConfig, StreamEvent, ToolCall,
 };
-use elroy_memory::{archive_memory_file, create_memory_file_with_frontmatter};
+use elroy_core::memory_store::{archive_memory_file, create_memory_file_with_frontmatter, read_memory_parts};
 use elroy_user::effective_persona;
 use serde_json::Value;
+
+use elroy_config::{
+    AppConfig, LlmProvider, embedding_provider_config_from_app_config,
+    fast_provider_config_from_app_config,
+};
+use elroy_context::load_validated_runtime_transcript;
+use elroy_tools::ToolExecutionResult;
 
 pub const CONTEXT_MESSAGE_SOURCE_TYPE: &str = "ContextMessageSet";
 pub const MEMORY_SOURCE_TYPE: &str = "Memory";
 pub const MEMORY_WORD_COUNT_LIMIT: usize = 300;
 pub const MEMORY_CONSOLIDATION_CLUSTER_LIMIT: usize = 3;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemorySourceType {
+    ContextMessageSet,
+    Memory,
+}
+
+pub struct MemorySource {
+    pub name: String,
+    pub source_type: MemorySourceType,
+    pub message_ids: Vec<i64>,
+    pub path: Option<String>,
+}
+
+pub fn get_source_list_from_frontmatter(frontmatter: Option<&str>) -> Vec<MemorySource> {
+    let mut sources = Vec::new();
+    if let Some(message_ids) = parse_context_message_source_ids(frontmatter) {
+        sources.push(MemorySource {
+            name: "Context messages".to_string(),
+            source_type: MemorySourceType::ContextMessageSet,
+            message_ids,
+            path: None,
+        });
+    }
+    if let Some(memory_sources) = parse_memory_sources(frontmatter) {
+        for (name, path) in memory_sources {
+            sources.push(MemorySource {
+                name,
+                source_type: MemorySourceType::Memory,
+                message_ids: Vec::new(),
+                path: Some(path),
+            });
+        }
+    }
+    sources
+}
+
+pub fn memory_consolidation_settings_from_app_config(
+    config: &AppConfig,
+) -> MemoryConsolidationSettings {
+    MemoryConsolidationSettings {
+        memory_cluster_similarity_threshold: config.memory_cluster_similarity_threshold,
+        max_memory_cluster_size: config.max_memory_cluster_size,
+        min_memory_cluster_size: config.min_memory_cluster_size,
+        fast_provider_config: fast_provider_config_from_app_config(config).ok(),
+        embedding_provider_config: embedding_provider_config_from_app_config(config).ok(),
+    }
+}
+pub fn create_consolidated_memory_from_config(
+    config: &AppConfig,
+    name: &str,
+    text: &str,
+    source_names: &[&str],
+) -> std::io::Result<PathBuf> {
+    create_consolidated_memory_from_plan(
+        &BootstrapPlan::from_config(config),
+        name,
+        text,
+        source_names,
+    )
+}
+
+pub fn create_consolidated_memory_from_plan(
+    bootstrap_plan: &BootstrapPlan,
+    name: &str,
+    text: &str,
+    source_names: &[&str],
+) -> std::io::Result<PathBuf> {
+    let mut connection = open_sqlite_connection(&bootstrap_plan.database_path)
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    run_migrations(&mut connection).map_err(|error| std::io::Error::other(error.to_string()))?;
+
+    let mut source_memories = Vec::new();
+    for source_name in source_names {
+        let memory = find_active_memory_by_name_in_scope(
+            &connection,
+            source_name,
+            &bootstrap_plan.memory_dir,
+        )
+        .map_err(|error| std::io::Error::other(error.to_string()))?
+        .ok_or_else(|| std::io::Error::other(format!("memory not found: {source_name}")))?;
+        source_memories.push(memory);
+    }
+
+    create_consolidated_memories_from_records(
+        bootstrap_plan,
+        &[ConsolidatedMemoryOutput {
+            name: name.to_string(),
+            text: text.to_string(),
+        }],
+        &source_memories,
+    )
+    .map(|mut created| created.remove(0))
+}
+pub fn sync_memory_context_after_mutation(
+    config: &AppConfig,
+    old_name: &str,
+    current_name: Option<&str>,
+) -> anyhow::Result<()> {
+    let mut connection = open_sqlite_connection(&config.database_path)?;
+    run_migrations(&mut connection)?;
+    let transcript = load_validated_runtime_transcript(
+        &mut connection,
+        &config.assistant_name,
+        config.llm_provider() == LlmProvider::Anthropic,
+    )?;
+    let old_tool_call_id = context_memory_tool_call_id(old_name);
+    let mut updated_transcript = transcript
+        .into_iter()
+        .filter(|message| !message_matches_tool_call_id(message, &old_tool_call_id))
+        .collect::<Vec<_>>();
+
+    if let Some(current_name) = current_name
+        && let Some(memory) =
+            find_active_memory_by_name_in_scope(&connection, current_name, &config.memory_dir)?
+        && !transcript_contains_context_memory(&updated_transcript, &memory.name)
+    {
+        updated_transcript.extend(context_memory_tool_messages(&memory));
+    }
+
+    replace_context_messages(&mut connection, LOCAL_USER_TOKEN, &updated_transcript)?;
+    Ok(())
+}
+
+pub fn sync_task_context_after_mutation(
+    config: &AppConfig,
+    old_name: &str,
+    current_name: Option<&str>,
+) -> anyhow::Result<()> {
+    let mut connection = open_sqlite_connection(&config.database_path)?;
+    run_migrations(&mut connection)?;
+    let transcript = load_validated_runtime_transcript(
+        &mut connection,
+        &config.assistant_name,
+        config.llm_provider() == LlmProvider::Anthropic,
+    )?;
+    let old_tool_call_id = context_task_tool_call_id(old_name);
+    let mut updated_transcript = transcript
+        .into_iter()
+        .filter(|message| !message_matches_tool_call_id(message, &old_tool_call_id))
+        .collect::<Vec<_>>();
+
+    if let Some(current_name) = current_name
+        && let Some(task) = elroy_db::find_active_agenda_item_by_name(&connection, current_name)?
+            .filter(|item| item.trigger_datetime.is_none() && item.trigger_context.is_none())
+        && !transcript_contains_context_task(&updated_transcript, &task.name)
+    {
+        updated_transcript.extend(context_task_tool_messages(&task));
+    }
+
+    replace_context_messages(&mut connection, LOCAL_USER_TOKEN, &updated_transcript)?;
+    Ok(())
+}
+
+pub fn sync_due_item_context_after_mutation(
+    config: &AppConfig,
+    old_name: &str,
+    current_name: Option<&str>,
+) -> anyhow::Result<()> {
+    let mut connection = open_sqlite_connection(&config.database_path)?;
+    run_migrations(&mut connection)?;
+    let transcript = load_validated_runtime_transcript(
+        &mut connection,
+        &config.assistant_name,
+        config.llm_provider() == LlmProvider::Anthropic,
+    )?;
+    let old_tool_call_id = context_due_item_tool_call_id(old_name);
+    let mut updated_transcript = transcript
+        .into_iter()
+        .filter(|message| !message_matches_tool_call_id(message, &old_tool_call_id))
+        .collect::<Vec<_>>();
+
+    if let Some(current_name) = current_name
+        && let Some(due_item) = elroy_db::find_active_agenda_item_by_name(&connection, current_name)?
+            .filter(|item| item.trigger_datetime.is_some() || item.trigger_context.is_some())
+        && !transcript_contains_context_due_item(&updated_transcript, &due_item.name)
+    {
+        updated_transcript.extend(context_due_item_tool_messages(&due_item));
+    }
+
+    replace_context_messages(&mut connection, LOCAL_USER_TOKEN, &updated_transcript)?;
+    Ok(())
+}
+
+pub fn mutate_memory_file_from_config(
+    config: &AppConfig,
+    name: &str,
+    operation: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> ToolExecutionResult {
+    let mut connection = match open_sqlite_connection(&config.database_path) {
+        Ok(connection) => connection,
+        Err(error) => {
+            return ToolExecutionResult::error(format!("failed to open database: {error}"));
+        }
+    };
+    if let Err(error) = run_migrations(&mut connection) {
+        return ToolExecutionResult::error(format!("failed to run migrations: {error}"));
+    }
+    let memory = match find_active_memory_by_name_in_scope(&connection, name, &config.memory_dir) {
+        Ok(Some(memory)) => memory,
+        Ok(None) => return ToolExecutionResult::error(format!("memory not found: {name}")),
+        Err(error) => return ToolExecutionResult::error(format!("database query failed: {error}")),
+    };
+    match operation(Path::new(&memory.file_path)).and_then(|()| {
+        elroy_db::bootstrap_database(&BootstrapPlan::from_config(config))
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        sync_memory_context_after_mutation(config, &memory.name, Some(&memory.name))
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        Ok(())
+    }) {
+        Ok(()) => ToolExecutionResult::success(
+            serde_json::json!({"updated": true, "name": memory.name, "file_path": memory.file_path})
+                .to_string(),
+        ),
+        Err(error) => ToolExecutionResult::error(format!("memory mutation failed: {error}")),
+    }
+}
+
+pub fn archive_memory_file_from_config(
+    config: &AppConfig,
+    name: &str,
+    operation: impl FnOnce(&Path) -> std::io::Result<PathBuf>,
+) -> ToolExecutionResult {
+    let mut connection = match open_sqlite_connection(&config.database_path) {
+        Ok(connection) => connection,
+        Err(error) => {
+            return ToolExecutionResult::error(format!("failed to open database: {error}"));
+        }
+    };
+    if let Err(error) = run_migrations(&mut connection) {
+        return ToolExecutionResult::error(format!("failed to run migrations: {error}"));
+    }
+    let memory = match find_active_memory_by_name_in_scope(&connection, name, &config.memory_dir) {
+        Ok(Some(memory)) => memory,
+        Ok(None) => return ToolExecutionResult::error(format!("memory not found: {name}")),
+        Err(error) => return ToolExecutionResult::error(format!("database query failed: {error}")),
+    };
+    match operation(Path::new(&memory.file_path)).and_then(|new_path| {
+        elroy_db::bootstrap_database(&BootstrapPlan::from_config(config))
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        remove_context_memory_messages_by_names(
+            &mut connection,
+            std::slice::from_ref(&memory.name),
+        )
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+        Ok(new_path)
+    }) {
+        Ok(new_path) => ToolExecutionResult::success(
+            serde_json::json!({
+                "updated": true,
+                "name": memory.name,
+                "file_path": memory.file_path,
+                "moved_to": new_path.display().to_string(),
+            })
+            .to_string(),
+        ),
+        Err(error) => ToolExecutionResult::error(format!("memory mutation failed: {error}")),
+    }
+}
+pub fn find_active_memory_by_name_in_scope(
+    connection: &rusqlite::Connection,
+    name: &str,
+    memory_dir: &Path,
+) -> rusqlite::Result<Option<MemoryRecord>> {
+    Ok(
+        list_active_memories_in_scope(connection, memory_dir, 10_000)?
+            .into_iter()
+            .find(|memory| memory.name.eq_ignore_ascii_case(name)),
+    )
+}
+
+pub fn list_active_memories_in_scope(
+    connection: &rusqlite::Connection,
+    memory_dir: &Path,
+    limit: usize,
+) -> rusqlite::Result<Vec<MemoryRecord>> {
+    Ok(list_all_active_memories_in_scope(connection, memory_dir)?
+        .into_iter()
+        .take(limit)
+        .collect())
+}
+
+pub fn search_active_memories_in_scope(
+    connection: &rusqlite::Connection,
+    memory_dir: &Path,
+    query: &str,
+    limit: usize,
+) -> rusqlite::Result<Vec<MemoryRecord>> {
+    Ok(search_active_memories(connection, query, 10_000)?
+        .into_iter()
+        .filter(|memory| Path::new(&memory.file_path).starts_with(memory_dir))
+        .take(limit)
+        .collect())
+}
+
+pub fn format_memory_listing(memories: &[MemoryRecord]) -> String {
+    if memories.is_empty() {
+        return "No memories found.".to_string();
+    }
+
+    let mut lines = vec!["Memories".to_string()];
+    for memory in memories.iter().rev() {
+        lines.push(format!(
+            "- {} | Text: {}",
+            memory.name,
+            excerpt(&memory.body, 180)
+        ));
+    }
+    lines.join("\n")
+}
+
+pub fn get_source_list_for_memory_from_config(
+    config: &AppConfig,
+    name: &str,
+) -> anyhow::Result<String> {
+    let connection = open_sqlite_connection(&config.database_path)?;
+    run_migrations(&mut open_sqlite_connection(&config.database_path)?)?;
+    let memory = find_active_memory_by_name_in_scope(&connection, name, &config.memory_dir)?
+        .ok_or_else(|| anyhow::anyhow!("Memory '{name}' not found for the current user."))?;
+
+    let (frontmatter, _) = read_memory_parts(Path::new(&memory.file_path))?;
+    let sources = get_source_list_from_frontmatter(frontmatter.as_deref());
+
+    let payload = sources
+        .into_iter()
+        .map(|source| {
+            let source_type = match source.source_type {
+                MemorySourceType::ContextMessageSet => CONTEXT_MESSAGE_SOURCE_TYPE,
+                MemorySourceType::Memory => MEMORY_SOURCE_TYPE,
+            };
+            let id = if source.message_ids.is_empty() {
+                source.name
+            } else {
+                source.message_ids[0].to_string() // Simplified for now as per previous behavior
+            };
+            serde_json::json!([source_type, id])
+        })
+        .collect::<Vec<_>>();
+
+    Ok(serde_json::to_string(&payload)?)
+}
+
+pub fn get_source_content_for_memory_from_config(
+    config: &AppConfig,
+    name: &str,
+    index: usize,
+) -> anyhow::Result<String> {
+    let mut connection = open_sqlite_connection(&config.database_path)?;
+    run_migrations(&mut connection)?;
+    let memory = find_active_memory_by_name_in_scope(&connection, name, &config.memory_dir)?
+        .ok_or_else(|| anyhow::anyhow!("Memory '{name}' not found for the current user."))?;
+
+    let (frontmatter, body) = read_memory_parts(Path::new(&memory.file_path))?;
+    let sources = get_source_list_from_frontmatter(frontmatter.as_deref());
+
+    if sources.is_empty() {
+        return Ok(format!("No sources found for memory '{}'", name.to_lowercase()));
+    }
+
+    if index >= sources.len() {
+        anyhow::bail!("Index {index} out of range. Available indices: {:?}", (0..sources.len()).collect::<Vec<_>>());
+    }
+
+    let source = &sources[index];
+    match source.source_type {
+        MemorySourceType::ContextMessageSet => {
+            let messages = load_messages_by_ids(&mut connection, &source.message_ids)?;
+            Ok(format_context_message_source_content(&messages))
+        }
+        MemorySourceType::Memory => {
+            let source_path = source.path.as_deref().ok_or_else(|| anyhow::anyhow!("missing path for memory source"))?;
+            let source_body = if let Ok(content) = std::fs::read_to_string(source_path) {
+                let (_, body) = read_memory_parts(Path::new(source_path))?;
+                body
+            } else {
+                format!("Error: Unable to read source memory file for '{}'", source.name)
+            };
+            Ok(format_memory_file_source_content(&source.name, &source_body))
+        }
+    }
+}
+
 // ── helper functions (moved from elroy-app) ───────────────────────────────────
 
-pub fn format_memory_detail(memory: &MemoryRecord) -> String {
+pub fn format_memory_detail(memory: &elroy_db::MemoryRecord) -> String {
     format!("#{}\n{}", memory.name, memory.body)
+}
+
+pub fn format_due_item_detail(item: &elroy_db::AgendaItemRecord) -> String {
+    let mut lines = vec![format!("Due item '{}':", item.name)];
+    if let Some(trigger_datetime) = &item.trigger_datetime {
+        let formatted = parse_sidebar_trigger_datetime(trigger_datetime)
+            .map(|datetime| datetime.format("%Y-%m-%d %H:%M:%S").to_string())
+            .unwrap_or_else(|| trigger_datetime.clone());
+        lines.push(format!("Trigger Time: {formatted}"));
+    }
+    if let Some(trigger_context) = &item.trigger_context {
+        lines.push(format!("Context: {trigger_context}"));
+    }
+    lines.push(format!("Text: {}", item.body));
+    lines.join("\n")
+}
+
+pub fn format_agenda_item_detail(item: &elroy_db::AgendaItemRecord) -> String {
+    let mut text = format!("# Agenda Item: {}\n\n{}", item.name, item.body.trim());
+    if let Some(agenda_date) = item.agenda_date.as_deref() {
+        text.push_str(&format!("\n\nAgenda date: {agenda_date}"));
+    }
+    text
+}
+
+pub fn format_memory_examination(memory: &MemoryRecord) -> String {
+    format!(
+        "# Memory: {}\n\n*to view the source content this memory is based on, call tool `get_source_content_for_memory({}, idx)`\n\n{}",
+        memory.name,
+        memory.name,
+        memory.body.trim()
+    )
+}
+
+pub fn format_memory_search_results(
+    memories: &[&MemoryRecord],
+    due_items: &[&AgendaItemRecord],
+    agenda_items: &[&AgendaItemRecord],
+) -> String {
+    if memories.is_empty() && due_items.is_empty() && agenda_items.is_empty() {
+        return "No relevant memories found".to_string();
+    }
+
+    let mut lines = vec!["Search Results".to_string()];
+    for memory in memories {
+        lines.push(format!(
+            "- Memory | {} | {}",
+            memory.name,
+            excerpt(&memory.body, 180)
+        ));
+    }
+    for item in due_items {
+        lines.push(format!(
+            "- DueItem | {} | {}",
+            item.name,
+            excerpt(&item.body, 180)
+        ));
+    }
+    for item in agenda_items {
+        lines.push(format!(
+            "- AgendaItem | {} | {}",
+            item.name,
+            excerpt(&item.body, 180)
+        ));
+    }
+    lines.join("\n")
 }
 
 pub fn format_agenda_item_recall_detail(item: &AgendaItemRecord) -> String {
@@ -47,15 +502,6 @@ pub fn format_agenda_item_recall_detail(item: &AgendaItemRecord) -> String {
         );
     }
     format!("#Agenda: {}\n{}", item.name, item.body.trim())
-}
-
-pub fn excerpt(body: &str, max_chars: usize) -> String {
-    let trimmed = body.trim();
-    if trimmed.chars().count() <= max_chars {
-        return trimmed.to_string();
-    }
-    let shortened = trimmed.chars().take(max_chars).collect::<String>();
-    format!("{shortened}...")
 }
 
 pub fn synthetic_tool_context_messages(
@@ -226,6 +672,7 @@ pub struct RecallSelectionClients<'a> {
     pub recency_weight: f32,
     pub connection: Option<&'a rusqlite::Connection>,
     pub query_embedding: Option<&'a [f32]>,
+    pub now_iso: Option<&'a str>,
 }
 
 pub struct ReflectiveRecallPromptInputs<'a> {
@@ -315,6 +762,7 @@ pub fn recall_memory_context_messages_with_decision(
         RecallSelectionClients {
             limit: 2,
             query_embedding: shared_query_embedding.as_deref(),
+            now_iso: selection_clients.now_iso,
             ..selection_clients
         },
     );
@@ -508,6 +956,7 @@ pub fn recall_memory_context_messages(
             recency_weight: 0.0,
             connection: None,
             query_embedding: None,
+            now_iso: None,
         },
         context,
     )
@@ -1012,7 +1461,12 @@ pub fn select_relevant_recall_due_items<'a>(
         selection_clients.relevance_model,
         selection_clients.embedding_client,
     );
-    let overlap_candidates = select_due_items_by_overlap(query, due_items, candidate_limit, None);
+    let overlap_candidates = select_due_items_by_overlap(
+        query,
+        due_items,
+        candidate_limit,
+        selection_clients.now_iso,
+    );
     let candidates = if selection_clients.relevance_model.is_some() {
         let mut merged_candidates = overlap_candidates;
         for candidate in embedding_rank_candidates(
@@ -1662,7 +2116,6 @@ pub fn select_due_items_by_overlap<'a>(
     let mut scored = due_items
         .iter()
         .filter_map(|item| {
-            let trigger_context = item.trigger_context.as_deref()?;
             if skip_time_due_before.is_some_and(|now_iso| {
                 item.trigger_datetime
                     .as_deref()
@@ -1671,14 +2124,17 @@ pub fn select_due_items_by_overlap<'a>(
                 return None;
             }
 
+            let trigger_context = item.trigger_context.as_deref().unwrap_or("");
             let mut haystack = String::with_capacity(
                 item.name.len() + item.body.len() + trigger_context.len() + 2,
             );
             haystack.push_str(&item.name);
             haystack.push(' ');
             haystack.push_str(&item.body);
-            haystack.push(' ');
-            haystack.push_str(trigger_context);
+            if !trigger_context.is_empty() {
+                haystack.push(' ');
+                haystack.push_str(trigger_context);
+            }
             let due_item_tokens = significant_tokens(&haystack);
             let overlap = prompt_tokens.intersection(&due_item_tokens).count();
             (overlap > 0).then_some((overlap, item.updated_at_unix, item))
@@ -1944,9 +2400,19 @@ pub fn list_all_active_memories_in_scope(
     connection: &rusqlite::Connection,
     memory_dir: &Path,
 ) -> rusqlite::Result<Vec<MemoryRecord>> {
+    let memory_dir = memory_dir.canonicalize().unwrap_or_else(|_| memory_dir.to_path_buf());
     Ok(list_all_active_memories(connection)?
         .into_iter()
-        .filter(|memory| Path::new(&memory.file_path).starts_with(memory_dir))
+        .filter(|memory| {
+            let path = Path::new(&memory.file_path);
+            let path = if path.is_relative() {
+                memory_dir.join(path)
+            } else {
+                path.to_path_buf()
+            };
+            let path = path.canonicalize().unwrap_or(path);
+            path.starts_with(&memory_dir)
+        })
         .collect())
 }
 
@@ -2241,6 +2707,274 @@ pub fn consolidate_semantic_memory_clusters(
     }
 
     Ok(())
+}
+
+pub fn update_outdated_or_incorrect_memory_from_config(
+    config: &AppConfig,
+    memory_name: &str,
+    update_text: &str,
+) -> ToolExecutionResult {
+    let mut connection = match open_sqlite_connection(&config.database_path) {
+        Ok(connection) => connection,
+        Err(error) => {
+            return ToolExecutionResult::error(format!("failed to open database: {error}"));
+        }
+    };
+    if let Err(error) = run_migrations(&mut connection) {
+        return ToolExecutionResult::error(format!("failed to run migrations: {error}"));
+    }
+    let memory = match find_active_memory_by_name_in_scope(&connection, memory_name, &config.memory_dir) {
+        Ok(Some(memory)) => memory,
+        Ok(None) => {
+            return ToolExecutionResult::success(format!("Memory '{memory_name}' not found"));
+        }
+        Err(error) => {
+            return ToolExecutionResult::error(format!("database query failed: {error}"));
+        }
+    };
+    let path = Path::new(&memory.file_path);
+    let existing = match read_memory_parts(path) {
+        Ok((_, body)) => body,
+        Err(error) => {
+            return ToolExecutionResult::error(format!("failed to read memory file: {error}"));
+        }
+    };
+
+    let mut updated = existing;
+    if !updated.is_empty() {
+        updated.push_str("\n\n");
+    }
+    updated.push_str(&format!(
+        "Update ({}):\n{}",
+        chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC"),
+        update_text.trim()
+    ));
+
+    let archive_dir = config.memory_dir.join("archive");
+    match archive_memory_file(path, &archive_dir) {
+        Ok(archived_path) => {
+            let frontmatter = memory_source_frontmatter(&[(memory_name, &archived_path)]);
+            match create_memory_file_with_frontmatter(
+                &config.memory_dir,
+                memory_name,
+                &updated,
+                frontmatter.as_deref(),
+            ) {
+                Ok(_) => {
+                    if let Err(error) = elroy_db::bootstrap_database(&BootstrapPlan::from_config(config)) {
+                        return ToolExecutionResult::error(format!(
+                            "failed to rebuild derived state: {error}"
+                        ));
+                    }
+                    if let Err(error) = sync_memory_context_after_mutation(config, memory_name, Some(memory_name)) {
+                        return ToolExecutionResult::error(format!(
+                            "failed to sync context: {error}"
+                        ));
+                    }
+                    ToolExecutionResult::success(format!(
+                        "Memory '{}' has been updated",
+                        memory_name
+                    ))
+                }
+                Err(error) => ToolExecutionResult::error(format!("failed to create updated memory file: {error}")),
+            }
+        }
+        Err(error) => ToolExecutionResult::error(format!("failed to archive old memory: {error}")),
+    }
+}
+
+pub fn search_memories_from_config(
+    config: &AppConfig,
+    query: &str,
+    limit: usize,
+) -> ToolExecutionResult {
+    let limit = limit.min(2);
+    let mut connection = match open_sqlite_connection(&config.database_path) {
+        Ok(connection) => connection,
+        Err(error) => {
+            return ToolExecutionResult::error(format!("failed to open database: {error}"));
+        }
+    };
+    if let Err(error) = run_migrations(&mut connection) {
+        return ToolExecutionResult::error(format!("failed to run migrations: {error}"));
+    }
+
+    let provider_config = fast_provider_config_from_app_config(config).ok();
+    let embedding_provider_config = embedding_provider_config_from_app_config(config).ok();
+
+    let relevance_model = best_effort_provider_model(provider_config.as_ref(), &config.assistant_name);
+    let embedding_client = best_effort_embedding_client(embedding_provider_config.as_ref());
+
+    let query_embedding = embedding_client.as_ref().and_then(|client| client.embed(query).ok());
+
+    let selection_clients = RecallSelectionClients {
+        limit,
+        embedding_distance_threshold: Some(config.l2_memory_relevance_distance_threshold as f32),
+        recency_weight: config.recency_weight as f32,
+        connection: Some(&connection),
+        relevance_model: relevance_model.as_ref().map(|m| m as &dyn ModelClient),
+        embedding_client: embedding_client.as_ref(),
+        query_embedding: query_embedding.as_deref(),
+        now_iso: None,
+    };
+
+    let source_fetch_limit = semantic_recall_source_fetch_limit(
+        limit * 3,
+        relevance_model.as_ref().map(|model| model as &dyn ModelClient),
+        embedding_client.as_ref(),
+    );
+
+    let memories = if semantic_recall_enabled(
+        relevance_model.as_ref().map(|model| model as &dyn ModelClient),
+        embedding_client.as_ref(),
+    ) {
+        match list_all_active_memories_in_scope(&connection, &config.memory_dir) {
+            Ok(memories) => memories,
+            Err(error) => return ToolExecutionResult::error(format!("database query failed: {error}")),
+        }
+    } else {
+        match search_active_memories_in_scope(&connection, &config.memory_dir, query, 10_000) {
+            Ok(memories) => memories,
+            Err(error) => return ToolExecutionResult::error(format!("database query failed: {error}")),
+        }
+    };
+
+    let due_items = match elroy_db::list_active_due_items(&connection, source_fetch_limit) {
+        Ok(items) => items,
+        Err(error) => return ToolExecutionResult::error(format!("database query failed: {error}")),
+    };
+    let agenda_items = match elroy_db::list_active_plain_agenda_items(&connection, source_fetch_limit) {
+        Ok(items) => items,
+        Err(error) => return ToolExecutionResult::error(format!("database query failed: {error}")),
+    };
+
+    let relevant_memories = select_relevant_recall_memories(
+        query,
+        &memories,
+        &[],
+        selection_clients,
+    );
+    let relevant_due_items = select_relevant_recall_due_items(
+        query,
+        &due_items,
+        selection_clients,
+    );
+    let relevant_agenda_items = select_relevant_recall_agenda_items(
+        query,
+        &agenda_items,
+        selection_clients,
+    );
+
+    ToolExecutionResult::success(format_memory_search_results(
+        &relevant_memories,
+        &relevant_due_items,
+        &relevant_agenda_items,
+    ))
+}
+pub fn format_due_item_examination(item: &elroy_db::AgendaItemRecord) -> String {
+    let mut text = format!("# Due Item: {}\n\n{}", item.name, item.body.trim());
+    if let Some(trigger_datetime) = item.trigger_datetime.as_deref() {
+        text.push_str(&format!("\n\nScheduled for: {trigger_datetime}"));
+    }
+    if let Some(trigger_context) = item.trigger_context.as_deref() {
+        text.push_str(&format!("\n\nTrigger context: {trigger_context}"));
+    }
+    text
+}
+
+pub fn examine_memories_from_config(
+    config: &AppConfig,
+    question: &str,
+) -> ToolExecutionResult {
+    let mut connection = match open_sqlite_connection(&config.database_path) {
+        Ok(connection) => connection,
+        Err(error) => {
+            return ToolExecutionResult::error(format!("failed to open database: {error}"));
+        }
+    };
+    if let Err(error) = run_migrations(&mut connection) {
+        return ToolExecutionResult::error(format!("failed to run migrations: {error}"));
+    }
+
+    let provider_config = fast_provider_config_from_app_config(config).ok();
+    let embedding_provider_config = embedding_provider_config_from_app_config(config).ok();
+
+    let relevance_model = best_effort_provider_model(provider_config.as_ref(), &config.assistant_name);
+    let embedding_client = best_effort_embedding_client(embedding_provider_config.as_ref());
+
+    let query_embedding = embedding_client.as_ref().and_then(|client| client.embed(question).ok());
+
+    let selection_clients = RecallSelectionClients {
+        limit: 2,
+        embedding_distance_threshold: Some(config.l2_memory_relevance_distance_threshold as f32),
+        recency_weight: config.recency_weight as f32,
+        connection: Some(&connection),
+        relevance_model: relevance_model.as_ref().map(|m| m as &dyn ModelClient),
+        embedding_client: embedding_client.as_ref(),
+        query_embedding: query_embedding.as_deref(),
+        now_iso: None,
+    };
+
+    let memories = match list_all_active_memories_in_scope(&connection, &config.memory_dir) {
+        Ok(memories) => memories,
+        Err(error) => return ToolExecutionResult::error(format!("database query failed: {error}")),
+    };
+    let due_items = match elroy_db::list_active_due_items(&connection, 1_000) {
+        Ok(items) => items,
+        Err(error) => return ToolExecutionResult::error(format!("database query failed: {error}")),
+    };
+    let agenda_items = match elroy_db::list_active_plain_agenda_items(&connection, 1_000) {
+        Ok(items) => items,
+        Err(error) => return ToolExecutionResult::error(format!("database query failed: {error}")),
+    };
+
+    let recalled_memories = select_relevant_recall_memories(
+        question,
+        &memories,
+        &[],
+        selection_clients,
+    );
+
+    let recalled_due_items = select_relevant_recall_due_items(
+        question,
+        &due_items,
+        selection_clients,
+    );
+
+    let recalled_agenda_items = select_relevant_recall_agenda_items(
+        question,
+        &agenda_items,
+        selection_clients,
+    );
+
+    let mut reports = Vec::new();
+
+    if !recalled_memories.is_empty() {
+        reports.push("### RELEVANT MEMORIES".to_string());
+        for memory in recalled_memories {
+            reports.push(format_memory_examination(&memory));
+        }
+    }
+
+    if !recalled_due_items.is_empty() {
+        reports.push("### RELEVANT DUE ITEMS".to_string());
+        for item in recalled_due_items {
+            reports.push(format_due_item_examination(&item));
+        }
+    }
+
+    if !recalled_agenda_items.is_empty() {
+        reports.push("### RELEVANT AGENDA ITEMS".to_string());
+        for item in recalled_agenda_items {
+            reports.push(format_agenda_item_detail(&item));
+        }
+    }
+
+    if reports.is_empty() {
+        ToolExecutionResult::success("No relevant memories found".to_string())
+    } else {
+        ToolExecutionResult::success(reports.join("\n\n"))
+    }
 }
 
 fn load_or_create_cached_memory_embeddings(

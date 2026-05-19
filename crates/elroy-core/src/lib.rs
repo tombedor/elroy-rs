@@ -8,7 +8,18 @@ use elroy_llm::{
 };
 use elroy_tools::{ExecutableToolRegistry, ToolRegistry, ToolSpec};
 
+pub mod memory_store;
+
 static BACKGROUND_STATUSES: OnceLock<Mutex<Vec<(String, String)>>> = OnceLock::new();
+
+pub fn excerpt(body: &str, max_chars: usize) -> String {
+    let trimmed = body.trim();
+    if trimmed.chars().count() <= max_chars {
+        return trimmed.to_string();
+    }
+    let shortened = trimmed.chars().take(max_chars).collect::<String>();
+    format!("{shortened}...")
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppSession {

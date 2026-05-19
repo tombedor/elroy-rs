@@ -11,11 +11,12 @@ workspace = true
 
 [dependencies]
 elroy-config = { path = "../elroy-config" }
+elroy-context = { path = "../elroy-context" }
 elroy-core = { path = "../elroy-core" }
 elroy-db = { path = "../elroy-db" }
 elroy-llm = { path = "../elroy-llm" }
-elroy-memory = { path = "../elroy-memory" }
 elroy-user = { path = "../elroy-user" }
+elroy-tools = { path = "../elroy-tools" }
 anyhow = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 rusqlite = { version = "0.37", features = ["bundled"] }

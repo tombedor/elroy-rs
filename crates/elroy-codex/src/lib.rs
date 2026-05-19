@@ -1,3 +1,5 @@
+pub mod tools;
+
 use std::collections::hash_map::DefaultHasher;
 use std::ffi::OsString;
 use std::hash::{Hash, Hasher};

@@ -12,6 +12,7 @@ use elroy_codex::{
     get_codex_session_by_thread_id, list_recent_codex_sessions, resume_codex_session_with_bin,
     resume_codex_session_with_hook,
 };
+use elroy_codex::tools::{codex_background_status_key, codex_tools};
 use elroy_config::{
     AppConfig, LlmProvider, embedding_provider_config_from_app_config,
     fast_provider_config_from_app_config, provider_config_from_app_config,
@@ -19,7 +20,7 @@ use elroy_config::{
 use elroy_core::{
     ConversationOrchestrator, LiveProviderModel, LocalToolExecutor,
     ModelClient, StreamingModelClient, TurnEventStream, clear_background_status,
-    get_background_status, set_background_status,
+    get_background_status, set_background_status, excerpt,
 };
 use elroy_db::{
     AgendaItemRecord, BootstrapPlan, LOCAL_USER_TOKEN, MemoryRecord, SYNTHETIC_FIRST_USER_MESSAGE,
@@ -27,20 +28,30 @@ use elroy_db::{
     list_active_plain_agenda_items, list_inactive_due_items,
     load_context_messages, load_messages_by_ids,
     load_user_preferences, open_sqlite_connection, record_deleted_due_item_tombstone,
-    replace_context_messages, run_migrations, save_user_preferences,
-    search_active_memories,
+    replace_context_messages, run_migrations,
 };
 use elroy_feature_requests::{
     FeatureRequestRecord, feature_request_tools, get_feature_request, is_active_feature_request,
     list_feature_requests, list_self_reflection_feature_requests, update_feature_request,
 };
 use elroy_llm::{
-    ConversationMessage, EmbeddingProviderConfig, LiveEmbeddingClient, LiveModelClient,
-    MessageRole, StreamEvent,
+    ConversationMessage, LiveModelClient, MessageRole, StreamEvent,
 };
-use elroy_memory::{
-    archive_memory_file, create_memory_file_with_frontmatter, read_memory_parts, sanitize_filename,
-    update_memory_body,
+use elroy_core::memory_store::{read_memory_parts, sanitize_filename};
+use elroy_memory::tools::memory_tools;
+use elroy_recall::{
+    context_memory_tool_call_id, context_memory_tool_messages,
+    context_task_tool_call_id, context_task_tool_messages,
+    format_agenda_item_recall_detail, format_due_item_detail,
+    formulate_memory_from_transcript, list_all_active_memories_in_scope,
+    message_matches_tool_call_id, recall_due_item_context_messages,
+    recall_memory_context_messages, select_relevant_recall_agenda_items,
+    select_relevant_recall_due_items, select_relevant_recall_memories,
+    sync_due_item_context_after_mutation, sync_task_context_after_mutation,
+    best_effort_provider_model, best_effort_embedding_client,
+    semantic_recall_source_fetch_limit, semantic_recall_enabled,
+    format_memory_search_results, format_memory_examination,
+    MEMORY_SOURCE_TYPE, CONTEXT_MESSAGE_SOURCE_TYPE,
 };
 use elroy_self_reflection::{SelfReflectionConfig, SelfReflectionOrchestrator};
 use elroy_tasks::{list_active_tasks, list_due_tasks, task_tools};
@@ -53,7 +64,7 @@ use elroy_tui::{
     TuiCommandPaletteEntry, TuiCommandParameter, TuiSidebarDetail, TuiSlashCommandAction,
     TuiSnapshot,
 };
-use elroy_user::{effective_persona, effective_user_full_name, effective_user_preferred_name};
+use elroy_user::{effective_persona, tools::user_tools};
 use serde_json::{Map, Value, json};
 
 mod context;
@@ -1449,6 +1460,7 @@ fn run_prompt_with_model_and_registry_internal(
             recency_weight: recall_models.recency_weight,
             connection: Some(connection),
             query_embedding: None,
+            now_iso: Some(&now_iso),
         },
         RecallContext {
             transcript: &existing_transcript,
@@ -1482,6 +1494,7 @@ fn run_prompt_with_model_and_registry_internal(
             recency_weight: recall_models.recency_weight,
             connection: Some(connection),
             query_embedding: None,
+            now_iso: Some(&now_iso),
         },
     );
     let mut model_transcript = existing_transcript.clone();
@@ -1617,6 +1630,7 @@ fn run_prompt_with_model_and_registry_stream_internal(
             recency_weight: recall_models.recency_weight,
             connection: Some(&connection),
             query_embedding: None,
+            now_iso: Some(&now_iso),
         },
         RecallContext {
             transcript: &existing_transcript,
@@ -1650,6 +1664,7 @@ fn run_prompt_with_model_and_registry_stream_internal(
             recency_weight: recall_models.recency_weight,
             connection: Some(&connection),
             query_embedding: None,
+            now_iso: Some(&now_iso),
         },
     );
     let mut model_transcript = existing_transcript.clone();
@@ -1758,7 +1773,7 @@ fn refresh_context_if_needed(
             .iter()
             .any(|message| message.role == MessageRole::User)
         {
-            let (name, text) = formulate_memory_from_transcript(&transcript);
+            let (name, text) = elroy_recall::formulate_memory_from_transcript(&transcript);
             create_memory_file_from_context_messages(
                 &bootstrap_plan.memory_dir,
                 &name,
@@ -1803,21 +1818,6 @@ fn refresh_context_if_needed(
     result
 }
 
-fn format_due_item_detail(item: &AgendaItemRecord) -> String {
-    let mut lines = vec![format!("Due item '{}':", item.name)];
-    if let Some(trigger_datetime) = &item.trigger_datetime {
-        let formatted = parse_sidebar_trigger_datetime(trigger_datetime)
-            .map(|datetime| datetime.format("%Y-%m-%d %H:%M:%S").to_string())
-            .unwrap_or_else(|| trigger_datetime.clone());
-        lines.push(format!("Trigger Time: {formatted}"));
-    }
-    if let Some(trigger_context) = &item.trigger_context {
-        lines.push(format!("Context: {trigger_context}"));
-    }
-    lines.push(format!("Text: {}", item.body));
-    lines.join("\n")
-}
-
 fn format_due_item_listing(items: &[AgendaItemRecord], active: bool) -> String {
     if items.is_empty() {
         let status = if active { "active" } else { "inactive" };
@@ -1854,65 +1854,6 @@ fn format_due_item_listing(items: &[AgendaItemRecord], active: bool) -> String {
             line.push_str(&format!(" | Comment: {closing_comment}"));
         }
         lines.push(line);
-    }
-    lines.join("\n")
-}
-
-fn format_memory_examination(memory: &MemoryRecord) -> String {
-    format!(
-        "# Memory: {}\n\n*to view the source content this memory is based on, call tool `get_source_content_for_memory({}, idx)`\n\n{}",
-        memory.name,
-        memory.name,
-        memory.body.trim()
-    )
-}
-
-fn format_memory_listing(memories: &[MemoryRecord]) -> String {
-    if memories.is_empty() {
-        return "No memories found.".to_string();
-    }
-
-    let mut lines = vec!["Memories".to_string()];
-    for memory in memories.iter().rev() {
-        lines.push(format!(
-            "- {} | Text: {}",
-            memory.name,
-            excerpt(&memory.body, 180)
-        ));
-    }
-    lines.join("\n")
-}
-
-fn format_memory_search_results(
-    memories: &[&MemoryRecord],
-    due_items: &[&AgendaItemRecord],
-    agenda_items: &[&AgendaItemRecord],
-) -> String {
-    if memories.is_empty() && due_items.is_empty() && agenda_items.is_empty() {
-        return "No relevant memories found".to_string();
-    }
-
-    let mut lines = vec!["Search Results".to_string()];
-    for memory in memories {
-        lines.push(format!(
-            "- Memory | {} | {}",
-            memory.name,
-            excerpt(&memory.body, 180)
-        ));
-    }
-    for item in due_items {
-        lines.push(format!(
-            "- DueItem | {} | {}",
-            item.name,
-            excerpt(&item.body, 180)
-        ));
-    }
-    for item in agenda_items {
-        lines.push(format!(
-            "- AgendaItem | {} | {}",
-            item.name,
-            excerpt(&item.body, 180)
-        ));
     }
     lines.join("\n")
 }
@@ -1977,10 +1918,6 @@ fn codex_completion_followup_prompt(result: &CodexSessionResult) -> String {
         result.status,
         result.summary,
     )
-}
-
-fn codex_background_status_key(session_id: &str) -> String {
-    format!("codex-session-{session_id}")
 }
 
 fn codex_background_status_message(session_id: &str) -> String {
@@ -2719,149 +2656,6 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
         },
     );
 
-    let config_for_memory_write = config.clone();
-    let create_memory = ExecutableTool::new(
-        ToolSpec::new(
-            "create_memory",
-            "Create a new file-backed memory and rebuild derived state.",
-            JsonSchema::object(
-                [
-                    ("name", json!({"type": "string"})),
-                    ("text", json!({"type": "string"})),
-                ],
-                ["name", "text"],
-            ),
-        ),
-        move |arguments| {
-            let Some(name) = arguments.get("name").and_then(Value::as_str) else {
-                return ToolExecutionResult::error("create_memory requires a string name");
-            };
-            let Some(text) = arguments.get("text").and_then(Value::as_str) else {
-                return ToolExecutionResult::error("create_memory requires string text");
-            };
-            let created = (|| -> Result<PathBuf, std::io::Error> {
-                let mut connection = open_sqlite_connection(&config_for_memory_write.database_path)
-                    .map_err(|error| std::io::Error::other(error.to_string()))?;
-                run_migrations(&mut connection)
-                    .map_err(|error| std::io::Error::other(error.to_string()))?;
-                let context_messages = load_context_messages(&mut connection, LOCAL_USER_TOKEN)
-                    .map_err(|error| std::io::Error::other(error.to_string()))?;
-                let path = create_memory_file_from_context_messages(
-                    &config_for_memory_write.memory_dir,
-                    name,
-                    text,
-                    &context_messages,
-                )?;
-                elroy_db::bootstrap_database(&BootstrapPlan::from_config(&config_for_memory_write))
-                    .map_err(|error| std::io::Error::other(error.to_string()))?;
-                record_memory_creation_and_maybe_consolidate(
-                    &mut connection,
-                    &BootstrapPlan::from_config(&config_for_memory_write),
-                    config_for_memory_write.memories_between_consolidation,
-                    Some(&memory_consolidation_settings_from_app_config(
-                        &config_for_memory_write,
-                    )),
-                )
-                .map_err(|error| std::io::Error::other(error.to_string()))?;
-                Ok(path)
-            })();
-            match created {
-                Ok(_path) => ToolExecutionResult::success(format!("New memory created: {name}")),
-                Err(error) => {
-                    ToolExecutionResult::error(format!("failed to create memory: {error}"))
-                }
-            }
-        },
-    );
-
-    let config_for_consolidated_memory_write = config.clone();
-    let create_consolidated_memory = ExecutableTool::new(
-        ToolSpec::new(
-            "create_consolidated_memory",
-            "Create a consolidated memory from one or more existing active memories.",
-            JsonSchema::object(
-                [
-                    ("name", json!({"type": "string"})),
-                    ("text", json!({"type": "string"})),
-                    (
-                        "source_names",
-                        json!({
-                            "type": "array",
-                            "items": {"type": "string"}
-                        }),
-                    ),
-                ],
-                ["name", "text", "source_names"],
-            ),
-        ),
-        move |arguments| {
-            let Some(name) = arguments.get("name").and_then(Value::as_str) else {
-                return ToolExecutionResult::error(
-                    "create_consolidated_memory requires a string name",
-                );
-            };
-            let Some(text) = arguments.get("text").and_then(Value::as_str) else {
-                return ToolExecutionResult::error(
-                    "create_consolidated_memory requires string text",
-                );
-            };
-            let Some(source_names) = arguments.get("source_names").and_then(Value::as_array) else {
-                return ToolExecutionResult::error(
-                    "create_consolidated_memory requires array source_names",
-                );
-            };
-            let source_names = source_names
-                .iter()
-                .map(Value::as_str)
-                .collect::<Option<Vec<_>>>();
-            let Some(source_names) = source_names else {
-                return ToolExecutionResult::error(
-                    "create_consolidated_memory requires string source_names entries",
-                );
-            };
-            if source_names.is_empty() {
-                return ToolExecutionResult::error(
-                    "create_consolidated_memory requires at least one source memory",
-                );
-            }
-            match create_consolidated_memory_from_config(
-                &config_for_consolidated_memory_write,
-                name,
-                text,
-                &source_names,
-            ) {
-                Ok(path) => ToolExecutionResult::success(
-                    json!({
-                        "created": true,
-                        "file_path": path.display().to_string(),
-                    })
-                    .to_string(),
-                ),
-                Err(error) => ToolExecutionResult::error(format!(
-                    "failed to create consolidated memory: {error}"
-                )),
-            }
-        },
-    );
-
-    let get_fast_recall = ExecutableTool::new(
-        ToolSpec::new(
-            "get_fast_recall",
-            "No-op tool used to acknowledge synthetic recall context.",
-            JsonSchema::object(Vec::<(String, Value)>::new(), [] as [&str; 0]),
-        ),
-        move |_| ToolExecutionResult::success("OK".to_string()),
-    );
-
-    let get_reflective_recall = ExecutableTool::new(
-        ToolSpec::new(
-            "get_reflective_recall",
-            "No-op tool used to acknowledge synthetic reflective recall context.",
-            JsonSchema::object(Vec::<(String, Value)>::new(), [] as [&str; 0]),
-        ),
-        move |_| ToolExecutionResult::success("OK".to_string()),
-    );
-
     let config_for_agenda_write = config.clone();
     let add_agenda_item = ExecutableTool::new(
         ToolSpec::new(
@@ -3341,171 +3135,6 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
                     "failed to remove due item from context: {error}"
                 )),
             }
-        },
-    );
-
-    let config_for_memory_update = config.clone();
-    let update_memory = ExecutableTool::new(
-        ToolSpec::new(
-            "update_memory",
-            "Replace the body text of one active memory by exact name.",
-            JsonSchema::object(
-                [
-                    ("memory_name", json!({"type": "string"})),
-                    ("name", json!({"type": "string"})),
-                    ("text", json!({"type": "string"})),
-                ],
-                ["text"],
-            ),
-        ),
-        move |arguments| {
-            let Some(name) = arguments
-                .get("memory_name")
-                .and_then(Value::as_str)
-                .or_else(|| arguments.get("name").and_then(Value::as_str))
-            else {
-                return ToolExecutionResult::error("update_memory requires a string name");
-            };
-            let Some(text) = arguments.get("text").and_then(Value::as_str) else {
-                return ToolExecutionResult::error("update_memory requires string text");
-            };
-            mutate_memory_file_from_config(&config_for_memory_update, name, |path| {
-                update_memory_body(path, text)
-            })
-        },
-    );
-
-    let config_for_outdated_memory_update = config.clone();
-    let update_outdated_or_incorrect_memory = ExecutableTool::new(
-        ToolSpec::new(
-            "update_outdated_or_incorrect_memory",
-            "Replace one active memory with an updated version while preserving the old content as a source.",
-            JsonSchema::object(
-                [
-                    ("memory_name", json!({"type": "string"})),
-                    ("update_text", json!({"type": "string"})),
-                ],
-                ["memory_name", "update_text"],
-            ),
-        ),
-        move |arguments| {
-            let Some(memory_name) = arguments.get("memory_name").and_then(Value::as_str) else {
-                return ToolExecutionResult::error(
-                    "update_outdated_or_incorrect_memory requires string memory_name",
-                );
-            };
-            let Some(update_text) = arguments.get("update_text").and_then(Value::as_str) else {
-                return ToolExecutionResult::error(
-                    "update_outdated_or_incorrect_memory requires string update_text",
-                );
-            };
-            let mut connection =
-                match open_sqlite_connection(&config_for_outdated_memory_update.database_path) {
-                    Ok(connection) => connection,
-                    Err(error) => {
-                        return ToolExecutionResult::error(format!(
-                            "failed to open database: {error}"
-                        ));
-                    }
-                };
-            let memory = match find_active_memory_by_name_in_scope(
-                &connection,
-                memory_name,
-                &config_for_outdated_memory_update.memory_dir,
-            ) {
-                Ok(Some(memory)) => memory,
-                Ok(None) => {
-                    return ToolExecutionResult::success(format!(
-                        "Memory '{memory_name}' not found"
-                    ));
-                }
-                Err(error) => {
-                    return ToolExecutionResult::error(format!("database query failed: {error}"));
-                }
-            };
-            let path = Path::new(&memory.file_path);
-            let existing = match read_memory_parts(path) {
-                Ok((_, body)) => body,
-                Err(error) => {
-                    return ToolExecutionResult::error(format!("memory mutation failed: {error}"));
-                }
-            };
-            let mut updated = existing;
-            if !updated.is_empty() {
-                updated.push_str("\n\n");
-            }
-            updated.push_str(&format!(
-                "Update ({}):\n{}",
-                Utc::now().format("%Y-%m-%d %H:%M:%S UTC"),
-                update_text.trim()
-            ));
-            let archive_dir = config_for_outdated_memory_update.memory_dir.join("archive");
-            let archived_path = match archive_memory_file(path, &archive_dir) {
-                Ok(path) => path,
-                Err(error) => {
-                    return ToolExecutionResult::error(format!("memory mutation failed: {error}"));
-                }
-            };
-            let frontmatter = memory_source_frontmatter(&[(&memory.name, archived_path.as_path())]);
-            if let Err(error) = create_memory_file_with_frontmatter(
-                &config_for_outdated_memory_update.memory_dir,
-                &memory.name,
-                &updated,
-                frontmatter.as_deref(),
-            ) {
-                return ToolExecutionResult::error(format!("memory mutation failed: {error}"));
-            }
-            if let Err(error) = elroy_db::bootstrap_database(&BootstrapPlan::from_config(
-                &config_for_outdated_memory_update,
-            )) {
-                return ToolExecutionResult::error(format!("memory mutation failed: {error}"));
-            }
-            if let Err(error) = record_memory_creation_and_maybe_consolidate(
-                &mut connection,
-                &BootstrapPlan::from_config(&config_for_outdated_memory_update),
-                config_for_outdated_memory_update.memories_between_consolidation,
-                Some(&memory_consolidation_settings_from_app_config(
-                    &config_for_outdated_memory_update,
-                )),
-            ) {
-                return ToolExecutionResult::error(format!("memory mutation failed: {error}"));
-            }
-            if let Err(error) = sync_memory_context_after_mutation(
-                &config_for_outdated_memory_update,
-                &memory.name,
-                Some(&memory.name),
-            ) {
-                return ToolExecutionResult::error(format!("memory mutation failed: {error}"));
-            }
-            ToolExecutionResult::success(format!("Memory '{memory_name}' has been updated"))
-        },
-    );
-
-    let config_for_memory_archive = config.clone();
-    let archive_memory = ExecutableTool::new(
-        ToolSpec::new(
-            "archive_memory",
-            "Archive one active memory by exact name.",
-            JsonSchema::object(
-                [
-                    ("memory_name", json!({"type": "string"})),
-                    ("name", json!({"type": "string"})),
-                ],
-                [] as [&str; 0],
-            ),
-        ),
-        move |arguments| {
-            let Some(name) = arguments
-                .get("memory_name")
-                .and_then(Value::as_str)
-                .or_else(|| arguments.get("name").and_then(Value::as_str))
-            else {
-                return ToolExecutionResult::error("archive_memory requires a string name");
-            };
-            let archive_dir = config_for_memory_archive.memory_dir.join("archive");
-            archive_memory_file_from_config(&config_for_memory_archive, name, |path| {
-                archive_memory_file(path, &archive_dir)
-            })
         },
     );
 
@@ -3989,7 +3618,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
             let updated_transcript = transcript
                 .into_iter()
                 .filter(|message| {
-                    !message_matches_context_memory(message, &context_memory_tool_call_id)
+                    !message_matches_tool_call_id(message, &context_memory_tool_call_id)
                 })
                 .collect::<Vec<_>>();
             if let Err(error) =
@@ -4093,184 +3722,18 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
         },
     );
 
-    let config_for_assistant_name = config.clone();
-    let set_assistant_name = ExecutableTool::new(
-        ToolSpec::new(
-            "set_assistant_name",
-            "Set the assistant name for this local user.",
-            JsonSchema::object(
-                [("assistant_name", json!({"type": "string"}))],
-                ["assistant_name"],
-            ),
-        ),
-        move |arguments| {
-            let Some(assistant_name) = arguments.get("assistant_name").and_then(Value::as_str)
-            else {
-                return ToolExecutionResult::error(
-                    "set_assistant_name requires string assistant_name",
-                );
-            };
-            mutate_user_preferences_in_config(&config_for_assistant_name, |record| {
-                record.assistant_name = Some(assistant_name.to_string());
-                Ok(format!("Assistant name updated to {assistant_name}."))
-            })
-        },
-    );
-
-    let config_for_persona = config.clone();
-    let set_persona = ExecutableTool::new(
-        ToolSpec::new(
-            "set_persona",
-            "Set the system persona template for this local user.",
-            JsonSchema::object(
-                [("system_persona", json!({"type": "string"}))],
-                ["system_persona"],
-            ),
-        ),
-        move |arguments| {
-            let Some(system_persona) = arguments.get("system_persona").and_then(Value::as_str)
-            else {
-                return ToolExecutionResult::error("set_persona requires string system_persona");
-            };
-            let system_persona = system_persona.trim();
-            if system_persona.is_empty() {
-                return ToolExecutionResult::error("System persona cannot be blank.");
-            }
-            mutate_user_preferences_in_config(&config_for_persona, |record| {
-                if record.system_persona.as_deref() == Some(system_persona) {
-                    return Ok("New system persona and old system persona are identical".into());
-                }
-                record.system_persona = Some(system_persona.to_string());
-                Ok("System persona updated.".into())
-            })
-        },
-    );
-
-    let config_for_reset_system_persona = config.clone();
-    let reset_system_persona = ExecutableTool::new(
-        ToolSpec::new(
-            "reset_system_persona",
-            "Clear the persisted system persona for this local user.",
-            JsonSchema::object(Vec::<(String, Value)>::new(), [] as [&str; 0]),
-        ),
-        move |_| {
-            mutate_user_preferences_in_config(&config_for_reset_system_persona, |record| {
-                record.system_persona = None;
-                Ok("System persona cleared, will now use default persona.".into())
-            })
-        },
-    );
-
-    let config_for_preferred_name = config.clone();
-    let set_user_preferred_name = ExecutableTool::new(
-        ToolSpec::new(
-            "set_user_preferred_name",
-            "Set the preferred name for this local user.",
-            JsonSchema::object(
-                [
-                    ("preferred_name", json!({"type": "string"})),
-                    ("override_existing", json!({"type": "boolean"})),
-                ],
-                ["preferred_name"],
-            ),
-        ),
-        move |arguments| {
-            let Some(preferred_name) = arguments.get("preferred_name").and_then(Value::as_str)
-            else {
-                return ToolExecutionResult::error(
-                    "set_user_preferred_name requires string preferred_name",
-                );
-            };
-            let override_existing = arguments
-                .get("override_existing")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            mutate_user_preferences_in_config(&config_for_preferred_name, |record| {
-                let existing = effective_user_preferred_name(Some(record));
-                if existing != elroy_user::DEFAULT_USER_PREFERRED_NAME && !override_existing {
-                    return Ok(format!(
-                        "Preferred name already set to {}. If this should be changed, use override_existing=True.",
-                        existing
-                    ));
-                }
-                record.preferred_name = Some(preferred_name.to_string());
-                Ok(format!(
-                    "Set user preferred name to {}. Was {}.",
-                    preferred_name, existing
-                ))
-            })
-        },
-    );
-
-    let database_path = config.database_path.clone();
-    let get_user_preferred_name = ExecutableTool::new(
-        ToolSpec::new(
-            "get_user_preferred_name",
-            "Return the preferred name for this local user.",
-            JsonSchema::object(Vec::<(String, Value)>::new(), [] as [&str; 0]),
-        ),
-        move |_| {
-            with_user_preferences_at_path(&database_path, |record| {
-                Ok(ToolExecutionResult::success(effective_user_preferred_name(
-                    record.as_ref(),
-                )))
-            })
-        },
-    );
-
-    let config_for_full_name = config.clone();
-    let set_user_full_name = ExecutableTool::new(
-        ToolSpec::new(
-            "set_user_full_name",
-            "Set the full name for this local user.",
-            JsonSchema::object(
-                [
-                    ("full_name", json!({"type": "string"})),
-                    ("override_existing", json!({"type": "boolean"})),
-                ],
-                ["full_name"],
-            ),
-        ),
-        move |arguments| {
-            let Some(full_name) = arguments.get("full_name").and_then(Value::as_str) else {
-                return ToolExecutionResult::error("set_user_full_name requires string full_name");
-            };
-            let override_existing = arguments
-                .get("override_existing")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            mutate_user_preferences_in_config(&config_for_full_name, |record| {
-                let existing = effective_user_full_name(Some(record));
-                if existing != elroy_user::UNKNOWN_FULL_NAME && !override_existing {
-                    return Ok(format!(
-                        "Full name already set to {}. If this should be changed, set override_existing=True.",
-                        existing
-                    ));
-                }
-                record.full_name = Some(full_name.to_string());
-                Ok(format!(
-                    "Full name set to {}. Previous value was {}.",
-                    full_name, existing
-                ))
-            })
-        },
-    );
-
-    let database_path = config.database_path.clone();
-    let get_user_full_name = ExecutableTool::new(
-        ToolSpec::new(
-            "get_user_full_name",
-            "Return the full name for this local user.",
-            JsonSchema::object(Vec::<(String, Value)>::new(), [] as [&str; 0]),
-        ),
-        move |_| {
-            with_user_preferences_at_path(&database_path, |record| {
-                Ok(ToolExecutionResult::success(effective_user_full_name(
-                    record.as_ref(),
-                )))
-            })
-        },
-    );
+    let mut user_tools_iter = user_tools(
+        config.clone(),
+        std::sync::Arc::new(|conn, cfg| refresh_persisted_system_instructions(conn, cfg)),
+    )
+    .into_iter();
+    let set_assistant_name = user_tools_iter.next().expect("user_tools[0]");
+    let set_persona = user_tools_iter.next().expect("user_tools[1]");
+    let reset_system_persona = user_tools_iter.next().expect("user_tools[2]");
+    let set_user_preferred_name = user_tools_iter.next().expect("user_tools[3]");
+    let get_user_preferred_name = user_tools_iter.next().expect("user_tools[4]");
+    let set_user_full_name = user_tools_iter.next().expect("user_tools[5]");
+    let get_user_full_name = user_tools_iter.next().expect("user_tools[6]");
 
     let database_path = config.database_path.clone();
     let codex_bin_for_dispatch = codex_bin_override.clone();
@@ -4535,319 +3998,6 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
     );
 
     let database_path = config.database_path.clone();
-    let memory_dir_for_list_memories = config.memory_dir.clone();
-    let list_memories = ExecutableTool::new(
-        ToolSpec::new(
-            "list_memories",
-            "List active memories available to Elroy.",
-            JsonSchema::object([("limit", json!({"type": "integer"}))], [] as [&str; 0]),
-        ),
-        move |arguments| {
-            let limit = argument_limit(&arguments, 10);
-            with_tool_connection(&database_path, |connection| {
-                let memories = list_active_memories_in_scope(
-                    connection,
-                    &memory_dir_for_list_memories,
-                    limit,
-                )?;
-                let payload = memories
-                    .into_iter()
-                    .map(|memory| {
-                        json!({
-                            "name": memory.name,
-                            "file_path": memory.file_path,
-                            "excerpt": excerpt(&memory.body, 180),
-                            "updated_at_unix": memory.updated_at_unix,
-                        })
-                    })
-                    .collect::<Vec<_>>();
-                Ok(ToolExecutionResult::success(
-                    serde_json::to_string_pretty(&payload)
-                        .expect("memory payload should serialize"),
-                ))
-            })
-        },
-    );
-
-    let database_path = config.database_path.clone();
-    let memory_dir_for_print_memories = config.memory_dir.clone();
-    let print_memories = ExecutableTool::new(
-        ToolSpec::new(
-            "print_memories",
-            "List active memories available to Elroy.",
-            JsonSchema::object([("n", json!({"type": "integer"}))], [] as [&str; 0]),
-        ),
-        move |arguments| {
-            let limit = argument_limit(&arguments, 10);
-            with_tool_connection(&database_path, |connection| {
-                let memories = list_active_memories_in_scope(
-                    connection,
-                    &memory_dir_for_print_memories,
-                    limit,
-                )?;
-                Ok(ToolExecutionResult::success(format_memory_listing(
-                    &memories,
-                )))
-            })
-        },
-    );
-
-    let database_path = config.database_path.clone();
-    let memory_dir_for_search_memories = config.memory_dir.clone();
-    let provider_config_for_search_memories = fast_provider_config_from_app_config(config).ok();
-    let embedding_provider_config_for_search_memories =
-        embedding_provider_config_from_app_config(config).ok();
-    let assistant_name_for_search_memories = config.assistant_name.clone();
-    let embedding_distance_threshold_for_search_memories =
-        config.l2_memory_relevance_distance_threshold as f32;
-    let recency_weight_for_search_memories = config.recency_weight as f32;
-    let search_memories = ExecutableTool::new(
-        ToolSpec::new(
-            "search_memories",
-            "Search active memories by keyword.",
-            JsonSchema::object([("query", json!({"type": "string"}))], ["query"]),
-        ),
-        move |arguments| {
-            let Some(query) = arguments.get("query").and_then(Value::as_str) else {
-                return ToolExecutionResult::error("search_memories requires a string query");
-            };
-            let recall_limit = argument_limit(&arguments, 10).min(2);
-            let relevance_model = best_effort_provider_model(
-                provider_config_for_search_memories.as_ref(),
-                &assistant_name_for_search_memories,
-            );
-            let embedding_client = best_effort_embedding_client(
-                embedding_provider_config_for_search_memories.as_ref(),
-            );
-            with_tool_connection(&database_path, |connection| {
-                let shared_query_embedding = embedding_client
-                    .as_ref()
-                    .and_then(|client| client.embed(query).ok());
-                let source_fetch_limit = semantic_recall_source_fetch_limit(
-                    recall_limit * 3,
-                    relevance_model
-                        .as_ref()
-                        .map(|model| model as &dyn ModelClient),
-                    embedding_client.as_ref(),
-                );
-                let memories = if semantic_recall_enabled(
-                    relevance_model
-                        .as_ref()
-                        .map(|model| model as &dyn ModelClient),
-                    embedding_client.as_ref(),
-                ) {
-                    list_active_memories_in_scope(
-                        connection,
-                        &memory_dir_for_search_memories,
-                        source_fetch_limit,
-                    )?
-                } else {
-                    search_active_memories_in_scope(
-                        connection,
-                        &memory_dir_for_search_memories,
-                        query,
-                        source_fetch_limit,
-                    )?
-                };
-                let due_items = list_active_due_items(connection, source_fetch_limit)?;
-                let agenda_items = list_active_plain_agenda_items(connection, source_fetch_limit)?;
-                let relevant_memories = select_relevant_recall_memories(
-                    query,
-                    &memories,
-                    &[],
-                    RecallSelectionClients {
-                        limit: recall_limit,
-                        relevance_model: relevance_model
-                            .as_ref()
-                            .map(|model| model as &dyn ModelClient),
-                        embedding_client: embedding_client.as_ref(),
-                        embedding_distance_threshold: Some(
-                            embedding_distance_threshold_for_search_memories,
-                        ),
-                        recency_weight: recency_weight_for_search_memories,
-                        connection: Some(connection),
-                        query_embedding: shared_query_embedding.as_deref(),
-                    },
-                );
-                let relevant_due_items = select_relevant_recall_due_items(
-                    query,
-                    &due_items,
-                    RecallSelectionClients {
-                        limit: recall_limit,
-                        relevance_model: relevance_model
-                            .as_ref()
-                            .map(|model| model as &dyn ModelClient),
-                        embedding_client: embedding_client.as_ref(),
-                        embedding_distance_threshold: Some(
-                            embedding_distance_threshold_for_search_memories,
-                        ),
-                        recency_weight: recency_weight_for_search_memories,
-                        connection: Some(connection),
-                        query_embedding: shared_query_embedding.as_deref(),
-                    },
-                );
-                let relevant_agenda_items = select_relevant_recall_agenda_items(
-                    query,
-                    &agenda_items,
-                    RecallSelectionClients {
-                        limit: recall_limit,
-                        relevance_model: relevance_model
-                            .as_ref()
-                            .map(|model| model as &dyn ModelClient),
-                        embedding_client: embedding_client.as_ref(),
-                        embedding_distance_threshold: Some(
-                            embedding_distance_threshold_for_search_memories,
-                        ),
-                        recency_weight: recency_weight_for_search_memories,
-                        connection: Some(connection),
-                        query_embedding: shared_query_embedding.as_deref(),
-                    },
-                );
-                Ok(ToolExecutionResult::success(format_memory_search_results(
-                    &relevant_memories,
-                    &relevant_due_items,
-                    &relevant_agenda_items,
-                )))
-            })
-        },
-    );
-
-    let database_path = config.database_path.clone();
-    let memory_dir_for_examine_memories = config.memory_dir.clone();
-    let provider_config_for_examine_memories = fast_provider_config_from_app_config(config).ok();
-    let embedding_provider_config_for_examine_memories =
-        embedding_provider_config_from_app_config(config).ok();
-    let assistant_name_for_examine_memories = config.assistant_name.clone();
-    let embedding_distance_threshold_for_examine_memories =
-        config.l2_memory_relevance_distance_threshold as f32;
-    let recency_weight_for_examine_memories = config.recency_weight as f32;
-    let examine_memories = ExecutableTool::new(
-        ToolSpec::new(
-            "examine_memories",
-            "Search memories and due items for the answer to a question.",
-            JsonSchema::object([("question", json!({"type": "string"}))], ["question"]),
-        ),
-        move |arguments| {
-            let Some(question) = arguments.get("question").and_then(Value::as_str) else {
-                return ToolExecutionResult::error("examine_memories requires a string question");
-            };
-            let recall_limit = argument_limit(&arguments, 10).min(2);
-            let relevance_model = best_effort_provider_model(
-                provider_config_for_examine_memories.as_ref(),
-                &assistant_name_for_examine_memories,
-            );
-            let embedding_client = best_effort_embedding_client(
-                embedding_provider_config_for_examine_memories.as_ref(),
-            );
-            with_tool_connection(&database_path, |connection| {
-                let shared_query_embedding = embedding_client
-                    .as_ref()
-                    .and_then(|client| client.embed(question).ok());
-                let source_fetch_limit = semantic_recall_source_fetch_limit(
-                    recall_limit * 3,
-                    relevance_model
-                        .as_ref()
-                        .map(|model| model as &dyn ModelClient),
-                    embedding_client.as_ref(),
-                );
-                let memories = list_active_memories_in_scope(
-                    connection,
-                    &memory_dir_for_examine_memories,
-                    source_fetch_limit,
-                )?;
-                let due_items = list_active_due_items(connection, source_fetch_limit)?;
-                let agenda_items = list_active_plain_agenda_items(connection, source_fetch_limit)?;
-                let relevant_memories = select_relevant_recall_memories(
-                    question,
-                    &memories,
-                    &[],
-                    RecallSelectionClients {
-                        limit: recall_limit,
-                        relevance_model: relevance_model
-                            .as_ref()
-                            .map(|model| model as &dyn ModelClient),
-                        embedding_client: embedding_client.as_ref(),
-                        embedding_distance_threshold: Some(
-                            embedding_distance_threshold_for_examine_memories,
-                        ),
-                        recency_weight: recency_weight_for_examine_memories,
-                        connection: Some(connection),
-                        query_embedding: shared_query_embedding.as_deref(),
-                    },
-                );
-                let relevant_due_items = select_relevant_recall_due_items(
-                    question,
-                    &due_items,
-                    RecallSelectionClients {
-                        limit: recall_limit,
-                        relevance_model: relevance_model
-                            .as_ref()
-                            .map(|model| model as &dyn ModelClient),
-                        embedding_client: embedding_client.as_ref(),
-                        embedding_distance_threshold: Some(
-                            embedding_distance_threshold_for_examine_memories,
-                        ),
-                        recency_weight: recency_weight_for_examine_memories,
-                        connection: Some(connection),
-                        query_embedding: shared_query_embedding.as_deref(),
-                    },
-                );
-                let relevant_agenda_items = select_relevant_recall_agenda_items(
-                    question,
-                    &agenda_items,
-                    RecallSelectionClients {
-                        limit: recall_limit,
-                        relevance_model: relevance_model
-                            .as_ref()
-                            .map(|model| model as &dyn ModelClient),
-                        embedding_client: embedding_client.as_ref(),
-                        embedding_distance_threshold: Some(
-                            embedding_distance_threshold_for_examine_memories,
-                        ),
-                        recency_weight: recency_weight_for_examine_memories,
-                        connection: Some(connection),
-                        query_embedding: shared_query_embedding.as_deref(),
-                    },
-                );
-
-                let mut sections = relevant_memories
-                    .into_iter()
-                    .map(format_memory_examination)
-                    .collect::<Vec<_>>();
-                sections.extend(relevant_due_items.into_iter().map(|item| {
-                    let mut text = format!("# Due Item: {}\n\n{}", item.name, item.body.trim());
-                    if let Some(trigger_datetime) = item.trigger_datetime.as_deref() {
-                        text.push_str(&format!("\n\nScheduled for: {trigger_datetime}"));
-                    }
-                    if let Some(trigger_context) = item.trigger_context.as_deref() {
-                        text.push_str(&format!("\nTrigger context: {trigger_context}"));
-                    }
-                    text
-                }));
-                sections.extend(relevant_agenda_items.into_iter().map(|item| {
-                    let mut text = format!("# Agenda Item: {}\n\n{}", item.name, item.body.trim());
-                    if let Some(agenda_date) = item.agenda_date.as_deref() {
-                        text.push_str(&format!("\n\nAgenda date: {agenda_date}"));
-                    }
-                    if item.checklist_total > 0 {
-                        text.push_str(&format!(
-                            "\nChecklist progress: {}/{}",
-                            item.checklist_completed, item.checklist_total
-                        ));
-                    }
-                    text
-                }));
-
-                if sections.is_empty() {
-                    Ok(ToolExecutionResult::success(
-                        "No relevant memories found".to_string(),
-                    ))
-                } else {
-                    Ok(ToolExecutionResult::success(sections.join("\n\n")))
-                }
-            })
-        },
-    );
 
     let database_path = config.database_path.clone();
     let list_agenda = ExecutableTool::new(
@@ -5141,220 +4291,6 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
     );
 
     let database_path = config.database_path.clone();
-    let memory_dir_for_show_memory = config.memory_dir.clone();
-    let show_memory = ExecutableTool::new(
-        ToolSpec::new(
-            "show_memory",
-            "Show one active memory by exact name.",
-            JsonSchema::object(
-                [
-                    ("memory_name", json!({"type": "string"})),
-                    ("name", json!({"type": "string"})),
-                ],
-                [] as [&str; 0],
-            ),
-        ),
-        move |arguments| {
-            let Some(name) = arguments
-                .get("memory_name")
-                .and_then(Value::as_str)
-                .or_else(|| arguments.get("name").and_then(Value::as_str))
-            else {
-                return ToolExecutionResult::error("show_memory requires a string name");
-            };
-            with_tool_connection(&database_path, |connection| {
-                let Some(memory) = find_active_memory_by_name_in_scope(
-                    connection,
-                    name,
-                    &memory_dir_for_show_memory,
-                )?
-                else {
-                    return Ok(ToolExecutionResult::error(format!(
-                        "Memory '{name}' not found for the current user."
-                    )));
-                };
-                Ok(ToolExecutionResult::success(
-                    json!({
-                        "name": memory.name,
-                        "file_path": memory.file_path,
-                        "body": memory.body,
-                        "updated_at_unix": memory.updated_at_unix,
-                    })
-                    .to_string(),
-                ))
-            })
-        },
-    );
-
-    let database_path = config.database_path.clone();
-    let memory_dir_for_print_memory = config.memory_dir.clone();
-    let print_memory = ExecutableTool::new(
-        ToolSpec::new(
-            "print_memory",
-            "Show one active memory by exact name.",
-            JsonSchema::object(
-                [("memory_name", json!({"type": "string"}))],
-                ["memory_name"],
-            ),
-        ),
-        move |arguments| {
-            let Some(name) = arguments
-                .get("memory_name")
-                .and_then(Value::as_str)
-                .or_else(|| arguments.get("name").and_then(Value::as_str))
-            else {
-                return ToolExecutionResult::error("print_memory requires a string name");
-            };
-            with_tool_connection(&database_path, |connection| {
-                let Some(memory) = find_active_memory_by_name_in_scope(
-                    connection,
-                    name,
-                    &memory_dir_for_print_memory,
-                )?
-                else {
-                    return Ok(ToolExecutionResult::success(format!(
-                        "Memory '{name}' not found for the current user."
-                    )));
-                };
-                Ok(ToolExecutionResult::success(format_memory_detail(&memory)))
-            })
-        },
-    );
-
-    let database_path = config.database_path.clone();
-    let memory_dir_for_source_list = config.memory_dir.clone();
-    let get_source_list_for_memory = ExecutableTool::new(
-        ToolSpec::new(
-            "get_source_list_for_memory",
-            "List available sources for one active memory.",
-            JsonSchema::object(
-                [("memory_name", json!({"type": "string"}))],
-                ["memory_name"],
-            ),
-        ),
-        move |arguments| {
-            let Some(memory_name) = arguments.get("memory_name").and_then(Value::as_str) else {
-                return ToolExecutionResult::error(
-                    "get_source_list_for_memory requires string memory_name",
-                );
-            };
-            with_tool_connection(&database_path, |connection| {
-                let Some(memory) = find_active_memory_by_name_in_scope(
-                    connection,
-                    memory_name,
-                    &memory_dir_for_source_list,
-                )?
-                else {
-                    return Ok(ToolExecutionResult::error(format!(
-                        "Memory '{memory_name}' not found for the current user."
-                    )));
-                };
-                let path = Path::new(&memory.file_path);
-                let sources = match read_memory_parts(path) {
-                    Ok((frontmatter, _)) => list_memory_sources(frontmatter.as_deref()),
-                    Err(_) => Vec::new(),
-                };
-                Ok(ToolExecutionResult::success(
-                    json!(
-                        sources
-                            .into_iter()
-                            .map(|(source_type, name)| json!([source_type, name]))
-                            .collect::<Vec<_>>()
-                    )
-                    .to_string(),
-                ))
-            })
-        },
-    );
-
-    let database_path = config.database_path.clone();
-    let memory_dir_for_source_content = config.memory_dir.clone();
-    let get_source_content_for_memory = ExecutableTool::new(
-        ToolSpec::new(
-            "get_source_content_for_memory",
-            "Show the file-backed source content for one active memory.",
-            JsonSchema::object(
-                [
-                    ("memory_name", json!({"type": "string"})),
-                    ("index", json!({"type": "integer"})),
-                ],
-                ["memory_name"],
-            ),
-        ),
-        move |arguments| {
-            let Some(memory_name) = arguments.get("memory_name").and_then(Value::as_str) else {
-                return ToolExecutionResult::error(
-                    "get_source_content_for_memory requires string memory_name",
-                );
-            };
-            let index = arguments.get("index").and_then(Value::as_i64).unwrap_or(0);
-            if index < 0 {
-                return ToolExecutionResult::error(format!(
-                    "Index {index} out of range. Available indices: [0]"
-                ));
-            }
-            with_tool_connection(&database_path, |connection| {
-                let Some(memory) = find_active_memory_by_name_in_scope(
-                    connection,
-                    memory_name,
-                    &memory_dir_for_source_content,
-                )?
-                else {
-                    return Ok(ToolExecutionResult::error(format!(
-                        "Memory '{memory_name}' not found for the current user."
-                    )));
-                };
-                let path = Path::new(&memory.file_path);
-                let Ok((frontmatter, body)) = read_memory_parts(path) else {
-                    return Ok(ToolExecutionResult::success(format!(
-                        "No sources found for memory '{memory_name}'"
-                    )));
-                };
-                if let Some(memory_sources) = parse_memory_sources(frontmatter.as_deref()) {
-                    if index as usize >= memory_sources.len() {
-                        return Ok(ToolExecutionResult::error(format!(
-                            "Index {index} out of range. Available indices: {:?}",
-                            (0..memory_sources.len()).collect::<Vec<_>>()
-                        )));
-                    }
-                    let (source_name, source_path) = &memory_sources[index as usize];
-                    let Ok((_, source_body)) = read_memory_parts(Path::new(source_path)) else {
-                        return Ok(ToolExecutionResult::success(format!(
-                            "Source not found with type: {MEMORY_SOURCE_TYPE}, name: {source_name}"
-                        )));
-                    };
-                    return Ok(ToolExecutionResult::success(format!(
-                        "# Source content for memory: {} ({} / {})\n\n{}",
-                        memory.name,
-                        index,
-                        memory_sources.len() - 1,
-                        format_memory_file_source_content(source_name, &source_body)
-                    )));
-                }
-                if let Some(message_ids) = parse_context_message_source_ids(frontmatter.as_deref())
-                {
-                    if index > 0 {
-                        return Ok(ToolExecutionResult::error(format!(
-                            "Index {index} out of range. Available indices: [0]"
-                        )));
-                    }
-                    let source_messages = load_messages_by_ids(connection, &message_ids)?;
-                    return Ok(ToolExecutionResult::success(format!(
-                        "# Source content for memory: {} (0 / 0)\n\n{}",
-                        memory.name,
-                        format_context_message_source_content(&source_messages)
-                    )));
-                }
-                let _ = body;
-                Ok(ToolExecutionResult::success(format!(
-                    "No sources found for memory '{}'",
-                    memory.name
-                )))
-            })
-        },
-    );
-
-    let database_path = config.database_path.clone();
     let show_agenda_item = ExecutableTool::new(
         ToolSpec::new(
             "show_agenda_item",
@@ -5389,7 +4325,7 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
     );
 
     let excluded_tools = config.exclude_tools.iter().cloned().collect::<HashSet<_>>();
-    let tools = vec![
+    let mut tools = vec![
         get_current_date,
         pwd,
         ls,
@@ -5398,10 +4334,15 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
         get_help,
         print_config,
         tail_elroy_logs,
-        create_memory,
-        create_consolidated_memory,
-        get_fast_recall,
-        get_reflective_recall,
+    ];
+    tools.extend(memory_tools(config));
+    tools.extend(codex_tools(
+        config.clone(),
+        codex_bin,
+        codex_completion_hook.clone(),
+    ));
+    tools.extend(user_tools(config));
+    tools.extend(vec![
         add_agenda_item,
         create_task,
         create_due_item,
@@ -5427,9 +4368,6 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
         complete_due_item,
         delete_task,
         delete_due_item,
-        update_memory,
-        update_outdated_or_incorrect_memory,
-        archive_memory,
         add_agenda_item_update,
         complete_agenda_item,
         delete_agenda_item,
@@ -5446,10 +4384,6 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
         list_triggered_tasks_tool,
         list_due_tasks_tool,
         list_today_tasks_tool,
-        list_memories,
-        print_memories,
-        search_memories,
-        examine_memories,
         list_agenda,
         list_agenda_items,
         list_agenda_items_cmd,
@@ -5460,12 +4394,8 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
         show_task,
         show_due_item,
         print_due_item,
-        show_memory,
-        print_memory,
-        get_source_list_for_memory,
-        get_source_content_for_memory,
         show_agenda_item,
-    ];
+    ]);
 
     ExecutableToolRegistry::new(
         tools
@@ -5473,101 +4403,6 @@ fn build_live_tool_registry_with_codex_bin_and_hook(
             .filter(|tool| !excluded_tools.contains(&tool.spec().name))
             .collect(),
     )
-}
-
-fn with_user_preferences_at_path(
-    database_path: &Path,
-    operation: impl FnOnce(Option<UserPreferenceRecord>) -> rusqlite::Result<ToolExecutionResult>,
-) -> ToolExecutionResult {
-    let mut connection = match open_sqlite_connection(database_path) {
-        Ok(connection) => connection,
-        Err(error) => {
-            return ToolExecutionResult::error(format!("failed to open database: {error}"));
-        }
-    };
-    if let Err(error) = run_migrations(&mut connection) {
-        return ToolExecutionResult::error(format!("failed to run migrations: {error}"));
-    }
-    match load_user_preferences(&connection, LOCAL_USER_TOKEN).and_then(operation) {
-        Ok(result) => result,
-        Err(error) => ToolExecutionResult::error(format!("database query failed: {error}")),
-    }
-}
-
-fn mutate_user_preferences_in_config(
-    config: &AppConfig,
-    operation: impl FnOnce(&mut UserPreferenceRecord) -> rusqlite::Result<String>,
-) -> ToolExecutionResult {
-    let mut connection = match open_sqlite_connection(&config.database_path) {
-        Ok(connection) => connection,
-        Err(error) => {
-            return ToolExecutionResult::error(format!("failed to open database: {error}"));
-        }
-    };
-    if let Err(error) = run_migrations(&mut connection) {
-        return ToolExecutionResult::error(format!("failed to run migrations: {error}"));
-    }
-    let mut record = load_user_preferences(&connection, LOCAL_USER_TOKEN)
-        .ok()
-        .flatten()
-        .unwrap_or(UserPreferenceRecord {
-            user_token: LOCAL_USER_TOKEN.to_string(),
-            assistant_name: None,
-            preferred_name: None,
-            full_name: None,
-            system_persona: None,
-            created_at_unix: 0,
-            updated_at_unix: 0,
-        });
-
-    match operation(&mut record).and_then(|message| {
-        save_user_preferences(&mut connection, &record)?;
-        Ok(message)
-    }) {
-        Ok(message) => {
-            if let Err(error) = refresh_persisted_system_instructions(&mut connection, config) {
-                return ToolExecutionResult::error(format!(
-                    "user preference update failed: {error}"
-                ));
-            }
-            ToolExecutionResult::success(message)
-        }
-        Err(error) => ToolExecutionResult::error(format!("user preference update failed: {error}")),
-    }
-}
-
-fn mutate_memory_file_from_config(
-    config: &AppConfig,
-    name: &str,
-    operation: impl FnOnce(&Path) -> std::io::Result<()>,
-) -> ToolExecutionResult {
-    let mut connection = match open_sqlite_connection(&config.database_path) {
-        Ok(connection) => connection,
-        Err(error) => {
-            return ToolExecutionResult::error(format!("failed to open database: {error}"));
-        }
-    };
-    if let Err(error) = run_migrations(&mut connection) {
-        return ToolExecutionResult::error(format!("failed to run migrations: {error}"));
-    }
-    let memory = match find_active_memory_by_name_in_scope(&connection, name, &config.memory_dir) {
-        Ok(Some(memory)) => memory,
-        Ok(None) => return ToolExecutionResult::error(format!("memory not found: {name}")),
-        Err(error) => return ToolExecutionResult::error(format!("database query failed: {error}")),
-    };
-    match operation(Path::new(&memory.file_path)).and_then(|()| {
-        elroy_db::bootstrap_database(&BootstrapPlan::from_config(config))
-            .map_err(|error| std::io::Error::other(error.to_string()))?;
-        sync_memory_context_after_mutation(config, &memory.name, Some(&memory.name))
-            .map_err(|error| std::io::Error::other(error.to_string()))?;
-        Ok(())
-    }) {
-        Ok(()) => ToolExecutionResult::success(
-            json!({"updated": true, "name": memory.name, "file_path": memory.file_path})
-                .to_string(),
-        ),
-        Err(error) => ToolExecutionResult::error(format!("memory mutation failed: {error}")),
-    }
 }
 
 fn mutate_due_item_file_from_config_with_result(
@@ -5607,92 +4442,6 @@ fn mutate_due_item_file_from_config_with_result(
         }
         Err(error) => ToolExecutionResult::error(format!("due item mutation failed: {error}")),
     }
-}
-
-fn archive_memory_file_from_config(
-    config: &AppConfig,
-    name: &str,
-    operation: impl FnOnce(&Path) -> std::io::Result<PathBuf>,
-) -> ToolExecutionResult {
-    let connection = match open_sqlite_connection(&config.database_path) {
-        Ok(connection) => connection,
-        Err(error) => {
-            return ToolExecutionResult::error(format!("failed to open database: {error}"));
-        }
-    };
-    let memory = match find_active_memory_by_name_in_scope(&connection, name, &config.memory_dir) {
-        Ok(Some(memory)) => memory,
-        Ok(None) => return ToolExecutionResult::error(format!("memory not found: {name}")),
-        Err(error) => return ToolExecutionResult::error(format!("database query failed: {error}")),
-    };
-    match operation(Path::new(&memory.file_path)).and_then(|new_path| {
-        elroy_db::bootstrap_database(&BootstrapPlan::from_config(config))
-            .map_err(|error| std::io::Error::other(error.to_string()))?;
-        remove_context_memory_messages_by_names_from_database_path(
-            &config.database_path,
-            std::slice::from_ref(&memory.name),
-        )
-        .map_err(|error| std::io::Error::other(error.to_string()))?;
-        Ok(new_path)
-    }) {
-        Ok(new_path) => ToolExecutionResult::success(
-            json!({
-                "updated": true,
-                "name": memory.name,
-                "file_path": memory.file_path,
-                "moved_to": new_path.display().to_string(),
-            })
-            .to_string(),
-        ),
-        Err(error) => ToolExecutionResult::error(format!("memory mutation failed: {error}")),
-    }
-}
-
-fn create_consolidated_memory_from_config(
-    config: &AppConfig,
-    name: &str,
-    text: &str,
-    source_names: &[&str],
-) -> std::io::Result<PathBuf> {
-    create_consolidated_memory_from_plan(
-        &BootstrapPlan::from_config(config),
-        name,
-        text,
-        source_names,
-    )
-}
-
-fn create_consolidated_memory_from_plan(
-    bootstrap_plan: &BootstrapPlan,
-    name: &str,
-    text: &str,
-    source_names: &[&str],
-) -> std::io::Result<PathBuf> {
-    let mut connection = open_sqlite_connection(&bootstrap_plan.database_path)
-        .map_err(|error| std::io::Error::other(error.to_string()))?;
-    run_migrations(&mut connection).map_err(|error| std::io::Error::other(error.to_string()))?;
-
-    let mut source_memories = Vec::new();
-    for source_name in source_names {
-        let memory = find_active_memory_by_name_in_scope(
-            &connection,
-            source_name,
-            &bootstrap_plan.memory_dir,
-        )
-        .map_err(|error| std::io::Error::other(error.to_string()))?
-        .ok_or_else(|| std::io::Error::other(format!("memory not found: {source_name}")))?;
-        source_memories.push(memory);
-    }
-
-    create_consolidated_memories_from_records(
-        bootstrap_plan,
-        &[ConsolidatedMemoryOutput {
-            name: name.to_string(),
-            text: text.to_string(),
-        }],
-        &source_memories,
-    )
-    .map(|mut created| created.remove(0))
 }
 
 fn mutate_agenda_file_from_config_with_result(
@@ -5912,46 +4661,6 @@ fn codex_session_result_payload(result: CodexSessionResult) -> String {
     .to_string()
 }
 
-fn find_active_memory_by_name_in_scope(
-    connection: &rusqlite::Connection,
-    name: &str,
-    memory_dir: &Path,
-) -> rusqlite::Result<Option<elroy_db::MemoryRecord>> {
-    Ok(
-        list_active_memories_in_scope(connection, memory_dir, 10_000)?
-            .into_iter()
-            .find(|memory| memory.name.eq_ignore_ascii_case(name)),
-    )
-}
-
-fn list_active_memories_in_scope(
-    connection: &rusqlite::Connection,
-    memory_dir: &Path,
-    limit: usize,
-) -> rusqlite::Result<Vec<elroy_db::MemoryRecord>> {
-    Ok(list_all_active_memories_in_scope(connection, memory_dir)?
-        .into_iter()
-        .take(limit)
-        .collect())
-}
-
-fn search_active_memories_in_scope(
-    connection: &rusqlite::Connection,
-    memory_dir: &Path,
-    query: &str,
-    limit: usize,
-) -> rusqlite::Result<Vec<elroy_db::MemoryRecord>> {
-    Ok(search_active_memories(connection, query, 10_000)?
-        .into_iter()
-        .filter(|memory| Path::new(&memory.file_path).starts_with(memory_dir))
-        .take(limit)
-        .collect())
-}
-
-fn message_matches_context_memory(message: &ConversationMessage, tool_call_id: &str) -> bool {
-    message_matches_tool_call_id(message, tool_call_id)
-}
-
 fn remove_context_tool_messages_by_id(
     config: &AppConfig,
     tool_call_id: &str,
@@ -5969,124 +4678,6 @@ fn remove_context_tool_messages_by_id(
         .collect::<Vec<_>>();
     replace_context_messages(&mut connection, LOCAL_USER_TOKEN, &updated_transcript)?;
     Ok(())
-}
-
-fn remove_context_memory_messages_by_names_from_database_path(
-    database_path: &Path,
-    memory_names: &[String],
-) -> Result<(), AppError> {
-    let mut connection = open_sqlite_connection(database_path)?;
-    run_migrations(&mut connection)?;
-    remove_context_memory_messages_by_names(&mut connection, memory_names)?;
-    Ok(())
-}
-
-fn sync_memory_context_after_mutation(
-    config: &AppConfig,
-    old_name: &str,
-    current_name: Option<&str>,
-) -> Result<(), AppError> {
-    let mut connection = open_sqlite_connection(&config.database_path)?;
-    run_migrations(&mut connection)?;
-    let transcript = load_validated_runtime_transcript(
-        &mut connection,
-        &config.assistant_name,
-        config.llm_provider() == LlmProvider::Anthropic,
-    )?;
-    let old_tool_call_id = context_memory_tool_call_id(old_name);
-    let mut updated_transcript = transcript
-        .into_iter()
-        .filter(|message| !message_matches_tool_call_id(message, &old_tool_call_id))
-        .collect::<Vec<_>>();
-
-    if let Some(current_name) = current_name
-        && let Some(memory) =
-            find_active_memory_by_name_in_scope(&connection, current_name, &config.memory_dir)?
-        && !transcript_contains_context_memory(&updated_transcript, &memory.name)
-    {
-        updated_transcript.extend(context_memory_tool_messages(&memory));
-    }
-
-    replace_context_messages(&mut connection, LOCAL_USER_TOKEN, &updated_transcript)?;
-    Ok(())
-}
-
-fn sync_task_context_after_mutation(
-    config: &AppConfig,
-    old_name: &str,
-    current_name: Option<&str>,
-) -> Result<(), AppError> {
-    let mut connection = open_sqlite_connection(&config.database_path)?;
-    run_migrations(&mut connection)?;
-    let transcript = load_validated_runtime_transcript(
-        &mut connection,
-        &config.assistant_name,
-        config.llm_provider() == LlmProvider::Anthropic,
-    )?;
-    let old_tool_call_id = context_task_tool_call_id(old_name);
-    let mut updated_transcript = transcript
-        .into_iter()
-        .filter(|message| !message_matches_tool_call_id(message, &old_tool_call_id))
-        .collect::<Vec<_>>();
-
-    if let Some(current_name) = current_name
-        && let Some(task) = find_active_agenda_item_by_name(&connection, current_name)?
-            .filter(|item| item.trigger_datetime.is_none() && item.trigger_context.is_none())
-        && !transcript_contains_context_task(&updated_transcript, &task.name)
-    {
-        updated_transcript.extend(context_task_tool_messages(&task));
-    }
-
-    replace_context_messages(&mut connection, LOCAL_USER_TOKEN, &updated_transcript)?;
-    Ok(())
-}
-
-fn sync_due_item_context_after_mutation(
-    config: &AppConfig,
-    old_name: &str,
-    current_name: Option<&str>,
-) -> Result<(), AppError> {
-    let mut connection = open_sqlite_connection(&config.database_path)?;
-    run_migrations(&mut connection)?;
-    let transcript = load_validated_runtime_transcript(
-        &mut connection,
-        &config.assistant_name,
-        config.llm_provider() == LlmProvider::Anthropic,
-    )?;
-    let old_tool_call_id = context_due_item_tool_call_id(old_name);
-    let mut updated_transcript = transcript
-        .into_iter()
-        .filter(|message| !message_matches_tool_call_id(message, &old_tool_call_id))
-        .collect::<Vec<_>>();
-
-    if let Some(current_name) = current_name
-        && let Some(due_item) = find_active_agenda_item_by_name(&connection, current_name)?
-            .filter(|item| item.trigger_datetime.is_some() || item.trigger_context.is_some())
-        && !transcript_contains_context_due_item(&updated_transcript, &due_item.name)
-    {
-        updated_transcript.extend(context_due_item_tool_messages(&due_item));
-    }
-
-    replace_context_messages(&mut connection, LOCAL_USER_TOKEN, &updated_transcript)?;
-    Ok(())
-}
-
-pub(crate) fn best_effort_embedding_client(
-    provider_config: Option<&EmbeddingProviderConfig>,
-) -> Option<LiveEmbeddingClient> {
-    provider_config.and_then(|config| LiveEmbeddingClient::new(config.clone()).ok())
-}
-
-fn memory_consolidation_settings_from_app_config(
-    config: &AppConfig,
-) -> MemoryConsolidationSettings {
-    MemoryConsolidationSettings {
-        memory_cluster_similarity_threshold: config.memory_cluster_similarity_threshold,
-        max_memory_cluster_size: config.max_memory_cluster_size,
-        min_memory_cluster_size: config.min_memory_cluster_size,
-        fast_provider_config: fast_provider_config_from_app_config(config).ok(),
-        embedding_provider_config: embedding_provider_config_from_app_config(config).ok(),
-    }
 }
 
 #[cfg(test)]
@@ -8663,7 +7254,7 @@ User still wants to compare grocery prices after the shopping trip.",
 
         let mut connection = open_sqlite_connection(&database_path).expect("database should open");
         run_migrations(&mut connection).expect("migrations should run");
-        let memories = crate::list_all_active_memories_in_scope(&connection, &memory_dir)
+        let memories = elroy_recall::list_all_active_memories_in_scope(&connection, &memory_dir)
             .expect("memories should load");
         assert_eq!(memories.len(), 3);
 
@@ -12352,6 +10943,7 @@ User still wants to compare grocery prices after the shopping trip.",
                 recency_weight: 0.0,
                 connection: None,
                 query_embedding: None,
+                now_iso: None,
             },
         );
 
@@ -12418,6 +11010,7 @@ User still wants to compare grocery prices after the shopping trip.",
                 recency_weight: 0.0,
                 connection: None,
                 query_embedding: None,
+                now_iso: None,
             },
         );
 
@@ -12472,6 +11065,7 @@ User still wants to compare grocery prices after the shopping trip.",
                 recency_weight: 0.0,
                 connection: None,
                 query_embedding: None,
+                now_iso: None,
             },
         );
 
@@ -12526,6 +11120,7 @@ User still wants to compare grocery prices after the shopping trip.",
                 recency_weight: 0.0,
                 connection: None,
                 query_embedding: None,
+                now_iso: None,
             },
         );
 
@@ -12579,6 +11174,7 @@ User still wants to compare grocery prices after the shopping trip.",
                 recency_weight: 0.0,
                 connection: None,
                 query_embedding: None,
+                now_iso: None,
             },
         );
 
@@ -12666,6 +11262,7 @@ User still wants to compare grocery prices after the shopping trip.",
                 recency_weight: 0.0,
                 connection: None,
                 query_embedding: None,
+                now_iso: None,
             },
         );
 
@@ -12741,6 +11338,7 @@ User still wants to compare grocery prices after the shopping trip.",
                 recency_weight: 0.0,
                 connection: None,
                 query_embedding: None,
+                now_iso: None,
             },
         );
 
@@ -12853,6 +11451,7 @@ User still wants to compare grocery prices after the shopping trip.",
                 recency_weight: 0.0,
                 connection: None,
                 query_embedding: None,
+                now_iso: None,
             },
         );
 
@@ -12965,6 +11564,7 @@ User still wants to compare grocery prices after the shopping trip.",
                 recency_weight: 0.0,
                 connection: None,
                 query_embedding: None,
+                now_iso: None,
             },
         );
 
@@ -22950,7 +21550,8 @@ User still wants to compare grocery prices after the shopping trip.",
                 embedding_distance_threshold: None,
                 recency_weight: 0.0,
                 connection: None,
-            query_embedding: None,
+                query_embedding: None,
+                now_iso: None,
             },
             RecallContext {
                 transcript: &[],
@@ -23008,7 +21609,8 @@ User still wants to compare grocery prices after the shopping trip.",
                 embedding_distance_threshold: None,
                 recency_weight: 0.0,
                 connection: None,
-            query_embedding: None,
+                query_embedding: None,
+                now_iso: None,
             },
             RecallContext {
                 transcript: &[],
@@ -23072,7 +21674,8 @@ User still wants to compare grocery prices after the shopping trip.",
                 embedding_distance_threshold: None,
                 recency_weight: 0.0,
                 connection: None,
-            query_embedding: None,
+                query_embedding: None,
+                now_iso: None,
             },
             RecallContext {
                 transcript: &[],
@@ -23129,7 +21732,8 @@ User still wants to compare grocery prices after the shopping trip.",
                 embedding_distance_threshold: None,
                 recency_weight: 0.0,
                 connection: None,
-            query_embedding: None,
+                query_embedding: None,
+                now_iso: None,
             },
             RecallContext {
                 transcript: &[],
@@ -23176,7 +21780,9 @@ User still wants to compare grocery prices after the shopping trip.",
                 recency_weight: 0.0,
                 connection: None,
             query_embedding: None,
-            },
+            now_iso: None,
+            }
+,
             RecallContext {
                 transcript: &[],
                 memories: &[MemoryRecord {
@@ -23239,7 +21845,8 @@ User still wants to compare grocery prices after the shopping trip.",
                 embedding_distance_threshold: None,
                 recency_weight: 0.0,
                 connection: None,
-            query_embedding: None,
+                query_embedding: None,
+                now_iso: None,
             },
             RecallContext {
                 transcript: &[],
@@ -23994,7 +22601,9 @@ User still wants to compare grocery prices after the shopping trip.",
                 recency_weight: 0.0,
                 connection: None,
             query_embedding: None,
-            },
+            now_iso: None,
+            }
+,
         );
         let relevant_due_items = select_relevant_recall_due_items(
             "What workout gear should I bring?",
@@ -24007,7 +22616,9 @@ User still wants to compare grocery prices after the shopping trip.",
                 recency_weight: 0.0,
                 connection: None,
             query_embedding: None,
-            },
+            now_iso: None,
+            }
+,
         );
         let relevant_agenda_items = select_relevant_recall_agenda_items(
             "What workout gear should I bring?",
@@ -24020,7 +22631,9 @@ User still wants to compare grocery prices after the shopping trip.",
                 recency_weight: 0.0,
                 connection: None,
             query_embedding: None,
-            },
+            now_iso: None,
+            }
+,
         );
 
         assert!(relevant_memories.is_empty());
@@ -24101,7 +22714,9 @@ User still wants to compare grocery prices after the shopping trip.",
                 recency_weight: 0.0,
                 connection: None,
             query_embedding: None,
-            },
+            now_iso: None,
+            }
+,
         );
         let relevant_due_items = select_relevant_recall_due_items(
             "What gear should I bring to practice?",
@@ -24114,7 +22729,9 @@ User still wants to compare grocery prices after the shopping trip.",
                 recency_weight: 0.0,
                 connection: None,
             query_embedding: None,
-            },
+            now_iso: None,
+            }
+,
         );
         let relevant_agenda_items = select_relevant_recall_agenda_items(
             "What gear should I bring to practice?",
@@ -24127,7 +22744,9 @@ User still wants to compare grocery prices after the shopping trip.",
                 recency_weight: 0.0,
                 connection: None,
             query_embedding: None,
-            },
+            now_iso: None,
+            }
+,
         );
 
         assert_eq!(relevant_memories.len(), 1);
@@ -24294,7 +22913,9 @@ User still wants to compare grocery prices after the shopping trip.",
                 recency_weight: 0.0,
                 connection: None,
             query_embedding: None,
-            },
+            now_iso: None,
+            }
+,
         );
         let relevant_due_items = select_relevant_recall_due_items(
             "What gear should I bring to practice?",
@@ -24307,7 +22928,9 @@ User still wants to compare grocery prices after the shopping trip.",
                 recency_weight: 0.0,
                 connection: None,
             query_embedding: None,
-            },
+            now_iso: None,
+            }
+,
         );
         let relevant_agenda_items = select_relevant_recall_agenda_items(
             "What gear should I bring to practice?",
@@ -24320,7 +22943,9 @@ User still wants to compare grocery prices after the shopping trip.",
                 recency_weight: 0.0,
                 connection: None,
             query_embedding: None,
-            },
+            now_iso: None,
+            }
+,
         );
 
         assert_eq!(relevant_memories.len(), 1);
@@ -24447,7 +23072,9 @@ User still wants to compare grocery prices after the shopping trip.",
                 recency_weight: 0.0,
                 connection: None,
             query_embedding: None,
-            },
+            now_iso: None,
+            }
+,
         );
         let with_recency_weight = select_relevant_recall_memories(
             "What belongs in my workout kit?",
@@ -24461,7 +23088,9 @@ User still wants to compare grocery prices after the shopping trip.",
                 recency_weight: 0.1,
                 connection: None,
             query_embedding: None,
-            },
+            now_iso: None,
+            }
+,
         );
 
         assert_eq!(without_recency_weight.len(), 2);
@@ -24523,7 +23152,8 @@ User still wants to compare grocery prices after the shopping trip.",
                 embedding_distance_threshold: None,
                 recency_weight: 0.0,
                 connection: None,
-            query_embedding: None,
+                query_embedding: None,
+                now_iso: None,
             },
             RecallContext {
                 transcript: &transcript,
