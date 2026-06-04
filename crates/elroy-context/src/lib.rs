@@ -1,11 +1,15 @@
+pub mod tools;
+pub use tools::context_tools;
+
 use chrono::{Local, TimeZone, Utc};
 use elroy_config::{AppConfig, fast_provider_config_from_app_config};
 use elroy_core::{
     ConversationRequest, LiveProviderModel, ModelClient, excerpt, validated_transcript,
 };
 use elroy_db::{
-    LOCAL_USER_TOKEN, SYNTHETIC_FIRST_USER_MESSAGE, UserPreferenceRecord, load_context_messages,
-    load_user_preferences, replace_context_messages,
+    LOCAL_USER_TOKEN, SYNTHETIC_FIRST_USER_MESSAGE, UserPreferenceRecord, append_context_messages,
+    load_context_messages, load_user_preferences, remove_context_messages_by_ids,
+    replace_context_messages,
 };
 use elroy_llm::{ConversationMessage, LiveModelClient, MessageRole, StreamEvent};
 use elroy_user::{effective_persona, effective_user_preferred_name};
@@ -182,6 +186,26 @@ pub fn reset_persisted_context(
     let preferences = load_user_preferences(connection, LOCAL_USER_TOKEN)?;
     let system_message = current_system_message(&config.assistant_name, preferences.as_ref());
     replace_context_messages(connection, LOCAL_USER_TOKEN, &[system_message])?;
+    Ok(())
+}
+
+pub fn add_persisted_context_messages(
+    connection: &mut rusqlite::Connection,
+    messages: &[ConversationMessage],
+) -> anyhow::Result<()> {
+    append_context_messages(connection, LOCAL_USER_TOKEN, messages)?;
+    Ok(())
+}
+
+pub fn remove_persisted_context_messages(
+    connection: &mut rusqlite::Connection,
+    messages: &[ConversationMessage],
+) -> anyhow::Result<()> {
+    let message_ids = messages
+        .iter()
+        .filter_map(|message| message.id)
+        .collect::<Vec<_>>();
+    remove_context_messages_by_ids(connection, LOCAL_USER_TOKEN, &message_ids)?;
     Ok(())
 }
 
@@ -582,4 +606,66 @@ pub fn strip_input_message_for_persistence(
         transcript.remove(persistent_prefix_len);
     }
     transcript
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{add_persisted_context_messages, remove_persisted_context_messages};
+    use elroy_core::validated_transcript;
+    use elroy_db::{
+        LOCAL_USER_TOKEN, load_context_messages, replace_context_messages, run_migrations,
+    };
+    use elroy_llm::{ConversationMessage, MessageRole};
+    use rusqlite::Connection;
+
+    #[test]
+    fn persisted_context_messages_can_be_appended() {
+        let mut connection = Connection::open_in_memory().expect("sqlite should open");
+        run_migrations(&mut connection).expect("migrations should run");
+
+        replace_context_messages(
+            &mut connection,
+            LOCAL_USER_TOKEN,
+            &[
+                ConversationMessage::new(MessageRole::System, "system"),
+                ConversationMessage::new(MessageRole::User, "first"),
+            ],
+        )
+        .expect("messages should persist");
+
+        add_persisted_context_messages(
+            &mut connection,
+            &[ConversationMessage::new(MessageRole::Assistant, "second")],
+        )
+        .expect("messages should append");
+
+        let stored = load_context_messages(&mut connection, LOCAL_USER_TOKEN).expect("load ok");
+        assert_eq!(stored.len(), 3);
+        assert_eq!(stored[0].role, MessageRole::System);
+        assert_eq!(stored[1].content.as_deref(), Some("first"));
+        assert_eq!(stored[2].content.as_deref(), Some("second"));
+    }
+
+    #[test]
+    fn persisted_context_messages_can_be_removed_by_message_identity() {
+        let mut connection = Connection::open_in_memory().expect("sqlite should open");
+        run_migrations(&mut connection).expect("migrations should run");
+
+        let messages = validated_transcript(&[
+            ConversationMessage::new(MessageRole::System, "system"),
+            ConversationMessage::new(MessageRole::User, "first"),
+            ConversationMessage::new(MessageRole::Assistant, "second"),
+            ConversationMessage::new(MessageRole::User, "third"),
+        ]);
+        replace_context_messages(&mut connection, LOCAL_USER_TOKEN, &messages)
+            .expect("messages should persist");
+
+        let stored = load_context_messages(&mut connection, LOCAL_USER_TOKEN).expect("load ok");
+        remove_persisted_context_messages(&mut connection, &stored[1..3]).expect("remove ok");
+
+        let refreshed = load_context_messages(&mut connection, LOCAL_USER_TOKEN).expect("load ok");
+        assert_eq!(refreshed.len(), 2);
+        assert_eq!(refreshed[0].role, MessageRole::System);
+        assert_eq!(refreshed[1].content.as_deref(), Some("third"));
+    }
 }

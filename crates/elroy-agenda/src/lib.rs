@@ -1,3 +1,6 @@
+pub mod tools;
+pub use tools::{agenda_tools, parse_optional_line_number_argument};
+
 use std::path::{Path, PathBuf};
 
 use serde_yaml::{Mapping as YamlMapping, Value as YamlValue};
@@ -23,7 +26,7 @@ pub fn create_agenda_file(
     let mut frontmatter = vec![format!("date: {}", date.unwrap_or("unscheduled"))];
     frontmatter.push("completed: false".to_string());
     if let Some(trigger_datetime) = trigger_datetime {
-        frontmatter.push(format!("trigger_datetime: {trigger_datetime}"));
+        frontmatter.push(format!("trigger_datetime: \"{trigger_datetime}\""));
     }
     if let Some(trigger_context) = trigger_context {
         frontmatter.push(format!("trigger_context: {trigger_context}"));

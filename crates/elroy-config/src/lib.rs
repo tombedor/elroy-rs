@@ -19,6 +19,7 @@ pub struct AppConfig {
     pub embedding_model_size: usize,
     pub max_tokens: usize,
     pub assistant_name: String,
+    pub show_internal_thought: bool,
     pub reflect: bool,
     pub enable_assistant_greeting: bool,
     pub min_convo_age_for_greeting_minutes: f64,
@@ -97,6 +98,7 @@ impl AppConfig {
             embedding_model_size: 1536,
             max_tokens: 100_000,
             assistant_name: "Elroy".to_string(),
+            show_internal_thought: false,
             reflect: false,
             enable_assistant_greeting: false,
             min_convo_age_for_greeting_minutes: 5.0,
@@ -154,6 +156,9 @@ impl AppConfig {
         }
         if let Some(assistant_name) = file_config.default_assistant_name {
             self.assistant_name = assistant_name;
+        }
+        if let Some(show_internal_thought) = file_config.show_internal_thought {
+            self.show_internal_thought = show_internal_thought;
         }
         if let Some(reflect) = file_config.reflect {
             self.reflect = reflect;
@@ -270,6 +275,9 @@ impl AppConfig {
         }
         if let Some(assistant_name) = env.get("ELROY_DEFAULT_ASSISTANT_NAME") {
             self.assistant_name = assistant_name.clone();
+        }
+        if let Some(show_internal_thought) = env.get("ELROY_SHOW_INTERNAL_THOUGHT") {
+            self.show_internal_thought = parse_bool(show_internal_thought);
         }
         if let Some(reflect) = env.get("ELROY_REFLECT") {
             self.reflect = parse_bool(reflect);
@@ -400,6 +408,7 @@ struct FileConfig {
     embedding_model_size: Option<usize>,
     max_tokens: Option<usize>,
     default_assistant_name: Option<String>,
+    show_internal_thought: Option<bool>,
     reflect: Option<bool>,
     enable_assistant_greeting: Option<bool>,
     min_convo_age_for_greeting_minutes: Option<f64>,
@@ -676,6 +685,7 @@ mod tests {
         assert_eq!(config.embedding_model_size, 1536);
         assert_eq!(config.max_tokens, 100_000);
         assert_eq!(config.context_refresh_target_tokens(), 33_333);
+        assert!(!config.show_internal_thought);
         assert!(!config.reflect);
         assert!(!config.enable_assistant_greeting);
         assert_eq!(config.min_convo_age_for_greeting_minutes, 5.0);
@@ -724,7 +734,7 @@ mod tests {
         let config_path = home_dir.join("elroy.conf.yaml");
         fs::write(
             &config_path,
-            "chat_model: gpt-5-nano\nfast_model: gpt-5.4-mini\nembedding_model: text-embedding-3-large\nembedding_model_size: 3072\nmax_tokens: 9000\nreflect: true\nenable_assistant_greeting: true\nmin_convo_age_for_greeting_minutes: 15.5\nmax_context_age_minutes: 180.0\nmessages_between_memory: 12\nmemories_between_consolidation: 6\nrecency_weight: 0.125\nl2_memory_relevance_distance_threshold: 1.11\nmemory_cluster_similarity_threshold: 0.33\nmax_memory_cluster_size: 7\nmin_memory_cluster_size: 4\nmemory_reflection_max_words: 42\nmessages_between_self_reflection: 4\nmemory_recall_classifier_enabled: false\nmemory_recall_classifier_window: 7\nexclude_tools:\n  - get_user_preferred_name\n  - get_help\nmemory_dir: /tmp/elroy-memories\nagenda_dir: /tmp/elroy-agenda\ndatabase_url: sqlite:////tmp/elroy.db\nfast_model_api_key: fast-key\nfast_model_api_base: http://localhost:1234/fast\nembedding_model_api_key: embed-key\nembedding_model_api_base: http://localhost:1234/embeddings\nirrelevant_key: ignored\n",
+            "chat_model: gpt-5-nano\nfast_model: gpt-5.4-mini\nembedding_model: text-embedding-3-large\nembedding_model_size: 3072\nmax_tokens: 9000\nshow_internal_thought: true\nreflect: true\nenable_assistant_greeting: true\nmin_convo_age_for_greeting_minutes: 15.5\nmax_context_age_minutes: 180.0\nmessages_between_memory: 12\nmemories_between_consolidation: 6\nrecency_weight: 0.125\nl2_memory_relevance_distance_threshold: 1.11\nmemory_cluster_similarity_threshold: 0.33\nmax_memory_cluster_size: 7\nmin_memory_cluster_size: 4\nmemory_reflection_max_words: 42\nmessages_between_self_reflection: 4\nmemory_recall_classifier_enabled: false\nmemory_recall_classifier_window: 7\nexclude_tools:\n  - get_user_preferred_name\n  - get_help\nmemory_dir: /tmp/elroy-memories\nagenda_dir: /tmp/elroy-agenda\ndatabase_url: sqlite:////tmp/elroy.db\nfast_model_api_key: fast-key\nfast_model_api_base: http://localhost:1234/fast\nembedding_model_api_key: embed-key\nembedding_model_api_base: http://localhost:1234/embeddings\nirrelevant_key: ignored\n",
         )
         .expect("config fixture should be written");
 
@@ -737,6 +747,7 @@ mod tests {
         assert_eq!(config.embedding_model_size, 3072);
         assert_eq!(config.max_tokens, 9000);
         assert_eq!(config.context_refresh_target_tokens(), 3000);
+        assert!(config.show_internal_thought);
         assert_eq!(config.memory_dir, PathBuf::from("/tmp/elroy-memories"));
         assert_eq!(config.agenda_dir, PathBuf::from("/tmp/elroy-agenda"));
         assert_eq!(config.database_path, PathBuf::from("/tmp/elroy.db"));
@@ -803,6 +814,10 @@ mod tests {
             ),
             ("ELROY_EMBEDDING_MODEL_SIZE".to_string(), "3072".to_string()),
             ("ELROY_MAX_TOKENS".to_string(), "12000".to_string()),
+            (
+                "ELROY_SHOW_INTERNAL_THOUGHT".to_string(),
+                "true".to_string(),
+            ),
             (
                 "ELROY_DEFAULT_ASSISTANT_NAME".to_string(),
                 "EnvElroy".to_string(),
@@ -909,6 +924,7 @@ mod tests {
         assert_eq!(config.max_tokens, 12_000);
         assert_eq!(config.context_refresh_target_tokens(), 4_000);
         assert_eq!(config.assistant_name, "EnvElroy");
+        assert!(config.show_internal_thought);
         assert!(config.reflect);
         assert!(config.enable_assistant_greeting);
         assert_eq!(config.min_convo_age_for_greeting_minutes, 2.5);

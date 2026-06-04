@@ -230,7 +230,7 @@ mod tests {
 
         let content = fs::read_to_string(path).expect("task file should read");
         assert!(content.contains("date: 2026-04-15"));
-        assert!(content.contains("trigger_datetime: 2026-04-14T09:00:00"));
+        assert!(content.contains("trigger_datetime: \"2026-04-14T09:00:00\""));
         assert!(content.contains("trigger_context: after payroll email"));
 
         fs::remove_dir_all(root).expect("root should be removed");

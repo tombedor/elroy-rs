@@ -10,12 +10,18 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
+elroy-agenda = { path = "../elroy-agenda" }
 elroy-config = { path = "../elroy-config" }
+elroy-context = { path = "../elroy-context" }
 elroy-core = { path = "../elroy-core" }
 elroy-db = { path = "../elroy-db" }
+elroy-llm = { path = "../elroy-llm" }
 elroy-recall = { path = "../elroy-recall" }
 elroy-tools = { path = "../elroy-tools" }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 serde_json = "1"
 rusqlite = { version = "0.37", features = ["bundled"] }
 anyhow = "1"
 
+[dev-dependencies]
+mockito = "1"

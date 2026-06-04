@@ -64,10 +64,14 @@ pub struct TuiApp {
     pub title: String,
     pub model_name: String,
     pub status: String,
+    pub show_internal_thought: bool,
     pub prompt_active: bool,
     pub command_active: bool,
     pub background_status: Option<String>,
+    pub spinner_chars: String,
+    pub spinner_index: usize,
     pub input: String,
+    pub input_cursor: usize,
     pub input_completions: Vec<String>,
     pub input_history: Vec<String>,
     pub history_index: Option<usize>,
@@ -87,6 +91,11 @@ pub struct TuiApp {
     pub feature_request_titles: Vec<String>,
     pub codex_session_titles: Vec<String>,
     pub selected_sidebar_index: usize,
+    pub selected_memory_index: usize,
+    pub selected_agenda_index: usize,
+    pub selected_improvement_index: usize,
+    pub selected_feature_request_index: usize,
+    pub selected_codex_session_index: usize,
     pub rendered_context_message_ids: HashSet<i64>,
     pub last_viewport_width: usize,
     pub last_viewport_height: usize,
@@ -140,6 +149,7 @@ pub struct TuiCommandForm {
     pub description: String,
     pub parameters: Vec<TuiCommandParameter>,
     pub initial_values: Vec<(String, String)>,
+    pub source: TuiCommandSource,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -160,10 +170,17 @@ pub struct TuiCommandPaletteEntry {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TuiCommandSource {
+    Palette,
+    Slash,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TuiCommandExecution {
     pub command_name: String,
     pub display_name: String,
     pub values: Vec<(String, String)>,
+    pub source: TuiCommandSource,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -196,6 +213,7 @@ pub struct CommandFormState {
     pub command_name: String,
     pub description: String,
     pub fields: Vec<CommandFormFieldState>,
+    pub source: TuiCommandSource,
     pub selected_field: usize,
     pub error: Option<String>,
 }
@@ -239,6 +257,12 @@ pub trait TuiPromptStream {
 
 pub trait TuiRuntime {
     fn load_snapshot(&mut self) -> Result<TuiSnapshot, String>;
+    fn load_prompt_history(&mut self) -> Result<Vec<String>, String> {
+        Ok(Vec::new())
+    }
+    fn remember_prompt(&mut self, _prompt: &str) -> Result<(), String> {
+        Ok(())
+    }
     fn load_command_palette_entries(&mut self) -> Result<Vec<TuiCommandPaletteEntry>, String>;
     fn launch_named_command(&mut self, name: &str) -> Result<TuiSlashCommandAction, String>;
     fn handle_slash_command(&mut self, prompt: &str) -> Result<TuiSlashCommandAction, String>;
@@ -276,6 +300,7 @@ pub fn run() -> io::Result<TuiRunResult> {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct TuiSnapshot {
     pub conversation_lines: Vec<String>,
+    pub show_internal_thought: bool,
     pub memory_titles: Vec<String>,
     pub agenda_titles: Vec<String>,
     pub input_completions: Vec<String>,
@@ -305,10 +330,7 @@ pub fn run_with_snapshot_and_runtime<R: TuiRuntime>(
 
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
-    let mut app = TuiApp::from_snapshot(snapshot);
-    if let Ok(context_messages) = runtime.load_context_messages() {
-        app.mark_context_messages_rendered(&context_messages);
-    }
+    let mut app = initialize_app_from_snapshot(snapshot, runtime);
     let mut pending_prompt = start_startup_prompt_stream(&mut app, runtime);
     let result = run_event_loop(&mut terminal, &mut app, runtime, &mut pending_prompt);
 
@@ -324,6 +346,17 @@ pub fn run_with_snapshot_and_runtime<R: TuiRuntime>(
     result
 }
 
+fn initialize_app_from_snapshot(snapshot: TuiSnapshot, runtime: &mut impl TuiRuntime) -> TuiApp {
+    let mut app = TuiApp::from_snapshot(snapshot);
+    if let Ok(prompt_history) = runtime.load_prompt_history() {
+        app.input_history = prompt_history;
+    }
+    if let Ok(context_messages) = runtime.load_context_messages() {
+        app.mark_context_messages_rendered(&context_messages);
+    }
+    app
+}
+
 fn run_event_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut TuiApp,
@@ -334,6 +367,7 @@ fn run_event_loop(
     let mut last_context_poll = Instant::now();
     let mut deferred_context_refresh_at = None;
     let mut previous_background_status = None;
+    let mut last_spinner_tick = Instant::now();
 
     loop {
         if let Some(result) = drive_runtime_tick(
@@ -359,8 +393,12 @@ fn run_event_loop(
             &mut last_context_poll,
             Instant::now(),
         );
+        maybe_advance_prompt_spinner(app, &mut last_spinner_tick, Instant::now());
         terminal.draw(|frame| {
             app.render(frame.area(), frame.buffer_mut());
+            if let Some((x, y)) = app.input_cursor_screen_position(frame.area()) {
+                frame.set_cursor_position((x, y));
+            }
         })?;
 
         if !event::poll(Duration::from_millis(100))? {
@@ -385,6 +423,19 @@ fn run_event_loop(
             _ => {}
         }
     }
+}
+
+fn maybe_advance_prompt_spinner(app: &mut TuiApp, last_spinner_tick: &mut Instant, now: Instant) {
+    if !app.prompt_active {
+        app.reset_spinner();
+        *last_spinner_tick = now;
+        return;
+    }
+    if now.duration_since(*last_spinner_tick) < Duration::from_millis(80) {
+        return;
+    }
+    app.advance_spinner();
+    *last_spinner_tick = now;
 }
 
 fn maybe_enable_context_polling_after_prompt_completion(
@@ -492,6 +543,13 @@ fn apply_key_event(
     }
 
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        if app.focus == FocusTarget::Input && !app.input.is_empty() {
+            app.input.clear();
+            app.input_cursor = 0;
+            app.reset_prompt_history_navigation();
+            app.status = "cleared prompt".to_string();
+            return TuiExit::Continue;
+        }
         apply_intent_with_runtime(app, UiIntent::CancelPrompt, runtime, pending_prompt);
         return TuiExit::Continue;
     }
@@ -531,13 +589,39 @@ fn apply_key_event(
         match key.code {
             KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 app.reset_prompt_history_navigation();
-                app.input.push(ch);
+                app.insert_input_char(ch);
                 app.status = "editing prompt".to_string();
                 return TuiExit::Continue;
             }
             KeyCode::Backspace => {
                 app.reset_prompt_history_navigation();
-                app.input.pop();
+                app.delete_input_backward();
+                app.status = "editing prompt".to_string();
+                return TuiExit::Continue;
+            }
+            KeyCode::Delete => {
+                app.reset_prompt_history_navigation();
+                app.delete_input_forward();
+                app.status = "editing prompt".to_string();
+                return TuiExit::Continue;
+            }
+            KeyCode::Left => {
+                app.move_input_cursor_left();
+                app.status = "editing prompt".to_string();
+                return TuiExit::Continue;
+            }
+            KeyCode::Right => {
+                app.move_input_cursor_right();
+                app.status = "editing prompt".to_string();
+                return TuiExit::Continue;
+            }
+            KeyCode::Home => {
+                app.move_input_cursor_home();
+                app.status = "editing prompt".to_string();
+                return TuiExit::Continue;
+            }
+            KeyCode::End => {
+                app.move_input_cursor_end();
                 app.status = "editing prompt".to_string();
                 return TuiExit::Continue;
             }
@@ -571,12 +655,14 @@ fn apply_intent_with_runtime(
                     .to_string();
                 return;
             }
+            let _ = runtime.remember_prompt(&submitted);
             match runtime.handle_slash_command(&submitted) {
                 Ok(TuiSlashCommandAction::Execute(command)) => {
                     match start_command_execution(app, runtime, command) {
                         Ok(()) => {
                             app.record_submitted_prompt(&submitted);
                             app.input.clear();
+                            app.input_cursor = 0;
                         }
                         Err(error) => {
                             app.status = format!("command launch failed: {error}");
@@ -587,6 +673,7 @@ fn apply_intent_with_runtime(
                 Ok(TuiSlashCommandAction::OpenForm(form)) => {
                     app.record_submitted_prompt(&submitted);
                     app.input.clear();
+                    app.input_cursor = 0;
                     app.open_command_form(form);
                     app.status = format!(
                         "editing slash command: /{}",
@@ -610,6 +697,7 @@ fn apply_intent_with_runtime(
                     app.record_submitted_prompt(&submitted);
                     app.rendered_context_message_ids.clear();
                     app.input.clear();
+                    app.input_cursor = 0;
                     app.status = "thinking...".to_string();
                     *pending_prompt = Some(PendingPrompt {
                         submitted_prompt: Some(submitted),
@@ -640,6 +728,7 @@ fn apply_intent_with_runtime(
             }
             if app.focus == FocusTarget::Input {
                 app.input.clear();
+                app.input_cursor = 0;
                 app.status = "cleared prompt".to_string();
             }
         }
@@ -697,13 +786,12 @@ fn start_command_execution(
         );
     }
 
-    let display_name = command.display_name.clone();
     match runtime.start_command_execution(command) {
         Ok(()) => {
             app.command_active = true;
             app.focus = FocusTarget::Input;
             app.follow_conversation_output = true;
-            app.status = format!("running command: /{display_name}");
+            app.status = "running command...".to_string();
             Ok(())
         }
         Err(error) => Err(error),
@@ -743,7 +831,7 @@ fn apply_paste_event(app: &mut TuiApp, text: &str) {
 
     if app.focus == FocusTarget::Input {
         app.reset_prompt_history_navigation();
-        app.input.push_str(&flattened);
+        app.insert_input_text(&flattened);
         app.status = "editing prompt".to_string();
     }
 }
@@ -775,7 +863,11 @@ fn maybe_complete_command_execution(
     match runtime.poll_command_execution() {
         Ok(Some(snapshot)) => {
             app.command_active = false;
+            let has_status = snapshot.status.is_some();
             app.apply_snapshot(snapshot);
+            if !has_status {
+                app.status.clear();
+            }
             app.focus = FocusTarget::Input;
             app.follow_conversation_output = true;
             match runtime.take_restart_request() {
@@ -799,6 +891,11 @@ fn maybe_complete_command_execution(
 
 fn flatten_pasted_text(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn is_recallable_prompt(text: &str) -> bool {
+    let stripped = text.trim();
+    !stripped.is_empty() && !stripped.starts_with('/')
 }
 
 fn wrapped_line_count(text: &str, width: usize) -> usize {
@@ -991,12 +1088,13 @@ fn apply_prompt_update(app: &mut TuiApp, update: PromptUpdate) {
             } else {
                 app.conversation_lines.push(format!("assistant: {delta}"));
             }
-            if app.focus != FocusTarget::Command(CommandPane::Conversation) {
-                app.follow_conversation_output = true;
-            }
         }
         PromptUpdate::InternalThought(content) => {
-            app.status = format!("thinking: {content}");
+            if app.show_internal_thought {
+                append_internal_thought_line(app, content);
+            } else {
+                app.status = format!("thinking: {content}");
+            }
         }
         PromptUpdate::ToolCall {
             name,
@@ -1004,9 +1102,6 @@ fn apply_prompt_update(app: &mut TuiApp, update: PromptUpdate) {
         } => {
             app.conversation_lines
                 .push(format!("tool requested: {name} {arguments_json}"));
-            if app.focus != FocusTarget::Command(CommandPane::Conversation) {
-                app.follow_conversation_output = true;
-            }
         }
         PromptUpdate::ToolResult { content, is_error } => {
             let label = if is_error {
@@ -1015,9 +1110,6 @@ fn apply_prompt_update(app: &mut TuiApp, update: PromptUpdate) {
                 "tool result"
             };
             app.conversation_lines.push(format!("{label}: {content}"));
-            if app.focus != FocusTarget::Command(CommandPane::Conversation) {
-                app.follow_conversation_output = true;
-            }
         }
         PromptUpdate::Status(content) => {
             app.status = content;
@@ -1034,6 +1126,8 @@ fn key_event_token(key: KeyEvent) -> Option<&'static str> {
         (KeyCode::Down, _) => Some("down"),
         (KeyCode::PageUp, _) => Some("page_up"),
         (KeyCode::PageDown, _) => Some("page_down"),
+        (KeyCode::Left, _) => Some("left"),
+        (KeyCode::Right, _) => Some("right"),
         (KeyCode::Tab, KeyModifiers::SHIFT) => Some("shift+tab"),
         (KeyCode::BackTab, _) => Some("shift+tab"),
         (KeyCode::Tab, _) => Some("tab"),
@@ -1057,10 +1151,14 @@ impl TuiApp {
             title: "Elroy".to_string(),
             model_name: "gpt-5".to_string(),
             status: "bootstrap".to_string(),
+            show_internal_thought: false,
             prompt_active: false,
             command_active: false,
             background_status: None,
+            spinner_chars: "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏".to_string(),
+            spinner_index: 0,
             input: String::new(),
+            input_cursor: 0,
             input_completions: Vec::new(),
             input_history: Vec::new(),
             history_index: None,
@@ -1070,7 +1168,7 @@ impl TuiApp {
             detail_modal: None,
             sidebar_section: SidebarSection::Memories,
             focus: FocusTarget::Input,
-            last_command_pane: CommandPane::Conversation,
+            last_command_pane: CommandPane::Sidebar,
             conversation_lines: vec!["Conversation history and streaming output".to_string()],
             conversation_scroll: 0,
             follow_conversation_output: true,
@@ -1080,6 +1178,11 @@ impl TuiApp {
             feature_request_titles: Vec::new(),
             codex_session_titles: Vec::new(),
             selected_sidebar_index: 0,
+            selected_memory_index: 0,
+            selected_agenda_index: 0,
+            selected_improvement_index: 0,
+            selected_feature_request_index: 0,
+            selected_codex_session_index: 0,
             rendered_context_message_ids: HashSet::new(),
             last_viewport_width: 80,
             last_viewport_height: 24,
@@ -1096,6 +1199,7 @@ impl TuiApp {
         if !snapshot.conversation_lines.is_empty() {
             self.conversation_lines = snapshot.conversation_lines;
         }
+        self.show_internal_thought = snapshot.show_internal_thought;
         self.memory_titles = snapshot.memory_titles;
         self.agenda_titles = snapshot.agenda_titles;
         self.input_completions = snapshot.input_completions;
@@ -1108,10 +1212,9 @@ impl TuiApp {
         if let Some(status) = snapshot.status {
             self.status = status;
         }
-        let active_len = self.active_sidebar_items().len();
-        if self.selected_sidebar_index >= active_len {
-            self.selected_sidebar_index = active_len.saturating_sub(1);
-        }
+        self.clamp_all_sidebar_selections();
+        self.selected_sidebar_index = self.saved_sidebar_index(self.sidebar_section);
+        self.input_cursor = self.input_char_len();
     }
 
     pub fn mark_context_messages_rendered(&mut self, context_messages: &[TuiContextMessage]) {
@@ -1120,12 +1223,12 @@ impl TuiApp {
     }
 
     pub fn render_new_context_messages(&mut self, unseen_messages: &[TuiContextMessage]) {
-        self.conversation_lines
-            .extend(unseen_messages.iter().map(format_context_message_line));
+        self.conversation_lines.extend(
+            unseen_messages.iter().flat_map(|message| {
+                format_context_message_lines(message, self.show_internal_thought)
+            }),
+        );
         self.mark_context_messages_rendered(unseen_messages);
-        if self.focus != FocusTarget::Command(CommandPane::Conversation) {
-            self.follow_conversation_output = true;
-        }
     }
 
     pub fn mark_messages_rendered_after_bootstrap_stream(
@@ -1224,7 +1327,8 @@ impl TuiApp {
             .block(self.block_for_focus(FocusTarget::Input, "Input"))
             .wrap(Wrap { trim: false })
             .scroll((
-                wrapped_line_count(self.input.as_str(), input_viewport_width).saturating_sub(input_viewport_height) as u16,
+                wrapped_line_count(self.input.as_str(), input_viewport_width)
+                    .saturating_sub(input_viewport_height) as u16,
                 0,
             ))
             .render(vertical[1], buf);
@@ -1243,6 +1347,40 @@ impl TuiApp {
         } else if let Some(detail_modal) = &self.detail_modal {
             self.render_detail_modal(detail_modal, area, buf);
         }
+    }
+
+    pub fn input_cursor_screen_position(&self, area: Rect) -> Option<(u16, u16)> {
+        if self.focus != FocusTarget::Input
+            || self.command_palette.is_some()
+            || self.command_form.is_some()
+            || self.detail_modal.is_some()
+        {
+            return None;
+        }
+
+        let input_height = self.input_box_height(area.width, area.height);
+        let vertical = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(1),
+                Constraint::Length(input_height),
+                Constraint::Length(1),
+            ])
+            .split(area);
+        let input_area = vertical[1];
+        let input_viewport_width = input_area.width.saturating_sub(2).max(1) as usize;
+        let input_viewport_height = input_area.height.saturating_sub(2).max(1) as usize;
+        let cursor_index = self.input_cursor.min(self.input_char_len());
+        let cursor_row = cursor_index / input_viewport_width;
+        let cursor_col = cursor_index % input_viewport_width;
+        let scroll_row = wrapped_line_count(self.input.as_str(), input_viewport_width)
+            .saturating_sub(input_viewport_height);
+        let visible_row = cursor_row.saturating_sub(scroll_row);
+        let max_visible_row = input_viewport_height.saturating_sub(1);
+        Some((
+            input_area.x + 1 + cursor_col as u16,
+            input_area.y + 1 + visible_row.min(max_visible_row) as u16,
+        ))
     }
 
     fn block_for_focus<'a>(&self, target: FocusTarget, title: &'a str) -> Block<'a> {
@@ -1290,7 +1428,7 @@ impl TuiApp {
         let available_width = total_width.saturating_sub(2).max(1) as usize;
         let wrapped_lines = wrapped_line_count(self.input.as_str(), available_width);
         let content_height = wrapped_lines.max(1) as u16;
-        let desired = content_height.saturating_add(2).max(3);
+        let desired = content_height.saturating_add(2).clamp(3, 8);
         let max_height = total_height.saturating_sub(2).max(3);
         desired.min(max_height)
     }
@@ -1315,7 +1453,11 @@ impl TuiApp {
     }
 
     fn active_sidebar_items(&self) -> &[String] {
-        match self.sidebar_section {
+        self.sidebar_items_for(self.sidebar_section)
+    }
+
+    fn sidebar_items_for(&self, section: SidebarSection) -> &[String] {
+        match section {
             SidebarSection::Memories => &self.memory_titles,
             SidebarSection::Agenda => &self.agenda_titles,
             SidebarSection::Improvements => &self.improvement_titles,
@@ -1324,7 +1466,11 @@ impl TuiApp {
         }
     }
 
-    fn effective_conversation_scroll(&self, viewport_width: usize, viewport_height: usize) -> usize {
+    fn effective_conversation_scroll(
+        &self,
+        viewport_width: usize,
+        viewport_height: usize,
+    ) -> usize {
         let total_lines = wrapped_line_count(&self.conversation_lines.join("\n"), viewport_width);
         let max_scroll = total_lines.saturating_sub(viewport_height.max(1));
         if self.follow_conversation_output {
@@ -1347,13 +1493,44 @@ impl TuiApp {
     }
 
     pub fn footer_status_text(&self) -> String {
-        if self.prompt_active || self.command_active {
+        if self.prompt_active {
+            return format!(
+                "{} {}",
+                self.active_spinner_char(),
+                if self.status.is_empty() {
+                    "thinking..."
+                } else {
+                    self.status.as_str()
+                }
+            );
+        }
+        if self.command_active {
             return self.status.clone();
         }
         if let Some(background_status) = &self.background_status {
             return format!("● {}  ⟳ {}", self.model_name, background_status);
         }
         format!("● {}", self.model_name)
+    }
+
+    fn reset_spinner(&mut self) {
+        self.spinner_index = 0;
+    }
+
+    fn advance_spinner(&mut self) {
+        let len = self.spinner_chars.chars().count();
+        if len == 0 {
+            self.spinner_index = 0;
+            return;
+        }
+        self.spinner_index = (self.spinner_index + 1) % len;
+    }
+
+    fn active_spinner_char(&self) -> char {
+        self.spinner_chars
+            .chars()
+            .nth(self.spinner_index)
+            .unwrap_or('●')
     }
 
     fn render_detail_modal(&self, detail_modal: &DetailModalState, area: Rect, buf: &mut Buffer) {
@@ -1541,16 +1718,68 @@ impl TuiApp {
     }
 
     fn focus_sidebar_section(&mut self, section: SidebarSection) {
+        self.save_current_sidebar_index();
         self.sidebar_section = section;
-        self.selected_sidebar_index = 0;
+        self.selected_sidebar_index = self.saved_sidebar_index(section);
         self.focus = FocusTarget::Command(CommandPane::Sidebar);
         self.last_command_pane = CommandPane::Sidebar;
     }
 
+    fn save_current_sidebar_index(&mut self) {
+        let clamped = self.clamp_sidebar_index(self.sidebar_section, self.selected_sidebar_index);
+        self.set_saved_sidebar_index(self.sidebar_section, clamped);
+        self.selected_sidebar_index = clamped;
+    }
+
+    fn saved_sidebar_index(&self, section: SidebarSection) -> usize {
+        let index = match section {
+            SidebarSection::Memories => self.selected_memory_index,
+            SidebarSection::Agenda => self.selected_agenda_index,
+            SidebarSection::Improvements => self.selected_improvement_index,
+            SidebarSection::FeatureRequests => self.selected_feature_request_index,
+            SidebarSection::CodexSessions => self.selected_codex_session_index,
+        };
+        self.clamp_sidebar_index(section, index)
+    }
+
+    fn set_saved_sidebar_index(&mut self, section: SidebarSection, index: usize) {
+        match section {
+            SidebarSection::Memories => self.selected_memory_index = index,
+            SidebarSection::Agenda => self.selected_agenda_index = index,
+            SidebarSection::Improvements => self.selected_improvement_index = index,
+            SidebarSection::FeatureRequests => self.selected_feature_request_index = index,
+            SidebarSection::CodexSessions => self.selected_codex_session_index = index,
+        }
+    }
+
+    fn clamp_sidebar_index(&self, section: SidebarSection, index: usize) -> usize {
+        index.min(self.sidebar_items_for(section).len().saturating_sub(1))
+    }
+
+    fn clamp_all_sidebar_selections(&mut self) {
+        self.selected_memory_index =
+            self.clamp_sidebar_index(SidebarSection::Memories, self.selected_memory_index);
+        self.selected_agenda_index =
+            self.clamp_sidebar_index(SidebarSection::Agenda, self.selected_agenda_index);
+        self.selected_improvement_index = self.clamp_sidebar_index(
+            SidebarSection::Improvements,
+            self.selected_improvement_index,
+        );
+        self.selected_feature_request_index = self.clamp_sidebar_index(
+            SidebarSection::FeatureRequests,
+            self.selected_feature_request_index,
+        );
+        self.selected_codex_session_index = self.clamp_sidebar_index(
+            SidebarSection::CodexSessions,
+            self.selected_codex_session_index,
+        );
+    }
+
     fn record_submitted_prompt(&mut self, submitted: &str) {
         self.reset_prompt_history_navigation();
-        self.input_history.retain(|entry| entry != submitted);
-        self.input_history.insert(0, submitted.to_string());
+        if is_recallable_prompt(submitted) {
+            self.input_history.insert(0, submitted.to_string());
+        }
     }
 
     fn reset_prompt_history_navigation(&mut self) {
@@ -1574,6 +1803,7 @@ impl TuiApp {
         };
         self.history_index = Some(next_index);
         self.input = self.input_history[next_index].clone();
+        self.input_cursor = self.input_char_len();
         self.status = "prompt history previous".to_string();
     }
 
@@ -1591,6 +1821,7 @@ impl TuiApp {
             self.history_index = Some(next_index);
             self.input = self.input_history[next_index].clone();
         }
+        self.input_cursor = self.input_char_len();
         self.status = "prompt history next".to_string();
     }
 
@@ -1615,8 +1846,71 @@ impl TuiApp {
         if let Some(completion) = matched_completion {
             self.reset_prompt_history_navigation();
             self.input = completion;
+            self.input_cursor = self.input_char_len();
         }
         self.status = "input completion requested".to_string();
+    }
+
+    fn input_char_len(&self) -> usize {
+        self.input.chars().count()
+    }
+
+    fn input_byte_index(&self, char_index: usize) -> usize {
+        if char_index == 0 {
+            return 0;
+        }
+        self.input
+            .char_indices()
+            .nth(char_index)
+            .map(|(index, _)| index)
+            .unwrap_or(self.input.len())
+    }
+
+    fn insert_input_char(&mut self, ch: char) {
+        let byte_index = self.input_byte_index(self.input_cursor);
+        self.input.insert(byte_index, ch);
+        self.input_cursor += 1;
+    }
+
+    fn insert_input_text(&mut self, text: &str) {
+        let byte_index = self.input_byte_index(self.input_cursor);
+        self.input.insert_str(byte_index, text);
+        self.input_cursor += text.chars().count();
+    }
+
+    fn delete_input_backward(&mut self) {
+        if self.input_cursor == 0 {
+            return;
+        }
+        let end = self.input_byte_index(self.input_cursor);
+        let start = self.input_byte_index(self.input_cursor - 1);
+        self.input.replace_range(start..end, "");
+        self.input_cursor -= 1;
+    }
+
+    fn delete_input_forward(&mut self) {
+        if self.input_cursor >= self.input_char_len() {
+            return;
+        }
+        let start = self.input_byte_index(self.input_cursor);
+        let end = self.input_byte_index(self.input_cursor + 1);
+        self.input.replace_range(start..end, "");
+    }
+
+    fn move_input_cursor_left(&mut self) {
+        self.input_cursor = self.input_cursor.saturating_sub(1);
+    }
+
+    fn move_input_cursor_right(&mut self) {
+        self.input_cursor = (self.input_cursor + 1).min(self.input_char_len());
+    }
+
+    fn move_input_cursor_home(&mut self) {
+        self.input_cursor = 0;
+    }
+
+    fn move_input_cursor_end(&mut self) {
+        self.input_cursor = self.input_char_len();
     }
 
     pub fn handle_modal_key(&mut self, key: &str) -> UiIntent {
@@ -1698,6 +1992,7 @@ impl TuiApp {
                 } else {
                     self.status = format!("submitted prompt: {submitted}");
                     self.input.clear();
+                    self.input_cursor = 0;
                 }
             }
             UiIntent::CancelPrompt => {
@@ -1721,6 +2016,7 @@ impl TuiApp {
                     if self.selected_sidebar_index > 0 {
                         self.selected_sidebar_index -= 1;
                     }
+                    self.save_current_sidebar_index();
                     self.status = "moved selection up".to_string();
                 }
             }
@@ -1734,6 +2030,7 @@ impl TuiApp {
                     if self.selected_sidebar_index + 1 < len {
                         self.selected_sidebar_index += 1;
                     }
+                    self.save_current_sidebar_index();
                     self.status = "moved selection down".to_string();
                 }
             }
@@ -1925,8 +2222,8 @@ impl TuiApp {
 
     fn scroll_conversation_by(&mut self, lines: usize, direction: ScrollDir) {
         if self.follow_conversation_output {
-            self.conversation_scroll =
-                self.effective_conversation_scroll(self.last_viewport_width, self.last_viewport_height);
+            self.conversation_scroll = self
+                .effective_conversation_scroll(self.last_viewport_width, self.last_viewport_height);
             self.follow_conversation_output = false;
         }
         match direction {
@@ -1935,8 +2232,10 @@ impl TuiApp {
                 self.status = "scrolled conversation up".to_string();
             }
             ScrollDir::Down => {
-                let total_lines =
-                    wrapped_line_count(&self.conversation_lines.join("\n"), self.last_viewport_width);
+                let total_lines = wrapped_line_count(
+                    &self.conversation_lines.join("\n"),
+                    self.last_viewport_width,
+                );
                 let max_scroll = total_lines.saturating_sub(self.last_viewport_height.max(1));
                 self.conversation_scroll = self
                     .conversation_scroll
@@ -1991,6 +2290,7 @@ impl From<TuiCommandForm> for CommandFormState {
             command_name: value.command_name,
             description: value.description,
             fields,
+            source: value.source,
             selected_field,
             error: None,
         }
@@ -2074,16 +2374,20 @@ impl CommandPaletteState {
 
     fn apply_query(&mut self) {
         let query = self.query.to_ascii_lowercase();
-        self.filtered_indices = self
+        let mut scored = self
             .all_entries
             .iter()
             .enumerate()
             .filter_map(|(index, entry)| {
-                let haystack =
-                    format!("{} {}", entry.title, entry.description).to_ascii_lowercase();
-                haystack.contains(&query).then_some(index)
+                command_palette_match_score(&query, entry).map(|score| (index, score))
             })
-            .collect();
+            .collect::<Vec<_>>();
+        scored.sort_by(|(left_index, left_score), (right_index, right_score)| {
+            right_score
+                .cmp(left_score)
+                .then_with(|| left_index.cmp(right_index))
+        });
+        self.filtered_indices = scored.into_iter().map(|(index, _)| index).collect();
         if self.filtered_indices.is_empty() || self.selected_index >= self.filtered_indices.len() {
             self.selected_index = 0;
         }
@@ -2103,6 +2407,49 @@ impl CommandPaletteState {
         let index = *self.filtered_indices.get(self.selected_index)?;
         self.all_entries.get(index).cloned()
     }
+}
+
+fn command_palette_match_score(query: &str, entry: &TuiCommandPaletteEntry) -> Option<i32> {
+    if query.is_empty() {
+        return Some(0);
+    }
+
+    let title = entry.title.to_ascii_lowercase();
+    let description = entry.description.to_ascii_lowercase();
+    let haystack = format!("{title} {description}");
+
+    if title.starts_with(query) {
+        return Some(500 - title.len() as i32);
+    }
+    if title.contains(query) {
+        return Some(400 - title.len() as i32);
+    }
+    if haystack.contains(query) {
+        return Some(300 - haystack.len() as i32);
+    }
+    if is_subsequence(query, &title) {
+        return Some(200 - title.len() as i32);
+    }
+    if is_subsequence(query, &haystack) {
+        return Some(100 - haystack.len() as i32);
+    }
+    None
+}
+
+fn is_subsequence(needle: &str, haystack: &str) -> bool {
+    let mut needle_chars = needle.chars();
+    let Some(mut current) = needle_chars.next() else {
+        return true;
+    };
+    for ch in haystack.chars() {
+        if ch == current {
+            match needle_chars.next() {
+                Some(next) => current = next,
+                None => return true,
+            }
+        }
+    }
+    false
 }
 
 fn handle_command_palette_key(app: &mut TuiApp, key: KeyEvent, runtime: &mut impl TuiRuntime) {
@@ -2238,6 +2585,7 @@ fn handle_command_form_key(app: &mut TuiApp, key: KeyEvent, runtime: &mut impl T
                 command_name: command_name.clone(),
                 display_name: command_name,
                 values,
+                source: command_form.source.clone(),
             };
             match start_command_execution(app, runtime, command) {
                 Ok(()) => {
@@ -2285,8 +2633,89 @@ fn modal_key_token(key: KeyEvent) -> Option<&'static str> {
     }
 }
 
-fn format_context_message_line(message: &TuiContextMessage) -> String {
-    format!("{}: {}", message.role, message.content)
+fn split_internal_thought_segments(content: &str) -> Vec<(bool, String)> {
+    const OPEN_TAG: &str = "<internal_thought>";
+    const CLOSE_TAG: &str = "</internal_thought>";
+
+    let mut segments = Vec::new();
+    let mut rest = content;
+
+    loop {
+        let Some(start) = rest.find(OPEN_TAG) else {
+            if !rest.is_empty() {
+                segments.push((false, rest.to_string()));
+            }
+            break;
+        };
+        if start > 0 {
+            segments.push((false, rest[..start].to_string()));
+        }
+        rest = &rest[start + OPEN_TAG.len()..];
+        let Some(end) = rest.find(CLOSE_TAG) else {
+            break;
+        };
+        if end > 0 {
+            segments.push((true, rest[..end].to_string()));
+        }
+        rest = &rest[end + CLOSE_TAG.len()..];
+    }
+
+    segments
+}
+
+pub fn format_assistant_transcript_lines(
+    content: &str,
+    show_internal_thought: bool,
+) -> Vec<String> {
+    split_internal_thought_segments(content)
+        .into_iter()
+        .filter_map(|(is_thought, segment)| {
+            if segment.is_empty() {
+                return None;
+            }
+            if is_thought {
+                if show_internal_thought {
+                    Some(format!("thinking: {segment}"))
+                } else {
+                    None
+                }
+            } else {
+                Some(format!("assistant: {segment}"))
+            }
+        })
+        .collect()
+}
+
+pub fn strip_internal_thought_segments(content: &str) -> String {
+    split_internal_thought_segments(content)
+        .into_iter()
+        .filter_map(|(is_thought, segment)| (!is_thought).then_some(segment))
+        .collect()
+}
+
+fn format_context_message_lines(
+    message: &TuiContextMessage,
+    show_internal_thought: bool,
+) -> Vec<String> {
+    match message.role.as_str() {
+        "system" => Vec::new(),
+        "assistant" => format_assistant_transcript_lines(&message.content, show_internal_thought),
+        "tool" if !message.content.is_empty() => {
+            vec![format!("tool result: {}", message.content)]
+        }
+        role if !message.content.is_empty() => vec![format!("{role}: {}", message.content)],
+        _ => Vec::new(),
+    }
+}
+
+fn append_internal_thought_line(app: &mut TuiApp, content: String) {
+    if let Some(last) = app.conversation_lines.last_mut()
+        && last.starts_with("thinking: ")
+    {
+        last.push_str(&content);
+    } else {
+        app.conversation_lines.push(format!("thinking: {content}"));
+    }
 }
 
 struct NoopRuntime;
@@ -2408,11 +2837,12 @@ mod tests {
     use super::{
         CommandFormState, CommandPane, FocusTarget, PendingPrompt, PromptAdvance, PromptUpdate,
         SidebarAction, SidebarSection, TuiApp, TuiCommandExecution, TuiCommandForm,
-        TuiCommandPaletteAction, TuiCommandPaletteEntry, TuiCommandParameter, TuiContextMessage,
-        TuiExit, TuiPromptStream, TuiRunResult, TuiRuntime, TuiSidebarDetail,
+        TuiCommandPaletteAction, TuiCommandPaletteEntry, TuiCommandParameter, TuiCommandSource,
+        TuiContextMessage, TuiExit, TuiPromptStream, TuiRunResult, TuiRuntime, TuiSidebarDetail,
         TuiSlashCommandAction, TuiSnapshot, UiIntent, advance_prompt_stream,
         apply_intent_with_runtime, apply_key_event, apply_mouse_event, apply_paste_event,
-        drive_runtime_tick, key_event_token, maybe_complete_command_execution,
+        apply_prompt_update, drive_runtime_tick, initialize_app_from_snapshot, key_event_token,
+        maybe_advance_prompt_spinner, maybe_complete_command_execution,
         maybe_enable_context_polling_after_prompt_completion, maybe_poll_context_updates,
         maybe_refresh_snapshot_after_background_completion, maybe_run_deferred_context_refresh,
         poll_context_updates, start_startup_prompt_stream,
@@ -2443,6 +2873,8 @@ mod tests {
         completed_command_execution_snapshot: Option<TuiSnapshot>,
         command_execution_error: Option<String>,
         submitted_prompts: Vec<String>,
+        loaded_prompt_history: Vec<String>,
+        remembered_prompts: Vec<String>,
         self_reflection_runs: usize,
         last_opened: Option<(SidebarSection, String)>,
         last_mutation: Option<(SidebarSection, String, SidebarAction)>,
@@ -2485,6 +2917,15 @@ mod tests {
 
         fn load_command_palette_entries(&mut self) -> Result<Vec<TuiCommandPaletteEntry>, String> {
             Ok(self.command_palette_entries.clone())
+        }
+
+        fn load_prompt_history(&mut self) -> Result<Vec<String>, String> {
+            Ok(self.loaded_prompt_history.clone())
+        }
+
+        fn remember_prompt(&mut self, prompt: &str) -> Result<(), String> {
+            self.remembered_prompts.push(prompt.to_string());
+            Ok(())
         }
 
         fn launch_named_command(&mut self, _name: &str) -> Result<TuiSlashCommandAction, String> {
@@ -2809,6 +3250,14 @@ mod tests {
     }
 
     #[test]
+    fn input_box_height_caps_at_python_max_height() {
+        let mut app = TuiApp::bootstrap();
+        app.input = "wrapped ".repeat(200);
+
+        assert_eq!(app.input_box_height(20, 40), 8);
+    }
+
+    #[test]
     fn input_box_height_keeps_body_visible_on_short_terminal() {
         let mut app = TuiApp::bootstrap();
         app.input = "x".repeat(400);
@@ -2918,9 +3367,17 @@ mod tests {
         let mut app = TuiApp::bootstrap();
 
         assert_eq!(app.handle_key("escape"), UiIntent::Noop);
+        assert_eq!(app.focus, FocusTarget::Command(CommandPane::Sidebar));
+        assert_eq!(app.handle_key("escape"), UiIntent::Noop);
+        assert_eq!(app.focus, FocusTarget::Input);
+
+        app.handle_key("ctrl+m");
+        app.handle_key("tab");
         assert_eq!(app.focus, FocusTarget::Command(CommandPane::Conversation));
         assert_eq!(app.handle_key("escape"), UiIntent::Noop);
         assert_eq!(app.focus, FocusTarget::Input);
+        assert_eq!(app.handle_key("escape"), UiIntent::Noop);
+        assert_eq!(app.focus, FocusTarget::Command(CommandPane::Conversation));
     }
 
     #[test]
@@ -2966,34 +3423,90 @@ mod tests {
     }
 
     #[test]
-    fn sidebar_section_switches_reset_selection_to_first_item() {
+    fn left_right_key_events_switch_sidebar_sections_when_sidebar_is_focused() {
+        let mut app = TuiApp::bootstrap();
+        app.focus = FocusTarget::Command(CommandPane::Sidebar);
+        let mut runtime = FakeRuntime::default();
+        let mut pending = None;
+
+        apply_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+            &mut runtime,
+            &mut pending,
+        );
+        assert_eq!(app.sidebar_section, SidebarSection::Agenda);
+
+        apply_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Left, KeyModifiers::NONE),
+            &mut runtime,
+            &mut pending,
+        );
+        assert_eq!(app.sidebar_section, SidebarSection::Memories);
+    }
+
+    #[test]
+    fn sidebar_section_switches_restore_saved_selection_per_section() {
         let mut app = TuiApp::bootstrap();
         app.memory_titles = vec!["Memory A".to_string(), "Memory B".to_string()];
         app.agenda_titles = vec!["Agenda A".to_string(), "Agenda B".to_string()];
-        app.improvement_titles = vec!["Improvement A".to_string()];
-        app.selected_sidebar_index = 1;
+
+        app.handle_key("escape");
+        let intent = app.handle_key("down");
+        app.apply_intent(intent);
+        assert_eq!(app.sidebar_section, SidebarSection::Memories);
+        assert_eq!(app.selected_sidebar_index, 1);
 
         app.handle_key("ctrl+a");
         assert_eq!(app.sidebar_section, SidebarSection::Agenda);
         assert_eq!(app.selected_sidebar_index, 0);
 
-        app.selected_sidebar_index = 1;
-        app.handle_key("right");
-        assert_eq!(app.sidebar_section, SidebarSection::Improvements);
+        let intent = app.handle_key("down");
+        app.apply_intent(intent);
+        assert_eq!(app.selected_sidebar_index, 1);
+
+        app.handle_key("ctrl+m");
+        assert_eq!(app.sidebar_section, SidebarSection::Memories);
+        assert_eq!(app.selected_sidebar_index, 1);
+
+        app.handle_key("ctrl+a");
+        assert_eq!(app.sidebar_section, SidebarSection::Agenda);
+        assert_eq!(app.selected_sidebar_index, 1);
+    }
+
+    #[test]
+    fn sidebar_saved_selection_clamps_after_snapshot_shrinks_section() {
+        let mut app = TuiApp::from_snapshot(TuiSnapshot {
+            agenda_titles: vec!["Agenda A".to_string(), "Agenda B".to_string()],
+            ..TuiSnapshot::default()
+        });
+        app.handle_key("ctrl+a");
+        let intent = app.handle_key("down");
+        app.apply_intent(intent);
+        assert_eq!(app.selected_sidebar_index, 1);
+
+        app.apply_snapshot(TuiSnapshot {
+            agenda_titles: vec!["Agenda A".to_string()],
+            ..TuiSnapshot::default()
+        });
+
+        assert_eq!(app.sidebar_section, SidebarSection::Agenda);
         assert_eq!(app.selected_sidebar_index, 0);
+        assert_eq!(app.selected_agenda_index, 0);
     }
 
     #[test]
     fn command_mode_tab_toggles_between_conversation_and_sidebar() {
         let mut app = TuiApp::bootstrap();
         app.handle_key("escape");
-        assert_eq!(app.focus, FocusTarget::Command(CommandPane::Conversation));
-
-        app.handle_key("tab");
         assert_eq!(app.focus, FocusTarget::Command(CommandPane::Sidebar));
 
-        app.handle_key("shift+tab");
+        app.handle_key("tab");
         assert_eq!(app.focus, FocusTarget::Command(CommandPane::Conversation));
+
+        app.handle_key("shift+tab");
+        assert_eq!(app.focus, FocusTarget::Command(CommandPane::Sidebar));
     }
 
     #[test]
@@ -3036,6 +3549,7 @@ mod tests {
         app.memory_titles = vec!["One".to_string(), "Two".to_string()];
         app.selected_sidebar_index = 1;
         app.handle_key("escape");
+        app.handle_key("tab");
         assert_eq!(app.focus, FocusTarget::Command(CommandPane::Conversation));
 
         // Use small viewport (1) so max_scroll = 3 - 1 = 2.
@@ -3100,6 +3614,34 @@ mod tests {
     }
 
     #[test]
+    fn streamed_output_does_not_resume_following_after_manual_input_scroll() {
+        let mut app = TuiApp::bootstrap();
+        app.conversation_lines = vec!["line 0".to_string(), "line 1".to_string()];
+        app.follow_conversation_output = true;
+        app.focus = FocusTarget::Input;
+        app.last_viewport_width = 80;
+        app.last_viewport_height = 1;
+
+        apply_mouse_event(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+        assert!(!app.follow_conversation_output);
+
+        apply_prompt_update(
+            &mut app,
+            PromptUpdate::AssistantDelta("new output".to_string()),
+        );
+
+        assert!(!app.follow_conversation_output);
+    }
+
+    #[test]
     fn mouse_scroll_is_ignored_when_modal_is_open() {
         let mut app = TuiApp::bootstrap();
         app.conversation_lines = vec!["line 0".to_string(), "line 1".to_string()];
@@ -3108,6 +3650,7 @@ mod tests {
             command_name: "create_memory".to_string(),
             description: "desc".to_string(),
             fields: vec![],
+            source: TuiCommandSource::Palette,
             selected_field: 0,
             error: None,
         });
@@ -3130,6 +3673,7 @@ mod tests {
     fn escaping_from_conversation_browse_reenables_following_latest_output() {
         let mut app = TuiApp::bootstrap();
         app.handle_key("escape");
+        app.handle_key("tab");
         let down = app.handle_key("j");
         app.apply_intent(down);
         assert!(!app.follow_conversation_output);
@@ -3236,7 +3780,50 @@ mod tests {
         apply_paste_event(&mut app, "---\ntitle: note\n---\nhello world");
 
         assert_eq!(app.input, "--- title: note --- hello world");
+        assert_eq!(app.input_cursor, app.input_char_len());
         assert_eq!(app.status, "editing prompt");
+    }
+
+    #[test]
+    fn chat_input_supports_cursor_insertion_and_deletion() {
+        let mut app = TuiApp::bootstrap();
+        app.input = "helo".to_string();
+        app.input_cursor = app.input_char_len().saturating_sub(1);
+        let mut runtime = FakeRuntime::default();
+        let mut pending = None;
+
+        apply_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE),
+            &mut runtime,
+            &mut pending,
+        );
+        assert_eq!(app.input, "hello");
+        assert_eq!(app.input_cursor, 4);
+
+        apply_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Left, KeyModifiers::NONE),
+            &mut runtime,
+            &mut pending,
+        );
+        apply_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE),
+            &mut runtime,
+            &mut pending,
+        );
+        assert_eq!(app.input, "helo");
+        assert_eq!(app.input_cursor, 3);
+
+        apply_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+            &mut runtime,
+            &mut pending,
+        );
+        assert_eq!(app.input, "heo");
+        assert_eq!(app.input_cursor, 2);
     }
 
     #[test]
@@ -3301,17 +3888,66 @@ mod tests {
         app.status = "thinking...".to_string();
         app.background_status = Some("syncing memories...".to_string());
 
-        assert_eq!(app.footer_status_text(), "thinking...");
+        assert_eq!(app.footer_status_text(), "⠋ thinking...");
     }
 
     #[test]
     fn footer_status_text_prefers_active_status_during_command_action() {
         let mut app = TuiApp::bootstrap();
         app.command_active = true;
-        app.status = "running command: /help".to_string();
+        app.status = "running command...".to_string();
         app.background_status = Some("running command...".to_string());
 
-        assert_eq!(app.footer_status_text(), "running command: /help");
+        assert_eq!(app.footer_status_text(), "running command...");
+    }
+
+    #[test]
+    fn internal_thought_prompt_updates_append_to_conversation_when_enabled() {
+        let mut app = TuiApp::bootstrap();
+        app.show_internal_thought = true;
+
+        apply_prompt_update(
+            &mut app,
+            PromptUpdate::InternalThought("Need to think".to_string()),
+        );
+        apply_prompt_update(&mut app, PromptUpdate::InternalThought(" more".to_string()));
+
+        assert_eq!(
+            app.conversation_lines.last().map(String::as_str),
+            Some("thinking: Need to think more")
+        );
+        assert_eq!(app.status, "bootstrap");
+    }
+
+    #[test]
+    fn prompt_spinner_advances_only_while_prompt_is_active() {
+        let mut app = TuiApp::bootstrap();
+        let start = Instant::now();
+        let mut last_spinner_tick = start;
+
+        app.prompt_active = true;
+        maybe_advance_prompt_spinner(
+            &mut app,
+            &mut last_spinner_tick,
+            start + Duration::from_millis(79),
+        );
+        assert_eq!(app.footer_status_text(), "⠋ bootstrap");
+
+        maybe_advance_prompt_spinner(
+            &mut app,
+            &mut last_spinner_tick,
+            start + Duration::from_millis(80),
+        );
+        assert_eq!(app.footer_status_text(), "⠙ bootstrap");
+
+        app.prompt_active = false;
+        maybe_advance_prompt_spinner(
+            &mut app,
+            &mut last_spinner_tick,
+            start + Duration::from_millis(81),
+        );
+        app.prompt_active = true;
+        assert_eq!(app.footer_status_text(), "⠋ bootstrap");
     }
 
     #[test]
@@ -3398,6 +4034,7 @@ mod tests {
                 command_name: "get_help".to_string(),
                 display_name: "help".to_string(),
                 values: vec![],
+                source: TuiCommandSource::Slash,
             })),
             ..FakeRuntime::default()
         };
@@ -3410,28 +4047,30 @@ mod tests {
         assert_eq!(app.input, "");
         assert_eq!(app.focus, FocusTarget::Input);
         assert!(app.command_active);
-        assert_eq!(app.status, "running command: /help");
+        assert_eq!(app.status, "running command...");
         assert_eq!(
             runtime.started_command_executions,
             vec![TuiCommandExecution {
                 command_name: "get_help".to_string(),
                 display_name: "help".to_string(),
                 values: vec![],
+                source: TuiCommandSource::Slash,
             }]
         );
         runtime.completed_command_execution_snapshot = Some(TuiSnapshot {
             conversation_lines: vec!["tool result: Available commands...".to_string()],
-            status: Some("slash command executed: /help".to_string()),
+            status: None,
             ..TuiSnapshot::default()
         });
         maybe_complete_command_execution(&mut app, &mut runtime);
         assert!(!app.command_active);
-        assert_eq!(app.status, "slash command executed: /help");
+        assert!(app.status.is_empty());
         assert_eq!(
             app.conversation_lines.last().map(String::as_str),
             Some("tool result: Available commands...")
         );
-        assert_eq!(app.input_history, vec!["/help".to_string()]);
+        assert!(app.input_history.is_empty());
+        assert_eq!(runtime.remembered_prompts, vec!["/help".to_string()]);
     }
 
     #[test]
@@ -3476,7 +4115,11 @@ mod tests {
         );
         assert_eq!(app.status, "thinking...");
         assert_eq!(app.input, "");
-        assert_eq!(app.input_history, vec!["/set_assistant_name".to_string()]);
+        assert!(app.input_history.is_empty());
+        assert_eq!(
+            runtime.remembered_prompts,
+            vec!["/set_assistant_name".to_string()]
+        );
     }
 
     #[test]
@@ -3502,6 +4145,7 @@ mod tests {
                     },
                 ],
                 initial_values: vec![("name".to_string(), "trip".to_string())],
+                source: TuiCommandSource::Slash,
             })),
             ..FakeRuntime::default()
         };
@@ -3512,7 +4156,11 @@ mod tests {
         assert!(pending.is_none());
         assert!(runtime.submitted_prompts.is_empty());
         assert_eq!(app.input, "");
-        assert_eq!(app.input_history, vec!["/create_memory trip".to_string()]);
+        assert!(app.input_history.is_empty());
+        assert_eq!(
+            runtime.remembered_prompts,
+            vec!["/create_memory trip".to_string()]
+        );
         let command_form = app.command_form.as_ref().expect("command form should open");
         assert_eq!(command_form.command_name, "create_memory");
         assert_eq!(command_form.selected_field, 1);
@@ -3543,6 +4191,7 @@ mod tests {
                 },
             ],
             initial_values: vec![("name".to_string(), "trip".to_string())],
+            source: TuiCommandSource::Palette,
         });
         let mut runtime = FakeRuntime::default();
         let mut pending = None;
@@ -3589,13 +4238,14 @@ mod tests {
                     ("name".to_string(), "trip".to_string()),
                     ("text".to_string(), "note".to_string()),
                 ],
+                source: TuiCommandSource::Palette,
             }]
         );
         assert!(app.command_active);
-        assert_eq!(app.status, "running command: /create_memory");
+        assert_eq!(app.status, "running command...");
         runtime.completed_command_execution_snapshot = Some(TuiSnapshot {
             conversation_lines: vec!["tool result: submitted /create_memory".to_string()],
-            status: Some("slash command executed: /create_memory".to_string()),
+            status: None,
             ..TuiSnapshot::default()
         });
         maybe_complete_command_execution(&mut app, &mut runtime);
@@ -3604,7 +4254,7 @@ mod tests {
             app.conversation_lines.last().map(String::as_str),
             Some("tool result: submitted /create_memory")
         );
-        assert_eq!(app.status, "slash command executed: /create_memory");
+        assert!(app.status.is_empty());
     }
 
     #[test]
@@ -3612,7 +4262,7 @@ mod tests {
         let mut app = TuiApp::bootstrap();
         app.command_active = true;
         app.focus = FocusTarget::Command(CommandPane::Conversation);
-        app.status = "running command: /create_memory".to_string();
+        app.status = "running command...".to_string();
         app.follow_conversation_output = false;
         let mut runtime = FakeRuntime {
             command_execution_error: Some("background worker exploded".to_string()),
@@ -3642,6 +4292,7 @@ mod tests {
                 suggestions: vec![],
             }],
             initial_values: vec![("name".to_string(), "trip".to_string())],
+            source: TuiCommandSource::Palette,
         });
         let mut runtime = FakeRuntime::default();
         let mut pending = None;
@@ -3678,6 +4329,7 @@ mod tests {
                 suggestions: vec![],
             }],
             initial_values: vec![("name".to_string(), "trip".to_string())],
+            source: TuiCommandSource::Palette,
         });
         let mut runtime = FakeRuntime::default();
         let mut pending = None;
@@ -3713,6 +4365,7 @@ mod tests {
                 suggestions: vec![],
             }],
             initial_values: vec![("name".to_string(), "trip".to_string())],
+            source: TuiCommandSource::Palette,
         });
         let mut runtime = FakeRuntime {
             start_command_execution_error: Some("memory_name must be a string".to_string()),
@@ -3742,7 +4395,7 @@ mod tests {
     fn command_action_keeps_input_editable_and_blocks_submit() {
         let mut app = TuiApp::bootstrap();
         app.command_active = true;
-        app.status = "running command: /refresh_system_instructions".to_string();
+        app.status = "running command...".to_string();
         let mut runtime = FakeRuntime::default();
         let mut pending = None;
 
@@ -3795,6 +4448,7 @@ mod tests {
                 },
             ],
             initial_values: vec![],
+            source: TuiCommandSource::Palette,
         });
         let mut runtime = FakeRuntime::default();
         let mut pending = None;
@@ -3854,6 +4508,7 @@ mod tests {
                 },
             ],
             initial_values: vec![],
+            source: TuiCommandSource::Palette,
         });
         let mut runtime = FakeRuntime::default();
         let mut pending = None;
@@ -3889,6 +4544,7 @@ mod tests {
                 suggestions: vec![],
             }],
             initial_values: vec![("name".to_string(), "trip".to_string())],
+            source: TuiCommandSource::Palette,
         });
         let mut runtime = FakeRuntime::default();
         let mut pending = None;
@@ -3992,6 +4648,7 @@ mod tests {
                     command_name: "refresh_system_instructions".to_string(),
                     display_name: "refresh_system_instructions".to_string(),
                     values: vec![],
+                    source: TuiCommandSource::Palette,
                 },
             )),
             ..FakeRuntime::default()
@@ -4014,6 +4671,7 @@ mod tests {
                 command_name: "refresh_system_instructions".to_string(),
                 display_name: "refresh_system_instructions".to_string(),
                 values: vec![],
+                source: TuiCommandSource::Palette,
             }]
         );
         runtime.completed_command_execution_snapshot = Some(TuiSnapshot {
@@ -4160,7 +4818,7 @@ mod tests {
         app.command_active = true;
         let mut runtime = FakeRuntime {
             completed_command_execution_snapshot: Some(TuiSnapshot {
-                status: Some("slash command executed: /restart_session".to_string()),
+                status: None,
                 ..TuiSnapshot::default()
             }),
             pending_restart_request: Some("Restarted successfully. Ready to continue.".to_string()),
@@ -4183,7 +4841,7 @@ mod tests {
         app.command_active = true;
         let mut runtime = FakeRuntime {
             completed_command_execution_snapshot: Some(TuiSnapshot {
-                status: Some("slash command executed: /restart_session".to_string()),
+                status: None,
                 ..TuiSnapshot::default()
             }),
             pending_restart_request: Some("Restarted successfully. Ready to continue.".to_string()),
@@ -4286,6 +4944,7 @@ mod tests {
                     },
                 ],
                 initial_values: vec![],
+                source: TuiCommandSource::Palette,
             })),
             ..FakeRuntime::default()
         };
@@ -4325,6 +4984,7 @@ mod tests {
                     },
                 ],
                 initial_values: vec![],
+                source: TuiCommandSource::Palette,
             })),
             ..FakeRuntime::default()
         };
@@ -4397,6 +5057,7 @@ mod tests {
                     ("name".to_string(), "Trip".to_string()),
                     ("text".to_string(), "User prefers aisle seats.".to_string()),
                 ],
+                source: TuiCommandSource::Palette,
             }]
         );
     }
@@ -4417,6 +5078,7 @@ mod tests {
                     command_name: "refresh_system_instructions".to_string(),
                     display_name: "refresh_system_instructions".to_string(),
                     values: vec![],
+                    source: TuiCommandSource::Palette,
                 },
             )),
             ..FakeRuntime::default()
@@ -4453,6 +5115,7 @@ mod tests {
                     command_name: "refresh_system_instructions".to_string(),
                     display_name: "refresh_system_instructions".to_string(),
                     values: vec![],
+                    source: TuiCommandSource::Palette,
                 },
             )),
             ..FakeRuntime::default()
@@ -4499,6 +5162,7 @@ mod tests {
                     suggestions: vec![],
                 }],
                 initial_values: vec![],
+                source: TuiCommandSource::Palette,
             })),
             ..FakeRuntime::default()
         };
@@ -4553,6 +5217,95 @@ mod tests {
     }
 
     #[test]
+    fn command_palette_fuzzy_matches_non_contiguous_query() {
+        let mut app = TuiApp::bootstrap();
+        app.open_command_palette(vec![
+            TuiCommandPaletteEntry {
+                title: "/create_memory".to_string(),
+                description: "Create a memory".to_string(),
+                action: TuiCommandPaletteAction::ToolCommand("create_memory".to_string()),
+            },
+            TuiCommandPaletteEntry {
+                title: "/show_memory".to_string(),
+                description: "Show a memory".to_string(),
+                action: TuiCommandPaletteAction::ToolCommand("show_memory".to_string()),
+            },
+        ]);
+        let mut runtime = FakeRuntime::default();
+        let mut pending = None;
+
+        apply_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE),
+            &mut runtime,
+            &mut pending,
+        );
+        apply_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE),
+            &mut runtime,
+            &mut pending,
+        );
+
+        let command_palette = app
+            .command_palette
+            .as_ref()
+            .expect("command palette should remain open");
+        assert_eq!(command_palette.query, "sm");
+        assert_eq!(
+            command_palette.selected_entry().map(|entry| entry.title),
+            Some("/show_memory".to_string())
+        );
+    }
+
+    #[test]
+    fn command_palette_prefers_title_prefix_match_over_description_match() {
+        let mut app = TuiApp::bootstrap();
+        app.open_command_palette(vec![
+            TuiCommandPaletteEntry {
+                title: "/create_memory".to_string(),
+                description: "Show a memory entry".to_string(),
+                action: TuiCommandPaletteAction::ToolCommand("create_memory".to_string()),
+            },
+            TuiCommandPaletteEntry {
+                title: "/show_memory".to_string(),
+                description: "Display a memory".to_string(),
+                action: TuiCommandPaletteAction::ToolCommand("show_memory".to_string()),
+            },
+        ]);
+        let mut runtime = FakeRuntime::default();
+        let mut pending = None;
+
+        apply_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE),
+            &mut runtime,
+            &mut pending,
+        );
+        apply_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE),
+            &mut runtime,
+            &mut pending,
+        );
+        apply_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE),
+            &mut runtime,
+            &mut pending,
+        );
+
+        let command_palette = app
+            .command_palette
+            .as_ref()
+            .expect("command palette should remain open");
+        assert_eq!(
+            command_palette.selected_entry().map(|entry| entry.title),
+            Some("/show_memory".to_string())
+        );
+    }
+
+    #[test]
     fn command_palette_reports_no_match_without_closing() {
         let mut app = TuiApp::bootstrap();
         app.open_command_palette(vec![TuiCommandPaletteEntry {
@@ -4590,8 +5343,28 @@ mod tests {
         apply_intent_with_runtime(&mut app, UiIntent::SubmitPrompt, &mut runtime, &mut pending);
 
         assert_eq!(app.input_history, vec!["hello runtime".to_string()]);
+        assert_eq!(
+            runtime.remembered_prompts,
+            vec!["hello runtime".to_string()]
+        );
         app.apply_intent(UiIntent::HistoryPrevious);
         assert_eq!(app.input, "hello runtime");
+    }
+
+    #[test]
+    fn initialize_app_from_snapshot_loads_prompt_history_from_runtime() {
+        let snapshot = TuiSnapshot::default();
+        let mut runtime = FakeRuntime {
+            loaded_prompt_history: vec!["latest".to_string(), "older".to_string()],
+            ..FakeRuntime::default()
+        };
+
+        let app = initialize_app_from_snapshot(snapshot, &mut runtime);
+
+        assert_eq!(
+            app.input_history,
+            vec!["latest".to_string(), "older".to_string()]
+        );
     }
 
     #[test]
@@ -4670,7 +5443,7 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_c_cancels_active_stream_and_preserves_draft() {
+    fn ctrl_c_clears_active_draft_before_canceling_stream() {
         let mut app = TuiApp::bootstrap();
         let mut runtime = FakeRuntime::default();
         let mut pending = None;
@@ -4688,7 +5461,19 @@ mod tests {
             ),
             TuiExit::Continue
         );
-        assert_eq!(app.input, "draft");
+        assert_eq!(app.input, "");
+        assert_eq!(app.status, "cleared prompt");
+        assert!(pending.is_some());
+
+        assert_eq!(
+            apply_key_event(
+                &mut app,
+                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+                &mut runtime,
+                &mut pending,
+            ),
+            TuiExit::Continue
+        );
         assert_eq!(app.status, "Chat stream cancelled");
         assert!(pending.is_none());
     }
@@ -5464,6 +6249,168 @@ mod tests {
             ]
         );
         assert_eq!(app.rendered_context_message_ids, HashSet::from([1, 2]));
+    }
+
+    #[test]
+    fn poll_context_updates_formats_tool_results_and_skips_system_messages() {
+        let mut app = TuiApp::from_snapshot(TuiSnapshot {
+            conversation_lines: vec!["assistant: existing".to_string()],
+            ..TuiSnapshot::default()
+        });
+        app.rendered_context_message_ids = HashSet::from([1]);
+        let mut runtime = FakeRuntime {
+            context_messages: vec![
+                TuiContextMessage {
+                    id: 1,
+                    role: "assistant".to_string(),
+                    content: "existing".to_string(),
+                },
+                TuiContextMessage {
+                    id: 2,
+                    role: "system".to_string(),
+                    content: "system prompt".to_string(),
+                },
+                TuiContextMessage {
+                    id: 3,
+                    role: "tool".to_string(),
+                    content: "background tool output".to_string(),
+                },
+            ],
+            ..FakeRuntime::default()
+        };
+
+        poll_context_updates(&mut app, &mut runtime);
+
+        assert_eq!(
+            app.conversation_lines,
+            vec![
+                "assistant: existing".to_string(),
+                "tool result: background tool output".to_string(),
+            ]
+        );
+        assert_eq!(app.rendered_context_message_ids, HashSet::from([1, 2, 3]));
+    }
+
+    #[test]
+    fn poll_context_updates_hides_internal_thought_segments_in_assistant_messages() {
+        let mut app = TuiApp::from_snapshot(TuiSnapshot {
+            conversation_lines: vec!["assistant: existing".to_string()],
+            ..TuiSnapshot::default()
+        });
+        app.rendered_context_message_ids = HashSet::from([1]);
+        let mut runtime = FakeRuntime {
+            context_messages: vec![
+                TuiContextMessage {
+                    id: 1,
+                    role: "assistant".to_string(),
+                    content: "existing".to_string(),
+                },
+                TuiContextMessage {
+                    id: 2,
+                    role: "assistant".to_string(),
+                    content: "<internal_thought>Need to think</internal_thought>Visible answer"
+                        .to_string(),
+                },
+                TuiContextMessage {
+                    id: 3,
+                    role: "assistant".to_string(),
+                    content: "<internal_thought>hidden only</internal_thought>".to_string(),
+                },
+            ],
+            ..FakeRuntime::default()
+        };
+
+        poll_context_updates(&mut app, &mut runtime);
+
+        assert_eq!(
+            app.conversation_lines,
+            vec![
+                "assistant: existing".to_string(),
+                "assistant: Visible answer".to_string(),
+            ]
+        );
+        assert_eq!(app.rendered_context_message_ids, HashSet::from([1, 2, 3]));
+    }
+
+    #[test]
+    fn poll_context_updates_can_render_internal_thought_segments_when_enabled() {
+        let mut app = TuiApp::from_snapshot(TuiSnapshot {
+            conversation_lines: vec!["assistant: existing".to_string()],
+            show_internal_thought: true,
+            ..TuiSnapshot::default()
+        });
+        app.rendered_context_message_ids = HashSet::from([1]);
+        let mut runtime = FakeRuntime {
+            context_messages: vec![
+                TuiContextMessage {
+                    id: 1,
+                    role: "assistant".to_string(),
+                    content: "existing".to_string(),
+                },
+                TuiContextMessage {
+                    id: 2,
+                    role: "assistant".to_string(),
+                    content: "<internal_thought>Need to think</internal_thought>Visible answer"
+                        .to_string(),
+                },
+            ],
+            ..FakeRuntime::default()
+        };
+
+        poll_context_updates(&mut app, &mut runtime);
+
+        assert_eq!(
+            app.conversation_lines,
+            vec![
+                "assistant: existing".to_string(),
+                "thinking: Need to think".to_string(),
+                "assistant: Visible answer".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn background_context_updates_do_not_resume_following_after_manual_input_scroll() {
+        let mut app = TuiApp::from_snapshot(TuiSnapshot {
+            conversation_lines: vec!["assistant: existing".to_string()],
+            ..TuiSnapshot::default()
+        });
+        app.rendered_context_message_ids = HashSet::from([1]);
+        app.follow_conversation_output = true;
+        app.focus = FocusTarget::Input;
+        app.last_viewport_width = 80;
+        app.last_viewport_height = 1;
+
+        apply_mouse_event(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+        assert!(!app.follow_conversation_output);
+
+        let mut runtime = FakeRuntime {
+            context_messages: vec![
+                TuiContextMessage {
+                    id: 1,
+                    role: "assistant".to_string(),
+                    content: "existing".to_string(),
+                },
+                TuiContextMessage {
+                    id: 2,
+                    role: "assistant".to_string(),
+                    content: "background update".to_string(),
+                },
+            ],
+            ..FakeRuntime::default()
+        };
+
+        poll_context_updates(&mut app, &mut runtime);
+
+        assert!(!app.follow_conversation_output);
     }
 
     #[test]

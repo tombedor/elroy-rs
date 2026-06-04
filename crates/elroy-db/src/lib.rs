@@ -507,6 +507,55 @@ pub fn list_all_active_memories(connection: &Connection) -> rusqlite::Result<Vec
     rows.collect()
 }
 
+pub fn load_memories_by_ids(
+    connection: &Connection,
+    memory_ids: &[i64],
+) -> rusqlite::Result<Vec<MemoryRecord>> {
+    if memory_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let placeholders = (1..=memory_ids.len())
+        .map(|index| format!("?{index}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let query = format!(
+        "SELECT
+            id,
+            legacy_frontmatter_id,
+            name,
+            file_path,
+            body,
+            is_active,
+            updated_at_unix
+        FROM memories
+        WHERE id IN ({placeholders})"
+    );
+    let mut statement = connection.prepare(&query)?;
+    let rows = statement.query_map(rusqlite::params_from_iter(memory_ids.iter()), |row| {
+        Ok(MemoryRecord {
+            id: row.get(0)?,
+            legacy_frontmatter_id: row.get(1)?,
+            name: row.get(2)?,
+            file_path: row.get(3)?,
+            body: row.get(4)?,
+            is_active: row.get::<_, i64>(5)? != 0,
+            updated_at_unix: row.get(6)?,
+        })
+    })?;
+
+    let mut by_id = rows
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .into_iter()
+        .map(|memory| (memory.id, memory))
+        .collect::<std::collections::HashMap<_, _>>();
+
+    Ok(memory_ids
+        .iter()
+        .filter_map(|memory_id| by_id.remove(memory_id))
+        .collect())
+}
+
 pub fn search_active_memories(
     connection: &Connection,
     query: &str,
@@ -1088,6 +1137,116 @@ pub fn replace_context_messages(
     transaction.commit()
 }
 
+pub fn append_context_messages(
+    connection: &mut Connection,
+    user_token: &str,
+    messages: &[ConversationMessage],
+) -> rusqlite::Result<()> {
+    if messages.is_empty() {
+        return Ok(());
+    }
+
+    let set_id = get_or_create_context_message_set(connection, user_token)?;
+    let updated_at = unix_timestamp_now();
+    let transaction =
+        connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let mut next_position: i64 = transaction.query_row(
+        "SELECT COALESCE(MAX(position), -1) + 1 FROM context_messages WHERE set_id = ?1",
+        [set_id],
+        |row| row.get(0),
+    )?;
+
+    for message in messages {
+        let tool_calls_json = message
+            .tool_calls
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(json_to_sql_error)?;
+        transaction.execute(
+            "INSERT INTO context_messages (
+                set_id,
+                position,
+                role,
+                content,
+                chat_model,
+                created_at_unix,
+                tool_calls_json,
+                tool_call_id
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                set_id,
+                next_position,
+                message_role_name(&message.role),
+                message.content,
+                message.chat_model,
+                message.created_at_unix,
+                tool_calls_json,
+                message.tool_call_id,
+            ],
+        )?;
+        next_position += 1;
+    }
+
+    transaction.execute(
+        "UPDATE context_message_sets SET updated_at_unix = ?2 WHERE id = ?1",
+        params![set_id, updated_at],
+    )?;
+    transaction.commit()
+}
+
+pub fn remove_context_messages_by_ids(
+    connection: &mut Connection,
+    user_token: &str,
+    message_ids: &[i64],
+) -> rusqlite::Result<()> {
+    if message_ids.is_empty() {
+        return Ok(());
+    }
+
+    let set_id = get_or_create_context_message_set(connection, user_token)?;
+    let updated_at = unix_timestamp_now();
+    let transaction =
+        connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let placeholders = (1..=message_ids.len())
+        .map(|index| format!("?{}", index + 1))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let delete_query =
+        format!("DELETE FROM context_messages WHERE set_id = ?1 AND id IN ({placeholders})");
+    let delete_params = std::iter::once(set_id)
+        .chain(message_ids.iter().copied())
+        .collect::<Vec<_>>();
+    transaction.execute(
+        &delete_query,
+        rusqlite::params_from_iter(delete_params.iter()),
+    )?;
+
+    let remaining_ids = {
+        let mut statement = transaction.prepare(
+            "SELECT id
+             FROM context_messages
+             WHERE set_id = ?1
+             ORDER BY position ASC, id ASC",
+        )?;
+        let rows = statement.query_map([set_id], |row| row.get::<_, i64>(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+
+    for (position, message_id) in remaining_ids.into_iter().enumerate() {
+        transaction.execute(
+            "UPDATE context_messages SET position = ?2 WHERE id = ?1",
+            params![message_id, position as i64],
+        )?;
+    }
+
+    transaction.execute(
+        "UPDATE context_message_sets SET updated_at_unix = ?2 WHERE id = ?1",
+        params![set_id, updated_at],
+    )?;
+    transaction.commit()
+}
+
 pub fn load_user_preferences(
     connection: &Connection,
     user_token: &str,
@@ -1576,14 +1735,15 @@ mod tests {
 
     use super::{
         AgendaItemRecord, BootstrapInventory, BootstrapPlan, MemoryOperationTrackerRecord,
-        UserPreferenceRecord, archived_markdown_files, bootstrap_database, bootstrap_documents,
-        derived_counts, find_active_agenda_item_by_name, find_active_memory_by_name,
-        get_or_create_context_message_set, get_or_create_memory_operation_tracker,
-        list_active_agenda_items, list_active_due_items, list_active_memories,
-        list_active_plain_agenda_items, list_inactive_due_items, load_context_messages,
-        load_memory_embeddings_for_paths, load_memory_operation_tracker, load_messages_by_ids,
-        load_user_preferences, markdown_files, open_sqlite_connection, persist_bootstrap_documents,
-        record_deleted_due_item_tombstone, replace_context_messages, run_migrations,
+        UserPreferenceRecord, append_context_messages, archived_markdown_files, bootstrap_database,
+        bootstrap_documents, derived_counts, find_active_agenda_item_by_name,
+        find_active_memory_by_name, get_or_create_context_message_set,
+        get_or_create_memory_operation_tracker, list_active_agenda_items, list_active_due_items,
+        list_active_memories, list_active_plain_agenda_items, list_inactive_due_items,
+        load_context_messages, load_memories_by_ids, load_memory_embeddings_for_paths,
+        load_memory_operation_tracker, load_messages_by_ids, load_user_preferences, markdown_files,
+        open_sqlite_connection, persist_bootstrap_documents, record_deleted_due_item_tombstone,
+        remove_context_messages_by_ids, replace_context_messages, run_migrations,
         save_memory_operation_tracker, save_user_preferences, search_active_memories,
         sync_derived_domain_tables, upsert_memory_embedding,
     };
@@ -2019,6 +2179,172 @@ mod tests {
         assert_eq!(loaded.len(), 2);
         assert_eq!(loaded[0].content.as_deref(), Some("first reply"));
         assert_eq!(loaded[1].content.as_deref(), Some("first user"));
+    }
+
+    #[test]
+    fn append_and_remove_context_messages_preserve_order() {
+        let mut connection = Connection::open_in_memory().expect("sqlite should open");
+        run_migrations(&mut connection).expect("migrations should run");
+
+        replace_context_messages(
+            &mut connection,
+            "local-user",
+            &[
+                ConversationMessage::new(MessageRole::System, "system"),
+                ConversationMessage::new(MessageRole::User, "first"),
+            ],
+        )
+        .expect("messages should persist");
+        append_context_messages(
+            &mut connection,
+            "local-user",
+            &[
+                ConversationMessage::new(MessageRole::Assistant, "second"),
+                ConversationMessage::new(MessageRole::User, "third"),
+            ],
+        )
+        .expect("messages should append");
+
+        let stored = load_context_messages(&mut connection, "local-user").expect("messages load");
+        assert_eq!(stored.len(), 4);
+        assert_eq!(stored[0].content.as_deref(), Some("system"));
+        assert_eq!(stored[1].content.as_deref(), Some("first"));
+        assert_eq!(stored[2].content.as_deref(), Some("second"));
+        assert_eq!(stored[3].content.as_deref(), Some("third"));
+
+        remove_context_messages_by_ids(
+            &mut connection,
+            "local-user",
+            &[
+                stored[1].id.expect("message id"),
+                stored[2].id.expect("message id"),
+            ],
+        )
+        .expect("messages should remove");
+
+        let refreshed =
+            load_context_messages(&mut connection, "local-user").expect("messages load");
+        assert_eq!(refreshed.len(), 2);
+        assert_eq!(refreshed[0].content.as_deref(), Some("system"));
+        assert_eq!(refreshed[1].content.as_deref(), Some("third"));
+    }
+
+    #[test]
+    fn append_context_messages_supports_concurrent_writers() {
+        let unique = format!(
+            "elroy-rs-db-context-append-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let db_path = std::env::temp_dir().join(format!("{unique}.sqlite"));
+        let mut setup = Connection::open(&db_path).expect("sqlite should open");
+        run_migrations(&mut setup).expect("migrations should run");
+        replace_context_messages(
+            &mut setup,
+            "local-user",
+            &[ConversationMessage::new(MessageRole::System, "system")],
+        )
+        .expect("messages should persist");
+        drop(setup);
+
+        let mut handles = Vec::new();
+        for index in 0..4 {
+            let db_path = db_path.clone();
+            handles.push(std::thread::spawn(move || {
+                let mut connection = Connection::open(&db_path).expect("sqlite should open");
+                append_context_messages(
+                    &mut connection,
+                    "local-user",
+                    &[ConversationMessage::new(
+                        MessageRole::User,
+                        format!("test message {index}"),
+                    )],
+                )
+                .expect("message should append");
+            }));
+        }
+        for handle in handles {
+            handle.join().expect("thread should join");
+        }
+
+        let mut verify = Connection::open(&db_path).expect("sqlite should open");
+        let stored = load_context_messages(&mut verify, "local-user").expect("messages load");
+        assert_eq!(stored.len(), 5);
+        let contents = stored
+            .iter()
+            .filter_map(|message| message.content.as_deref())
+            .collect::<Vec<_>>();
+        assert!(contents.contains(&"system"));
+        for index in 0..4 {
+            assert!(contents.contains(&format!("test message {index}").as_str()));
+        }
+
+        std::fs::remove_file(db_path).expect("db file should be removed");
+    }
+
+    #[test]
+    fn load_memories_by_ids_preserves_requested_order() {
+        let mut connection = Connection::open_in_memory().expect("sqlite should open");
+        run_migrations(&mut connection).expect("migrations should run");
+
+        let unique = format!(
+            "elroy-rs-db-load-memories-by-id-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        std::fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        std::fs::write(
+            memory_dir.join("test_memory_1.md"),
+            "This is the first test memory",
+        )
+        .expect("first memory fixture should be written");
+        std::fs::write(
+            memory_dir.join("test_memory_2.md"),
+            "This is the second test memory",
+        )
+        .expect("second memory fixture should be written");
+        std::fs::write(
+            memory_dir.join("test_memory_3.md"),
+            "This is the third test memory",
+        )
+        .expect("third memory fixture should be written");
+
+        let inventory = BootstrapInventory {
+            memory_files: vec![
+                memory_dir.join("test_memory_1.md"),
+                memory_dir.join("test_memory_2.md"),
+                memory_dir.join("test_memory_3.md"),
+            ],
+            archived_memory_files: Vec::new(),
+            agenda_files: Vec::new(),
+        };
+        let documents = bootstrap_documents(&inventory).expect("documents should parse");
+        persist_bootstrap_documents(&mut connection, &documents)
+            .expect("bootstrap documents should persist");
+        sync_derived_domain_tables(&mut connection, &documents)
+            .expect("derived tables should sync");
+
+        let memory_1 = find_active_memory_by_name(&connection, "test memory 1")
+            .expect("first memory lookup should succeed")
+            .expect("first memory should exist");
+        let memory_3 = find_active_memory_by_name(&connection, "test memory 3")
+            .expect("third memory lookup should succeed")
+            .expect("third memory should exist");
+
+        let loaded = load_memories_by_ids(&connection, &[memory_3.id, memory_1.id])
+            .expect("memories should load by ids");
+
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].name, "test memory 3");
+        assert_eq!(loaded[1].name, "test memory 1");
+
+        std::fs::remove_dir_all(home).expect("home should be removed");
     }
 
     #[test]

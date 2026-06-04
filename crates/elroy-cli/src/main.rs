@@ -1,5 +1,8 @@
 use std::collections::VecDeque;
 use std::env;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 
@@ -153,9 +156,45 @@ fn build_restart_command(
     command
 }
 
+fn prompt_history_path(home_dir: &Path) -> PathBuf {
+    home_dir.join("cache").join("history")
+}
+
+fn is_recallable_prompt(text: &str) -> bool {
+    let stripped = text.trim();
+    !stripped.is_empty() && !stripped.starts_with('/')
+}
+
+fn load_prompt_history(home_dir: &Path) -> Vec<String> {
+    let Ok(contents) = fs::read_to_string(prompt_history_path(home_dir)) else {
+        return Vec::new();
+    };
+    contents
+        .lines()
+        .rev()
+        .filter_map(|line| line.strip_prefix('+'))
+        .filter(|text| is_recallable_prompt(text))
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn append_prompt_history(home_dir: &Path, text: &str) {
+    if !is_recallable_prompt(text) {
+        return;
+    }
+    let path = prompt_history_path(home_dir);
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(file, "+{text}");
+    }
+}
+
 struct CliTuiRuntime {
     runtime: AppRuntime,
     startup_resume_message: Option<String>,
+    startup_session_context_initialized: bool,
     deferred_context_refresh: Option<BackgroundTask<()>>,
     deferred_context_refresh_error: Option<String>,
     deferred_auto_memory: Option<BackgroundTask<()>>,
@@ -219,6 +258,7 @@ impl CliTuiRuntime {
         Self {
             runtime,
             startup_resume_message: env::var(RESTART_RESUME_MESSAGE_ENV).ok(),
+            startup_session_context_initialized: false,
             deferred_context_refresh: None,
             deferred_context_refresh_error: None,
             deferred_auto_memory: None,
@@ -316,6 +356,7 @@ impl CliTuiRuntime {
         &mut self,
         restart_resume_message: Option<&str>,
     ) -> Result<Option<Box<dyn TuiPromptStream>>, String> {
+        self.ensure_startup_session_context()?;
         self.poll_deferred_context_refresh();
         self.poll_deferred_auto_memory();
         self.poll_deferred_self_reflection();
@@ -352,6 +393,17 @@ impl CliTuiRuntime {
             .expect("finished deferred command task should exist");
         task.join().map(Some)
     }
+
+    fn ensure_startup_session_context(&mut self) -> Result<(), String> {
+        if self.startup_session_context_initialized {
+            return Ok(());
+        }
+        self.runtime
+            .append_startup_session_context()
+            .map_err(|error| error.to_string())?;
+        self.startup_session_context_initialized = true;
+        Ok(())
+    }
 }
 
 impl Drop for CliTuiRuntime {
@@ -369,6 +421,15 @@ impl TuiRuntime for CliTuiRuntime {
         self.runtime
             .load_snapshot()
             .map_err(|error| error.to_string())
+    }
+
+    fn load_prompt_history(&mut self) -> Result<Vec<String>, String> {
+        Ok(load_prompt_history(&self.runtime.config().home_dir))
+    }
+
+    fn remember_prompt(&mut self, prompt: &str) -> Result<(), String> {
+        append_prompt_history(&self.runtime.config().home_dir, prompt);
+        Ok(())
     }
 
     fn load_command_palette_entries(
@@ -436,6 +497,7 @@ impl TuiRuntime for CliTuiRuntime {
                 &command.command_name,
                 &command.display_name,
                 &command.values,
+                &command.source,
             );
             clear_background_status("command-action");
             result.map_err(|error| error.to_string())
@@ -536,6 +598,7 @@ impl TuiRuntime for CliTuiRuntime {
     }
 
     fn load_context_messages(&mut self) -> Result<Vec<TuiContextMessage>, String> {
+        self.ensure_startup_session_context()?;
         self.poll_deferred_context_refresh();
         self.poll_deferred_auto_memory();
         self.poll_deferred_self_reflection();
@@ -544,6 +607,7 @@ impl TuiRuntime for CliTuiRuntime {
             .map(|messages| {
                 messages
                     .into_iter()
+                    .filter(|message| !elroy_app::is_bootstrap_session_context_message(message))
                     .filter_map(|message| {
                         Some(TuiContextMessage {
                             id: message.id?,
@@ -759,9 +823,12 @@ mod tests {
     use elroy_core::{clear_background_status, get_background_status, set_background_status};
     use elroy_db::{open_sqlite_connection, replace_context_messages, run_migrations};
     use elroy_llm::{ConversationMessage, MessageRole};
-    use elroy_tui::{TuiCommandExecution, TuiRuntime};
+    use elroy_tui::{TuiCommandExecution, TuiCommandSource, TuiRuntime};
 
-    use super::{AppConfig, AppRuntime, BackgroundTask, CliTuiRuntime, prompt_arg};
+    use super::{
+        AppConfig, AppRuntime, BackgroundTask, CliTuiRuntime, append_prompt_history,
+        load_prompt_history, prompt_arg,
+    };
 
     fn cli_runtime_test_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -813,6 +880,7 @@ mod tests {
         let mut runtime = CliTuiRuntime {
             runtime: AppRuntime::new(config),
             startup_resume_message: None,
+            startup_session_context_initialized: false,
             deferred_context_refresh: Some(BackgroundTask::spawn(|| {
                 Err("refresh exploded".to_string())
             })),
@@ -852,6 +920,7 @@ mod tests {
         let mut runtime = CliTuiRuntime {
             runtime: AppRuntime::new(config),
             startup_resume_message: None,
+            startup_session_context_initialized: false,
             deferred_context_refresh: Some(BackgroundTask::spawn(move || {
                 set_background_status("context-refresh", "refreshing context...");
                 rx.recv().expect("signal should arrive");
@@ -889,6 +958,33 @@ mod tests {
     }
 
     #[test]
+    fn prompt_history_store_persists_recallable_prompts_only() {
+        let _guard = cli_runtime_test_lock()
+            .lock()
+            .expect("cli runtime test lock should work");
+        let unique = format!(
+            "elroy-rs-cli-prompt-history-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+
+        append_prompt_history(&home, "first prompt");
+        append_prompt_history(&home, "/help");
+        append_prompt_history(&home, "   ");
+        append_prompt_history(&home, "second prompt");
+
+        assert_eq!(
+            load_prompt_history(&home),
+            vec!["second prompt".to_string(), "first prompt".to_string()]
+        );
+
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
     fn cli_tui_runtime_surfaces_deferred_self_reflection_failures_in_background_status() {
         let _guard = cli_runtime_test_lock()
             .lock()
@@ -897,6 +993,7 @@ mod tests {
         let mut runtime = CliTuiRuntime {
             runtime: AppRuntime::new(config),
             startup_resume_message: None,
+            startup_session_context_initialized: false,
             deferred_context_refresh: None,
             deferred_context_refresh_error: None,
             deferred_auto_memory: None,
@@ -936,6 +1033,7 @@ mod tests {
         let mut runtime = CliTuiRuntime {
             runtime: AppRuntime::new(config),
             startup_resume_message: None,
+            startup_session_context_initialized: false,
             deferred_context_refresh: None,
             deferred_context_refresh_error: None,
             deferred_auto_memory: None,
@@ -984,6 +1082,7 @@ mod tests {
         let mut runtime = CliTuiRuntime {
             runtime: AppRuntime::new(config),
             startup_resume_message: None,
+            startup_session_context_initialized: false,
             deferred_context_refresh: None,
             deferred_context_refresh_error: None,
             deferred_auto_memory: Some(BackgroundTask::spawn(
@@ -1023,6 +1122,7 @@ mod tests {
         let mut runtime = CliTuiRuntime {
             runtime: AppRuntime::new(config),
             startup_resume_message: None,
+            startup_session_context_initialized: false,
             deferred_context_refresh: None,
             deferred_context_refresh_error: None,
             deferred_auto_memory: Some(BackgroundTask::spawn(move || {
@@ -1379,6 +1479,116 @@ mod tests {
     }
 
     #[test]
+    fn cli_tui_runtime_startup_bootstrap_injects_hidden_session_context() {
+        let _guard = cli_runtime_test_lock()
+            .lock()
+            .expect("cli runtime test lock should work");
+        let unique = format!(
+            "elroy-rs-cli-startup-session-context-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+
+        let mut connection = open_sqlite_connection(&database_path).expect("database should open");
+        run_migrations(&mut connection).expect("migrations should run");
+        let stale_user = elroy_llm::ConversationMessage {
+            role: elroy_llm::MessageRole::User,
+            content: Some("hello".to_string()),
+            chat_model: None,
+            id: None,
+            created_at_unix: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_secs() as i64
+                - 600,
+            tool_calls: None,
+            tool_call_id: None,
+        };
+        elroy_db::replace_context_messages(&mut connection, "local-user", &[stale_user])
+            .expect("messages should persist");
+        drop(connection);
+
+        let mut server = mockito::Server::new();
+        let _mock = server
+            .mock("POST", "/responses")
+            .match_body(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::Regex("get_session_context".to_string()),
+                mockito::Matcher::Regex("Current date/time:".to_string()),
+                mockito::Matcher::Regex("has logged in".to_string()),
+            ]))
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_body(concat!(
+                "event: response.output_text.delta\n",
+                "data: {\"delta\":\"Good to see you again.\"}\n\n",
+                "data: [DONE]\n\n"
+            ))
+            .create();
+
+        let mut config = AppConfig::defaults();
+        config.home_dir = home.clone();
+        config.config_path = home.join("elroy.conf.yaml");
+        config.memory_dir = memory_dir;
+        config.agenda_dir = agenda_dir;
+        config.database_path = database_path.clone();
+        config.openai_api_key = Some("test-key".to_string());
+        config.openai_base_url = format!("{}/responses", server.url());
+        config.enable_assistant_greeting = true;
+        config.min_convo_age_for_greeting_minutes = 5.0;
+
+        let mut runtime = CliTuiRuntime::new(AppRuntime::new(config));
+        let hidden_messages = runtime
+            .load_context_messages()
+            .expect("context messages should load");
+        assert!(
+            hidden_messages
+                .iter()
+                .any(|message| message.role == "user" && message.content == "hello")
+        );
+
+        let mut stream = runtime
+            .start_startup_prompt_stream()
+            .expect("startup stream should evaluate")
+            .expect("greeting stream should exist");
+        while stream
+            .next_update()
+            .expect("stream should advance")
+            .is_some()
+        {}
+        let _ = stream.finalize().expect("snapshot should finalize");
+
+        let mut reopened = open_sqlite_connection(&database_path).expect("database should reopen");
+        let stored =
+            elroy_db::load_context_messages(&mut reopened, "local-user").expect("load should work");
+        let bootstrap_messages = stored
+            .iter()
+            .filter(|message| elroy_app::is_bootstrap_session_context_message(message))
+            .count();
+        assert!(bootstrap_messages >= 1);
+        let bootstrap_results = stored
+            .iter()
+            .filter(|message| {
+                message.role == elroy_llm::MessageRole::Tool
+                    && message
+                        .tool_call_id
+                        .as_deref()
+                        .is_some_and(|id| id.starts_with("bootstrap-session-context:"))
+            })
+            .count();
+        assert!(bootstrap_results >= 1);
+
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
     fn cli_tui_runtime_prompt_stream_queues_and_runs_deferred_auto_memory() {
         let _guard = cli_runtime_test_lock()
             .lock()
@@ -1525,6 +1735,7 @@ mod tests {
                 command_name: "get_help".to_string(),
                 display_name: "help".to_string(),
                 values: vec![],
+                source: TuiCommandSource::Slash,
             })
             .expect("background command should schedule");
 
@@ -1549,10 +1760,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1));
         };
 
-        assert_eq!(
-            completed_snapshot.status.as_deref(),
-            Some("slash command executed: /help")
-        );
+        assert_eq!(completed_snapshot.status, None);
         assert!(
             completed_snapshot
                 .conversation_lines
@@ -1602,6 +1810,7 @@ mod tests {
                 command_name: "show_memory".to_string(),
                 display_name: "show_memory".to_string(),
                 values: vec![],
+                source: TuiCommandSource::Slash,
             })
             .expect("background command should schedule");
 
@@ -1628,7 +1837,7 @@ mod tests {
 
         assert_eq!(
             completed_snapshot.status.as_deref(),
-            Some("slash command failed: /show_memory")
+            Some("command failed: show_memory requires a string name")
         );
         assert!(
             completed_snapshot
@@ -1682,6 +1891,7 @@ mod tests {
                     "resume_message".to_string(),
                     "Restarted successfully. Ready to continue.".to_string(),
                 )],
+                source: TuiCommandSource::Slash,
             })
             .expect("background restart command should schedule");
 
@@ -1695,10 +1905,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1));
         };
 
-        assert_eq!(
-            completed_snapshot.status.as_deref(),
-            Some("slash command executed: /restart_session")
-        );
+        assert_eq!(completed_snapshot.status, None);
         assert_eq!(
             runtime
                 .take_restart_request()
@@ -1970,6 +2177,7 @@ mod tests {
                     ("prompt".to_string(), "update notes".to_string()),
                     ("repo_path".to_string(), repo_root.display().to_string()),
                 ],
+                source: TuiCommandSource::Slash,
             })
             .expect("codex dispatch command should schedule");
 
@@ -1994,10 +2202,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1));
         };
 
-        assert_eq!(
-            completed_snapshot.status.as_deref(),
-            Some("slash command executed: /dispatch_codex_session")
-        );
+        assert_eq!(completed_snapshot.status, None);
 
         let running_status = wait_for_runtime_background_status(
             &mut runtime,
@@ -2097,6 +2302,7 @@ mod tests {
                     ("prompt".to_string(), "update notes".to_string()),
                     ("repo_path".to_string(), repo_root.display().to_string()),
                 ],
+                source: TuiCommandSource::Slash,
             })
             .expect("codex dispatch command should schedule");
         while runtime
@@ -2128,6 +2334,7 @@ mod tests {
                     ("session_id".to_string(), "thread-123".to_string()),
                     ("prompt".to_string(), "follow up".to_string()),
                 ],
+                source: TuiCommandSource::Slash,
             })
             .expect("codex resume command should schedule");
 
@@ -2152,10 +2359,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1));
         };
 
-        assert_eq!(
-            completed_snapshot.status.as_deref(),
-            Some("slash command executed: /resume_codex_session")
-        );
+        assert_eq!(completed_snapshot.status, None);
 
         let running_status = wait_for_runtime_background_status(
             &mut runtime,

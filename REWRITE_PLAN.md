@@ -47,6 +47,8 @@ What is still broadly incomplete is concentrated in a smaller set of high-value 
 - broader repository-level persistence behavior
 - more representative end-to-end parity coverage
 
+Recent Phase 2 progress has closed two concrete startup/session gaps: the Rust CLI/TUI path now mirrors Python’s hidden `get_session_context` bootstrap before greeting or restart evaluation, while keeping that synthetic bootstrap pair out of the visible transcript, and prompt history now persists across TUI restarts with Python-style exclusion of slash commands from recalled history. The older “multi-session history/switching” wording was too broad; the Python UI source does not expose a separate session-switching workflow, so the remaining Phase 2 TUI work is now better described as runtime/UI coordination and background-rendering edge cases.
+
 That means sequencing should now optimize for "usable release candidate" behavior, not for raw parity-matrix row count.
 
 ## What Not To Prioritize
@@ -92,38 +94,70 @@ Why this comes first:
 
 - `From<anyhow::Error> for AppError` added to `elroy-app` so domain crates returning `anyhow::Result` can interoperate with `elroy-app`'s error type via `?`.
 
+### Session Progress (2026-05-24)
+
+**Done:**
+
+- `crates/elroy-agenda/src/tools.rs` now owns the agenda and due-item tool execution slice, and `crates/elroy-agenda/src/lib.rs` exports `agenda_tools(...)` for the app registry.
+
+- `crates/elroy-tools/src/base.rs` now owns the base filesystem/developer tool slice (`get_current_date`, `pwd`, `ls`, `read_file`, `restart_session`, `print_config`, `tail_elroy_logs`, `get_help`), and `elroy-app` now only provides the restart/help/config-report callbacks needed to compose those tools into the live registry.
+
+- `crates/elroy-context/src/tools.rs` now owns the persisted transcript management slice (`show_context_messages`, `reset_messages`, `refresh_system_instructions`), and `crates/elroy-memory/src/tools.rs` now owns the recall-dependent memory pin/drop slice (`add_memory_to_current_context`, `drop_memory_from_current_context`). `elroy-app` no longer has a dedicated context-tools module.
+
+- `crates/elroy-reminders/src/lib.rs` now owns the due-item surfacing wrapper layer used by prompt execution: timed due-item synthetic context, contextual due-item context-message assembly, and the shared orchestration that merges timed/contextual reminder surfacing before a model turn.
+
+- The other domain tool slices are already extracted and wired through the live registry: `elroy-memory/src/tools.rs`, `elroy-tasks/src/tools.rs`, `elroy-user/src/tools.rs`, `elroy-feature-requests/src/tools.rs`, and `elroy-codex/src/tools.rs`.
+
+- The extracted due-item tool paths were brought back to current parity expectations for this slice: contextual due-item creation re-pins context, due-item completion/deletion preserve the Python-style confirmation text and context cleanup, and recreating a completed due item now reclaims the canonical logical name so follow-up lookup/context flows still work.
+
+**Validation run for this slice:**
+
+- `cargo fmt --all -- crates/elroy-agenda/src/lib.rs crates/elroy-agenda/src/tools.rs crates/elroy-tools/src/lib.rs crates/elroy-tools/src/base.rs crates/elroy-context/src/lib.rs crates/elroy-context/src/tools.rs crates/elroy-memory/src/tools.rs crates/elroy-reminders/src/lib.rs crates/elroy-recall/src/lib.rs crates/elroy-app/src/lib.rs`
+- `cargo check -p elroy-app -p elroy-tools -p elroy-context -p elroy-memory`
+- `cargo test -p elroy-tools -- --nocapture`
+- `cargo test -p elroy-codex -- --nocapture`
+- `cargo test -p elroy-agenda -- --nocapture`
+- `cargo test -p elroy-feature-requests -- --nocapture`
+- `cargo test -p elroy-tasks -- --nocapture`
+- `cargo test -p elroy-user -- --nocapture`
+- `cargo test -p elroy-memory -- --nocapture`
+- `cargo test -p elroy-context -- --nocapture`
+- `cargo test -p elroy-reminders -- --nocapture`
+- `cargo test -p elroy-app live_tool_registry_can_`
+- `cargo clippy -p elroy-app -p elroy-agenda -p elroy-codex -p elroy-tools -p elroy-context -p elroy-reminders -p elroy-recall -p elroy-tasks -p elroy-user --all-targets --all-features`
+- `cargo test -p elroy-app`
+- `just lint`
+- `just test`
+- `cargo build --workspace`
+
 **State after session:**
 
-- `elroy-app/src/lib.rs`: ~25,600 LOC total (7,057 production + 18,562 test)
-- `elroy-app/src/consolidation.rs`: 786 LOC (still inline module in elroy-app, not yet moved to elroy-recall)
-- Production code (non-test) in elroy-app is ~7,850 LOC across lib.rs + consolidation.rs — already close to 8K target if only counting non-test code
-- `cargo build` and `cargo test` clean
-
-**Remaining for this phase:**
-
-1. **Move `consolidation.rs` to `elroy-recall`** — the module is 786 LOC and belongs in elroy-recall per the plan. Key dependencies to resolve:
-   - `formulate_memory_from_transcript` (in lib.rs ~line 2014) → move to elroy-recall
-   - `create_consolidated_memories_from_records` (in lib.rs ~line 6457) → move to elroy-recall
-   - `list_all_active_memories_in_scope` (in lib.rs ~line 6796) → move to elroy-recall or elroy-db
-   - `best_effort_provider_model` (in lib.rs ~line 1463) → move to elroy-recall
-   - Constants `CONTEXT_MESSAGE_SOURCE_TYPE`, `MEMORY_SOURCE_TYPE`, `MEMORY_WORD_COUNT_LIMIT`, `MEMORY_CONSOLIDATION_CLUSTER_LIMIT` → define in elroy-recall, re-import in elroy-app where still needed
-
-2. **Create `elroy-reminders`** — due-item surfacing functions are still embedded in `elroy-app`. Identify the ~300-500 LOC of reminder selection + synthetic message generation and move to `crates/elroy-reminders/src/lib.rs`. The skeleton Cargo.toml already exists.
-
-3. **Move tool execution to domain crates** — the `build_live_tool_registry_with_codex_bin_and_hook` function is ~3,900 LOC (lines 2273–6184 in lib.rs). Each domain crate should export `fn {domain}_tools(config: AppConfig) -> Vec<ExecutableTool>`. elroy-app calls each and combines. Groupings:
-   - `elroy-memory/src/tools.rs`: create_memory, create_consolidated_memory, get_fast_recall, get_reflective_recall, update_memory, update_outdated_or_incorrect_memory, archive_memory, list_memories, print_memories, search_memories, examine_memories, show_memory, print_memory, get_source_list_for_memory, get_source_content_for_memory
-   - `elroy-agenda/src/tools.rs`: add_agenda_item, add_agenda_item_update, complete_agenda_item, delete_agenda_item, add_agenda_checklist_item, edit_agenda_checklist_item, complete_agenda_checklist_item, list_agenda, list_agenda_items, list_agenda_items_cmd, list_due_items, print_active_due_items, list_inactive_due_items, print_inactive_due_items, show_agenda_item, create_due_item, update_due_item_text, rename_due_item, complete_due_item, delete_due_item, show_due_item, print_due_item
-   - `elroy-tasks/src/tools.rs`: create_task, update_task_text, rename_task, complete_task, delete_task, list_tasks, list_triggered_tasks, list_due_tasks, list_today_tasks, show_task
-   - `elroy-user/src/tools.rs`: set_assistant_name, set_persona, reset_system_persona, set_user_preferred_name, get_user_preferred_name, set_user_full_name, get_user_full_name
-   - `elroy-feature-requests/src/tools.rs`: list_feature_requests, make_feature_request, edit_feature_request
-   - `elroy-codex/src/tools.rs`: dispatch_codex_session, resume_codex_session, list_codex_sessions, show_codex_session
-   - `elroy-tools` (base): get_current_date, pwd, ls, read_file, restart_session, print_config, tail_elroy_logs, get_help, show_context_messages, add_memory_to_current_context, drop_memory_from_current_context, clear_context_messages, reset_messages, refresh_system_instructions
-
-4. **Move tests alongside their tools** — the 18,562-line test section is the main reason lib.rs exceeds 8K. Tests for memory tools should live in elroy-memory, etc. This is the most mechanical but largest-volume step.
+- `elroy-app/src/lib.rs`: 1,309 LOC total after the base-tool, context-tool, reminder-surfacing, additional crate-local test moves, the internal registry/restart extraction, the TUI helper extraction, the runtime-helper extraction, and the final app-test extraction into `crates/elroy-app/src/tests.rs`
+- `crates/elroy-app/src/tests.rs`: 15,487 LOC of app-owned integration and runtime coverage that no longer bloats the app boundary file itself
+- Consolidation helpers now live in `elroy-recall/src/lib.rs`; the old `elroy-app/src/consolidation.rs` note is obsolete
+- The remaining structural extraction gap inside the live registry is now narrower than the older plan implied: the major tool families already live in their destination crates, and `elroy-app` is mostly a combiner plus the broader runtime/TUI-facing orchestration layer rather than an owner of individual tool implementations
+- `elroy-context/src/tools.rs` now also owns the direct reset/refresh/show behavior coverage for its extracted transcript tools instead of leaving that slice under `elroy-app`'s live-registry tests
+- `elroy-tools/src/base.rs` now also owns the direct filesystem/time/help/restart/log-tail behavior coverage for its extracted base tools instead of leaving those cases under `elroy-app`'s live-registry tests
+- `elroy-feature-requests/src/tools.rs` now also owns the direct list/create/merge/edit behavior coverage for its extracted markdown feature-request tools instead of leaving that slice under `elroy-app`'s live-registry tests
+- `elroy-user/src/tools.rs` now also owns the direct persisted-preferences and refreshed-system-message behavior coverage for its extracted user-preference tools instead of leaving that slice under `elroy-app`'s live-registry tests
+- `elroy-tasks/src/tools.rs` now also owns the direct create/update/rename/complete/delete/list behavior coverage for its extracted task tools, including context-refresh effects and due-task filtering, instead of leaving that slice under `elroy-app`'s live-registry tests
+- `elroy-codex/src/tools.rs` now also owns the direct list/show session behavior coverage for its extracted codex tools instead of leaving that slice under `elroy-app`'s live-registry tests; the background dispatch/resume workflow test still remains in `elroy-app` because it exercises the app-owned completion-hook seam
+- `elroy-agenda/src/tools.rs` now also owns the direct checklist-item behavior coverage for its extracted agenda tools instead of leaving that slice under `elroy-app`'s live-registry tests
+- `elroy-agenda/src/tools.rs` now also owns the direct inactive due-item listing/detail behavior coverage for its extracted due-item tools instead of leaving that slice under `elroy-app`'s live-registry tests
+- `elroy-agenda/src/tools.rs` now also owns the direct agenda-item mutation coverage and the direct due-item create/update/rename/complete/delete behavior coverage for its extracted agenda/due-item tools instead of leaving those slices under `elroy-app`'s live-registry tests
+- `elroy-agenda/src/tools.rs` now also owns the direct show/list/print agenda-item read-path coverage for its extracted agenda tools instead of leaving those slices under `elroy-app`'s live-registry tests
+- `elroy-memory/src/tools.rs` now also owns the direct show/print/list/source-content/source-list behavior coverage for its extracted read-only memory tools instead of leaving that slice under `elroy-app`'s live-registry tests
+- `elroy-memory/src/tools.rs` now also owns the direct add/drop pinned-context, update/archive, and outdated-memory-update behavior coverage for its extracted mutation-heavy memory tools instead of leaving those slices under `elroy-app`'s live-registry tests
+- `crates/elroy-reminders/src/lib.rs` now owns the contextual due-item selector itself, including overlap/semantic/embedding reminder selection behavior and crate-local coverage for that selector, instead of delegating that reminder-specific seam back into `elroy-recall`
+- `crates/elroy-app/src/tool_registry.rs` now owns the live tool-registry composition block plus session-restart support state/callback wiring, reducing `elroy-app/src/lib.rs` production bulk without changing app-owned behavior
+- `crates/elroy-app/src/ui_helpers.rs` now owns command-form ordering, snapshot/sidebar formatting, and related TUI-facing helper logic, reducing `elroy-app/src/lib.rs` production bulk without changing app-owned behavior
+- `crates/elroy-app/src/runtime_helpers.rs` now owns prompt-finalization, provider-model construction, context-refresh, self-reflection, and background codex follow-up helper logic, reducing `elroy-app/src/lib.rs` production bulk without changing app-owned behavior
+- `crates/elroy-agenda/src/tools.rs` now also owns the remaining due-item schema-surface assertions that had been left behind in the app crate, so `elroy-app` no longer carries direct schema checks for that tool family
+- Phase 1 structural extraction work is complete; the next remaining product work starts in Phase 2 rather than another round of app-boundary slicing
 
 ### Note on 8K LOC Target
 
-The non-test production code in elroy-app is already at ~7,850 LOC. If the 8K target counts only production code, steps 1–2 above would clear it. If it counts tests too, step 4 (moving tests) is required. Tests that exercise tool behavior should move with the tools; integration tests that test elroy-app's routing/wiring layer stay in elroy-app.
+The app boundary file target is now satisfied: `crates/elroy-app/src/lib.rs` is 1,309 LOC. App-owned integration tests remain in `crates/elroy-app/src/tests.rs`, while direct tool-behavior coverage has been moved alongside the owning crates where appropriate.
 
 ### New Crates To Create
 
@@ -135,7 +169,7 @@ Owns all memory recall and consolidation logic currently embedded in `elroy-app`
 - candidate selection and expansion (lexical overlap, embedding ranking) ✅ moved
 - relevance filtering (model-backed) ✅ moved
 - reflective recall generation (deterministic and model-backed) ✅ moved
-- exact-duplicate and semantic-cluster consolidation ❌ still in elroy-app/src/consolidation.rs
+- exact-duplicate and semantic-cluster consolidation ✅ moved
 - embedding cache management ✅ moved
 - auto-memory creation from context ✅ moved
 
@@ -151,16 +185,17 @@ Owns all context message loading and refresh logic currently embedded in `elroy-
 - context refresh scheduling and orchestration ✅ moved
 - due-item and reminder pinning into transcript context ✅ moved
 
-**`elroy-reminders`** ❌ Not yet populated
+**`elroy-reminders`** `partial`
 
 Owns due-item surfacing workflows currently embedded in `elroy-app`:
 
-- due-item context message generation
-- synthetic tool message creation for surfaced reminders
-- reminder selection heuristics
-- interplay between due items, tasks, and current context
+- due-item context message generation ✅ moved
+- synthetic tool message creation for surfaced reminders ✅ moved
+- prompt-time orchestration that merges timed and contextual reminder surfacing ✅ moved
+- reminder selection heuristics ✅ moved
+- interplay between due items, tasks, and current context `partial`
 
-Skeleton Cargo.toml exists but lib.rs is empty.
+The crate is no longer empty, but it is not yet the full home for every due-item/task interaction seam.
 
 ### Domain Crates That Expand
 
@@ -168,12 +203,12 @@ Each of these crates gains a `tools` module owning its own tool execution and to
 
 | Crate | Tools to absorb from elroy-app | Status |
 |---|---|---|
-| `elroy-memory` | `create_memory`, `show_memory`, `search_memories`, `print_memories`, `update_memory`, `archive_memory`, recall tools | ❌ |
-| `elroy-agenda` | `create_agenda_item`, `update_agenda_item`, `complete_agenda_item`, checklist tools, due-item tools | ❌ |
-| `elroy-tasks` | `create_task`, `show_task`, `list_tasks`, `update_task`, `complete_task` | ❌ |
-| `elroy-user` | `update_user_preferred_name`, `update_assistant_name`, user preference tools | ❌ |
-| `elroy-feature-requests` | `create_feature_request`, `list_feature_requests`, `show_feature_request`, `update_feature_request` | ❌ |
-| `elroy-codex` | `dispatch_codex_session`, `resume_codex_session`, `list_codex_sessions` | ❌ |
+| `elroy-memory` | `create_memory`, `show_memory`, `search_memories`, `print_memories`, `update_memory`, `archive_memory`, recall tools | `partial` |
+| `elroy-agenda` | `create_agenda_item`, `update_agenda_item`, `complete_agenda_item`, checklist tools, due-item tools | `partial` |
+| `elroy-tasks` | `create_task`, `show_task`, `list_tasks`, `update_task`, `complete_task` | `partial` |
+| `elroy-user` | `update_user_preferred_name`, `update_assistant_name`, user preference tools | `partial` |
+| `elroy-feature-requests` | `create_feature_request`, `list_feature_requests`, `show_feature_request`, `update_feature_request` | `partial` |
+| `elroy-codex` | `dispatch_codex_session`, `resume_codex_session`, `list_codex_sessions` | `partial` |
 
 ### `elroy-tools` Expands
 
@@ -183,7 +218,7 @@ Each of these crates gains a `tools` module owning its own tool execution and to
 - developer tools: `get_help`, `print_config`, `tail_elroy_logs`, `restart_session`
 - context tools: `reset_messages`, `refresh_system_instructions`
 
-Status: ❌ not yet started
+Status: `partial`; filesystem/developer tools now live in `crates/elroy-tools/src/base.rs`, while the persisted-context tool slice now lives in `crates/elroy-context/src/tools.rs` and the memory pin/drop tools now live in `crates/elroy-memory/src/tools.rs`
 
 ### `elroy-app` After Refactoring
 
@@ -195,7 +230,7 @@ Status: ❌ not yet started
 - command palette and command form prefilling
 - `process_message` / `load_snapshot` / `load_context_messages` surface API for TUI/CLI
 
-Target size: under 8K LOC (down from ~28K). Current: ~25,600 LOC (7,850 production + 18,562 tests).
+Target size: under 8K LOC (down from ~28K). Current: `crates/elroy-app/src/lib.rs` is 1,309 LOC, with app-owned integration coverage split into `crates/elroy-app/src/tests.rs`.
 
 ### Dependency Graph (After)
 
@@ -215,15 +250,15 @@ No bidirectional dependencies. Domain orchestrators depend on stores; stores do 
 
 ### Exit Criteria
 
-- [x] `elroy-recall` created; all recall logic moved from `elroy-app` (consolidation still pending)
+- [x] `elroy-recall` created; all recall logic moved from `elroy-app`
 - [x] `elroy-context` created; transcript loading, validation, and refresh orchestration moved from `elroy-app`
-- [ ] Consolidation logic moved from `elroy-app/src/consolidation.rs` to `elroy-recall`
-- [ ] `elroy-reminders` created; due-item surfacing moved from `elroy-app`
-- [ ] Each domain crate owns its tool execution; match arms removed from `elroy-app`
-- [ ] `elroy-tools` owns base/filesystem/developer tools
-- [ ] `elroy-app` is under 8K LOC
-- [ ] All existing tests pass with no behavioral changes
-- [ ] `cargo build` and `cargo test` are clean
+- [x] Consolidation logic moved from `elroy-app` to `elroy-recall`
+- [x] `elroy-reminders` created; due-item surfacing moved from `elroy-app`
+- [x] Each domain crate owns its tool execution; match arms removed from `elroy-app`
+- [x] `elroy-tools` owns base/filesystem/developer tools
+- [x] `elroy-app` is under 8K LOC
+- [x] All existing tests pass with no behavioral changes
+- [x] `cargo build` and `cargo test` are clean
 
 Usable checkpoint:
 
@@ -362,7 +397,7 @@ Primary parity rows to advance:
 
 Remaining gap checklist (derived from parity matrix "still missing" notes; resolve each as implemented or intentional delta before declaring Phase 1 complete):
 
-- [ ] Broader session workflows in the TUI — concretely: decide whether Phase 1 still needs anything beyond the already-ported greeting-on-fresh-start and restart/session transitions, or whether the remaining work is truly multi-session history/session switching and can wait for a later phase
+- [x] Broader session workflows in the TUI — for Phase 1, the already-ported greeting-on-fresh-start and restart/session transitions are sufficient; the remaining gaps are broader multi-session history/switching workflows and belong to the later TUI-focused phases rather than the structural refactor phase
 - [x] Deeper command-form validation parity — required fields now validate before final submit at the TUI layer instead of only surfacing a missing-value failure on `Enter`
 - [x] Fuller Textual-style command-palette system-command behavior — Python’s surfaced system-command set (`Focus Memories`, `Focus Agenda`, `Refresh System Instructions`, `Reset Messages`) is now present in the Rust palette, with additional Rust-only section focus entries documented as intentional extensions
 - [x] Broader background-status producers — the shared Rust footer now covers the real long-running background paths in use (`context-refresh`, `self-reflection`, `auto-memory`, background command execution, Codex dispatch/resume plus completion follow-up); the remaining Python-only worker groups (`session-bootstrap`, `sidebar-refresh`) are foreground or synchronous flows in the current Rust architecture rather than missing shared background producers
@@ -370,7 +405,6 @@ Remaining gap checklist (derived from parity matrix "still missing" notes; resol
 Focus areas:
 
 1. Finish the remaining session workflow gaps in the TUI.
-   - full restart/session transitions
    - remaining background-message rendering edge cases
    - stronger foreground/background prompt state coordination
 2. Finish broader background-status producer coverage.
@@ -390,6 +424,27 @@ Exit criteria:
 Usable checkpoint:
 
 - "Rust as daily-driver local assistant" for single-user interactive use
+
+### Phase 2 Progress (2026-05-24)
+
+- The CLI/TUI startup path now injects the hidden Python-style `get_session_context` bootstrap tool/result pair before greeting or restart evaluation instead of skipping that session bootstrap entirely.
+- That bootstrap payload now carries the Python-style local current date/time and first-chat-today greeting hint, and it is filtered back out of visible snapshot/TUI conversation rendering the same way Python hides it from the normal transcript surface.
+- Direct coverage now exists in `crates/elroy-app/src/tests.rs` and `crates/elroy-cli/src/main.rs` for both the persisted hidden bootstrap pair and the startup-stream adapter path that consumes it.
+- The CLI/TUI path now also persists prompt history under the Python-style home cache history file, restores that history on startup for `Up`/`Down` recall, and excludes slash commands from recalled history instead of treating them as ordinary prompts.
+- Local command result presentation now matches Python more closely: toast-target tool results only stay transient for palette-launched commands, while slash-launched commands and slash-opened command-form submissions now write their tool result into conversation history instead of incorrectly using the toast path.
+- Background local-command status is now also source-neutral instead of slash-branded: the TUI enters a generic `running command...` state while the worker is active, ordinary non-toast command completions no longer synthesize a `slash command executed: /...` status, and tool-layer failures now surface as command failures without pretending every local command came from slash input.
+- Persisted transcript rendering is now a little closer to Python too: system messages stay hidden in the TUI snapshot path, and persisted tool-role messages render as `tool result: ...` in both initial snapshot loads and background context-poll appends instead of showing a raw `tool: ...` prefix.
+- Persisted assistant transcript rendering is now a little closer to Python too: hidden `<internal_thought>...</internal_thought>` segments are stripped from both snapshot loads and background context-poll appends instead of leaking those raw tags into the visible conversation pane.
+- The Python-style `show_internal_thought` toggle now also exists in the Rust config/runtime path: it loads from file/env config, stays hidden by default, and when enabled it renders live and persisted assistant thought segments into the TUI conversation pane as plain-text `thinking: ...` lines instead of dropping them entirely.
+- The Rust TUI chat composer now supports basic in-line editing instead of being append-only: characters insert at the cursor, `Backspace`/`Delete` edit around the cursor, the terminal cursor is positioned inside the input box, paste inserts at the cursor, and real `Left`/`Right` key events now work through the live event path again, including sidebar section switching while command-mode sidebar focus is active.
+- Prompt-active footer rendering is now a little closer to Python’s Textual worker status too: active chat streams use the Python braille spinner sequence instead of a static status line, while background and command-action footer behavior stays unchanged.
+- Manual conversation scrolling now stays respected across new streamed prompt output and background context-poll appends even while input focus is retained, instead of snapping the view back to the latest line just because the user was not in explicit conversation-browse focus.
+- The first `Escape` out of chat mode now mirrors Python’s `toggle_browse` default too: browse mode enters the sidebar first, not the conversation pane, while repeated `Tab` / `Shift+Tab` still cycle between sidebar and history and the last non-chat target is remembered when returning from chat mode.
+- The wrapped chat composer now also matches Python’s height cap more closely: it still grows for multi-line drafts, but it stops at the Python-style 8-row maximum instead of continuing to expand until it consumes most of the terminal body.
+- Command-palette filtering is now less literal and a little closer to Python’s matcher-driven behavior: title-prefix and title-substring matches are preferred, but non-contiguous fuzzy matches still remain selectable instead of requiring exact contiguous substrings everywhere.
+- `Ctrl+C` handling now matches Python’s key priority more closely: when the chat input is focused and contains text, it clears that draft first, even if a prompt stream is active; pressing `Ctrl+C` again with an empty draft still cancels the active stream.
+- Sidebar section switching now preserves Python-style per-section selection state: each sidebar list remembers its selected row when switching away and restores it when switching back, while refreshed sidebar snapshots clamp saved selections if a list shrinks.
+- Validation for this slice: `cargo test -p elroy-config loads_yaml_config_and_ignores_unknown_keys -- --nocapture`, `cargo test -p elroy-config environment_overrides_file_values -- --nocapture`, `cargo test -p elroy-tui prompt_spinner_advances_only_while_prompt_is_active -- --nocapture`, `cargo test -p elroy-tui footer_status_text_prefers_active_status_during_prompt -- --nocapture`, `cargo test -p elroy-tui streamed_output_does_not_resume_following_after_manual_input_scroll -- --nocapture`, `cargo test -p elroy-tui background_context_updates_do_not_resume_following_after_manual_input_scroll -- --nocapture`, `cargo test -p elroy-tui escape_toggles_between_chat_and_last_command_pane -- --nocapture`, `cargo test -p elroy-tui command_mode_tab_toggles_between_conversation_and_sidebar -- --nocapture`, `cargo test -p elroy-tui command_mode_conversation_keys_scroll_history_instead_of_sidebar -- --nocapture`, `cargo test -p elroy-tui escaping_from_conversation_browse_reenables_following_latest_output -- --nocapture`, `cargo test -p elroy-tui input_box_height_grows_for_wrapped_text -- --nocapture`, `cargo test -p elroy-tui input_box_height_caps_at_python_max_height -- --nocapture`, `cargo test -p elroy-tui input_box_height_keeps_body_visible_on_short_terminal -- --nocapture`, `cargo test -p elroy-tui command_palette_filters_entries_from_typed_query -- --nocapture`, `cargo test -p elroy-tui command_palette_fuzzy_matches_non_contiguous_query -- --nocapture`, `cargo test -p elroy-tui command_palette_prefers_title_prefix_match_over_description_match -- --nocapture`, `cargo test -p elroy-tui left_right_key_events_switch_sidebar_sections_when_sidebar_is_focused -- --nocapture`, `cargo test -p elroy-tui chat_input_supports_cursor_insertion_and_deletion -- --nocapture`, `cargo test -p elroy-tui multiline_paste_is_flattened_in_chat_input -- --nocapture`, `cargo test -p elroy-tui chat_input_up_down_cycles_prompt_history -- --nocapture`, `cargo test -p elroy-tui apply_key_event_appends_input_and_submits_prompt -- --nocapture`, `cargo test -p elroy-tui internal_thought_prompt_updates_append_to_conversation_when_enabled -- --nocapture`, `cargo test -p elroy-tui poll_context_updates_hides_internal_thought_segments_in_assistant_messages -- --nocapture`, `cargo test -p elroy-tui poll_context_updates_can_render_internal_thought_segments_when_enabled -- --nocapture`, `cargo test -p elroy-app load_snapshot_formats_persisted_tool_messages_and_skips_system_lines -- --nocapture`, `cargo test -p elroy-app load_snapshot_can_render_internal_thought_segments_when_enabled -- --nocapture`, `cargo test -p elroy-tui -- --nocapture`, `cargo fmt --all`, and `cargo clippy -p elroy-config -p elroy-app -p elroy-tui --all-targets --all-features`.
 
 ## Phase 3: Memory And Reminder Quality
 
@@ -438,6 +493,18 @@ Usable checkpoint:
 
 - "Rust preserves the core Elroy differentiators" instead of merely reproducing CRUD surfaces
 
+### Phase 3 Progress (2026-05-25)
+
+- The repository-side Python `augment_text` helper is now present in Rust as `elroy_recall::augment_text_from_config(...)` instead of being an unported memory-quality gap.
+- That path reuses the existing recall selectors over active memories and due items, asks the configured model to enrich the note text only when relevant context exists, and otherwise returns the original text unchanged.
+- Direct scenario coverage now mirrors the Python memory tests for both the relevant-memory augmentation case and the no-relevant-memory passthrough case.
+- The repository-side Python `ingest_memo` helper is now also present in Rust as `elroy_memory::ingest_memo_from_config(...)`, converting freeform note text into either a pinned memory or a due item through the normal file-backed stores.
+- The Rust helper now also matches Python’s retry behavior for invalid due-item proposals: if the model first returns a past-due reminder, the retry prompt includes that failure and can succeed on a follow-up attempt instead of failing immediately.
+- Direct scenario coverage now exists for both the memory-creation path and the invalid-reminder-then-contextual-reminder retry path.
+- Newly created due items now also persist an embedding record immediately when embedding config is available, instead of waiting for a later semantic-recall path to lazily backfill that cache.
+- Direct crate-local coverage now proves `create_due_item` persists that embedding record on creation.
+- Validation for this slice: `cargo fmt --all`, `cargo test -p elroy-recall augment_text_from_config -- --nocapture`, `cargo clippy -p elroy-recall --all-targets --all-features`, `cargo test -p elroy-memory ingest_memo_from_config -- --nocapture`, `cargo clippy -p elroy-memory --all-targets --all-features`, `cargo test -p elroy-agenda create_due_item_persists_embedding_when_embedding_config_is_available -- --nocapture`, and `cargo clippy -p elroy-agenda --all-targets --all-features`.
+
 ## Phase 4: Repository And Persistence Completion
 
 Goal:
@@ -471,6 +538,32 @@ Exit criteria:
 Usable checkpoint:
 
 - "Rust is safe to adopt on existing user data without hidden repository caveats"
+
+### Phase 4 Progress (2026-05-25)
+
+- The Python repository-side `get_memories(ctx, [ids])` helper is now present in Rust as `elroy_memory::get_memories_from_config(...)`, backed by a lower-level `elroy_db::load_memories_by_ids(...)` query helper.
+- That Rust path now matches the Python test shape for selective memory-ID lookup, including the empty-list and missing-ID cases instead of leaving that repository read helper unported.
+- Direct crate-local coverage now exists in both `elroy-memory` and `elroy-db` for the requested-ID lookup behavior and stable requested-order return shape.
+- The Python repository-side context-message add/remove operations now also have Rust equivalents through `elroy_context::add_persisted_context_messages(...)` and `elroy_context::remove_persisted_context_messages(...)`, backed by transactional `elroy_db::append_context_messages(...)` / `remove_context_messages_by_ids(...)` helpers rather than whole-transcript replacement.
+- Those DB helpers now also take an immediate SQLite transaction so concurrent append writers serialize cleanly around the `position` index instead of racing on load-modify-replace behavior.
+- Direct crate-local coverage now exists for append/remove ordering, wrapper-level add/remove behavior, and concurrent append writers against a shared SQLite file.
+- The Python memory read-store query helpers now also have Rust equivalents through `elroy_memory::get_memory_by_name_from_config(...)` and `elroy_memory::get_active_memories_from_config(...)`, instead of leaving those repository-level reads spread across lower-level DB and recall helpers only.
+- Direct crate-local coverage now exists that those helpers return the active in-scope memories while excluding archived ones.
+- The Python memory source-read surface now also has a first structured Rust repository helper via `elroy_memory::get_source_list_for_memory_structured_from_config(...)`, plus a thin `get_source_content_for_memory_text_from_config(...)` wrapper for the corresponding source-content retrieval path.
+- Direct crate-local coverage now exists that those helpers return structured `("Memory", name)` lineage for consolidated memories and `("ContextMessageSet", id)` lineage for transcript-backed memories while preserving the expected source content lookup behavior.
+- The Python reminder read/query helpers now also have Rust equivalents through `elroy_reminders::get_db_due_item_by_name_from_config(...)`, `get_active_due_items_from_config(...)`, `get_due_timed_items_from_config(...)`, `get_due_item_by_name_from_config(...)`, and `get_due_item_context_messages_from_config(...)`, instead of leaving that repository-level reminder read surface implicit in app/runtime assembly only.
+- Direct crate-local coverage now exists for the key Python repository cases: active due-item listing, exact-name lookup, timed-due detection, future timed-item omission, contextual-only omission from timed-due results, and timed due-item synthetic context generation.
+- The Python combined memory-query helper `get_relevant_memories_and_due_items(...)` now also has a structured Rust counterpart through `elroy_memory::get_relevant_memories_and_due_items_from_config(...)`, returning typed memory/due-item/agenda-item matches instead of only the formatted tool-report surface.
+- Direct crate-local coverage now exists that the helper can return all three categories from one overlap-based repository query.
+- The Python recall-query metadata helpers now also have Rust counterparts through `elroy_recall::get_recall_metadata(...)`, `is_item_in_context_message(...)`, `is_item_in_context(...)`, `is_memory_in_context_message(...)`, `is_memory_in_context(...)`, `is_agenda_item_in_context_message(...)`, and `is_agenda_item_in_context(...)`.
+- Direct crate-local coverage now exists that those helpers recognize the real synthetic current-context payloads emitted by `context_memory_tool_messages(...)` and `context_due_item_tool_messages(...)`.
+- The Python recall read-store `query_vector(...)` shape now also has Rust repository equivalents through `elroy_recall::query_memories_by_embedding(...)` and `elroy_recall::query_agenda_items_by_embedding(...)`, while the existing top-2 helpers for memories, due items, and plain agenda items now build on that shared ranked-query surface instead of only existing as standalone convenience wrappers.
+- Direct crate-local coverage now exists that those ranked-query helpers preserve Python-style ordering across active rows and that the top-2 memory/due/agendum wrappers filter out the correct categories on top of the shared agenda ranking.
+- The Python standalone recall-classifier surface now also has Rust equivalents through `elroy_recall::apply_memory_recall_heuristics(...)` and `should_recall_memory_from_config(...)`, with more specific heuristic reasoning for acknowledgments, greetings, and clarification-only prompts instead of only the earlier embedded boolean skip check.
+- Direct crate-local coverage now exists for the Python-style short-message heuristic cases, the config-disabled path, and the model-backed classifier path over recent conversation context.
+- The Python standalone memory-cluster consolidation surface now also has a first Rust repository entry point through `elroy_recall::MemoryCluster` plus `consolidate_memory_cluster_from_config(...)`, reusing the existing consolidation outputs/archive path instead of leaving consolidation only reachable through threshold-driven auto-memory orchestration.
+- Direct crate-local coverage now exists that consolidating a duplicate cluster archives the source memories and leaves only the consolidated active memory, matching the key Python repository expectation for `consolidate_memory_cluster(...)`.
+- Validation for this slice: `cargo fmt --all`, `cargo test -p elroy-memory get_memories_from_config_returns_requested_memory_ids -- --nocapture`, `cargo test -p elroy-memory memory_query_helpers_return_active_memories_in_scope -- --nocapture`, `cargo test -p elroy-memory source_helpers_return_structured_memory_and_context_sources -- --nocapture`, `cargo test -p elroy-memory relevant_recall_helper_returns_memory_due_item_and_agenda_item_matches -- --nocapture`, `cargo test -p elroy-reminders reminder_query_helpers_match_due_item_repository_cases -- --nocapture`, `cargo test -p elroy-recall -- --nocapture`, `cargo test -p elroy-db load_memories_by_ids_preserves_requested_order -- --nocapture`, `cargo test -p elroy-db append_and_remove_context_messages_preserve_order -- --nocapture`, `cargo test -p elroy-db append_context_messages_supports_concurrent_writers -- --nocapture`, `cargo test -p elroy-context persisted_context_messages_can_be_appended -- --nocapture`, `cargo test -p elroy-context persisted_context_messages_can_be_removed_by_message_identity -- --nocapture`, and `cargo clippy -p elroy-memory -p elroy-db -p elroy-context -p elroy-reminders -p elroy-recall --all-targets --all-features`.
 
 ## Phase 5: Codex And Operational Completion
 
@@ -507,6 +600,15 @@ Exit criteria:
 Usable checkpoint:
 
 - "Rust covers the operational workflows the active project actually relies on"
+
+### Phase 5 Progress (2026-06-03)
+
+- `list_codex_sessions` now accepts the Python-style `scope` argument, filtering to the home contrib repo for `scope="contrib"` and the current running Elroy repo for `scope="elroy"` while preserving the existing Rust `repo_path` filter when no scope is supplied.
+- The same tool now matches Python's error contract for unknown scopes and non-positive limits instead of silently defaulting or accepting arbitrary scope strings.
+- Direct Codex tool coverage now proves scoped listing, the existing explicit repo-path filter, and the invalid-scope/invalid-limit cases.
+- Python-named `inspect_elroy_with_codex` and `edit_contrib_with_codex` tool entries now exist in Rust, including Python-style inspection/contrib prompt construction, optional log inclusion for inspection, minimal home-contrib repo bootstrap for contrib edits, async Codex persistence, and shared running/completion status handling.
+- Direct Codex tool coverage now proves the inspection prompt/log contract and the named contrib launch path, including repo bootstrap and persisted prompt content.
+- The larger Phase 5 Codex launch gap is now narrower: the named Rust tools still reuse the isolated worktree dispatch path, while Python inspection runs directly against the source tree and Python contrib edits run directly in the home contrib repo.
 
 ## Phase 6: Test And Parity Closure
 

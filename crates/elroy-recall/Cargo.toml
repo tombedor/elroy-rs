@@ -21,3 +21,6 @@ anyhow = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 rusqlite = { version = "0.37", features = ["bundled"] }
 serde_json = "1"
+
+[dev-dependencies]
+mockito = "1"

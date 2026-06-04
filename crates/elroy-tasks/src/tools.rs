@@ -614,3 +614,293 @@ fn remove_context_tool_messages_by_id(
     replace_context_messages(&mut connection, LOCAL_USER_TOKEN, &updated_transcript)?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::Path;
+
+    use super::{context_task_tool_call_id, task_tools};
+    use elroy_config::AppConfig;
+    use elroy_db::{
+        BootstrapPlan, LOCAL_USER_TOKEN, load_context_messages, open_sqlite_connection,
+        replace_context_messages,
+    };
+    use elroy_llm::{ConversationMessage, MessageRole};
+    use elroy_tools::ExecutableToolRegistry;
+
+    fn context_dump(database_path: &Path) -> String {
+        let mut connection = open_sqlite_connection(database_path).expect("database should open");
+        let messages = load_context_messages(&mut connection, LOCAL_USER_TOKEN)
+            .expect("context messages should load");
+        serde_json::to_string(&messages).expect("context messages should serialize")
+    }
+
+    #[test]
+    fn task_tools_can_manage_tasks_and_refresh_context() {
+        let unique = format!(
+            "elroy-rs-task-tools-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+
+        let mut config = AppConfig::defaults();
+        config.memory_dir = memory_dir;
+        config.agenda_dir = agenda_dir.clone();
+        config.database_path = database_path.clone();
+
+        let registry = ExecutableToolRegistry::new(task_tools(config.clone()));
+        let created = registry.invoke(
+            "create_task",
+            "{\"name\":\"Job Search\",\"text\":\"Reach out to three contacts\"}",
+        );
+        assert!(!created.is_error);
+        assert_eq!(created.content, "Task 'job search' has been created.");
+
+        let duplicate = registry.invoke(
+            "create_task",
+            "{\"name\":\"job search\",\"text\":\"Reach out to one contact\"}",
+        );
+        assert!(duplicate.is_error);
+        assert_eq!(duplicate.content, "Task 'job search' already exists");
+
+        let updated = registry.invoke(
+            "update_task_text",
+            "{\"name\":\"job search\",\"text\":\"Reach out to four contacts\"}",
+        );
+        assert!(!updated.is_error);
+        assert_eq!(updated.content, "Task 'job search' text has been updated.");
+        let missing_updated = registry.invoke(
+            "update_task_text",
+            "{\"name\":\"missing\",\"text\":\"No-op\"}",
+        );
+        assert!(missing_updated.is_error);
+        assert_eq!(missing_updated.content, "Active task 'missing' not found.");
+
+        let renamed = registry.invoke(
+            "rename_task",
+            "{\"old_name\":\"job search\",\"new_name\":\"Career Search\"}",
+        );
+        assert!(!renamed.is_error);
+        assert_eq!(
+            renamed.content,
+            "Task 'job search' has been renamed to 'Career Search'."
+        );
+        assert!(agenda_dir.join("career_search.md").exists());
+        let missing_renamed = registry.invoke(
+            "rename_task",
+            "{\"old_name\":\"missing\",\"new_name\":\"Backup Search\"}",
+        );
+        assert!(missing_renamed.is_error);
+        assert_eq!(missing_renamed.content, "Active task 'missing' not found.");
+        let duplicate_renamed = registry.invoke(
+            "rename_task",
+            "{\"old_name\":\"career search\",\"new_name\":\"career search\"}",
+        );
+        assert!(duplicate_renamed.is_error);
+        assert_eq!(
+            duplicate_renamed.content,
+            "Active task 'career search' already exists."
+        );
+
+        let listed = registry.invoke("list_tasks", "{\"limit\":10}");
+        assert!(!listed.is_error);
+        assert!(listed.content.contains("career search"));
+
+        let shown = registry.invoke("show_task", "{\"name\":\"career search\"}");
+        assert!(!shown.is_error);
+        assert!(shown.content.contains("Reach out to four contacts"));
+        let missing_shown = registry.invoke("show_task", "{\"name\":\"missing\"}");
+        assert!(missing_shown.is_error);
+        assert_eq!(missing_shown.content, "Active task 'missing' not found.");
+
+        let completed = registry.invoke(
+            "complete_task",
+            "{\"name\":\"career search\",\"closing_comment\":\"done\"}",
+        );
+        assert!(!completed.is_error);
+        assert_eq!(
+            completed.content,
+            "Task 'career search' has been marked as completed. Comment: done"
+        );
+        let missing_completed = registry.invoke("complete_task", "{\"name\":\"missing\"}");
+        assert!(missing_completed.is_error);
+        assert_eq!(
+            missing_completed.content,
+            "Active task 'missing' not found."
+        );
+        let completed_recreated = registry.invoke(
+            "create_task",
+            "{\"name\":\"Career Search\",\"text\":\"Follow up with recruiters\"}",
+        );
+        assert!(!completed_recreated.is_error);
+        assert_eq!(
+            completed_recreated.content,
+            "Task 'career search' has been created."
+        );
+        let completed_recreated_shown =
+            registry.invoke("show_task", "{\"name\":\"career search\"}");
+        assert!(!completed_recreated_shown.is_error);
+        assert!(
+            completed_recreated_shown
+                .content
+                .contains("Follow up with recruiters")
+        );
+
+        let plain_created = registry.invoke(
+            "create_task",
+            "{\"name\":\"Inbox Zero\",\"text\":\"Clear email backlog\"}",
+        );
+        assert!(!plain_created.is_error);
+        let task_context = context_dump(&database_path);
+        assert!(task_context.contains(&context_task_tool_call_id("inbox zero")));
+        let plain_updated = registry.invoke(
+            "update_task_text",
+            "{\"name\":\"inbox zero\",\"text\":\"Clear email backlog tonight\"}",
+        );
+        assert!(!plain_updated.is_error);
+        let updated_task_context = context_dump(&database_path);
+        assert!(updated_task_context.contains(&context_task_tool_call_id("inbox zero")));
+        assert!(updated_task_context.contains("Clear email backlog tonight"));
+        let plain_renamed = registry.invoke(
+            "rename_task",
+            "{\"old_name\":\"inbox zero\",\"new_name\":\"Inbox Clean\"}",
+        );
+        assert!(!plain_renamed.is_error);
+        let renamed_task_context = context_dump(&database_path);
+        assert!(!renamed_task_context.contains(&context_task_tool_call_id("inbox zero")));
+        assert!(renamed_task_context.contains(&context_task_tool_call_id("inbox clean")));
+        let plain_completed = registry.invoke(
+            "complete_task",
+            "{\"name\":\"inbox clean\",\"closing_comment\":\"done\"}",
+        );
+        assert!(!plain_completed.is_error);
+        let completed_task_context = context_dump(&database_path);
+        assert!(!completed_task_context.contains(&context_task_tool_call_id("inbox clean")));
+
+        let deleted_created = registry.invoke(
+            "create_task",
+            "{\"name\":\"Desk Reset\",\"text\":\"Tidy the desk\"}",
+        );
+        assert!(!deleted_created.is_error);
+        let mut connection =
+            open_sqlite_connection(&config.database_path).expect("database should reopen");
+        let mut transcript =
+            load_context_messages(&mut connection, LOCAL_USER_TOKEN).expect("context should load");
+        transcript.insert(
+            0,
+            ConversationMessage::new(MessageRole::User, "keep context"),
+        );
+        replace_context_messages(&mut connection, LOCAL_USER_TOKEN, &transcript)
+            .expect("task context should persist");
+
+        let deleted = registry.invoke(
+            "delete_task",
+            "{\"name\":\"desk reset\",\"closing_comment\":\"superseded\"}",
+        );
+        assert!(!deleted.is_error);
+        assert_eq!(
+            deleted.content,
+            "Task 'desk reset' has been deleted. Comment: superseded"
+        );
+
+        let deleted_text =
+            fs::read_to_string(agenda_dir.join("desk_reset.md")).expect("task file should read");
+        assert!(deleted_text.contains("status: deleted"));
+        assert!(deleted_text.contains("closing_comment: superseded"));
+        let stripped_context = context_dump(&database_path);
+        assert!(!stripped_context.contains(&context_task_tool_call_id("desk reset")));
+        assert!(stripped_context.contains("keep context"));
+        let recreated = registry.invoke(
+            "create_task",
+            "{\"name\":\"Desk Reset\",\"text\":\"Tidy the desk again\"}",
+        );
+        assert!(!recreated.is_error);
+        assert_eq!(recreated.content, "Task 'desk reset' has been created.");
+        let recreated_shown = registry.invoke("show_task", "{\"name\":\"desk reset\"}");
+        assert!(!recreated_shown.is_error);
+        assert!(recreated_shown.content.contains("Tidy the desk again"));
+        let recreated_context = context_dump(&database_path);
+        assert!(recreated_context.contains(&context_task_tool_call_id("desk reset")));
+        let recreated_connection =
+            open_sqlite_connection(&config.database_path).expect("database should reopen");
+        let deleted_rows: i64 = recreated_connection
+            .query_row(
+                "SELECT COUNT(*) FROM agenda_items WHERE name = ?1 AND status = 'deleted' AND is_active IS NULL",
+                rusqlite::params!["desk reset"],
+                |row| row.get(0),
+            )
+            .expect("deleted task rows should query");
+        let active_rows: i64 = recreated_connection
+            .query_row(
+                "SELECT COUNT(*) FROM agenda_items WHERE name = ?1 AND status = 'created' AND is_active = 1",
+                rusqlite::params!["desk reset"],
+                |row| row.get(0),
+            )
+            .expect("active task rows should query");
+        assert_eq!(deleted_rows, 1);
+        assert_eq!(active_rows, 1);
+        let missing_deleted = registry.invoke("delete_task", "{\"name\":\"missing\"}");
+        assert!(missing_deleted.is_error);
+        assert_eq!(missing_deleted.content, "Active task 'missing' not found.");
+
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
+    fn list_due_tasks_excludes_future_and_context_only_tasks() {
+        let unique = format!(
+            "elroy-rs-task-due-filtering-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+
+        fs::write(
+            agenda_dir.join("past_due.md"),
+            "---\ndate: unscheduled\ncompleted: false\nstatus: created\ntrigger_datetime: 2000-01-01T09:00:00\n---\n\nPast due task\n",
+        )
+        .expect("past due task should be written");
+        fs::write(
+            agenda_dir.join("future_due.md"),
+            "---\ndate: unscheduled\ncompleted: false\nstatus: created\ntrigger_datetime: 2099-01-01T09:00:00\n---\n\nFuture due task\n",
+        )
+        .expect("future due task should be written");
+        fs::write(
+            agenda_dir.join("context_only.md"),
+            "---\ndate: unscheduled\ncompleted: false\nstatus: created\ntrigger_context: after breakfast\n---\n\nContext-only task\n",
+        )
+        .expect("context-only task should be written");
+
+        let mut config = AppConfig::defaults();
+        config.memory_dir = memory_dir;
+        config.agenda_dir = agenda_dir;
+        config.database_path = database_path;
+        elroy_db::bootstrap_database(&BootstrapPlan::from_config(&config))
+            .expect("bootstrap should succeed");
+
+        let registry = ExecutableToolRegistry::new(task_tools(config));
+        let due = registry.invoke("list_due_tasks", "{}");
+        assert!(!due.is_error);
+        assert!(due.content.contains("past due"));
+        assert!(!due.content.contains("future due"));
+        assert!(!due.content.contains("context-only"));
+
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
+}

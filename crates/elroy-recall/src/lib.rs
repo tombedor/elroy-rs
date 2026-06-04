@@ -25,7 +25,7 @@ use serde_json::Value;
 
 use elroy_config::{
     AppConfig, LlmProvider, embedding_provider_config_from_app_config,
-    fast_provider_config_from_app_config,
+    fast_provider_config_from_app_config, provider_config_from_app_config,
 };
 use elroy_context::load_validated_runtime_transcript;
 use elroy_tools::ToolExecutionResult;
@@ -681,6 +681,13 @@ pub struct RecalledItemRef {
     pub name: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecallMetadataEntry {
+    pub memory_type: String,
+    pub memory_id: Option<i64>,
+    pub name: String,
+}
+
 #[derive(Clone, Copy)]
 pub struct RecallSelectionClients<'a> {
     pub limit: usize,
@@ -712,6 +719,92 @@ pub fn transcript_contains_context_memory(
     transcript
         .iter()
         .any(|message| message_matches_tool_call_id(message, &tool_call_id))
+}
+
+pub fn get_recall_metadata(
+    context_message: &ConversationMessage,
+    desired_memory_type: Option<&str>,
+) -> Vec<RecallMetadataEntry> {
+    if context_message.role != MessageRole::Tool {
+        return Vec::new();
+    }
+    let Some(content) = context_message.content.as_deref() else {
+        return Vec::new();
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(content) else {
+        return Vec::new();
+    };
+
+    value
+        .get("recall_metadata")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|item| {
+            let memory_type = item
+                .get("memory_type")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("Memory");
+            if desired_memory_type.is_some_and(|desired| desired != memory_type) {
+                return None;
+            }
+            Some(RecallMetadataEntry {
+                memory_type: memory_type.to_string(),
+                memory_id: item.get("memory_id").and_then(serde_json::Value::as_i64),
+                name: item
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_ascii_lowercase(),
+            })
+        })
+        .collect()
+}
+
+pub fn is_item_in_context_message(
+    memory_type: &str,
+    item_id: i64,
+    context_message: &ConversationMessage,
+) -> bool {
+    get_recall_metadata(context_message, Some(memory_type))
+        .into_iter()
+        .any(|entry| entry.memory_id == Some(item_id))
+}
+
+pub fn is_item_in_context(
+    transcript: &[ConversationMessage],
+    memory_type: &str,
+    item_id: i64,
+) -> bool {
+    transcript
+        .iter()
+        .any(|message| is_item_in_context_message(memory_type, item_id, message))
+}
+
+pub fn is_memory_in_context_message(
+    memory: &MemoryRecord,
+    context_message: &ConversationMessage,
+) -> bool {
+    is_item_in_context_message("Memory", memory.id, context_message)
+}
+
+pub fn is_memory_in_context(transcript: &[ConversationMessage], memory: &MemoryRecord) -> bool {
+    is_item_in_context(transcript, "Memory", memory.id)
+}
+
+pub fn is_agenda_item_in_context_message(
+    item: &AgendaItemRecord,
+    context_message: &ConversationMessage,
+) -> bool {
+    is_item_in_context_message("AgendaItem", item.id, context_message)
+}
+
+pub fn is_agenda_item_in_context(
+    transcript: &[ConversationMessage],
+    item: &AgendaItemRecord,
+) -> bool {
+    is_item_in_context(transcript, "AgendaItem", item.id)
 }
 
 pub fn transcript_contains_context_due_item(
@@ -983,33 +1076,6 @@ pub fn recall_memory_context_messages(
     )
 }
 
-pub fn recall_due_item_context_messages(
-    prompt: &str,
-    transcript: &[ConversationMessage],
-    due_items: &[AgendaItemRecord],
-    now_iso: &str,
-    selection_clients: RecallSelectionClients<'_>,
-) -> Vec<ConversationMessage> {
-    let recall_query = build_recall_query(prompt, transcript, 6);
-    let recalled = select_relevant_contextual_due_items(
-        &recall_query,
-        due_items,
-        now_iso,
-        RecallSelectionClients {
-            limit: 2,
-            ..selection_clients
-        },
-    );
-    if recalled.is_empty() {
-        return Vec::new();
-    }
-    recalled
-        .into_iter()
-        .filter(|item| !transcript_contains_recalled_agenda_item(transcript, item.id, &item.name))
-        .flat_map(context_due_item_tool_messages)
-        .collect()
-}
-
 pub fn memory_recall_status_updates_with_decision(
     used_llm_classifier: bool,
     fetched_memories: bool,
@@ -1076,7 +1142,7 @@ pub fn prompt_prelude_status_updates(
     )
 }
 
-pub fn should_skip_memory_recall(prompt: &str) -> bool {
+pub fn apply_memory_recall_heuristics(prompt: &str) -> Option<MemoryRecallDecision> {
     let normalized = prompt
         .trim()
         .chars()
@@ -1092,10 +1158,14 @@ pub fn should_skip_memory_recall(prompt: &str) -> bool {
         .collect::<Vec<_>>()
         .join(" ");
     if normalized.is_empty() {
-        return true;
+        return Some(MemoryRecallDecision {
+            needs_recall: false,
+            reasoning: "Empty message detected by heuristic".to_string(),
+            used_llm: false,
+        });
     }
 
-    const SIMPLE_SHORT: &[&str] = &[
+    const SIMPLE_ACKNOWLEDGMENTS: &[&str] = &[
         "ok",
         "okay",
         "yes",
@@ -1120,9 +1190,26 @@ pub fn should_skip_memory_recall(prompt: &str) -> bool {
     ];
     const CLARIFICATIONS: &[&str] = &["what", "huh", "pardon", "sorry", "excuse me"];
 
-    (normalized.len() < 10 && SIMPLE_SHORT.contains(&normalized.as_str()))
-        || GREETINGS.contains(&normalized.as_str())
-        || CLARIFICATIONS.contains(&normalized.as_str())
+    let reasoning =
+        if normalized.len() < 10 && SIMPLE_ACKNOWLEDGMENTS.contains(&normalized.as_str()) {
+            Some("Simple acknowledgment detected by heuristic")
+        } else if GREETINGS.contains(&normalized.as_str()) {
+            Some("Simple greeting detected by heuristic")
+        } else if CLARIFICATIONS.contains(&normalized.as_str()) {
+            Some("Simple clarification detected by heuristic")
+        } else {
+            None
+        }?;
+
+    Some(MemoryRecallDecision {
+        needs_recall: false,
+        reasoning: reasoning.to_string(),
+        used_llm: false,
+    })
+}
+
+pub fn should_skip_memory_recall(prompt: &str) -> bool {
+    apply_memory_recall_heuristics(prompt).is_some()
 }
 
 pub fn parse_memory_recall_decision(response: &str) -> Option<(bool, String)> {
@@ -1387,6 +1474,132 @@ fn recency_penalty(updated_at_unix: i64, now_unix: i64, recency_weight: f32) -> 
     recency_weight * age_years
 }
 
+#[allow(clippy::too_many_arguments)]
+fn rank_candidates_by_cached_embedding<'a, T>(
+    connection: &rusqlite::Connection,
+    candidates: impl IntoIterator<Item = &'a T>,
+    query_embedding: &[f32],
+    limit: usize,
+    distance_threshold: Option<f32>,
+    recency_weight: f32,
+    file_path_fn: impl Fn(&T) -> &str,
+    updated_at_fn: impl Fn(&T) -> i64,
+) -> Vec<&'a T> {
+    let candidates = candidates.into_iter().collect::<Vec<_>>();
+    let paths = candidates
+        .iter()
+        .map(|candidate| file_path_fn(candidate).to_string())
+        .collect::<Vec<_>>();
+    let Ok(embedding_cache) = load_memory_embeddings_for_paths(connection, &paths) else {
+        return Vec::new();
+    };
+    let now_unix = Utc::now().timestamp();
+
+    let mut ranked = candidates
+        .into_iter()
+        .filter_map(|candidate| {
+            let cached = embedding_cache.get(file_path_fn(candidate))?;
+            let distance = l2_distance(query_embedding, &cached.embedding)?;
+            if let Some(distance_threshold) = distance_threshold
+                && distance > distance_threshold
+            {
+                return None;
+            }
+            let adjusted_distance =
+                distance + recency_penalty(updated_at_fn(candidate), now_unix, recency_weight);
+            Some((adjusted_distance, distance, candidate))
+        })
+        .collect::<Vec<_>>();
+    ranked.sort_by(
+        |(left_adjusted, left_distance, _), (right_adjusted, right_distance, _)| {
+            left_adjusted
+                .total_cmp(right_adjusted)
+                .then_with(|| left_distance.total_cmp(right_distance))
+        },
+    );
+    ranked
+        .into_iter()
+        .map(|(_, _, candidate)| candidate)
+        .take(limit)
+        .collect()
+}
+
+pub fn query_memories_by_embedding(
+    config: &AppConfig,
+    query_embedding: &[f32],
+) -> anyhow::Result<Vec<MemoryRecord>> {
+    let mut connection = open_sqlite_connection(&config.database_path)?;
+    run_migrations(&mut connection)?;
+    let memories = list_all_active_memories_in_scope(&connection, &config.memory_dir)?;
+    Ok(rank_candidates_by_cached_embedding(
+        &connection,
+        memories.iter(),
+        query_embedding,
+        memories.len(),
+        Some(config.l2_memory_relevance_distance_threshold as f32),
+        config.recency_weight as f32,
+        |memory| memory.file_path.as_str(),
+        |memory| memory.updated_at_unix,
+    )
+    .into_iter()
+    .cloned()
+    .collect())
+}
+
+pub fn query_agenda_items_by_embedding(
+    config: &AppConfig,
+    query_embedding: &[f32],
+) -> anyhow::Result<Vec<AgendaItemRecord>> {
+    let mut connection = open_sqlite_connection(&config.database_path)?;
+    run_migrations(&mut connection)?;
+    let agenda_items = elroy_db::list_active_agenda_items(&connection, 10_000)?;
+    Ok(rank_candidates_by_cached_embedding(
+        &connection,
+        agenda_items.iter(),
+        query_embedding,
+        agenda_items.len(),
+        Some(config.l2_memory_relevance_distance_threshold as f32),
+        config.recency_weight as f32,
+        |item| item.file_path.as_str(),
+        |item| item.updated_at_unix,
+    )
+    .into_iter()
+    .cloned()
+    .collect())
+}
+
+pub fn get_most_relevant_memories_from_query_embedding(
+    config: &AppConfig,
+    query_embedding: &[f32],
+) -> anyhow::Result<Vec<MemoryRecord>> {
+    Ok(query_memories_by_embedding(config, query_embedding)?
+        .into_iter()
+        .take(2)
+        .collect())
+}
+
+pub fn get_most_relevant_due_items_from_query_embedding(
+    config: &AppConfig,
+    query_embedding: &[f32],
+) -> anyhow::Result<Vec<AgendaItemRecord>> {
+    Ok(query_agenda_items_by_embedding(config, query_embedding)?
+        .into_iter()
+        .filter(|item| item.trigger_datetime.is_some() || item.trigger_context.is_some())
+        .take(2)
+        .collect())
+}
+
+pub fn get_most_relevant_agenda_items_from_query_embedding(
+    config: &AppConfig,
+    query_embedding: &[f32],
+) -> anyhow::Result<Vec<AgendaItemRecord>> {
+    Ok(query_agenda_items_by_embedding(config, query_embedding)?
+        .into_iter()
+        .filter(|item| item.trigger_datetime.is_none() && item.trigger_context.is_none())
+        .take(2)
+        .collect())
+}
+
 pub fn select_relevant_recall_memories<'a>(
     query: &str,
     memories: &'a [MemoryRecord],
@@ -1552,92 +1765,6 @@ pub fn select_relevant_recall_due_items<'a>(
     .collect()
 }
 
-pub fn select_relevant_contextual_due_items<'a>(
-    query: &str,
-    due_items: &'a [AgendaItemRecord],
-    now_iso: &str,
-    selection_clients: RecallSelectionClients<'_>,
-) -> Vec<&'a AgendaItemRecord> {
-    let candidate_limit = semantic_recall_candidate_limit(
-        selection_clients.limit,
-        selection_clients.relevance_model,
-        selection_clients.embedding_client,
-    );
-    let overlap_candidates =
-        select_due_items_by_overlap(query, due_items, candidate_limit, Some(now_iso));
-    let candidates = if selection_clients.relevance_model.is_some() {
-        let mut merged_candidates = overlap_candidates;
-        for candidate in embedding_rank_candidates(
-            query,
-            due_items
-                .iter()
-                .filter(|item| item.trigger_context.is_some()),
-            RecallSelectionClients {
-                limit: candidate_limit,
-                ..selection_clients
-            },
-            agenda_item_embedding_text,
-            |item| item.file_path.as_str(),
-            |item| item.updated_at_unix,
-        ) {
-            if merged_candidates
-                .iter()
-                .any(|existing| existing.id == candidate.id)
-            {
-                continue;
-            }
-            merged_candidates.push(candidate);
-            if merged_candidates.len() >= candidate_limit {
-                break;
-            }
-        }
-        for candidate in recent_contextual_due_item_candidates(due_items, candidate_limit, now_iso)
-        {
-            if merged_candidates
-                .iter()
-                .any(|existing| existing.id == candidate.id)
-            {
-                continue;
-            }
-            merged_candidates.push(candidate);
-            if merged_candidates.len() >= candidate_limit {
-                break;
-            }
-        }
-        merged_candidates
-    } else if selection_clients.embedding_client.is_some() {
-        let embedding_candidates = embedding_rank_candidates(
-            query,
-            due_items
-                .iter()
-                .filter(|item| item.trigger_context.is_some()),
-            RecallSelectionClients {
-                limit: candidate_limit,
-                ..selection_clients
-            },
-            agenda_item_embedding_text,
-            |item| item.file_path.as_str(),
-            |item| item.updated_at_unix,
-        );
-        if embedding_candidates.is_empty() {
-            overlap_candidates
-        } else {
-            embedding_candidates
-        }
-    } else {
-        overlap_candidates
-    };
-    filter_candidates_for_relevance(
-        selection_clients.relevance_model,
-        query,
-        candidates,
-        agenda_item_embedding_text,
-    )
-    .into_iter()
-    .take(selection_clients.limit)
-    .collect()
-}
-
 pub fn select_relevant_recall_agenda_items<'a>(
     query: &str,
     agenda_items: &'a [AgendaItemRecord],
@@ -1756,29 +1883,6 @@ fn recent_due_item_candidates(
     candidates.into_iter().take(limit).collect()
 }
 
-fn recent_contextual_due_item_candidates<'a>(
-    due_items: &'a [AgendaItemRecord],
-    limit: usize,
-    now_iso: &str,
-) -> Vec<&'a AgendaItemRecord> {
-    let mut candidates = due_items
-        .iter()
-        .filter(|item| item.trigger_context.is_some())
-        .filter(|item| {
-            item.trigger_datetime
-                .as_deref()
-                .is_none_or(|trigger_datetime| trigger_datetime > now_iso)
-        })
-        .collect::<Vec<_>>();
-    candidates.sort_by(|left, right| {
-        right
-            .updated_at_unix
-            .cmp(&left.updated_at_unix)
-            .then_with(|| left.name.cmp(&right.name))
-    });
-    candidates.into_iter().take(limit).collect()
-}
-
 fn recent_agenda_item_candidates(
     agenda_items: &[AgendaItemRecord],
     limit: usize,
@@ -1843,13 +1947,8 @@ pub fn determine_memory_recall_decision(
             used_llm: false,
         };
     }
-    if should_skip_memory_recall(prompt) {
-        return MemoryRecallDecision {
-            needs_recall: false,
-            reasoning: "Simple greeting/acknowledgment/clarification detected by heuristic"
-                .to_string(),
-            used_llm: false,
-        };
+    if let Some(decision) = apply_memory_recall_heuristics(prompt) {
+        return decision;
     }
     if let Some(model) = classifier_model
         && let Ok(decision) = classify_memory_recall_with_model(
@@ -1866,6 +1965,25 @@ pub fn determine_memory_recall_decision(
         reasoning: "classifier unavailable; falling back to conservative recall".to_string(),
         used_llm: false,
     }
+}
+
+pub fn should_recall_memory_from_config(
+    config: &AppConfig,
+    current_message: &str,
+    recent_messages: &[ConversationMessage],
+) -> MemoryRecallDecision {
+    let fast_provider_config = fast_provider_config_from_app_config(config).ok();
+    let classifier_model =
+        best_effort_provider_model(fast_provider_config.as_ref(), &config.assistant_name);
+    determine_memory_recall_decision(
+        config.memory_recall_classifier_enabled,
+        config.memory_recall_classifier_window,
+        current_message,
+        recent_messages,
+        classifier_model
+            .as_ref()
+            .map(|model| model as &dyn ModelClient),
+    )
 }
 
 pub fn build_recall_query(
@@ -2222,15 +2340,6 @@ fn select_agenda_items_by_overlap<'a>(
         .collect()
 }
 
-pub fn select_recalled_due_items<'a>(
-    prompt: &str,
-    due_items: &'a [AgendaItemRecord],
-    now_iso: &str,
-    limit: usize,
-) -> Vec<&'a AgendaItemRecord> {
-    select_due_items_by_overlap(prompt, due_items, limit, Some(now_iso))
-}
-
 pub fn parse_recalled_item_refs(content: &str, desired_memory_type: &str) -> Vec<RecalledItemRef> {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(content) else {
         return Vec::new();
@@ -2528,6 +2637,37 @@ pub struct ConsolidatedMemoryOutput {
     pub text: String,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct MemoryCluster {
+    pub memories: Vec<MemoryRecord>,
+    pub embeddings: Vec<Vec<f32>>,
+}
+
+pub fn consolidate_memory_cluster_from_config(
+    config: &AppConfig,
+    cluster: &MemoryCluster,
+) -> anyhow::Result<()> {
+    if cluster.memories.len() < 2 {
+        return Ok(());
+    }
+
+    let bootstrap_plan = BootstrapPlan::from_config(config);
+    let fast_provider_config = fast_provider_config_from_app_config(config).ok();
+    let fast_model =
+        best_effort_provider_model(fast_provider_config.as_ref(), &config.assistant_name);
+    let outputs = consolidate_memory_cluster_outputs(
+        &cluster.memories,
+        fast_model.as_ref().map(|model| model as &dyn ModelClient),
+    );
+    if outputs.is_empty() {
+        return Ok(());
+    }
+
+    create_consolidated_memories_from_records(&bootstrap_plan, &outputs, &cluster.memories)
+        .map(|_| ())
+        .map_err(|error| anyhow!(error.to_string()))
+}
+
 pub fn run_auto_memory_if_needed(
     connection: &mut rusqlite::Connection,
     bootstrap_plan: &BootstrapPlan,
@@ -2812,6 +2952,156 @@ pub fn update_outdated_or_incorrect_memory_from_config(
         }
         Err(error) => ToolExecutionResult::error(format!("failed to archive old memory: {error}")),
     }
+}
+
+fn format_due_item_fact(item: &AgendaItemRecord) -> String {
+    if let Some(trigger_datetime) = item.trigger_datetime.as_deref() {
+        return format!(
+            "#{} (Timed: {})\n{}",
+            item.name,
+            parse_sidebar_trigger_datetime(trigger_datetime)
+                .map(|datetime| datetime.format("%Y-%m-%d %H:%M:%S").to_string())
+                .unwrap_or_else(|| trigger_datetime.to_string()),
+            item.body.trim()
+        );
+    }
+    if let Some(trigger_context) = item.trigger_context.as_deref() {
+        return format!(
+            "#{} (Context: {})\n{}",
+            item.name,
+            trigger_context,
+            item.body.trim()
+        );
+    }
+    format!("#Agenda: {}\n{}", item.name, item.body.trim())
+}
+
+fn collect_assistant_response(events: Vec<StreamEvent>) -> String {
+    events
+        .into_iter()
+        .filter_map(|event| match event {
+            StreamEvent::AssistantResponse { content } => Some(content),
+            _ => None,
+        })
+        .collect::<String>()
+}
+
+fn augment_text_with_model(
+    text: &str,
+    relevant_facts: &[String],
+    model: Option<&dyn ModelClient>,
+) -> String {
+    if relevant_facts.is_empty() {
+        return text.to_string();
+    }
+    let Some(model) = model else {
+        return text.to_string();
+    };
+
+    let relevant_facts = relevant_facts.join("\n");
+    let prompt = format!("# Original Text\n\n{text}\n\n# Relevant memories\n\n{relevant_facts}");
+    let system = format!(
+        "Your job is to augment text with contextual information recalled from memory. \
+You will be provided with the initial text, as well as memories from storage which have been deemed to be relevant. \
+Use this information to augment the text with enough context such that future readers can better understand the memory.\n\n\
+This could include information about how subjects relate to the user.\n\n\
+If there is still unknown information, simply omit that context, do not add any content about how you don't know.\n\n\
+Respond with both augmented text, and a short title for the memory.\n\n\
+Translate relative dates to ISO 8601 format, where possible. Note that the current datetime is: {}",
+        Local::now().to_rfc3339()
+    );
+
+    let events = match model.next_events(ConversationRequest {
+        user_message: &prompt,
+        tools: &[],
+        transcript: &[ConversationMessage::new(
+            MessageRole::User,
+            format!("{system}\n\n{prompt}"),
+        )],
+        force_tool: None,
+    }) {
+        Ok(events) => events,
+        Err(_) => return text.to_string(),
+    };
+    let response = collect_assistant_response(events);
+    if response.trim().is_empty() {
+        text.to_string()
+    } else {
+        response
+    }
+}
+
+pub fn augment_text_from_config(config: &AppConfig, text: &str) -> anyhow::Result<String> {
+    let mut connection = open_sqlite_connection(&config.database_path)?;
+    run_migrations(&mut connection)?;
+
+    let provider_config = provider_config_from_app_config(config).ok();
+    let fast_provider_config = fast_provider_config_from_app_config(config).ok();
+    let embedding_provider_config = embedding_provider_config_from_app_config(config).ok();
+
+    let augmentation_model =
+        best_effort_provider_model(provider_config.as_ref(), &config.assistant_name);
+    let relevance_model =
+        best_effort_provider_model(fast_provider_config.as_ref(), &config.assistant_name);
+    let embedding_client = best_effort_embedding_client(embedding_provider_config.as_ref());
+    let query_embedding = embedding_client
+        .as_ref()
+        .and_then(|client| client.embed(text).ok());
+
+    let selection_clients = RecallSelectionClients {
+        limit: 2,
+        embedding_distance_threshold: Some(config.l2_memory_relevance_distance_threshold as f32),
+        recency_weight: config.recency_weight as f32,
+        connection: Some(&connection),
+        relevance_model: relevance_model
+            .as_ref()
+            .map(|model| model as &dyn ModelClient),
+        embedding_client: embedding_client.as_ref(),
+        query_embedding: query_embedding.as_deref(),
+        now_iso: None,
+    };
+
+    let source_fetch_limit = semantic_recall_source_fetch_limit(
+        10_000,
+        relevance_model
+            .as_ref()
+            .map(|model| model as &dyn ModelClient),
+        embedding_client.as_ref(),
+    );
+
+    let memories = if semantic_recall_enabled(
+        relevance_model
+            .as_ref()
+            .map(|model| model as &dyn ModelClient),
+        embedding_client.as_ref(),
+    ) {
+        list_all_active_memories_in_scope(&connection, &config.memory_dir)?
+    } else {
+        search_active_memories_in_scope(&connection, &config.memory_dir, text, 10_000)?
+    };
+    let due_items = elroy_db::list_active_due_items(&connection, source_fetch_limit)?;
+
+    let relevant_memories =
+        select_relevant_recall_memories(text, &memories, &[], selection_clients);
+    let relevant_due_items = select_relevant_recall_due_items(text, &due_items, selection_clients);
+
+    let mut relevant_facts = relevant_memories
+        .iter()
+        .map(|memory| format_memory_detail(memory))
+        .collect::<Vec<_>>();
+    relevant_facts.extend(
+        relevant_due_items
+            .iter()
+            .map(|item| format_due_item_fact(item)),
+    );
+
+    Ok(augment_text_with_model(
+        text,
+        &relevant_facts,
+        augmentation_model
+            .as_ref()
+            .map(|model| model as &dyn ModelClient),
+    ))
 }
 
 pub fn search_memories_from_config(
@@ -3531,4 +3821,620 @@ pub fn format_context_message_source_content(messages: &[ConversationMessage]) -
 
 pub fn format_memory_file_source_content(source_name: &str, source_body: &str) -> String {
     format!("#{source_name}\n{source_body}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        AgendaItemRecord, MemoryCluster, MemoryRecord, apply_memory_recall_heuristics,
+        augment_text_from_config, consolidate_memory_cluster_from_config,
+        context_due_item_tool_messages, context_memory_tool_messages,
+        get_most_relevant_agenda_items_from_query_embedding,
+        get_most_relevant_due_items_from_query_embedding,
+        get_most_relevant_memories_from_query_embedding, get_recall_metadata,
+        is_agenda_item_in_context, is_agenda_item_in_context_message, is_item_in_context,
+        is_item_in_context_message, is_memory_in_context, is_memory_in_context_message,
+        list_all_active_memories_in_scope, memory_embedding_text, query_agenda_items_by_embedding,
+        query_memories_by_embedding, should_recall_memory_from_config,
+    };
+    use elroy_config::AppConfig;
+    use elroy_core::memory_store::create_memory_file;
+    use elroy_db::{BootstrapPlan, open_sqlite_connection, upsert_memory_embedding};
+    use elroy_llm::{ConversationMessage, MessageRole};
+    use std::fs;
+
+    fn unique_home(prefix: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "{prefix}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        ))
+    }
+
+    fn memory_record(id: i64, name: &str, body: &str) -> MemoryRecord {
+        MemoryRecord {
+            id,
+            legacy_frontmatter_id: None,
+            name: name.to_string(),
+            file_path: format!("/tmp/{}.md", name.replace(' ', "_").to_ascii_lowercase()),
+            body: body.to_string(),
+            is_active: true,
+            updated_at_unix: 1,
+        }
+    }
+
+    fn due_item_record(id: i64, name: &str, body: &str) -> AgendaItemRecord {
+        AgendaItemRecord {
+            id,
+            legacy_frontmatter_id: None,
+            name: name.to_string(),
+            file_path: format!("/tmp/{}.md", name.replace(' ', "_").to_ascii_lowercase()),
+            agenda_date: Some("unscheduled".to_string()),
+            is_completed: false,
+            status: Some("created".to_string()),
+            trigger_datetime: Some("2099-01-01T09:00:00".to_string()),
+            trigger_context: Some("when I mention practice".to_string()),
+            closing_comment: None,
+            checklist_total: 0,
+            checklist_completed: 0,
+            body: body.to_string(),
+            is_active: true,
+            updated_at_unix: 1,
+        }
+    }
+
+    fn write_agenda_fixture(
+        agenda_dir: &std::path::Path,
+        file_stem: &str,
+        frontmatter: &str,
+        body: &str,
+    ) {
+        fs::write(
+            agenda_dir.join(format!("{file_stem}.md")),
+            format!("---\n{frontmatter}\n---\n\n{body}\n"),
+        )
+        .expect("agenda fixture should be written");
+    }
+
+    #[test]
+    fn recall_metadata_helpers_detect_memory_and_due_item_context() {
+        let memory = memory_record(1, "Practice Note", "Bring cleats");
+        let due_item = due_item_record(2, "Practice Reminder", "Pack resistance bands");
+
+        let memory_messages = context_memory_tool_messages(&memory);
+        let due_item_messages = context_due_item_tool_messages(&due_item);
+        let transcript = memory_messages
+            .iter()
+            .chain(due_item_messages.iter())
+            .cloned()
+            .collect::<Vec<ConversationMessage>>();
+
+        let memory_tool_message = &memory_messages[1];
+        let due_item_tool_message = &due_item_messages[1];
+
+        let memory_metadata = get_recall_metadata(memory_tool_message, Some("Memory"));
+        assert_eq!(memory_metadata.len(), 1);
+        assert_eq!(memory_metadata[0].memory_id, Some(1));
+        assert_eq!(memory_metadata[0].name, "practice note");
+
+        let due_item_metadata = get_recall_metadata(due_item_tool_message, Some("AgendaItem"));
+        assert_eq!(due_item_metadata.len(), 1);
+        assert_eq!(due_item_metadata[0].memory_id, Some(2));
+        assert_eq!(due_item_metadata[0].name, "practice reminder");
+
+        assert!(is_item_in_context_message("Memory", 1, memory_tool_message));
+        assert!(is_item_in_context_message(
+            "AgendaItem",
+            2,
+            due_item_tool_message
+        ));
+        assert!(is_item_in_context(&transcript, "Memory", 1));
+        assert!(is_item_in_context(&transcript, "AgendaItem", 2));
+        assert!(is_memory_in_context_message(&memory, memory_tool_message));
+        assert!(is_memory_in_context(&transcript, &memory));
+        assert!(is_agenda_item_in_context_message(
+            &due_item,
+            due_item_tool_message
+        ));
+        assert!(is_agenda_item_in_context(&transcript, &due_item));
+        assert!(!is_item_in_context(&transcript, "Memory", 999));
+        assert!(!is_item_in_context(&transcript, "AgendaItem", 999));
+    }
+
+    #[test]
+    fn memory_recall_heuristics_match_python_short_message_rules() {
+        let ok = apply_memory_recall_heuristics("ok").expect("ok should be heuristic");
+        assert!(!ok.needs_recall);
+        assert!(ok.reasoning.to_ascii_lowercase().contains("acknowledgment"));
+
+        let hello = apply_memory_recall_heuristics("HeLLo").expect("hello should be heuristic");
+        assert!(!hello.needs_recall);
+        assert!(hello.reasoning.to_ascii_lowercase().contains("greeting"));
+
+        let clarification =
+            apply_memory_recall_heuristics("what?").expect("clarification should be heuristic");
+        assert!(!clarification.needs_recall);
+        assert!(
+            clarification
+                .reasoning
+                .to_ascii_lowercase()
+                .contains("clarification")
+        );
+
+        assert!(apply_memory_recall_heuristics("What about Bob?").is_none());
+        assert!(
+            apply_memory_recall_heuristics("What did we discuss about my project last week?")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn should_recall_memory_from_config_uses_heuristic_and_model_paths() {
+        let recent_messages = vec![
+            ConversationMessage::new(MessageRole::User, "I'm working on a Python project"),
+            ConversationMessage::new(MessageRole::Assistant, "That's great! How can I help?"),
+        ];
+
+        let heuristic_config = AppConfig::defaults();
+        let heuristic_decision =
+            should_recall_memory_from_config(&heuristic_config, "thanks", &recent_messages);
+        assert!(!heuristic_decision.needs_recall);
+        assert!(
+            heuristic_decision
+                .reasoning
+                .to_ascii_lowercase()
+                .contains("acknowledgment")
+        );
+        assert!(!heuristic_decision.used_llm);
+
+        let mut server = mockito::Server::new();
+        let classifier_mock = server
+            .mock("POST", "/responses")
+            .match_header("authorization", "Bearer test-key")
+            .match_body(mockito::Matcher::Regex(
+                "Analyze if this message requires recalling information from long-term memory"
+                    .to_string(),
+            ))
+            .match_body(mockito::Matcher::Regex(
+                "What was that library you mentioned\\?".to_string(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "output": [{
+                        "type": "message",
+                        "content": [{
+                            "type": "output_text",
+                            "text": serde_json::json!({
+                                "needs_recall": true,
+                                "reasoning": "The question refers back to earlier discussion."
+                            }).to_string()
+                        }]
+                    }]
+                })
+                .to_string(),
+            )
+            .create();
+
+        let mut model_config = AppConfig::defaults();
+        model_config.openai_api_key = Some("test-key".to_string());
+        model_config.openai_base_url = format!("{}/responses", server.url());
+        let model_decision = should_recall_memory_from_config(
+            &model_config,
+            "What was that library you mentioned?",
+            &recent_messages,
+        );
+        assert!(model_decision.needs_recall);
+        assert!(model_decision.used_llm);
+        assert!(model_decision.reasoning.contains("earlier discussion"));
+        classifier_mock.assert();
+
+        let mut disabled_config = AppConfig::defaults();
+        disabled_config.memory_recall_classifier_enabled = false;
+        let disabled_decision =
+            should_recall_memory_from_config(&disabled_config, "hello", &recent_messages);
+        assert!(disabled_decision.needs_recall);
+        assert_eq!(disabled_decision.reasoning, "classifier disabled");
+        assert!(!disabled_decision.used_llm);
+    }
+
+    #[test]
+    fn consolidate_memory_cluster_from_config_archives_duplicate_source_memories() {
+        let home = unique_home("elroy-rs-recall-consolidate-cluster");
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+
+        create_memory_file(
+            &memory_dir,
+            "User's Hiking Habits",
+            "User mentioned they enjoy hiking in the mountains and try to go every weekend.",
+        )
+        .expect("first memory should be created");
+        create_memory_file(
+            &memory_dir,
+            "User's Mountain Activities",
+            "User mentioned they enjoy hiking in the mountains and try to go every weekend.",
+        )
+        .expect("second memory should be created");
+
+        let mut config = AppConfig::defaults();
+        config.home_dir = home.clone();
+        config.memory_dir = memory_dir;
+        config.agenda_dir = agenda_dir;
+        config.database_path = database_path.clone();
+        elroy_db::bootstrap_database(&BootstrapPlan::from_config(&config))
+            .expect("bootstrap should succeed");
+
+        let connection =
+            open_sqlite_connection(&database_path).expect("sqlite connection should open");
+        let active_memories = list_all_active_memories_in_scope(&connection, &config.memory_dir)
+            .expect("active memories should load");
+        assert_eq!(active_memories.len(), 2);
+
+        let cluster = MemoryCluster {
+            memories: active_memories,
+            embeddings: Vec::new(),
+        };
+        consolidate_memory_cluster_from_config(&config, &cluster)
+            .expect("cluster consolidation should succeed");
+
+        let reopened =
+            open_sqlite_connection(&database_path).expect("sqlite connection should reopen");
+        let reloaded_active_memories =
+            list_all_active_memories_in_scope(&reopened, &config.memory_dir)
+                .expect("reloaded active memories should load");
+        assert_eq!(reloaded_active_memories.len(), 1);
+        let consolidated_memory = &reloaded_active_memories[0];
+
+        assert!(
+            consolidated_memory
+                .body
+                .contains("enjoy hiking in the mountains")
+        );
+        let archived_entries = fs::read_dir(config.memory_dir.join("archive"))
+            .expect("memory archive directory should exist after consolidation")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("archive directory entries should load");
+        assert_eq!(archived_entries.len(), 2);
+
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
+    fn augment_text_from_config_uses_relevant_memory_context() {
+        let home = unique_home("elroy-rs-recall-augment-memory");
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+        fs::write(
+            memory_dir.join("my_best_friend.md"),
+            "My best friend's name is Ted, his birthday is April 27.\n",
+        )
+        .expect("memory file should be written");
+
+        let mut server = mockito::Server::new();
+        let relevance_mock = server
+            .mock("POST", "/responses")
+            .match_header("authorization", "Bearer test-key")
+            .match_body(mockito::Matcher::Regex(
+                "Your job is to determine which candidate recall items are relevant to a query\\."
+                    .to_string(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "output": [{
+                        "type": "message",
+                        "content": [{
+                            "type": "output_text",
+                            "text": serde_json::json!({
+                                "answers": [true],
+                                "reasoning": "Ted is directly relevant to the gift note."
+                            }).to_string()
+                        }]
+                    }]
+                })
+                .to_string(),
+            )
+            .create();
+        let augmentation_mock = server
+            .mock("POST", "/responses")
+            .match_header("authorization", "Bearer test-key")
+            .match_body(mockito::Matcher::Regex(
+                "Ted bday gift: War and Peace".to_string(),
+            ))
+            .match_body(mockito::Matcher::Regex("April 27".to_string()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "output": [{
+                        "type": "message",
+                        "content": [{
+                            "type": "output_text",
+                            "text": "Ted is your best friend, and his birthday is April 27, so War and Peace could be a fitting gift."
+                        }]
+                    }]
+                })
+                .to_string(),
+            )
+            .create();
+
+        let mut config = AppConfig::defaults();
+        config.home_dir = home.clone();
+        config.memory_dir = memory_dir;
+        config.agenda_dir = agenda_dir;
+        config.database_path = database_path;
+        config.openai_api_key = Some("test-key".to_string());
+        config.openai_base_url = format!("{}/responses", server.url());
+        elroy_db::bootstrap_database(&BootstrapPlan::from_config(&config))
+            .expect("bootstrap should succeed");
+
+        let response = augment_text_from_config(&config, "Ted bday gift: War and Peace")
+            .expect("augment text should succeed");
+
+        assert!(response.to_ascii_lowercase().contains("april 27"));
+        assert!(response.to_ascii_lowercase().contains("best friend"));
+
+        relevance_mock.assert();
+        augmentation_mock.assert();
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
+    fn augment_text_from_config_returns_original_when_no_relevant_memories_exist() {
+        let home = unique_home("elroy-rs-recall-augment-memory-none");
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+        fs::write(
+            memory_dir.join("chores.md"),
+            "I need to go to the grocery store Sunday.\n",
+        )
+        .expect("memory file should be written");
+
+        let mut config = AppConfig::defaults();
+        config.home_dir = home.clone();
+        config.memory_dir = memory_dir;
+        config.agenda_dir = agenda_dir;
+        config.database_path = database_path;
+        elroy_db::bootstrap_database(&BootstrapPlan::from_config(&config))
+            .expect("bootstrap should succeed");
+
+        let response = augment_text_from_config(&config, "My dog has been sick")
+            .expect("augment text should succeed");
+        assert_eq!(response, "My dog has been sick");
+
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
+
+    #[test]
+    fn embedding_query_helpers_rank_active_memory_and_agenda_rows() {
+        let home = unique_home("elroy-rs-recall-query-vector");
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+
+        create_memory_file(
+            &memory_dir,
+            "Exact practice note",
+            "Practice shooting follow through after warmups",
+        )
+        .expect("first memory should be created");
+        create_memory_file(
+            &memory_dir,
+            "Secondary practice note",
+            "Practice free throws after warmups",
+        )
+        .expect("second memory should be created");
+        create_memory_file(
+            &memory_dir,
+            "Irrelevant cooking note",
+            "Chop onions before heating the pan",
+        )
+        .expect("third memory should be created");
+
+        write_agenda_fixture(
+            &agenda_dir,
+            "exact_practice_reminder",
+            "date: unscheduled\ncompleted: false\ntrigger_datetime: 2099-01-01T09:00:00",
+            "Bring shooting sleeves to practice",
+        );
+        write_agenda_fixture(
+            &agenda_dir,
+            "secondary_practice_reminder",
+            "date: unscheduled\ncompleted: false\ntrigger_context: when I mention practice",
+            "Pack extra basketball socks",
+        );
+        write_agenda_fixture(
+            &agenda_dir,
+            "exact_practice_task",
+            "date: 2099-01-03\ncompleted: false",
+            "Review practice film",
+        );
+        write_agenda_fixture(
+            &agenda_dir,
+            "secondary_practice_task",
+            "date: 2099-01-04\ncompleted: false",
+            "Confirm practice travel time",
+        );
+        write_agenda_fixture(
+            &agenda_dir,
+            "irrelevant_cooking_task",
+            "date: 2099-01-05\ncompleted: false",
+            "Buy paprika for dinner",
+        );
+
+        let mut config = AppConfig::defaults();
+        config.home_dir = home.clone();
+        config.memory_dir = memory_dir;
+        config.agenda_dir = agenda_dir;
+        config.database_path = database_path.clone();
+        config.l2_memory_relevance_distance_threshold = 100.0;
+        elroy_db::bootstrap_database(&BootstrapPlan::from_config(&config))
+            .expect("bootstrap should succeed");
+
+        let connection =
+            open_sqlite_connection(&database_path).expect("sqlite connection should open");
+        let exact_memory = elroy_db::find_active_memory_by_name(&connection, "Exact practice note")
+            .expect("memory lookup should succeed")
+            .expect("exact memory should exist");
+        let secondary_memory =
+            elroy_db::find_active_memory_by_name(&connection, "Secondary practice note")
+                .expect("memory lookup should succeed")
+                .expect("secondary memory should exist");
+        let irrelevant_memory =
+            elroy_db::find_active_memory_by_name(&connection, "Irrelevant cooking note")
+                .expect("memory lookup should succeed")
+                .expect("irrelevant memory should exist");
+        let exact_due_item =
+            elroy_db::find_active_agenda_item_by_name(&connection, "Exact practice reminder")
+                .expect("agenda lookup should succeed")
+                .expect("exact due item should exist");
+        let secondary_due_item =
+            elroy_db::find_active_agenda_item_by_name(&connection, "Secondary practice reminder")
+                .expect("agenda lookup should succeed")
+                .expect("secondary due item should exist");
+        let exact_agenda_item =
+            elroy_db::find_active_agenda_item_by_name(&connection, "Exact practice task")
+                .expect("agenda lookup should succeed")
+                .expect("exact agenda item should exist");
+        let secondary_agenda_item =
+            elroy_db::find_active_agenda_item_by_name(&connection, "Secondary practice task")
+                .expect("agenda lookup should succeed")
+                .expect("secondary agenda item should exist");
+        let irrelevant_agenda_item =
+            elroy_db::find_active_agenda_item_by_name(&connection, "Irrelevant cooking task")
+                .expect("agenda lookup should succeed")
+                .expect("irrelevant agenda item should exist");
+
+        upsert_memory_embedding(
+            &connection,
+            &exact_memory.file_path,
+            &[0.0, 0.0],
+            &memory_embedding_text(&exact_memory),
+        )
+        .expect("exact memory embedding should persist");
+        upsert_memory_embedding(
+            &connection,
+            &secondary_memory.file_path,
+            &[0.1, 0.0],
+            &memory_embedding_text(&secondary_memory),
+        )
+        .expect("secondary memory embedding should persist");
+        upsert_memory_embedding(
+            &connection,
+            &irrelevant_memory.file_path,
+            &[9.0, 9.0],
+            &memory_embedding_text(&irrelevant_memory),
+        )
+        .expect("irrelevant memory embedding should persist");
+        upsert_memory_embedding(
+            &connection,
+            &exact_due_item.file_path,
+            &[0.0, 0.05],
+            &super::agenda_item_embedding_text(&exact_due_item),
+        )
+        .expect("exact due item embedding should persist");
+        upsert_memory_embedding(
+            &connection,
+            &secondary_due_item.file_path,
+            &[0.15, 0.0],
+            &super::agenda_item_embedding_text(&secondary_due_item),
+        )
+        .expect("secondary due item embedding should persist");
+        upsert_memory_embedding(
+            &connection,
+            &exact_agenda_item.file_path,
+            &[0.0, 0.1],
+            &super::agenda_item_embedding_text(&exact_agenda_item),
+        )
+        .expect("exact agenda embedding should persist");
+        upsert_memory_embedding(
+            &connection,
+            &secondary_agenda_item.file_path,
+            &[0.2, 0.0],
+            &super::agenda_item_embedding_text(&secondary_agenda_item),
+        )
+        .expect("secondary agenda embedding should persist");
+        upsert_memory_embedding(
+            &connection,
+            &irrelevant_agenda_item.file_path,
+            &[8.0, 8.0],
+            &super::agenda_item_embedding_text(&irrelevant_agenda_item),
+        )
+        .expect("irrelevant agenda embedding should persist");
+
+        let query_embedding = [0.0_f32, 0.0_f32];
+
+        let memory_results = query_memories_by_embedding(&config, &query_embedding)
+            .expect("memory query should work");
+        assert_eq!(
+            memory_results
+                .iter()
+                .map(|memory| memory.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["exact practice note", "secondary practice note"]
+        );
+        let top_memories =
+            get_most_relevant_memories_from_query_embedding(&config, &query_embedding)
+                .expect("top memory query should work");
+        assert_eq!(
+            top_memories
+                .iter()
+                .map(|memory| memory.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["exact practice note", "secondary practice note"]
+        );
+
+        let agenda_results = query_agenda_items_by_embedding(&config, &query_embedding)
+            .expect("agenda query should work");
+        assert_eq!(
+            agenda_results
+                .iter()
+                .map(|item| item.name.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "exact practice reminder",
+                "exact practice task",
+                "secondary practice reminder",
+                "secondary practice task",
+            ]
+        );
+        let top_due_items =
+            get_most_relevant_due_items_from_query_embedding(&config, &query_embedding)
+                .expect("top due-item query should work");
+        assert_eq!(
+            top_due_items
+                .iter()
+                .map(|item| item.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["exact practice reminder", "secondary practice reminder"]
+        );
+        let top_agenda_items =
+            get_most_relevant_agenda_items_from_query_embedding(&config, &query_embedding)
+                .expect("top agenda-item query should work");
+        assert_eq!(
+            top_agenda_items
+                .iter()
+                .map(|item| item.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["exact practice task", "secondary practice task"]
+        );
+
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
 }

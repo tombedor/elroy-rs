@@ -272,3 +272,89 @@ fn merge_feature_request_supporting_context(existing: Option<&str>, new_context:
         Some(existing) => format!("{}\n\n{}", existing.trim_end(), new_context),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use super::feature_request_tools;
+    use crate::list_feature_requests;
+    use elroy_tools::ExecutableToolRegistry;
+
+    #[test]
+    fn feature_request_tools_can_list_make_merge_and_edit_requests() {
+        let unique = format!(
+            "elroy-rs-feature-requests-tools-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        fs::create_dir_all(&home).expect("home should be created");
+
+        let registry = ExecutableToolRegistry::new(feature_request_tools(home.clone()));
+
+        let empty = registry.invoke("list_feature_requests", "{}");
+        assert!(!empty.is_error);
+        assert_eq!(empty.content, "No feature requests found.");
+
+        let created = registry.invoke(
+            "make_feature_request",
+            "{\"title\":\"Add calendar sync\",\"description\":\"Sync Elroy tasks to a calendar provider.\",\"rationale\":\"Users want a unified schedule.\"}",
+        );
+        assert!(!created.is_error);
+        assert!(
+            created
+                .content
+                .contains("Created feature request: Add calendar sync")
+        );
+
+        let merged = registry.invoke(
+            "make_feature_request",
+            "{\"title\":\"Add calendar synchronization\",\"description\":\"Sync tasks to an external calendar.\",\"rationale\":\"Users want calendar parity.\"}",
+        );
+        assert!(!merged.is_error);
+        assert!(
+            merged
+                .content
+                .contains("Merged into existing feature request: Add calendar sync")
+        );
+
+        let listed = registry.invoke("list_feature_requests", "{}");
+        assert!(!listed.is_error);
+        assert!(listed.content.contains("Feature requests (1):"));
+        assert!(
+            listed
+                .content
+                .contains("aliases: Add calendar synchronization")
+        );
+
+        let edited = registry.invoke(
+            "edit_feature_request",
+            "{\"identifier\":\"add calendar sync\",\"status\":\"closed\",\"description\":\"Sync Elroy tasks to a calendar provider with account selection.\"}",
+        );
+        assert!(!edited.is_error);
+        assert!(
+            edited
+                .content
+                .contains("Updated feature request: Add calendar sync")
+        );
+
+        let records = list_feature_requests(&home).expect("feature requests should list");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].status, "closed");
+        assert_eq!(
+            records[0].summary,
+            "Sync Elroy tasks to a calendar provider with account selection."
+        );
+        assert!(
+            records[0]
+                .supporting_context
+                .as_deref()
+                .is_some_and(|content| content.contains("Edited by user token: local-user"))
+        );
+
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
+}

@@ -21,3 +21,6 @@ elroy-recall = { path = "../elroy-recall" }
 elroy-tools = { path = "../elroy-tools" }
 rusqlite = { version = "0.37", features = ["bundled"] }
 serde_json = "1"
+
+[dev-dependencies]
+elroy-llm = { path = "../elroy-llm" }

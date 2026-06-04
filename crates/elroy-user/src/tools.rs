@@ -296,3 +296,152 @@ fn mutate_user_preferences_in_config(
         Err(error) => ToolExecutionResult::error(format!("user preference update failed: {error}")),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::sync::Arc;
+
+    use super::user_tools;
+    use crate::tools::PostSaveCallback;
+    use elroy_config::AppConfig;
+    use elroy_context::refresh_persisted_system_instructions;
+    use elroy_db::{
+        LOCAL_USER_TOKEN, load_context_messages, load_user_preferences, open_sqlite_connection,
+    };
+    use elroy_llm::MessageRole;
+    use elroy_tools::ExecutableToolRegistry;
+
+    fn refresh_callback() -> PostSaveCallback {
+        Arc::new(refresh_persisted_system_instructions)
+    }
+
+    #[test]
+    fn user_tools_can_manage_preferences_and_refresh_system_context() {
+        let unique = format!(
+            "elroy-rs-user-tools-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let home = std::env::temp_dir().join(unique);
+        let memory_dir = home.join("memories");
+        let agenda_dir = home.join("agenda");
+        let database_path = home.join("elroy.db");
+        fs::create_dir_all(&memory_dir).expect("memory dir should be created");
+        fs::create_dir_all(&agenda_dir).expect("agenda dir should be created");
+
+        let mut config = AppConfig::defaults();
+        config.memory_dir = memory_dir;
+        config.agenda_dir = agenda_dir;
+        config.database_path = database_path;
+
+        let registry = ExecutableToolRegistry::new(user_tools(config.clone(), refresh_callback()));
+        let default_name = registry.invoke("get_user_preferred_name", "{}");
+        assert!(!default_name.is_error);
+        assert_eq!(default_name.content, "User");
+
+        let preferred =
+            registry.invoke("set_user_preferred_name", "{\"preferred_name\":\"Jimmy\"}");
+        assert!(!preferred.is_error);
+        assert!(preferred.content.contains("Jimmy"));
+
+        let duplicate =
+            registry.invoke("set_user_preferred_name", "{\"preferred_name\":\"James\"}");
+        assert!(!duplicate.is_error);
+        assert_eq!(
+            duplicate.content,
+            "Preferred name already set to Jimmy. If this should be changed, use override_existing=True."
+        );
+
+        let preferred_override = registry.invoke(
+            "set_user_preferred_name",
+            "{\"preferred_name\":\"James\",\"override_existing\":true}",
+        );
+        assert!(!preferred_override.is_error);
+        assert_eq!(
+            preferred_override.content,
+            "Set user preferred name to James. Was Jimmy."
+        );
+
+        let assistant = registry.invoke("set_assistant_name", "{\"assistant_name\":\"Nova\"}");
+        assert!(!assistant.is_error);
+        assert!(assistant.content.contains("Nova"));
+
+        let full_name = registry.invoke("set_user_full_name", "{\"full_name\":\"James Smith\"}");
+        assert!(!full_name.is_error);
+        assert_eq!(
+            full_name.content,
+            "Full name set to James Smith. Previous value was Unknown name."
+        );
+
+        let full_name_duplicate =
+            registry.invoke("set_user_full_name", "{\"full_name\":\"James T. Smith\"}");
+        assert!(!full_name_duplicate.is_error);
+        assert_eq!(
+            full_name_duplicate.content,
+            "Full name already set to James Smith. If this should be changed, set override_existing=True."
+        );
+
+        let full_name_override = registry.invoke(
+            "set_user_full_name",
+            "{\"full_name\":\"James T. Smith\",\"override_existing\":true}",
+        );
+        assert!(!full_name_override.is_error);
+        assert_eq!(
+            full_name_override.content,
+            "Full name set to James T. Smith. Previous value was James Smith."
+        );
+
+        let get_full_name = registry.invoke("get_user_full_name", "{}");
+        assert!(!get_full_name.is_error);
+        assert_eq!(get_full_name.content, "James T. Smith");
+
+        let persona = registry.invoke(
+            "set_persona",
+            "{\"system_persona\":\"You are $ASSISTANT_ALIAS helping $USER_ALIAS.\"}",
+        );
+        assert!(!persona.is_error);
+        assert_eq!(persona.content, "System persona updated.");
+
+        let mut connection =
+            open_sqlite_connection(&config.database_path).expect("database should open");
+        let context = load_context_messages(&mut connection, LOCAL_USER_TOKEN).expect("load ok");
+        assert_eq!(context[0].role, MessageRole::System);
+        assert_eq!(
+            context[0].content.as_deref(),
+            Some("You are Nova helping James.")
+        );
+
+        let persisted = load_user_preferences(&connection, LOCAL_USER_TOKEN)
+            .expect("preferences should load")
+            .expect("preferences should exist");
+        assert_eq!(
+            persisted.system_persona.as_deref(),
+            Some("You are $ASSISTANT_ALIAS helping $USER_ALIAS.")
+        );
+
+        let reset = registry.invoke("reset_system_persona", "{}");
+        assert!(!reset.is_error);
+        assert_eq!(
+            reset.content,
+            "System persona cleared, will now use default persona."
+        );
+
+        let cleared = load_user_preferences(&connection, LOCAL_USER_TOKEN)
+            .expect("preferences should load")
+            .expect("preferences should exist");
+        assert_eq!(cleared.system_persona, None);
+        let context = load_context_messages(&mut connection, LOCAL_USER_TOKEN).expect("load ok");
+        assert_eq!(context[0].role, MessageRole::System);
+        assert!(
+            context[0]
+                .content
+                .as_deref()
+                .is_some_and(|content| content.contains("I am Nova"))
+        );
+
+        fs::remove_dir_all(home).expect("home should be removed");
+    }
+}

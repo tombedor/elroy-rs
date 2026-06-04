@@ -84,6 +84,14 @@ pub fn get_background_status() -> Option<String> {
     statuses.first().map(|(_, message)| message.clone())
 }
 
+pub fn get_background_status_for_key(key: &str) -> Option<String> {
+    let statuses = BACKGROUND_STATUSES.get_or_init(|| Mutex::new(Vec::new()));
+    let statuses = statuses.lock().expect("background status lock should work");
+    statuses
+        .iter()
+        .find_map(|(existing_key, message)| (existing_key == key).then(|| message.clone()))
+}
+
 pub struct ConversationRequest<'a> {
     pub user_message: &'a str,
     pub tools: &'a [ToolSpec],
@@ -686,7 +694,7 @@ mod tests {
 
     use super::{
         AppSession, TurnContext, clear_background_status, get_background_status,
-        set_background_status,
+        get_background_status_for_key, set_background_status,
     };
     use elroy_config::AppConfig;
     use elroy_llm::{ConversationMessage, MessageRole, StreamEvent, ToolCall};
@@ -1184,14 +1192,23 @@ mod tests {
             get_background_status().as_deref(),
             Some("syncing memories...")
         );
+        assert_eq!(
+            get_background_status_for_key("memory-sync").as_deref(),
+            Some("syncing memories...")
+        );
 
         set_background_status("other", "other background task");
         assert_eq!(
             get_background_status().as_deref(),
             Some("syncing memories...")
         );
+        assert_eq!(
+            get_background_status_for_key("other").as_deref(),
+            Some("other background task")
+        );
 
         clear_background_status("memory-sync");
+        assert!(get_background_status_for_key("memory-sync").is_none());
         assert_eq!(
             get_background_status().as_deref(),
             Some("other background task")
